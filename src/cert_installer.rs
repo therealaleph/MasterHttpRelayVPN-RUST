@@ -32,6 +32,10 @@ pub fn install_ca(path: &Path) -> Result<(), InstallError> {
         other => return Err(InstallError::Unsupported(other.to_string())),
     };
 
+    // Best-effort: also try to install into Firefox NSS stores if certutil
+    // is available. Firefox maintains its own trust store separate from the OS.
+    install_firefox_nss(&path_s);
+
     if ok {
         Ok(())
     } else {
@@ -263,4 +267,145 @@ fn install_windows(cert_path: &str) -> bool {
     }
     tracing::error!("Windows install failed — run as administrator or install manually.");
     false
+}
+
+// ---------- Firefox (NSS) ----------
+
+/// Best-effort install of the CA into all discovered Firefox profiles.
+/// Silently no-ops if `certutil` (from libnss3-tools) is not available.
+/// Firefox must be closed during install for changes to take effect.
+fn install_firefox_nss(cert_path: &str) {
+    // Check if certutil exists at all.
+    if Command::new("certutil")
+        .arg("--help")
+        .output()
+        .ok()
+        .map(|o| {
+            // macOS has a different certutil (built-in) that doesn't support -d.
+            // Look for NSS-specific flags in the help output.
+            String::from_utf8_lossy(&o.stderr).contains("-d")
+                || String::from_utf8_lossy(&o.stdout).contains("-d")
+        })
+        .unwrap_or(false)
+        == false
+    {
+        tracing::debug!(
+            "NSS certutil not found — Firefox users must import ca.crt manually \
+             via Settings -> Privacy & Security -> Certificates."
+        );
+        return;
+    }
+
+    let profiles = firefox_profile_dirs();
+    if profiles.is_empty() {
+        tracing::debug!("no Firefox profiles found");
+        return;
+    }
+
+    let mut ok = 0;
+    for p in &profiles {
+        if install_nss_in_profile(p, cert_path) {
+            ok += 1;
+        }
+    }
+    if ok > 0 {
+        tracing::info!("CA installed in {} Firefox profile(s).", ok);
+    } else {
+        tracing::debug!(
+            "No Firefox profiles updated. If Firefox wasn't running, try installing manually."
+        );
+    }
+}
+
+fn install_nss_in_profile(profile: &Path, cert_path: &str) -> bool {
+    let prefix = if profile.join("cert9.db").exists() {
+        "sql:"
+    } else if profile.join("cert8.db").exists() {
+        ""
+    } else {
+        return false;
+    };
+    let dir_arg = format!("{}{}", prefix, profile.display());
+
+    // Delete any stale entry first (ignore errors).
+    let _ = Command::new("certutil")
+        .args(["-D", "-n", CERT_NAME, "-d", &dir_arg])
+        .output();
+
+    let res = Command::new("certutil")
+        .args([
+            "-A",
+            "-n",
+            CERT_NAME,
+            "-t",
+            "C,,",
+            "-d",
+            &dir_arg,
+            "-i",
+            cert_path,
+        ])
+        .output();
+    match res {
+        Ok(o) if o.status.success() => {
+            tracing::debug!("NSS install ok: {}", profile.display());
+            true
+        }
+        Ok(o) => {
+            tracing::debug!(
+                "NSS install failed for {}: {}",
+                profile.display(),
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            false
+        }
+        Err(e) => {
+            tracing::debug!("NSS certutil exec failed for {}: {}", profile.display(), e);
+            false
+        }
+    }
+}
+
+fn firefox_profile_dirs() -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let home = std::env::var("HOME").unwrap_or_default();
+    match std::env::consts::OS {
+        "macos" => {
+            roots.push(PathBuf::from(format!(
+                "{}/Library/Application Support/Firefox/Profiles",
+                home
+            )));
+        }
+        "linux" => {
+            roots.push(PathBuf::from(format!("{}/.mozilla/firefox", home)));
+            roots.push(PathBuf::from(format!(
+                "{}/snap/firefox/common/.mozilla/firefox",
+                home
+            )));
+        }
+        "windows" => {
+            if let Ok(appdata) = std::env::var("APPDATA") {
+                roots.push(PathBuf::from(format!("{}\\Mozilla\\Firefox\\Profiles", appdata)));
+            }
+        }
+        _ => {}
+    }
+
+    let mut out: Vec<PathBuf> = Vec::new();
+    for root in &roots {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        for ent in entries.flatten() {
+            let p = ent.path();
+            if !p.is_dir() {
+                continue;
+            }
+            // A profile has cert9.db or cert8.db.
+            if p.join("cert9.db").exists() || p.join("cert8.db").exists() {
+                out.push(p);
+            }
+        }
+    }
+    out
 }
