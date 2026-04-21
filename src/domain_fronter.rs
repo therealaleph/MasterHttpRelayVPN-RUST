@@ -6,10 +6,8 @@
 //! `/macros/s/{script_id}/exec`. Apps Script performs the actual upstream
 //! HTTP fetch server-side and returns a JSON envelope.
 //!
-//! TODO(mvp): add HTTP/2 multiplexing (`h2` crate) for lower latency.
-//! TODO(mvp): add fetchAll batching — group concurrent relay calls.
-//! TODO(mvp): add request coalescing for concurrent identical GETs.
-//! TODO(mvp): add response cache and parallel range-based downloads.
+//! TODO: add HTTP/2 multiplexing (`h2` crate) for lower latency.
+//! TODO: add parallel range-based downloads.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -30,6 +28,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 
+use crate::cache::{cache_key, is_cacheable_method, parse_ttl, ResponseCache};
 use crate::config::Config;
 
 #[derive(Debug, thiserror::Error)]
@@ -69,6 +68,7 @@ pub struct DomainFronter {
     script_idx: AtomicUsize,
     tls_connector: TlsConnector,
     pool: Arc<Mutex<Vec<PoolEntry>>>,
+    cache: Arc<ResponseCache>,
 }
 
 /// Request payload sent to Apps Script (single, non-batch).
@@ -128,7 +128,12 @@ impl DomainFronter {
             script_idx: AtomicUsize::new(0),
             tls_connector,
             pool: Arc::new(Mutex::new(Vec::new())),
+            cache: Arc::new(ResponseCache::with_default()),
         })
+    }
+
+    pub fn cache(&self) -> &ResponseCache {
+        &self.cache
     }
 
     fn next_script_id(&self) -> &str {
@@ -182,7 +187,16 @@ impl DomainFronter {
         headers: &[(String, String)],
         body: &[u8],
     ) -> Vec<u8> {
-        match timeout(
+        let cacheable = is_cacheable_method(method) && body.is_empty();
+        let key = if cacheable { Some(cache_key(method, url)) } else { None };
+        if let Some(ref k) = key {
+            if let Some(hit) = self.cache.get(k) {
+                tracing::debug!("cache hit: {}", url);
+                return hit;
+            }
+        }
+
+        let bytes = match timeout(
             Duration::from_secs(REQUEST_TIMEOUT_SECS),
             self.do_relay_with_retry(method, url, headers, body),
         )
@@ -191,13 +205,21 @@ impl DomainFronter {
             Ok(Ok(bytes)) => bytes,
             Ok(Err(e)) => {
                 tracing::error!("Relay failed: {}", e);
-                error_response(502, &format!("Relay error: {}", e))
+                return error_response(502, &format!("Relay error: {}", e));
             }
             Err(_) => {
                 tracing::error!("Relay timeout");
-                error_response(504, "Relay timeout")
+                return error_response(504, "Relay timeout");
+            }
+        };
+
+        if let Some(k) = key {
+            if let Some(ttl) = parse_ttl(&bytes, url) {
+                tracing::debug!("cache store: {} ttl={}s", url, ttl.as_secs());
+                self.cache.put(k, bytes.clone(), ttl);
             }
         }
+        bytes
     }
 
     async fn do_relay_with_retry(

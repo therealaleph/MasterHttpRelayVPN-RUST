@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+mod cache;
 mod cert_installer;
 mod config;
 mod domain_fronter;
