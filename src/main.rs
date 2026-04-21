@@ -6,6 +6,8 @@ mod config;
 mod domain_fronter;
 mod mitm;
 mod proxy_server;
+mod scan_ips;
+mod test_cmd;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -25,6 +27,13 @@ struct Args {
     config_path: PathBuf,
     install_cert: bool,
     no_cert_check: bool,
+    command: Command,
+}
+
+enum Command {
+    Serve,
+    Test,
+    ScanIps,
 }
 
 fn print_help() {
@@ -32,7 +41,9 @@ fn print_help() {
         "mhrv-rs {} — Rust port of MasterHttpRelayVPN (apps_script mode only)
 
 USAGE:
-    mhrv-rs [--config PATH] [--install-cert] [--no-cert-check]
+    mhrv-rs [OPTIONS]                  Start the proxy server (default)
+    mhrv-rs test [OPTIONS]             Probe the Apps Script relay end-to-end
+    mhrv-rs scan-ips [OPTIONS]         Scan Google frontend IPs for reachability + latency
 
 OPTIONS:
     -c, --config PATH    Path to config.json (default: ./config.json)
@@ -52,8 +63,24 @@ fn parse_args() -> Result<Args, String> {
     let mut config_path = PathBuf::from("config.json");
     let mut install_cert = false;
     let mut no_cert_check = false;
+    let mut command = Command::Serve;
 
-    let mut it = std::env::args().skip(1);
+    let mut raw: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(first) = raw.first() {
+        match first.as_str() {
+            "test" => {
+                command = Command::Test;
+                raw.remove(0);
+            }
+            "scan-ips" => {
+                command = Command::ScanIps;
+                raw.remove(0);
+            }
+            _ => {}
+        }
+    }
+
+    let mut it = raw.into_iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "-h" | "--help" => {
@@ -77,6 +104,7 @@ fn parse_args() -> Result<Args, String> {
         config_path,
         install_cert,
         no_cert_check,
+        command,
     })
 }
 
@@ -135,6 +163,18 @@ async fn main() -> ExitCode {
     };
 
     init_logging(&config.log_level);
+
+    match args.command {
+        Command::Test => {
+            let ok = test_cmd::run(&config).await;
+            return if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE };
+        }
+        Command::ScanIps => {
+            let ok = scan_ips::run(&config).await;
+            return if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE };
+        }
+        Command::Serve => {}
+    }
 
     tracing::warn!("mhrv-rs {} starting (mode: apps_script)", VERSION);
     tracing::info!(
