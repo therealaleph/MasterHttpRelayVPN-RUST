@@ -14,15 +14,19 @@ android {
         applicationId = "com.therealaleph.mhrv"
         minSdk = 24 // Android 7.0 — covers 99%+ of live devices.
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 100
+        versionName = "1.0.0"
 
-        // Only arm64 for now — we can add armeabi-v7a in a second pass
-        // if field reports need it. Android emulators on Apple Silicon
-        // only run arm64 natively, so keeping things aarch64-only makes
-        // the dev loop fast.
+        // Ship all four mainstream Android ABIs:
+        //   - arm64-v8a      — 95%+ of real-world Android phones since 2019
+        //   - armeabi-v7a    — older/cheaper devices still on 32-bit ARM
+        //   - x86_64         — Android emulator on Intel Macs + Chromebooks
+        //   - x86            — legacy 32-bit Intel emulator; cheap to include
+        // Per-ABI .so files push the APK up to ~50 MB, but users expect one
+        // APK that Just Works rather than "pick the right ABI" which nobody
+        // does correctly. Google Play would auto-split; we ship universal.
         ndk {
-            abiFilters += listOf("arm64-v8a")
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64", "x86")
         }
     }
 
@@ -33,6 +37,15 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
             )
+            // Sign release builds with the debug keystore so users can
+            // sideload the APK without us shipping a proper release key.
+            // The project has no Play Store presence, so signature
+            // identity per-build doesn't matter — installability does.
+            // Gradle auto-creates `~/.android/debug.keystore` on first use;
+            // CI runners inherit that behaviour. Anyone rebuilding from
+            // source gets their own signature, which is what we want for
+            // an open-source project: trust the source, not a key we hold.
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
 
@@ -96,26 +109,33 @@ dependencies {
 val rustCrateDir = rootProject.projectDir.parentFile
 val jniLibsDir = file("src/main/jniLibs")
 
-// After cargo-ndk dumps artifacts into jniLibs/arm64-v8a/, the tun2proxy
-// cdylib lands as `libtun2proxy-<hash>.so` (rustc's deps/ naming convention,
-// because tun2proxy is a transitive dep not a root crate). Android's
-// System.loadLibrary expects a stable name, and the hash changes between
-// builds, so we normalize it to `libtun2proxy.so` here. Also deletes any
-// stale hash-suffixed copies from previous builds.
+// After cargo-ndk dumps artifacts into each jniLibs/<abi>/ dir, the
+// tun2proxy cdylib lands as `libtun2proxy-<hash>.so` (rustc's deps/ naming
+// convention, because tun2proxy is a transitive dep not a root crate).
+// Android's System.loadLibrary expects a stable name, and the hash changes
+// between builds, so we normalize it to `libtun2proxy.so` in every ABI dir.
+// Also deletes any stale hash-suffixed copies from previous builds.
 fun normalizeTun2proxySo() {
-    val abiDir = file("src/main/jniLibs/arm64-v8a")
-    if (!abiDir.isDirectory) return
-    val hashed = abiDir.listFiles { f -> f.name.matches(Regex("libtun2proxy-[0-9a-f]+\\.so")) }
-        ?: emptyArray()
-    // Keep only the newest (release build) and rename it.
-    val newest = hashed.maxByOrNull { it.lastModified() }
-    if (newest != null) {
-        val target = abiDir.resolve("libtun2proxy.so")
-        if (target.exists()) target.delete()
-        newest.copyTo(target, overwrite = true)
+    val jniLibsRoot = file("src/main/jniLibs")
+    if (!jniLibsRoot.isDirectory) return
+    jniLibsRoot.listFiles()?.filter { it.isDirectory }?.forEach { abiDir ->
+        val hashed = abiDir.listFiles { f -> f.name.matches(Regex("libtun2proxy-[0-9a-f]+\\.so")) }
+            ?: emptyArray()
+        val newest = hashed.maxByOrNull { it.lastModified() }
+        if (newest != null) {
+            val target = abiDir.resolve("libtun2proxy.so")
+            if (target.exists()) target.delete()
+            newest.copyTo(target, overwrite = true)
+        }
+        hashed.forEach { it.delete() }
     }
-    hashed.forEach { it.delete() }
 }
+
+// All ABIs we ship. Keep in sync with `android.defaultConfig.ndk.abiFilters`
+// above; if these drift, the APK either includes .so files with no matching
+// ABI entry (dead weight) or advertises ABIs with no .so (runtime
+// UnsatisfiedLinkError on devices that pick that split).
+val androidAbis = listOf("arm64-v8a", "armeabi-v7a", "x86_64", "x86")
 
 tasks.register<Exec>("cargoBuildDebug") {
     group = "build"
@@ -124,27 +144,27 @@ tasks.register<Exec>("cargoBuildDebug") {
     // never worth it just for a Rust stack trace you wouldn't see in
     // logcat anyway. If you need Rust debug symbols, temporarily drop
     // `--release` below and accept the APK size.
-    description = "Cross-compile mhrv_rs for arm64-v8a (release — same as cargoBuildRelease)"
+    description = "Cross-compile mhrv_rs for all ABIs (release — same as cargoBuildRelease)"
     workingDir = rustCrateDir
-    commandLine(
-        "cargo", "ndk",
-        "-t", "arm64-v8a",
-        "-o", jniLibsDir.absolutePath,
-        "build", "--release",
-    )
+    commandLine(buildList<String> {
+        add("cargo"); add("ndk")
+        androidAbis.forEach { add("-t"); add(it) }
+        add("-o"); add(jniLibsDir.absolutePath)
+        add("build"); add("--release")
+    })
     doLast { normalizeTun2proxySo() }
 }
 
 tasks.register<Exec>("cargoBuildRelease") {
     group = "build"
-    description = "Cross-compile mhrv_rs for arm64-v8a (release)"
+    description = "Cross-compile mhrv_rs for all ABIs (release)"
     workingDir = rustCrateDir
-    commandLine(
-        "cargo", "ndk",
-        "-t", "arm64-v8a",
-        "-o", jniLibsDir.absolutePath,
-        "build", "--release",
-    )
+    commandLine(buildList<String> {
+        add("cargo"); add("ndk")
+        androidAbis.forEach { add("-t"); add(it) }
+        add("-o"); add(jniLibsDir.absolutePath)
+        add("build"); add("--release")
+    })
     doLast { normalizeTun2proxySo() }
 }
 

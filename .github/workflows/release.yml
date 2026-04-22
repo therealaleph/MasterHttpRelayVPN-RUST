@@ -208,8 +208,73 @@ jobs:
             dist/${{ matrix.name }}-app.zip
           if-no-files-found: ignore
 
+  # Android build — separate job so it doesn't inflate the matrix. The
+  # Rust side here cross-compiles to FOUR ABIs (arm64-v8a, armeabi-v7a,
+  # x86_64, x86) via cargo-ndk and drops the .so files into the Gradle
+  # project's jniLibs/ tree, which then packages them into a single
+  # universal APK. Users pick it once, no per-ABI split.
+  android:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: 11076708
+
+      - name: Install NDK
+        run: |
+          yes | sdkmanager --install "ndk;26.1.10909125" >/dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/26.1.10909125" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      # `./gradlew :app:assembleRelease` triggers cargoBuildRelease first
+      # which invokes cargo-ndk with all four targets, then Gradle packages
+      # the APK (release buildType signed with the debug keystore — see
+      # android/app/build.gradle.kts comment explaining why).
+      - name: Build release APK
+        working-directory: android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Rename APK with version
+        working-directory: android
+        run: |
+          VER="${GITHUB_REF#refs/tags/v}"
+          SRC="app/build/outputs/apk/release/app-release.apk"
+          if [ ! -f "$SRC" ]; then
+            # Some AGP versions name it differently when the release config
+            # can't be auto-signed. Catch that up front with a clear error
+            # instead of a silent missing-artifact later.
+            echo "::error::expected $SRC to exist; actual outputs:"
+            find app/build/outputs/apk -type f -name '*.apk' -print
+            exit 1
+          fi
+          mkdir -p ../dist
+          cp "$SRC" "../dist/mhrv-rs-android-universal-v${VER}.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mhrv-rs-android-universal
+          path: dist/*.apk
+          if-no-files-found: error
+
   release:
-    needs: build
+    needs: [build, android]
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -47,7 +47,9 @@ For a handful of Google-owned domains (`google.com`, `youtube.com`, `fonts.googl
 
 ## Platforms
 
-Linux (x86_64, aarch64), macOS (x86_64, aarch64), Windows (x86_64). Prebuilt binaries on the [releases page](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases).
+Linux (x86_64, aarch64), macOS (x86_64, aarch64), Windows (x86_64), **Android 7.0+** (universal APK covering arm64, armv7, x86_64, x86). Prebuilt binaries on the [releases page](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases).
+
+**Android users** — grab `mhrv-rs-android-universal-v*.apk` and follow the full walk-through in [docs/android.md](docs/android.md). The Android build runs the exact same `mhrv-rs` crate as the desktop (via JNI) and adds a TUN bridge via `tun2proxy`, so every app on the device routes through the proxy without per-app configuration.
 
 ## What's in a release
 

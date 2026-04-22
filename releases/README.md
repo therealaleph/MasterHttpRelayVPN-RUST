@@ -2,10 +2,11 @@
 
 This folder contains the prebuilt binaries from the latest release, committed directly to the repository for users who cannot reach the GitHub Releases page.
 
-Current version: **v0.9.4**
+Current version: **v1.0.0**
 
 | File | Platform | Contents |
 |---|---|---|
+| `mhrv-rs-android-universal-v1.0.0.apk` | Android 7.0+ (all ABIs) | Universal APK — arm64-v8a, armeabi-v7a, x86_64, x86 in one file |
 | `mhrv-rs-linux-amd64.tar.gz` | Linux x86_64 | `mhrv-rs`, `mhrv-rs-ui`, `run.sh` |
 | `mhrv-rs-linux-arm64.tar.gz` | Linux aarch64 | `mhrv-rs`, `run.sh` (CLI only) |
 | `mhrv-rs-raspbian-armhf.tar.gz` | Raspberry Pi / ARMv7 hardfloat | `mhrv-rs`, `run.sh` (CLI only) |
@@ -42,7 +43,11 @@ cd mhrv-rs-macos-arm64        # or wherever the archive extracted to
 
 Extract `mhrv-rs-windows-amd64.zip`, then double-click `run.bat` inside the extracted folder (accept the UAC prompt so the MITM CA can be installed).
 
-See the [main README](../README.md) for full setup (Apps Script deployment, config, browser proxy settings).
+### Android
+
+Copy `mhrv-rs-android-universal-v1.0.0.apk` to your phone, tap it from the Files app, and allow "Install unknown apps" for whichever app is opening the APK (Files, Chrome, etc.). See [the Android guide](../docs/android.md) for the full walk-through of the first-run steps (Apps Script deployment, MITM CA install, VPN permission, SNI tester).
+
+See the [main README](../README.md) for desktop setup (Apps Script deployment, config, browser proxy settings).
 
 ---
 
@@ -50,7 +55,7 @@ See the [main README](../README.md) for full setup (Apps Script deployment, conf
 
 این پوشه شامل فایل‌های آخرین نسخه است و مستقیماً در ریپو قرار گرفته برای کاربرانی که به صفحهٔ GitHub Releases دسترسی ندارند.
 
-نسخهٔ فعلی: **v0.9.4**
+نسخهٔ فعلی: **v1.0.0**
 
 ### دانلود از طریق ZIP
 
@@ -68,4 +73,6 @@ cd mhrv-rs-macos-arm64
 
 **ویندوز:** فایل `mhrv-rs-windows-amd64.zip` را extract کنید و داخل پوشه روی `run.bat` دو بار کلیک کنید (UAC را قبول کنید تا گواهی MITM نصب شود).
 
-برای راه‌اندازی کامل (دیپلوی Apps Script، config، تنظیم proxy مرورگر) به [README اصلی](../README.md) مراجعه کنید.
+**اندروید:** فایل `mhrv-rs-android-universal-v1.0.0.apk` را روی گوشی کپی کنید، از Files app روی آن tap کنید و اجازهٔ "نصب برنامه‌های ناشناس" را بدهید. راهنمای کامل شروع به کار (دیپلوی Apps Script، نصب CA، اجازهٔ VPN، تستر SNI) در [راهنمای اندروید](../docs/android.md) هست.
+
+برای راه‌اندازی کامل دسکتاپ (دیپلوی Apps Script، config، تنظیم proxy مرورگر) به [README اصلی](../README.md) مراجعه کنید.
