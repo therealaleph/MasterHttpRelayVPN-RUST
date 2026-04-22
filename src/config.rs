@@ -165,6 +165,11 @@ impl Config {
                 ));
             }
         }
+        if self.scan_batch_size == 0 {
+            return Err(ConfigError::Invalid(
+                "scan_batch_size must be greater than 0".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -223,6 +228,18 @@ mod tests {
             "mode": "domain_fronting",
             "auth_key": "SECRET",
             "script_id": "X"
+        }"#;
+        let cfg: Config = serde_json::from_str(s).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_scan_batch_size() {
+        let s = r#"{
+            "mode": "apps_script",
+            "auth_key": "SECRET",
+            "script_id": "X",
+            "scan_batch_size": 0
         }"#;
         let cfg: Config = serde_json::from_str(s).unwrap();
         assert!(cfg.validate().is_err());
