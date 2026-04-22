@@ -1127,7 +1127,9 @@ fn parse_relay_json(body: &[u8]) -> Result<Vec<u8>, FronterError> {
     let status = data.s.unwrap_or(200);
     let status_text = status_text(status);
     let resp_body = match data.b {
-        Some(b) => B64.decode(b).unwrap_or_default(),
+        Some(b) => B64
+            .decode(b)
+            .map_err(|e| FronterError::BadResponse(format!("bad relay body base64: {}", e)))?,
         None => Vec::new(),
     };
 
@@ -1472,6 +1474,13 @@ mod tests {
         let body = r#"{"e":"unauthorized"}"#;
         let err = parse_relay_json(body.as_bytes()).unwrap_err();
         assert!(matches!(err, FronterError::Relay(_)));
+    }
+
+    #[test]
+    fn parse_relay_rejects_invalid_body_base64() {
+        let body = r#"{"s":200,"b":"***not-base64***"}"#;
+        let err = parse_relay_json(body.as_bytes()).unwrap_err();
+        assert!(matches!(err, FronterError::BadResponse(_)));
     }
 
     #[test]
