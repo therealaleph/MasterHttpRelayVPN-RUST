@@ -26,6 +26,9 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-22.04
             name: mhrv-rs-linux-arm64
+          - target: arm-unknown-linux-gnueabihf
+            os: ubuntu-latest
+            name: mhrv-rs-raspbian-armhf  
           - target: x86_64-apple-darwin
             os: macos-latest
             name: mhrv-rs-macos-amd64
@@ -73,6 +76,13 @@ jobs:
           echo '[target.aarch64-unknown-linux-gnu]' >> ~/.cargo/config.toml
           echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
 
+      - name: Install armhf cross-compile toolchain (Linux only)
+        if: matrix.target == 'arm-unknown-linux-gnueabihf'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabihf
+          echo '[target.arm-unknown-linux-gnueabihf]' >> ~/.cargo/config.toml
+          echo 'linker = "arm-linux-gnueabihf-gcc"' >> ~/.cargo/config.toml  
 
       - name: Install Windows MinGW toolchain
         if: matrix.target == 'x86_64-pc-windows-gnu'
@@ -120,7 +130,7 @@ jobs:
       # we still ship the CLI. We also skip the UI on musl targets (OpenWRT etc.
       # are headless, bundling X11 makes no sense).
       - name: Build UI
-        if: matrix.target != 'aarch64-unknown-linux-gnu' && !endsWith(matrix.target, '-linux-musl')
+        if: matrix.target != 'aarch64-unknown-linux-gnu' && matrix.target != 'arm-unknown-linux-gnueabihf' && !endsWith(matrix.target, '-linux-musl')
         run: cargo build --release --target ${{ matrix.target }} --features ui --bin mhrv-rs-ui
 
       - name: Package (unix)
