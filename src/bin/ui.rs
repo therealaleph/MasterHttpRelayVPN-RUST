@@ -1573,9 +1573,12 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                         ),
                     );
 
-                    let _ = server.run(shutdown_rx).await;
+                    if let Err(e) = server.run(shutdown_rx).await {
+                        push_log(&shared2, &format!("[ui] proxy error: {}", e));
+                    }
 
                     shared2.state.lock().unwrap().running = false;
+                    shared2.state.lock().unwrap().started_at = None;
                     push_log(&shared2, "[ui] proxy stopped");
                 });
 
@@ -1583,25 +1586,26 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
             }
 
             Ok(Cmd::Stop) => {
-                if let Some((handle, _, shutdown_tx)) = active.take() {
+                if let Some((mut handle, _, shutdown_tx)) = active.take() {
                     push_log(&shared, "[ui] stop requested");
                     let _ = shutdown_tx.send(());
 
                     // Give the proxy 2 seconds to shut down gracefully
                     rt.block_on(async {
                         tokio::select! {
-                            _ = handle => {
+                            _ = &mut handle => {
                                 push_log(&shared, "[ui] proxy stopped gracefully");
                             }
                             _ = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {
-                                push_log(&shared, "[ui] shutdown timeout, forcing abort");
+                                handle.abort();
+                                let _ = handle.await;
+                                push_log(&shared, "[ui] shutdown timeout, forced abort");
                             }
                         }
                     });
 
                     shared.state.lock().unwrap().running = false;
                     shared.state.lock().unwrap().started_at = None;
-                    shared.state.lock().unwrap().last_stats = None;
                 }
             }
 
@@ -1762,6 +1766,7 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
             if handle.is_finished() {
                 active = None;
                 shared.state.lock().unwrap().running = false;
+                shared.state.lock().unwrap().started_at = None;
             }
         }
     }
