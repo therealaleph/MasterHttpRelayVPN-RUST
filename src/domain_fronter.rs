@@ -77,6 +77,12 @@ pub struct DomainFronter {
     /// Fan-out factor: fire this many Apps Script instances in parallel
     /// per request and return first success. `<= 1` = off.
     parallel_relay: usize,
+    /// Enable the `normalize_x_graphql` URL rewrite (issue #16, credit
+    /// seramo_ir). When true, GETs to `x.com/i/api/graphql/<hash>/<op>`
+    /// have their query trimmed to the first `variables=` block so the
+    /// response cache isn't busted by the constantly-changing `features`
+    /// / `fieldToggles` params.
+    normalize_x_graphql: bool,
     tls_connector: TlsConnector,
     pool: Arc<Mutex<Vec<PoolEntry>>>,
     cache: Arc<ResponseCache>,
@@ -172,6 +178,7 @@ impl DomainFronter {
             http_host: "script.google.com",
             auth_key: config.auth_key.clone(),
             parallel_relay: config.parallel_relay as usize,
+            normalize_x_graphql: config.normalize_x_graphql,
             script_ids,
             script_idx: AtomicUsize::new(0),
             tls_connector,
@@ -388,6 +395,19 @@ impl DomainFronter {
         headers: &[(String, String)],
         body: &[u8],
     ) -> Vec<u8> {
+        // Optional URL rewrite for X/Twitter GraphQL (issue #16). Applied
+        // here, at the top of relay(), so it affects BOTH the cache key
+        // (so matching requests collapse into one entry) AND the URL that
+        // gets sent upstream to Apps Script (so Apps Script only has to
+        // fetch the trimmed variant, cutting quota usage).
+        let normalized;
+        let url: &str = if self.normalize_x_graphql {
+            normalized = normalize_x_graphql_url(url);
+            normalized.as_str()
+        } else {
+            url
+        };
+
         let coalescible = is_cacheable_method(method) && body.is_empty();
         let key = if coalescible { Some(cache_key(method, url)) } else { None };
         let t_start = Instant::now();
@@ -698,6 +718,58 @@ impl DomainFronter {
 /// strip Accept-Encoding: br (Apps Script can't decompress brotli).
 /// Extract the host (no scheme, no port, no path) from a URL string.
 /// Returns None for malformed / scheme-less inputs.
+/// Trim X/Twitter GraphQL URLs down to just the `variables=` query param,
+/// stripping everything from the first `&` in the query onward. See the
+/// `normalize_x_graphql` config field for the why.
+///
+/// Exact pattern mirrored from the Python community patch (issue #16):
+///
+///   host == "x.com"
+///   && path starts with "/i/api/graphql/"
+///   && query starts with "variables="
+///   → truncate at first `&` past the `?`.
+///
+/// Returns the possibly-rewritten URL. If the URL doesn't match the
+/// pattern the input is returned unchanged (as an owned String — the
+/// allocation is cheap on the slow path and keeps the caller's
+/// type-signature-juggling simple).
+fn normalize_x_graphql_url(url: &str) -> String {
+    // Split host from the rest. We accept both "x.com" and common legacy
+    // forms; the Python patch only checks x.com so we do the same to be
+    // safe about the endpoint actually accepting truncated requests.
+    let Some(rest) = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")) else {
+        return url.to_string();
+    };
+    let Some(slash) = rest.find('/') else {
+        return url.to_string();
+    };
+    let host = &rest[..slash];
+    let path_and_query = &rest[slash..];
+
+    // Strip port if present in host.
+    let host_no_port = host.split(':').next().unwrap_or(host);
+    if host_no_port != "x.com" {
+        return url.to_string();
+    }
+
+    let Some(q_idx) = path_and_query.find('?') else {
+        return url.to_string();
+    };
+    let path = &path_and_query[..q_idx];
+    let query = &path_and_query[q_idx + 1..];
+
+    if !path.starts_with("/i/api/graphql/") || !query.starts_with("variables=") {
+        return url.to_string();
+    }
+
+    let new_query = match query.find('&') {
+        Some(amp) => &query[..amp],
+        None => query,
+    };
+    let scheme = if url.starts_with("https://") { "https://" } else { "http://" };
+    format!("{}{}{}?{}", scheme, host, path, new_query)
+}
+
 fn extract_host(url: &str) -> Option<String> {
     let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     let authority = after_scheme.split('/').next().unwrap_or("");
@@ -1229,6 +1301,53 @@ impl ServerCertVerifier for NoVerify {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_x_graphql_trims_after_variables() {
+        // Real-looking x.com GraphQL URL with variables + features +
+        // fieldToggles. Only the variables= prefix should survive.
+        let in_url = "https://x.com/i/api/graphql/abcd1234/TweetDetail?variables=%7B%22focalTweetId%22%3A%221234%22%7D&features=%7B%22responsive_web_graphql_timeline_navigation_enabled%22%3Atrue%7D&fieldToggles=%7B%22withArticleRichContentState%22%3Atrue%7D";
+        let out = normalize_x_graphql_url(in_url);
+        assert!(out.starts_with("https://x.com/i/api/graphql/abcd1234/TweetDetail?variables="));
+        assert!(!out.contains("features="));
+        assert!(!out.contains("fieldToggles="));
+        assert!(!out.contains('&'));
+    }
+
+    #[test]
+    fn normalize_x_graphql_leaves_non_x_hosts_alone() {
+        let cases = [
+            "https://twitter.com/i/api/graphql/x/y?variables=z&features=q",
+            "https://x.co/i/api/graphql/x/y?variables=z&features=q",
+            "https://api.x.com/i/api/graphql/x/y?variables=z&features=q",
+            "https://example.com/?variables=1&other=2",
+        ];
+        for u in cases {
+            assert_eq!(normalize_x_graphql_url(u), u, "should pass through: {}", u);
+        }
+    }
+
+    #[test]
+    fn normalize_x_graphql_leaves_non_graphql_paths_alone() {
+        let cases = [
+            "https://x.com/home",
+            "https://x.com/i/api/2/notifications/view/generic.json",
+            "https://x.com/i/api/graphql/x/y",       // no query
+            "https://x.com/i/api/graphql/x/y?features=1&variables=2", // variables not first
+        ];
+        for u in cases {
+            assert_eq!(normalize_x_graphql_url(u), u, "should pass through: {}", u);
+        }
+    }
+
+    #[test]
+    fn normalize_x_graphql_is_idempotent() {
+        let once = normalize_x_graphql_url(
+            "https://x.com/i/api/graphql/H/Op?variables=%7B%7D&features=%7B%7D",
+        );
+        let twice = normalize_x_graphql_url(&once);
+        assert_eq!(once, twice);
+    }
 
     #[test]
     fn extract_host_strips_scheme_port_path() {

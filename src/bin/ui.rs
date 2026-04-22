@@ -172,7 +172,8 @@ struct FormState {
     fetch_ips_from_api: bool,
     max_ips_to_scan: usize,
     scan_batch_size:usize,
-    google_ip_validation: bool
+    google_ip_validation: bool,
+    normalize_x_graphql: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -247,7 +248,8 @@ fn load_form() -> (FormState, Option<String>) {
             fetch_ips_from_api:c.fetch_ips_from_api,
             max_ips_to_scan:c.max_ips_to_scan,
             google_ip_validation: c.google_ip_validation,
-            scan_batch_size:c.scan_batch_size
+            scan_batch_size:c.scan_batch_size,
+            normalize_x_graphql: c.normalize_x_graphql,
         }
     } else {
         FormState {
@@ -270,7 +272,8 @@ fn load_form() -> (FormState, Option<String>) {
             fetch_ips_from_api:false,
             max_ips_to_scan:100,
             google_ip_validation:true,
-            scan_batch_size:500
+            scan_batch_size:500,
+            normalize_x_graphql: false,
         }
     };
     (form, load_err)
@@ -396,7 +399,8 @@ impl FormState {
             fetch_ips_from_api:self.fetch_ips_from_api,
             max_ips_to_scan: self.max_ips_to_scan,
             google_ip_validation:self.google_ip_validation,
-            scan_batch_size:self.scan_batch_size
+            scan_batch_size:self.scan_batch_size,
+            normalize_x_graphql: self.normalize_x_graphql,
         })
     }
 }
@@ -433,6 +437,12 @@ struct ConfigWire<'a> {
     parallel_relay: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
     sni_hosts: Option<Vec<&'a str>>,
+    #[serde(skip_serializing_if = "is_false")]
+    normalize_x_graphql: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 fn is_zero_u8(v: &u8) -> bool {
@@ -470,6 +480,7 @@ impl<'a> From<&'a Config> for ConfigWire<'a> {
                 .sni_hosts
                 .as_ref()
                 .map(|v| v.iter().map(String::as_str).collect()),
+            normalize_x_graphql: c.normalize_x_graphql,
         }
     }
 }
@@ -762,6 +773,16 @@ impl eframe::App for App {
                     ui.horizontal(|ui| {
                         ui.add_space(120.0 + 8.0);
                         ui.checkbox(&mut self.form.show_auth_key, "Show auth key");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_space(120.0 + 8.0);
+                        ui.checkbox(&mut self.form.normalize_x_graphql, "Normalize X/Twitter GraphQL URLs")
+                            .on_hover_text(
+                                "Trim the `features` / `fieldToggles` query params from x.com/i/api/graphql/… \
+                                 requests before relaying. Massively improves cache hit rate when browsing \
+                                 Twitter/X. Off by default — some endpoints may reject trimmed requests. \
+                                 Credit: seramo_ir + Persian Python community (issue #16).",
+                            );
                     });
                 });
             });

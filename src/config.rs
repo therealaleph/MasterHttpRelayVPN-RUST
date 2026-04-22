@@ -90,7 +90,21 @@ pub struct Config {
     pub scan_batch_size:usize,
 
     #[serde(default = "default_google_ip_validation")]
-    pub google_ip_validation: bool
+    pub google_ip_validation: bool,
+    /// When true, GET requests to `x.com/i/api/graphql/<hash>/<op>?variables=…`
+    /// have their query trimmed to just the `variables=` param before being
+    /// relayed. The `features` / `fieldToggles` params that X ships with
+    /// these requests change frequently and bust the response cache —
+    /// stripping them dramatically improves hit rate on Twitter/X browsing.
+    ///
+    /// Credit: idea from seramo_ir, originally adapted to the Python
+    /// MasterHttpRelayVPN by the Persian community
+    /// (https://gist.github.com/seramo/0ae9e5d30ac23a73d5eb3bd2710fcd67).
+    ///
+    /// Off by default — some X endpoints may reject calls that omit
+    /// features. Turn on and observe.
+    #[serde(default)]
+    pub normalize_x_graphql: bool,
 }
 
 fn default_fetch_ips_from_api() -> bool { false }
