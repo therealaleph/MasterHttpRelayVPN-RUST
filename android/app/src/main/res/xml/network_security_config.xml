@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!--
+      We explicitly trust user-installed CAs for this app's own outbound
+      requests. This lets us talk to our OWN local MITM proxy (which signs
+      leaf certs with the CA we generate). Without this declaration, on
+      Android 7+ apps ignore user CAs — which is the whole pain point
+      users hit when trying to use mhrv-rs from the phone.
+
+      The system default (cleartextTrafficPermitted=false) stays. Plain
+      HTTP is not allowed except to localhost, which the VpnService loop
+      uses.
+    -->
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+    </domain-config>
+</network-security-config>

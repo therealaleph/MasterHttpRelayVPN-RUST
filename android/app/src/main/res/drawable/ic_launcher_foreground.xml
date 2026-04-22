@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Vector launcher icon. Simple monogram "M" in the mhrv-rs accent color.
+  Using a vector keeps the APK small and adapts to any density.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#4678B4"
+        android:pathData="M30,30 L30,78 L38,78 L38,46 L54,70 L70,46 L70,78 L78,78 L78,30 L70,30 L54,56 L38,30 Z" />
+</vector>

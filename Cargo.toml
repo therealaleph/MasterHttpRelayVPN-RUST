@@ -8,6 +8,10 @@ license = "MIT"
 [lib]
 name = "mhrv_rs"
 path = "src/lib.rs"
+# `cdylib` lets the Android app dlopen libmhrv_rs.so via System.loadLibrary.
+# `rlib` keeps the desktop binaries linking normally — same .rlib is used
+# for `mhrv-rs` and `mhrv-rs-ui` builds on macOS/Linux/Windows.
+crate-type = ["rlib", "cdylib"]
 
 [[bin]]
 name = "mhrv-rs"
@@ -61,6 +65,19 @@ eframe = { version = "0.28", default-features = false, features = [
 # pulled in transitively via tokio, so zero new weight.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Android-only deps: jni gives us the extern "system" wrappers used in
+# src/android_jni.rs; zero cost on any other platform because the whole
+# module is `#[cfg(target_os = "android")]`.
+#
+# tun2proxy is the TUN <-> SOCKS5 bridge — it reads raw IP packets from the
+# fd VpnService hands us, runs a userspace TCP/IP stack (smoltcp under the
+# hood), and funnels every TCP/UDP flow through our local SOCKS5. Without
+# this, VpnService establishes a TUN device nothing reads from and all
+# traffic black-holes (symptom: Chrome shows DNS_PROBE_STARTED).
+[target.'cfg(target_os = "android")'.dependencies]
+jni = { version = "0.21", default-features = false }
+tun2proxy = { version = "0.7", default-features = false }
 
 [dev-dependencies]
 # Used in mitm tests to sanity-check the cert extensions we emit.

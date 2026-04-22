@@ -12,3 +12,6 @@ pub mod scan_ips;
 pub mod scan_sni;
 pub mod test_cmd;
 pub mod update_check;
+
+#[cfg(target_os = "android")]
+pub mod android_jni;

@@ -8,7 +8,8 @@ use tokio_rustls::rustls::client::danger::{
 };
 use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio_rustls::rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
-use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tokio_rustls::rustls::server::Acceptor;
+use tokio_rustls::{LazyConfigAcceptor, TlsAcceptor, TlsConnector};
 
 use crate::config::Config;
 use crate::domain_fronter::DomainFronter;
@@ -725,40 +726,83 @@ async fn run_mitm_then_relay(
     mitm: Arc<Mutex<MitmCertManager>>,
     fronter: &DomainFronter,
 ) {
-    tracing::info!("MITM TLS -> {}:{}", host, port);
-
-    let server_config = {
-        let mut m = mitm.lock().await;
-        match m.get_server_config(host) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("cert gen failed for {}: {}", host, e);
-                return;
-            }
-        }
-    };
-    let acceptor = TlsAcceptor::from(server_config);
-
-    let mut tls = match acceptor.accept(sock).await {
-        Ok(t) => t,
+    // Peek the TLS ClientHello BEFORE minting the MITM cert. When the client
+    // resolves the hostname itself (DoH in Chrome/Firefox) and hands us a raw
+    // IP via SOCKS5, the only place the real hostname lives is the SNI. If we
+    // mint a cert for the IP, Chrome rejects with ERR_CERT_COMMON_NAME_INVALID
+    // — the IP isn't in the cert's SAN. Reading SNI up front and using it as
+    // both the cert subject and the upstream Host for the Apps Script relay
+    // is what unblocks Cloudflare-fronted sites and any browser on Android
+    // where DoH is the default.
+    let start = match LazyConfigAcceptor::new(Acceptor::default(), sock).await {
+        Ok(s) => s,
         Err(e) => {
-            tracing::debug!("TLS accept failed for {}: {}", host, e);
+            tracing::debug!("TLS ClientHello peek failed for {}: {}", host, e);
             return;
         }
     };
 
-    // Keep-alive loop: read HTTP requests from the decrypted stream.
-    // scheme=https because we MITM-terminated TLS.
+    let sni_hostname = start.client_hello().server_name().map(String::from);
+
+    // Effective host: SNI when present and looks like a hostname (anything
+    // other than a bare IPv4 literal — IP SNIs exist for weird setups but
+    // minting a cert for them still triggers ERR_CERT_COMMON_NAME_INVALID,
+    // so we fall through to the raw host in that case).
+    let effective_host: String = match sni_hostname.as_deref() {
+        Some(s) if !looks_like_ip(s) && !s.is_empty() => s.to_string(),
+        _ => host.to_string(),
+    };
+
+    tracing::info!(
+        "MITM TLS -> {}:{} (socks_host={}, sni={})",
+        effective_host,
+        port,
+        host,
+        sni_hostname.as_deref().unwrap_or("<none>"),
+    );
+
+    let server_config = {
+        let mut m = mitm.lock().await;
+        match m.get_server_config(&effective_host) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("cert gen failed for {}: {}", effective_host, e);
+                return;
+            }
+        }
+    };
+
+    let mut tls = match start.into_stream(server_config).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::debug!("TLS accept failed for {}: {}", effective_host, e);
+            return;
+        }
+    };
+
+    // Keep-alive loop: read HTTP requests from the decrypted stream. Pass the
+    // SNI-derived hostname so the Apps Script relay fetches
+    // `https://<real hostname>/path` instead of `https://<raw IP>/path` — the
+    // latter would produce an IP-in-Host request that Cloudflare/etc. reject
+    // outright.
     loop {
-        match handle_mitm_request(&mut tls, host, port, fronter, "https").await {
+        match handle_mitm_request(&mut tls, &effective_host, port, fronter, "https").await {
             Ok(true) => continue,
             Ok(false) => break,
             Err(e) => {
-                tracing::debug!("MITM handler error for {}: {}", host, e);
+                tracing::debug!("MITM handler error for {}: {}", effective_host, e);
                 break;
             }
         }
     }
+}
+
+/// True if `s` parses as an IPv4 or IPv6 literal. Used to decide whether
+/// a string is a hostname we should mint a MITM leaf cert for — IP SANs
+/// need their own cert extension and we don't bother emitting those,
+/// so fall back to the SOCKS5-provided target in that case.
+fn looks_like_ip(s: &str) -> bool {
+    s.parse::<std::net::IpAddr>().is_ok()
 }
 
 // ---------- Plain HTTP relay on a raw TCP stream (port 80 targets) ----------
@@ -958,6 +1002,48 @@ where
     } else {
         format!("{}://{}:{}{}", scheme, host, port, path)
     };
+
+    // Short-circuit CORS preflight at the MITM boundary.
+    //
+    // Apps Script's UrlFetchApp.fetch() only accepts methods {get, delete,
+    // patch, post, put} — OPTIONS triggers the Swedish-localized
+    // "Ett attribut med ogiltigt värde har angetts: method" error, which
+    // kills every XHR/fetch preflight and is the root cause of "JS doesn't
+    // load" on sites like Discord, Yahoo finance widgets, etc.
+    //
+    // Answering the preflight ourselves is safe: we already terminate the
+    // TLS for the browser (we minted the cert), so it's legitimate for us
+    // to own the wire-level conversation. CORS is a browser-side
+    // protection, not a network security one — responding 204 with
+    // permissive ACL headers just tells the browser the *subsequent* real
+    // request is allowed, and that real request still goes through the
+    // Apps Script relay where the origin server gets final say on content.
+    // The origin header is echoed (not "*") so Credentials-true responses
+    // stay spec-valid.
+    if method.eq_ignore_ascii_case("OPTIONS") {
+        tracing::info!("preflight 204 {} (short-circuit, no relay)", url);
+        let origin = header_value(&headers, "origin").unwrap_or("*");
+        let acrm = header_value(&headers, "access-control-request-method")
+            .unwrap_or("GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD");
+        let acrh = header_value(&headers, "access-control-request-headers").unwrap_or("*");
+        let resp = format!(
+            "HTTP/1.1 204 No Content\r\n\
+             Access-Control-Allow-Origin: {origin}\r\n\
+             Access-Control-Allow-Methods: {acrm}\r\n\
+             Access-Control-Allow-Headers: {acrh}\r\n\
+             Access-Control-Allow-Credentials: true\r\n\
+             Access-Control-Max-Age: 86400\r\n\
+             Vary: Origin, Access-Control-Request-Method, Access-Control-Request-Headers\r\n\
+             Content-Length: 0\r\n\
+             \r\n",
+        );
+        stream.write_all(resp.as_bytes()).await?;
+        stream.flush().await?;
+        let connection_close = headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("connection") && v.eq_ignore_ascii_case("close"));
+        return Ok(!connection_close);
+    }
 
     tracing::info!("relay {} {}", method, url);
 
