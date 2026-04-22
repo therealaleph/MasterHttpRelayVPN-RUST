@@ -1,6 +1,6 @@
 [package]
 name = "mhrv-rs"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2021"
 description = "Rust port of MasterHttpRelayVPN -- DPI bypass via Google Apps Script relay with domain fronting"
 license = "MIT"
@@ -61,6 +61,10 @@ eframe = { version = "0.28", default-features = false, features = [
 # pulled in transitively via tokio, so zero new weight.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+# Used in mitm tests to sanity-check the cert extensions we emit.
+x509-parser = "0.16"
 
 [profile.release]
 panic = "abort"

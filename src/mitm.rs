@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair,
-    KeyUsagePurpose, SanType,
+    BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
+    ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
@@ -104,7 +104,7 @@ impl MitmCertManager {
             KeyUsagePurpose::CrlSign,
         ];
         let now = time::OffsetDateTime::now_utc();
-        params.not_before = now;
+        params.not_before = now - time::Duration::minutes(5);
         params.not_after = now + time::Duration::days(3650);
 
         let key_pair = KeyPair::generate()?;
@@ -162,8 +162,25 @@ impl MitmCertManager {
             MitmError::Invalid(format!("bad dns name '{}': {}", domain, e))
         })?;
         params.subject_alt_names.push(SanType::DnsName(dns_name));
+
+        // Modern browsers (Chrome/Firefox, all current versions) reject TLS
+        // leaves that don't carry:
+        //   - ExtendedKeyUsage: serverAuth   → NET::ERR_CERT_INVALID otherwise
+        //   - KeyUsage: digitalSignature + keyEncipherment
+        // rcgen's `CertificateParams::default()` doesn't set these — we have
+        // to add them explicitly. Skipping this was the root cause of issue #11
+        // where users reinstalled the trusted CA dozens of times and browsers
+        // still refused to load HTTPS sites through the proxy.
+        params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyEncipherment,
+        ];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+
+        // Backdate not_before by 5 min to absorb clock skew between the
+        // MITM process and the browser / system clock.
         let now = time::OffsetDateTime::now_utc();
-        params.not_before = now;
+        params.not_before = now - time::Duration::minutes(5);
         params.not_after = now + time::Duration::days(365);
 
         let leaf_key = KeyPair::generate()?;
@@ -195,6 +212,48 @@ mod tests {
         let mut m = MitmCertManager::new_in(&tmp).unwrap();
         let cfg = m.get_server_config("example.com").unwrap();
         assert_eq!(cfg.alpn_protocols, vec![b"http/1.1".to_vec()]);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn leaf_has_serverauth_eku_and_key_usage() {
+        // Regression guard for issue #11. rcgen's CertificateParams::default()
+        // doesn't set these extensions; without them modern Chrome/Firefox
+        // reject every leaf with NET::ERR_CERT_INVALID even after the CA is
+        // trusted. Verified by spot-checking the DER with x509-parser.
+        use x509_parser::prelude::*;
+
+        init_crypto();
+        let tmp = tempdir();
+        let m = MitmCertManager::new_in(&tmp).unwrap();
+        let (leaf_der, _) = m.issue_leaf("example.com").unwrap();
+        let (_, parsed) = X509Certificate::from_der(&leaf_der).unwrap();
+
+        // ExtendedKeyUsage: serverAuth present.
+        let eku = parsed
+            .extended_key_usage()
+            .expect("eku extension lookup")
+            .expect("eku extension present");
+        assert!(eku.value.server_auth, "leaf must have serverAuth EKU");
+
+        // KeyUsage: digitalSignature + keyEncipherment present.
+        let ku = parsed
+            .key_usage()
+            .expect("key_usage extension lookup")
+            .expect("key_usage extension present");
+        assert!(ku.value.digital_signature(), "leaf must have digitalSignature KU");
+        assert!(ku.value.key_encipherment(), "leaf must have keyEncipherment KU");
+
+        // SAN has the domain we asked for.
+        let san = parsed
+            .subject_alternative_name()
+            .expect("san extension lookup")
+            .expect("san extension present");
+        let has_name = san.value.general_names.iter().any(|n| {
+            matches!(n, GeneralName::DNSName(s) if *s == "example.com")
+        });
+        assert!(has_name, "leaf SAN must contain example.com");
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

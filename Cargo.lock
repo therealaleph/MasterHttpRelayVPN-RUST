@@ -1317,7 +1317,7 @@ dependencies = [
 
 [[package]]
 name = "mhrv-rs"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1343,6 +1343,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "webpki-roots 0.26.11",
+ "x509-parser",
 ]
 
 [[package]]
