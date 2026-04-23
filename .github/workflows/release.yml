@@ -162,24 +162,33 @@ jobs:
       # stable channel — no prebuilt std.
       - name: Build CLI (mipsel-softfloat via docker)
         if: matrix.target == 'mipsel-unknown-linux-musl' && matrix.mipsel_softfloat == true
+        # The inner script is single-quoted so the `#` lines stay as
+        # real comments. An earlier version of this step used
+        # `sh -c "... \` (backslash-continuation inside a
+        # double-quoted YAML folded string) which collapsed into one
+        # line — the first `#` then commented out everything after it,
+        # reducing the whole docker payload to `set -eux;` and failing
+        # silently at the post-docker chown. Heredoc-style single
+        # quotes preserve newlines verbatim; no comment collapse.
         run: |
           docker run --rm -v "$PWD":/src -w /src \
             -e RUSTFLAGS='-C target-feature=+soft-float' \
             messense/rust-musl-cross:mipsel-musl \
-            sh -c "set -eux; \
-                   # The image ships with a pre-installed nightly that rustup \
-                   # can't cleanly upgrade — the expected \`clippy-preview/share/doc/clippy/README.md\` \
-                   # is missing, which fails the in-place upgrade \
-                   # (error: failure removing component 'clippy-preview...'). \
-                   # Nuke it first, then install fresh with only the profile \
-                   # bits we actually use. \
-                   rustup toolchain uninstall nightly 2>/dev/null || true; \
-                   rustup toolchain install nightly --profile minimal; \
-                   rustup component add rust-src --toolchain nightly; \
-                   cargo +nightly build --release \
-                     -Z build-std=std,panic_abort \
-                     --target mipsel-unknown-linux-musl \
-                     --bin mhrv-rs"
+            bash -c '
+              set -eux
+              # The image ships a pre-installed nightly that rustup
+              # cannot upgrade in place — `clippy-preview/share/doc/clippy/README.md`
+              # is missing from the pre-bake, and rustup errors with
+              # "failure removing component clippy-preview". Nuke it
+              # first, then install fresh.
+              rustup toolchain uninstall nightly 2>/dev/null || true
+              rustup toolchain install nightly --profile minimal
+              rustup component add rust-src --toolchain nightly
+              cargo +nightly build --release \
+                -Z build-std=std,panic_abort \
+                --target mipsel-unknown-linux-musl \
+                --bin mhrv-rs
+            '
           sudo chown -R "$(id -u):$(id -g)" target
 
       # UI build: we try to build the UI binary on every platform. If it fails
