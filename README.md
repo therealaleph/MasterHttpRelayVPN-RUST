@@ -160,7 +160,7 @@ Firefox keeps its own cert store; the installer also drops the CA into Firefox's
 
 Open the UI and fill in the form:
 
-- **Apps Script ID** — the Deployment ID from Step 1. Comma-separate multiple IDs for round-robin rotation across several deployments (higher quota, more throughput).
+- **Apps Script ID** — the Deployment ID from Step 1. Add multiple IDs (one per line in the UI, or a JSON array in `config.json`) for higher quota **and** lower latency. In `apps_script` mode, IDs are round-robined. In `full` mode, more IDs directly increase the pipeline depth (see [Full tunnel mode](#full-tunnel-mode) below).
 - **Auth key** — the same secret you set in `Code.gs`.
 - **Google IP** — `216.239.38.120` is a solid default. Use the **scan** button to probe for a faster one from your network.
 - **Front domain** — keep `www.google.com`.
@@ -261,6 +261,46 @@ Example config fragment (both UI and JSON):
 ```
 
 HTTP/HTTPS continues to route through the Apps Script relay (no change), and the SNI-rewrite tunnel for `google.com` / `youtube.com` / etc. keeps bypassing both — so YouTube stays as fast as before while Telegram gets a real tunnel.
+
+## Full tunnel mode
+
+Full tunnel mode (`"mode": "full"`) routes **all** traffic end-to-end through Apps Script and a remote [tunnel-node](tunnel-node/) — no MITM certificate needed. The trade-off is higher latency per request (every byte goes Apps Script → tunnel-node → destination), but it works for every protocol and every app without CA installation.
+
+### How deployment IDs affect performance
+
+Each Apps Script batch request takes ~2 seconds round-trip. In full mode, `mhrv-rs` runs a **pipelined batch multiplexer** that fires multiple batch requests concurrently without waiting for the previous one to return. The number of in-flight batches (the *pipeline depth*) scales directly with the number of deployment IDs you configure:
+
+```
+pipeline_depth = number_of_script_ids  (clamped to 2..12)
+```
+
+| Deployments | Pipeline depth | Effective batch interval | Notes |
+|-------------|---------------|------------------------|-------|
+| 1 | 2 | ~1.0s | Minimum — still pipelines 2 batches |
+| 3 | 3 | ~0.7s | Good for light browsing |
+| 6 | 6 | ~0.3s | Recommended for daily use |
+| 12 | 12 | ~0.17s | Maximum — diminishing returns past this |
+
+More deployments = more concurrent batches = lower per-session latency. Each batch round-robins across your deployment IDs, so the load is spread evenly and you're less likely to hit a single deployment's quota ceiling.
+
+**Resource guards** keep things safe:
+- **50 ops max** per batch — if more sessions are active, the mux splits into multiple batches
+- **4 MB payload cap** per batch — well under Apps Script's 50 MB limit
+- **30 s timeout** per batch — a slow/dead target can't block other sessions forever
+
+### Quick start
+
+1. Deploy [`CodeFull.gs`](assets/apps_script/CodeFull.gs) to 3–12 Google accounts (same steps as `Code.gs`, but use the full-mode script that forwards to your tunnel-node)
+2. Deploy the [tunnel-node](tunnel-node/) on a VPS
+3. Set `"mode": "full"` in your config with all deployment IDs:
+
+```json
+{
+  "mode": "full",
+  "script_id": ["id1", "id2", "id3", "id4", "id5", "id6"],
+  "auth_key": "your-secret"
+}
+```
 
 ## Running on OpenWRT (or any musl distro)
 
@@ -568,6 +608,27 @@ Original project: <https://github.com/masterking32/MasterHttpRelayVPN> by [@mast
 ۳. دکمهٔ **`Keep working only`** را بزنید — همه نام‌هایی که پاسخ ندادند را غیرفعال می‌کند
 ۴. اگر نام جدیدی می‌خواهید اضافه کنید، در کادر پایین نام را بنویسید و **`+ Add`** بزنید — خودکار تست می‌شود
 ۵. با **`Save config`** در پنجرهٔ اصلی ذخیره کنید
+
+### حالت تونل کامل (Full tunnel mode)
+
+حالت `"mode": "full"` **تمام** ترافیک را سرتاسر از طریق `Apps Script` و یک [tunnel-node](tunnel-node/) روی سرور شما عبور می‌دهد — **بدون نیاز به نصب گواهی `MITM`**. تنها هزینه‌اش تأخیر بیشتر است (هر بایت از مسیر `Apps Script → tunnel-node → مقصد` می‌رود)، اما برای هر پروتکل و هر برنامه بدون نصب `CA` کار می‌کند.
+
+#### چرا تعداد `Deployment ID` مهم است؟
+
+هر درخواست دسته‌ای (`batch`) به `Apps Script` حدود ۲ ثانیه طول می‌کشد. در حالت `full`، برنامه یک **لولهٔ موازی** (`pipeline`) اجرا می‌کند که چند درخواست دسته‌ای را همزمان می‌فرستد بدون اینکه منتظر پاسخ قبلی بماند. تعداد درخواست‌های همزمان مستقیماً با تعداد `Deployment ID`ها رابطه دارد:
+
+```
+عمق لوله = تعداد Deployment IDها  (حداقل ۲، حداکثر ۱۲)
+```
+
+| تعداد Deployment | عمق لوله | فاصلهٔ مؤثر بین دسته‌ها | |
+|-----------------|----------|------------------------|---|
+| ۱ | ۲ | ~۱ ثانیه | حداقل |
+| ۳ | ۳ | ~۰.۷ ثانیه | مناسب مرور سبک |
+| ۶ | ۶ | ~۰.۳ ثانیه | توصیه‌شده برای استفادهٔ روزانه |
+| ۱۲ | ۱۲ | ~۰.۱۷ ثانیه | حداکثر |
+
+بیشتر `Deployment` = بیشتر درخواست همزمان = تأخیر کمتر برای هر نشست. هر دسته بین `ID`ها چرخش می‌کند (`round-robin`)، پس بار به‌طور یکنواخت توزیع می‌شود.
 
 ### اجرا روی OpenWRT (روتر)
 
