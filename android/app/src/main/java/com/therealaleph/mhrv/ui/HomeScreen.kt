@@ -238,7 +238,7 @@ fun HomeScreen(
             Spacer(Modifier.height(4.dp))
             SectionHeader(stringResource(R.string.sec_apps_script_relay))
 
-            val appsScriptEnabled = cfg.mode == Mode.APPS_SCRIPT
+            val appsScriptEnabled = cfg.mode == Mode.APPS_SCRIPT || cfg.mode == Mode.FULL
             DeploymentIdsField(
                 urls = cfg.appsScriptUrls,
                 onChange = { persist(cfg.copy(appsScriptUrls = it)) },
@@ -418,6 +418,7 @@ fun HomeScreen(
                 },
                 enabled = (isVpnRunning ||
                     cfg.mode == Mode.GOOGLE_ONLY ||
+                    cfg.mode == Mode.FULL ||
                     (cfg.hasDeploymentId && cfg.authKey.isNotBlank())) && !transitionCooldown,
                 colors = ButtonDefaults.buttonColors(
                     containerColor = if (isVpnRunning) ErrRed else OkGreen,
@@ -729,11 +730,13 @@ private fun ModeDropdown(
     mode: Mode,
     onChange: (Mode) -> Unit,
 ) {
-    val labelApps = "Apps Script (full)"
+    val labelApps = "Apps Script (MITM)"
     val labelGoogle = "Google-only (bootstrap)"
+    val labelFull = "Full tunnel (no cert)"
     val currentLabel = when (mode) {
         Mode.APPS_SCRIPT -> labelApps
         Mode.GOOGLE_ONLY -> labelGoogle
+        Mode.FULL -> labelFull
     }
     var expanded by remember { mutableStateOf(false) }
 
@@ -762,6 +765,10 @@ private fun ModeDropdown(
                     text = { Text(labelGoogle) },
                     onClick = { onChange(Mode.GOOGLE_ONLY); expanded = false },
                 )
+                DropdownMenuItem(
+                    text = { Text(labelFull) },
+                    onClick = { onChange(Mode.FULL); expanded = false },
+                )
             }
         }
 
@@ -770,6 +777,8 @@ private fun ModeDropdown(
                 "Full DPI bypass through your deployed Apps Script relay."
             Mode.GOOGLE_ONLY ->
                 "Bootstrap: reach *.google.com directly so you can open script.google.com and deploy Code.gs. Non-Google traffic goes direct."
+            Mode.FULL ->
+                "All traffic tunneled end-to-end through Apps Script + remote tunnel node. No certificate needed."
         }
         Text(
             help,

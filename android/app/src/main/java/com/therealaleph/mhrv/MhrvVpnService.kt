@@ -90,19 +90,11 @@ class MhrvVpnService : VpnService() {
         // `ForegroundServiceDidNotStartInTimeException`. Every `stopSelf()`
         // path below MUST therefore happen after a `startForeground()`
         // call — otherwise the user-visible symptom is "the app crashes
-        // the instant I tap Start". See issue #73: user configured
-        // google_only mode (no deployment ID needed), which tripped the
-        // old early-return-before-startForeground branch.
-        //
-        // We call startForeground immediately here with the notification
-        // used by the normal running state; if we bail out below, we
-        // tear the foreground service down in an orderly way.
+        // the instant I tap Start". See issue #73.
         startForeground(NOTIF_ID, buildNotif(cfg.listenPort))
 
         // Deployment ID + auth key are only required in apps_script mode.
-        // google_only mode (bootstrap / Telegram-only use cases) runs
-        // with neither. Closes #73 regression where google_only users
-        // hit this branch and crashed on startForeground timeout.
+        // google_only (bootstrap) and full (tunnel) modes run without them.
         val needsAppsScriptCreds = cfg.mode == Mode.APPS_SCRIPT
         if (needsAppsScriptCreds && (!cfg.hasDeploymentId || cfg.authKey.isBlank())) {
             Log.e(TAG, "Config is incomplete — can't start proxy in apps_script mode")

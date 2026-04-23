@@ -255,6 +255,23 @@ async fn main() -> ExitCode {
                 config.listen_port
             );
         }
+        mhrv_rs::config::Mode::Full => {
+            tracing::info!(
+                "Full tunnel: SNI={} -> script.google.com (via {})",
+                config.front_domain,
+                config.google_ip
+            );
+            let sids = config.script_ids_resolved();
+            if sids.len() > 1 {
+                tracing::info!("Script IDs: {} (round-robin)", sids.len());
+            } else {
+                tracing::info!("Script ID: {}", sids[0]);
+            }
+            tracing::warn!(
+                "Full tunnel mode: NO certificate installation needed. \
+                 ALL traffic is tunneled end-to-end through Apps Script + tunnel node."
+            );
+        }
     }
 
     // Initialize MITM manager (generates CA on first run).
@@ -268,7 +285,7 @@ async fn main() -> ExitCode {
     };
     let ca_path = base.join(CA_CERT_FILE);
 
-    if !args.no_cert_check {
+    if !args.no_cert_check && mode != mhrv_rs::config::Mode::Full {
         if !is_ca_trusted(&ca_path) {
             tracing::warn!("MITM CA is not (obviously) trusted — attempting install...");
             match install_ca(&ca_path) {

@@ -57,7 +57,7 @@ pub enum FronterError {
 
 type PooledStream = TlsStream<TcpStream>;
 const POOL_TTL_SECS: u64 = 45;
-const POOL_MAX: usize = 20;
+const POOL_MAX: usize = 50;
 const REQUEST_TIMEOUT_SECS: u64 = 25;
 
 struct PoolEntry {
@@ -154,6 +154,42 @@ struct RelayResponse {
     b: Option<String>,
     #[serde(default)]
     e: Option<String>,
+}
+
+/// Parsed tunnel response JSON (full mode).
+#[derive(Deserialize, Debug, Clone)]
+pub struct TunnelResponse {
+    #[serde(default)]
+    pub sid: Option<String>,
+    #[serde(default)]
+    pub d: Option<String>,
+    #[serde(default)]
+    pub eof: Option<bool>,
+    #[serde(default)]
+    pub e: Option<String>,
+}
+
+/// A single op in a batch tunnel request.
+#[derive(Serialize, Clone, Debug)]
+pub struct BatchOp {
+    pub op: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub d: Option<String>,
+}
+
+/// Batch tunnel response from Apps Script / tunnel node.
+#[derive(Deserialize, Debug)]
+pub struct BatchTunnelResponse {
+    #[serde(default)]
+    pub r: Vec<TunnelResponse>,
+    #[serde(default)]
+    pub e: Option<String>,
 }
 
 impl DomainFronter {
@@ -922,6 +958,224 @@ impl DomainFronter {
         };
         Ok(serde_json::to_vec(&req)?)
     }
+
+    // ────── Full-mode tunnel protocol ──────────────────────────────────
+
+    /// Send a tunnel-protocol request through the domain-fronted connection
+    /// to Apps Script. Reuses the same TLS pool as `relay()` but builds a
+    /// tunnel JSON payload (the `t` field triggers `_doTunnel` in CodeFull.gs).
+    pub async fn tunnel_request(
+        &self,
+        op: &str,
+        host: Option<&str>,
+        port: Option<u16>,
+        sid: Option<&str>,
+        data: Option<String>,
+    ) -> Result<TunnelResponse, FronterError> {
+        let payload = self.build_tunnel_payload(op, host, port, sid, data)?;
+        let script_id = self.next_script_id();
+        let path = format!("/macros/s/{}/exec", script_id);
+
+        let mut entry = self.acquire().await?;
+
+        let req_head = format!(
+            "POST {path} HTTP/1.1\r\n\
+             Host: {host}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {len}\r\n\
+             Accept-Encoding: gzip\r\n\
+             Connection: keep-alive\r\n\
+             \r\n",
+            path = path,
+            host = self.http_host,
+            len = payload.len(),
+        );
+        entry.stream.write_all(req_head.as_bytes()).await?;
+        entry.stream.write_all(&payload).await?;
+        entry.stream.flush().await?;
+
+        let (mut status, mut resp_headers, mut resp_body) =
+            read_http_response(&mut entry.stream).await?;
+
+        // Follow redirect chain (Apps Script usually redirects /exec to
+        // googleusercontent.com). Same logic as do_relay_once_with.
+        for _ in 0..5 {
+            if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+                break;
+            }
+            let Some(loc) = header_get(&resp_headers, "location") else {
+                break;
+            };
+            let (rpath, rhost) = parse_redirect(&loc);
+            let rhost = rhost.unwrap_or_else(|| self.http_host.to_string());
+            let req = format!(
+                "GET {rpath} HTTP/1.1\r\n\
+                 Host: {rhost}\r\n\
+                 Accept-Encoding: gzip\r\n\
+                 Connection: keep-alive\r\n\
+                 \r\n",
+            );
+            entry.stream.write_all(req.as_bytes()).await?;
+            entry.stream.flush().await?;
+            let (s, h, b) = read_http_response(&mut entry.stream).await?;
+            status = s;
+            resp_headers = h;
+            resp_body = b;
+        }
+
+        if status != 200 {
+            let body_txt = String::from_utf8_lossy(&resp_body)
+                .chars()
+                .take(200)
+                .collect::<String>();
+            if should_blacklist(status, &body_txt) {
+                self.blacklist_script(&script_id, &format!("HTTP {}", status));
+            }
+            return Err(FronterError::Relay(format!(
+                "tunnel HTTP {}: {}",
+                status, body_txt
+            )));
+        }
+
+        // Parse tunnel response JSON
+        let text = std::str::from_utf8(&resp_body)
+            .map_err(|_| FronterError::BadResponse("non-utf8 tunnel response".into()))?
+            .trim();
+
+        // Apps Script may prepend HTML; extract first {...}
+        let json_str = if text.starts_with('{') {
+            text
+        } else {
+            let start = text.find('{').ok_or_else(|| {
+                FronterError::BadResponse(format!("no json in tunnel response: {}", &text[..text.len().min(200)]))
+            })?;
+            let end = text.rfind('}').ok_or_else(|| {
+                FronterError::BadResponse("no json end in tunnel response".into())
+            })?;
+            &text[start..=end]
+        };
+
+        let resp: TunnelResponse = serde_json::from_str(json_str)?;
+
+        self.release(entry).await;
+        Ok(resp)
+    }
+
+    fn build_tunnel_payload(
+        &self,
+        op: &str,
+        host: Option<&str>,
+        port: Option<u16>,
+        sid: Option<&str>,
+        data: Option<String>,
+    ) -> Result<Vec<u8>, FronterError> {
+        let mut map = serde_json::Map::new();
+        map.insert("k".into(), Value::String(self.auth_key.clone()));
+        map.insert("t".into(), Value::String(op.to_string()));
+        if let Some(h) = host {
+            map.insert("h".into(), Value::String(h.to_string()));
+        }
+        if let Some(p) = port {
+            map.insert("p".into(), Value::Number(serde_json::Number::from(p)));
+        }
+        if let Some(s) = sid {
+            map.insert("sid".into(), Value::String(s.to_string()));
+        }
+        if let Some(d) = data {
+            map.insert("d".into(), Value::String(d));
+        }
+        Ok(serde_json::to_vec(&Value::Object(map))?)
+    }
+
+    /// Send a batch of tunnel operations in one Apps Script round trip.
+    /// All active sessions' data is collected and sent together, and all
+    /// responses come back in one response. This reduces N Apps Script
+    /// calls to 1 per tick.
+    pub async fn tunnel_batch_request(
+        &self,
+        ops: &[BatchOp],
+    ) -> Result<BatchTunnelResponse, FronterError> {
+        let mut map = serde_json::Map::new();
+        map.insert("k".into(), Value::String(self.auth_key.clone()));
+        map.insert("t".into(), Value::String("batch".into()));
+        map.insert("ops".into(), serde_json::to_value(ops)?);
+        let payload = serde_json::to_vec(&Value::Object(map))?;
+
+        let script_id = self.next_script_id();
+        let path = format!("/macros/s/{}/exec", script_id);
+
+        let mut entry = self.acquire().await?;
+
+        let req_head = format!(
+            "POST {path} HTTP/1.1\r\n\
+             Host: {host}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {len}\r\n\
+             Accept-Encoding: gzip\r\n\
+             Connection: keep-alive\r\n\
+             \r\n",
+            path = path,
+            host = self.http_host,
+            len = payload.len(),
+        );
+        entry.stream.write_all(req_head.as_bytes()).await?;
+        entry.stream.write_all(&payload).await?;
+        entry.stream.flush().await?;
+
+        let (mut status, mut resp_headers, mut resp_body) =
+            read_http_response(&mut entry.stream).await?;
+
+        // Follow redirect chain
+        for _ in 0..5 {
+            if !matches!(status, 301 | 302 | 303 | 307 | 308) { break; }
+            let Some(loc) = header_get(&resp_headers, "location") else { break; };
+            let (rpath, rhost) = parse_redirect(&loc);
+            let rhost = rhost.unwrap_or_else(|| self.http_host.to_string());
+            let req = format!(
+                "GET {rpath} HTTP/1.1\r\nHost: {rhost}\r\nAccept-Encoding: gzip\r\nConnection: keep-alive\r\n\r\n",
+            );
+            entry.stream.write_all(req.as_bytes()).await?;
+            entry.stream.flush().await?;
+            let (s, h, b) = read_http_response(&mut entry.stream).await?;
+            status = s; resp_headers = h; resp_body = b;
+        }
+
+        if status != 200 {
+            let body_txt = String::from_utf8_lossy(&resp_body).chars().take(200).collect::<String>();
+            if should_blacklist(status, &body_txt) {
+                self.blacklist_script(&script_id, &format!("HTTP {}", status));
+            }
+            return Err(FronterError::Relay(format!("batch tunnel HTTP {}: {}", status, body_txt)));
+        }
+
+        let text = std::str::from_utf8(&resp_body)
+            .map_err(|_| FronterError::BadResponse("non-utf8 batch response".into()))?
+            .trim();
+
+        let json_str = if text.starts_with('{') {
+            text
+        } else {
+            let start = text.find('{').ok_or_else(|| {
+                FronterError::BadResponse(format!("no json in batch response: {}", &text[..text.len().min(200)]))
+            })?;
+            let end = text.rfind('}').ok_or_else(|| {
+                FronterError::BadResponse("no json end in batch response".into())
+            })?;
+            &text[start..=end]
+        };
+
+        tracing::debug!("batch response body: {}", &json_str[..json_str.len().min(500)]);
+
+        let resp: BatchTunnelResponse = match serde_json::from_str(json_str) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("batch JSON parse error: {} — body: {}", e, &json_str[..json_str.len().min(300)]);
+                return Err(FronterError::Json(e));
+            }
+        };
+        self.release(entry).await;
+        Ok(resp)
+    }
 }
 
 /// Strip connection-specific headers (matches Code.gs SKIP_HEADERS) and
@@ -1161,14 +1415,12 @@ pub const DEFAULT_GOOGLE_SNI_POOL: &[&str] = &[
     "drive.google.com",
     "docs.google.com",
     "calendar.google.com",
-    // accounts.googl.com is a Google-owned alias (googl.com redirects
-    // to Google properties) whose cert is served off the same GFE IP
-    // pool. Reported in issue #42 as passing DPI on Samantel / MCI
-    // (Iranian carriers) specifically, where some of the longer
-    // `*.google.com` names are selectively SNI-blocked. Rotation-only
-    // use: we never actually HTTP-to it, just present it in the TLS
-    // handshake.
-    "accounts.googl.com",
+    // accounts.google.com — standard Google account service, covered
+    // by the *.google.com wildcard cert. Originally listed as
+    // accounts.googl.com (issue #42) but that name is NOT in the SAN
+    // list of Google's GFE cert, causing TLS validation failures when
+    // verify_ssl is true.
+    "accounts.google.com",
     // scholar.google.com — same logic as accounts.googl.com, reported
     // in #47 as a DPI-passing SNI on MCI / Samantel. Covered by the
     // core *.google.com cert so it handshakes normally against
