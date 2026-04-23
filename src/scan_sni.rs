@@ -466,9 +466,13 @@ pub async fn fetch_dns_info(url_addr: &str) -> Result<String, Box<dyn std::error
     )
     .await??;
 
+    // DoH is a normal public HTTPS request, not a fronted probe. Keep
+    // certificate validation on so an on-path MITM can't forge PTR data and
+    // poison the discovered SNI pool.
+    let mut root_store = RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let tls_cfg = ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerify))
+        .with_root_certificates(root_store)
         .with_no_client_auth();
     let connector = TlsConnector::from(Arc::new(tls_cfg));
     let server_name = ServerName::try_from(host.to_string())?;
