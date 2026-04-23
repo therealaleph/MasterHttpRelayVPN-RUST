@@ -2214,6 +2214,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tun2proxy",
+ "url",
  "webpki-roots 0.26.11",
  "x509-parser",
 ]

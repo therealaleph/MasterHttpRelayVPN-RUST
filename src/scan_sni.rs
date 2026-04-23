@@ -11,8 +11,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use rustls::RootCertStore;
+use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::timeout;
 use tokio_rustls::rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
 };
@@ -21,6 +24,7 @@ use tokio_rustls::rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme}
 use tokio_rustls::TlsConnector;
 
 use crate::config::Config;
+use crate::scan_ips::{fetch_google_ips, FAMOUS_GOOGLE_DOMAINS};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const CONCURRENCY: usize = 8;
@@ -69,7 +73,10 @@ pub async fn probe_all(google_ip: &str, snis: Vec<String>) -> Vec<(String, Probe
         let ip = google_ip.to_string();
         tasks.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.ok();
-            (sni_clone.clone(), probe_with(&ip, &sni_clone, connector).await)
+            (
+                sni_clone.clone(),
+                probe_with(&ip, &sni_clone, connector).await,
+            )
         }));
     }
     let mut out = Vec::with_capacity(tasks.len());
@@ -163,30 +170,29 @@ async fn probe_with(google_ip: &str, sni: &str, connector: TlsConnector) -> Prob
         }
     };
 
-    let mut tls = match tokio::time::timeout(PROBE_TIMEOUT, connector.connect(server_name, tcp))
-        .await
-    {
-        Ok(Ok(t)) => t,
-        Ok(Err(e)) => {
-            // DPI that blocks the SNI typically kills the handshake here.
-            let emsg = e.to_string();
-            let reason = if emsg.contains("reset") || emsg.contains("peer") {
-                "handshake RST (SNI may be blocked)".into()
-            } else {
-                format!("tls: {}", emsg)
-            };
-            return ProbeResult {
-                latency_ms: None,
-                error: Some(reason),
-            };
-        }
-        Err(_) => {
-            return ProbeResult {
-                latency_ms: None,
-                error: Some("tls handshake timeout".into()),
-            };
-        }
-    };
+    let mut tls =
+        match tokio::time::timeout(PROBE_TIMEOUT, connector.connect(server_name, tcp)).await {
+            Ok(Ok(t)) => t,
+            Ok(Err(e)) => {
+                // DPI that blocks the SNI typically kills the handshake here.
+                let emsg = e.to_string();
+                let reason = if emsg.contains("reset") || emsg.contains("peer") {
+                    "handshake RST (SNI may be blocked)".into()
+                } else {
+                    format!("tls: {}", emsg)
+                };
+                return ProbeResult {
+                    latency_ms: None,
+                    error: Some(reason),
+                };
+            }
+            Err(_) => {
+                return ProbeResult {
+                    latency_ms: None,
+                    error: Some("tls handshake timeout".into()),
+                };
+            }
+        };
 
     // Handshake completed — SNI passed. Do a tiny HEAD to confirm the other
     // side actually speaks HTTP (catches weird misroutes).
@@ -271,6 +277,235 @@ fn truncate_reason(s: &str, max: usize) -> String {
         let cleaned: String = s.chars().take(max).filter(|c| !c.is_control()).collect();
         cleaned
     }
+}
+
+#[derive(Deserialize)]
+struct DnsResponse {
+    #[serde(rename = "Answer")]
+    answer: Option<Vec<DnsAnswer>>,
+}
+
+#[derive(Deserialize)]
+struct DnsAnswer {
+    data: String,
+}
+pub async fn discover_snis_from_google_ips(config: &Config) -> bool {
+    let ips = fetch_google_ips(config).await;
+    println!(
+        "Discovering SNIs for {} Google IPs via dns.google...",
+        ips.len()
+    );
+    println!();
+
+    let sem = Arc::new(tokio::sync::Semaphore::new(20));
+    let mut tasks = Vec::new();
+
+    for ip in ips {
+        let sem = sem.clone();
+
+        tasks.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await.ok();
+
+            let octets: Vec<&str> = ip.split('.').collect();
+            if octets.len() != 4 {
+                return Vec::new();
+            }
+
+            let ptr_name = format!(
+                "{}.{}.{}.{}.in-addr.arpa",
+                octets[3], octets[2], octets[1], octets[0]
+            );
+
+            let url = format!("https://dns.google/resolve?name={}&type=PTR", ptr_name);
+
+            match fetch_dns_info(&url).await {
+                Ok(body) => {
+                    if let Ok(dns_resp) = serde_json::from_str::<DnsResponse>(&body) {
+                        if let Some(answers) = dns_resp.answer {
+                            return answers
+                                .into_iter()
+                                .map(|a| a.data.trim_end_matches('.').to_lowercase())
+                                .filter(|d| {
+                                    d.contains("1e100.net")
+                                        || d.contains("google")
+                                        || d.contains("goog")
+                                        || d.contains("youtube")
+                                        || FAMOUS_GOOGLE_DOMAINS.iter().any(|famous| {
+                                            let base = famous
+                                                .trim_start_matches("www.")
+                                                .trim_end_matches(".com");
+                                            d.contains(base)
+                                        })
+                                })
+                                .collect::<Vec<_>>();
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("PTR lookup failed for {}: {}", ip, e);
+                }
+            }
+            Vec::new()
+        }));
+    }
+
+    let mut all_domains = std::collections::HashSet::new();
+    for task in tasks {
+        if let Ok(domains) = task.await {
+            all_domains.extend(domains);
+        }
+    }
+
+    let discovered: Vec<String> = all_domains.into_iter().collect();
+
+    if discovered.is_empty() {
+        println!("No SNI domains discovered.");
+        println!();
+        return false;
+    }
+
+    println!(
+        "Validating {} SNIs against DPI (IP: {})...",
+        discovered.len(),
+        config.google_ip
+    );
+    println!();
+
+    let sem = Arc::new(tokio::sync::Semaphore::new(config.scan_batch_size));
+    let mut validation_tasks = Vec::new();
+
+    for sni in discovered {
+        let test_ip_owned = config.google_ip.to_string();
+        let sem = sem.clone();
+
+        validation_tasks.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await.ok();
+            if validate_sni_against_dpi(&sni, &test_ip_owned).await {
+                Some(sni)
+            } else {
+                None
+            }
+        }));
+    }
+
+    let mut validation_ok: Vec<String> = Vec::new();
+
+    for task in validation_tasks {
+        if let Ok(Some(sni)) = task.await {
+            validation_ok.push(sni);
+        }
+    }
+
+    if validation_ok.is_empty() {
+        println!("No SNI domains passed DPI validation.");
+        println!();
+        false
+    } else {
+        validation_ok.sort();
+        println!("SNIs that passed DPI validation:");
+        println!();
+        for sni in validation_ok {
+            println!("  {}", sni);
+        }
+        println!();
+        true
+    }
+}
+
+async fn validate_sni_against_dpi(sni: &str, test_ip: &str) -> bool {
+    let addr = format!("{}:443", test_ip);
+
+    let tcp_stream = match timeout(Duration::from_secs(5), TcpStream::connect(&addr)).await {
+        Ok(Ok(stream)) => stream,
+        _ => return false,
+    };
+
+    let mut root_store = RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    let config = ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    let connector = TlsConnector::from(Arc::new(config));
+
+    let sni_owned = sni.to_string();
+    let domain = match ServerName::try_from(sni_owned.as_str()) {
+        Ok(d) => d.to_owned(),
+        Err(_) => return false,
+    };
+
+    match timeout(
+        Duration::from_secs(5),
+        connector.connect(domain, tcp_stream),
+    )
+    .await
+    {
+        Ok(Ok(_)) => true,
+        _ => false,
+    }
+}
+
+pub async fn fetch_dns_info(url_addr: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let parsed = url::Url::parse(url_addr)?;
+    let host = parsed.host_str().ok_or("No host in URL")?;
+    let port = parsed.port().unwrap_or(443);
+    let path = if parsed.path().is_empty() {
+        "/"
+    } else {
+        parsed.path()
+    };
+    let query = parsed
+        .query()
+        .map(|q| format!("?{}", q))
+        .unwrap_or_default();
+
+    let stream = tokio::time::timeout(
+        Duration::from_secs(10),
+        TcpStream::connect(format!("{}:{}", host, port)),
+    )
+    .await??;
+
+    let tls_cfg = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerify))
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(tls_cfg));
+    let server_name = ServerName::try_from(host.to_string())?;
+
+    let mut tls_stream = tokio::time::timeout(
+        Duration::from_secs(10),
+        connector.connect(server_name, stream),
+    )
+    .await??;
+
+    let request = format!(
+        "GET {}{} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n",
+        path, query, host
+    );
+    tls_stream.write_all(request.as_bytes()).await?;
+    tls_stream.flush().await?;
+
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let mut buf = [0u8; 4096];
+        loop {
+            match tls_stream.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => response.extend_from_slice(&buf[..n]),
+                Err(_) => break,
+            }
+        }
+    })
+    .await?;
+
+    let response_str = String::from_utf8_lossy(&response);
+    let body = response_str
+        .split("\r\n\r\n")
+        .nth(1)
+        .ok_or("No HTTP body found")?;
+
+    Ok(body.to_string())
 }
 
 #[derive(Debug)]
