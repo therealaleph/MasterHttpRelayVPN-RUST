@@ -1764,6 +1764,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_content_range_total_rejects_descending_range() {
+        let headers = vec![("Content-Range".to_string(), "bytes 10-4/20".to_string())];
+        assert_eq!(parse_content_range_total(&headers), None);
+    }
+
+    #[test]
+    fn parse_content_range_total_rejects_end_past_total() {
+        let headers = vec![("Content-Range".to_string(), "bytes 0-20/20".to_string())];
+        assert_eq!(parse_content_range_total(&headers), None);
+    }
+
+    #[test]
     fn parse_relay_error_field() {
         let body = r#"{"e":"unauthorized"}"#;
         let err = parse_relay_json(body.as_bytes()).unwrap_err();
