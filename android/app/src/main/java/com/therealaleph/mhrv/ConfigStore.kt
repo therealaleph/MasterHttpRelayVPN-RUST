@@ -59,7 +59,21 @@ enum class SplitMode { ALL, ONLY, EXCEPT }
  */
 enum class UiLang { AUTO, FA, EN }
 
+/**
+ * Operating mode. Mirrors the Rust-side `Mode` enum.
+ *
+ * - [APPS_SCRIPT] (default) — full DPI bypass through the user's deployed
+ *   Apps Script relay. Requires a Deployment ID + Auth key.
+ * - [GOOGLE_ONLY] — bootstrap mode. Only the SNI-rewrite tunnel to the
+ *   Google edge is active, so the user can reach `script.google.com` to
+ *   deploy Code.gs in the first place. No Deployment ID / Auth key needed.
+ *   Non-Google traffic goes direct (no relay).
+ */
+enum class Mode { APPS_SCRIPT, GOOGLE_ONLY }
+
 data class MhrvConfig(
+    val mode: Mode = Mode.APPS_SCRIPT,
+
     val listenHost: String = "127.0.0.1",
     val listenPort: Int = 8080,
     val socks5Port: Int? = 1081,
@@ -130,11 +144,17 @@ data class MhrvConfig(
         val obj = JSONObject().apply {
             // `mode` is required — without it serde errors with
             // "missing field `mode`" and startProxy silently returns 0.
-            put("mode", "apps_script")
+            put("mode", when (mode) {
+                Mode.APPS_SCRIPT -> "apps_script"
+                Mode.GOOGLE_ONLY -> "google_only"
+            })
             put("listen_host", listenHost)
             put("listen_port", listenPort)
             socks5Port?.let { put("socks5_port", it) }
 
+            // In google_only mode these are unused by the Rust side, but we
+            // still persist whatever the user typed so flipping back to
+            // apps_script mode doesn't wipe their settings.
             put("script_ids", JSONArray().apply { ids.forEach { put(it) } })
             put("auth_key", authKey)
 
@@ -209,6 +229,10 @@ object ConfigStore {
             }?.filter { it.isNotBlank() }.orEmpty()
 
             MhrvConfig(
+                mode = when (obj.optString("mode", "apps_script")) {
+                    "google_only" -> Mode.GOOGLE_ONLY
+                    else -> Mode.APPS_SCRIPT
+                },
                 listenHost = obj.optString("listen_host", "127.0.0.1"),
                 listenPort = obj.optInt("listen_port", 8080),
                 socks5Port = obj.optInt("socks5_port", 1081).takeIf { it > 0 },

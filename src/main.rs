@@ -202,23 +202,44 @@ async fn main() -> ExitCode {
     }
 
     let socks5_port = config.socks5_port.unwrap_or(config.listen_port + 1);
-    tracing::warn!("mhrv-rs {} starting (mode: apps_script)", VERSION);
+    let mode = match config.mode_kind() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("config: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+    tracing::warn!("mhrv-rs {} starting (mode: {})", VERSION, mode.as_str());
     tracing::info!(
         "HTTP proxy   : {}:{}",
         config.listen_host,
         config.listen_port
     );
     tracing::info!("SOCKS5 proxy : {}:{}", config.listen_host, socks5_port);
-    tracing::info!(
-        "Apps Script relay: SNI={} -> script.google.com (via {})",
-        config.front_domain,
-        config.google_ip
-    );
-    let sids = config.script_ids_resolved();
-    if sids.len() > 1 {
-        tracing::info!("Script IDs: {} (round-robin)", sids.len());
-    } else {
-        tracing::info!("Script ID: {}", sids[0]);
+    match mode {
+        mhrv_rs::config::Mode::AppsScript => {
+            tracing::info!(
+                "Apps Script relay: SNI={} -> script.google.com (via {})",
+                config.front_domain,
+                config.google_ip
+            );
+            let sids = config.script_ids_resolved();
+            if sids.len() > 1 {
+                tracing::info!("Script IDs: {} (round-robin)", sids.len());
+            } else {
+                tracing::info!("Script ID: {}", sids[0]);
+            }
+        }
+        mhrv_rs::config::Mode::GoogleOnly => {
+            tracing::warn!(
+                "google_only bootstrap: direct SNI-rewrite tunnel to {} only. \
+                 Open https://script.google.com in your browser (proxy set to \
+                 {}:{}), deploy Code.gs, then switch to apps_script mode.",
+                config.google_ip,
+                config.listen_host,
+                config.listen_port
+            );
+        }
     }
 
     // Initialize MITM manager (generates CA on first run).

@@ -97,6 +97,19 @@ This part is unchanged from the original project. Follow @masterking32's guide o
    - Who has access: **Anyone**
 6. Copy the **Deployment ID** (the long random string in the URL).
 
+#### Can't reach `script.google.com` from your network?
+
+If your ISP is already blocking Google Apps Script (or all of Google), you need Step 1's browser connection to succeed *before* you have a relay to use. `mhrv-rs` ships a small bootstrap mode for exactly this: `google_only`.
+
+1. Build / download the binary as in Step 2 below.
+2. Copy [`config.google-only.example.json`](config.google-only.example.json) to `config.json` — no `script_id`, no `auth_key` required.
+3. Run `mhrv-rs serve` and set your browser's HTTP proxy to `127.0.0.1:8085`.
+4. In `google_only` mode the proxy only relays `*.google.com`, `*.youtube.com`, and the other Google-edge hosts via the same SNI-rewrite tunnel the full client uses. Other traffic goes direct — no Apps Script relay exists yet.
+5. Do Step 1 in your browser (the connection to `script.google.com` will be SNI-fronted). Deploy Code.gs, copy the Deployment ID.
+6. In the desktop UI or the Android app (or by editing `config.json`) switch the mode back to `apps_script`, paste the Deployment ID and your auth key, and restart.
+
+You can also verify reachability before even starting the proxy: `mhrv-rs test-sni` probes `*.google.com` directly and works without any config beyond `google_ip` + `front_domain`.
+
 ### Step 2 — Download
 
 Grab the archive for your platform from the [releases page](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases) and extract it.
@@ -397,6 +410,24 @@ Original project: <https://github.com/masterking32/MasterHttpRelayVPN> by [@mast
 ۷. روی **`Deploy`** کلیک کنید. گوگل یک **`Deployment ID`** نشان می‌دهد — رشتهٔ طولانی تصادفی که داخل آدرس `URL` است. کپی‌اش کنید؛ در برنامه لازم دارید  
 
 > **نکته:** اگر نمی‌دانید رمز `AUTH_KEY` چه بگذارید، یک رشتهٔ تصادفی ۱۶ تا ۲۴ کاراکتری بسازید. مهم فقط این است که **دقیقاً همان رشته** را در برنامه هم وارد کنید.
+
+#### به `script.google.com` هم دسترسی ندارید؟
+
+اگر `ISP` شما از قبل `Apps Script` (یا کل گوگل) را مسدود کرده، برای مرحلهٔ ۱ باید مرورگرتان **اول** به `script.google.com` برسد — قبل از اینکه رله‌ای داشته باشید. `mhrv-rs` یک حالت بوت‌استرپ کوچک دقیقاً برای همین دارد: `google_only`.
+
+۱. برنامه را طبق مرحلهٔ ۲ پایین دانلود کنید
+
+۲. فایل [`config.google-only.example.json`](config.google-only.example.json) را در کنار فایل اجرایی به نام `config.json` کپی کنید — نه `script_id` لازم دارد و نه `auth_key`
+
+۳. برنامه را اجرا کنید و `HTTP proxy` مرورگرتان را روی `127.0.0.1:8085` تنظیم کنید
+
+۴. در حالت `google_only`، پروکسی فقط `*.google.com`، `*.youtube.com` و بقیهٔ میزبان‌های لبهٔ گوگل را از طریق همان تونل بازنویسی `SNI` رد می‌کند. بقیهٔ ترافیک مستقیم می‌رود — هنوز رله‌ای در کار نیست
+
+۵. حالا مرحلهٔ ۱ را در مرورگر انجام دهید (اتصال به `script.google.com` با `SNI` فرونت می‌شود). `Code.gs` را مستقر کنید و `Deployment ID` را کپی کنید
+
+۶. در `UI` دسکتاپ یا اندروید (یا با ویرایش `config.json`) حالت را به `apps_script` برگردانید، `Deployment ID` و `auth_key` را بچسبانید و برنامه را دوباره راه‌اندازی کنید
+
+برای بررسی قابلیت دسترسی قبل از راه‌اندازی پروکسی: دستور `mhrv-rs test-sni` دامنه‌های `*.google.com` را مستقیماً تست می‌کند و فقط به `google_ip` و `front_domain` نیاز دارد.
 
 #### مرحلهٔ ۲ — دانلود برنامه
 

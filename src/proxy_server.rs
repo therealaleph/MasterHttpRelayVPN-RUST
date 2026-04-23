@@ -11,7 +11,7 @@ use tokio_rustls::rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme}
 use tokio_rustls::rustls::server::Acceptor;
 use tokio_rustls::{LazyConfigAcceptor, TlsAcceptor, TlsConnector};
 
-use crate::config::Config;
+use crate::config::{Config, Mode};
 use crate::domain_fronter::DomainFronter;
 use crate::mitm::MitmCertManager;
 
@@ -104,7 +104,9 @@ pub struct ProxyServer {
     host: String,
     port: u16,
     socks5_port: u16,
-    fronter: Arc<DomainFronter>,
+    /// `None` in `google_only` (bootstrap) mode: no Apps Script relay is
+    /// wired up, only the SNI-rewrite tunnel path is live.
+    fronter: Option<Arc<DomainFronter>>,
     mitm: Arc<Mutex<MitmCertManager>>,
     rewrite_ctx: Arc<RewriteCtx>,
 }
@@ -115,12 +117,27 @@ pub struct RewriteCtx {
     pub hosts: std::collections::HashMap<String, String>,
     pub tls_connector: TlsConnector,
     pub upstream_socks5: Option<String>,
+    pub mode: Mode,
 }
 
 impl ProxyServer {
     pub fn new(config: &Config, mitm: Arc<Mutex<MitmCertManager>>) -> Result<Self, ProxyError> {
-        let fronter = DomainFronter::new(config)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
+        let mode = config
+            .mode_kind()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{e}")))?;
+
+        // `google_only` mode skips the Apps Script relay entirely, so we must
+        // not try to construct the DomainFronter — it errors on a missing
+        // `script_id`, which is exactly the state a bootstrapping user is in.
+        let fronter = match mode {
+            Mode::AppsScript => {
+                let f = DomainFronter::new(config).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::Other, format!("{e}"))
+                })?;
+                Some(Arc::new(f))
+            }
+            Mode::GoogleOnly => None,
+        };
 
         let tls_config = if config.verify_ssl {
             let mut roots = tokio_rustls::rustls::RootCertStore::empty();
@@ -142,6 +159,7 @@ impl ProxyServer {
             hosts: config.hosts.clone(),
             tls_connector,
             upstream_socks5: config.upstream_socks5.clone(),
+            mode,
         });
 
         let socks5_port = config.socks5_port.unwrap_or(config.listen_port + 1);
@@ -150,13 +168,13 @@ impl ProxyServer {
             host: config.listen_host.clone(),
             port: config.listen_port,
             socks5_port,
-            fronter: Arc::new(fronter),
+            fronter,
             mitm,
             rewrite_ctx,
         })
     }
 
-    pub fn fronter(&self) -> Arc<DomainFronter> {
+    pub fn fronter(&self) -> Option<Arc<DomainFronter>> {
         self.fronter.clone()
     }
     pub async fn run(
@@ -177,25 +195,30 @@ impl ProxyServer {
         );
         // Pre-warm the outbound connection pool so the user's first request
         // doesn't pay a fresh TLS handshake to Google edge. Best-effort;
-        // failures are logged and ignored.
-        let warm_fronter = self.fronter.clone();
-        tokio::spawn(async move {
-            warm_fronter.warm(3).await;
-        });
+        // failures are logged and ignored. Skipped in `google_only` — there
+        // is no fronter to warm.
+        if let Some(warm_fronter) = self.fronter.clone() {
+            tokio::spawn(async move {
+                warm_fronter.warm(3).await;
+            });
+        }
 
-        let stats_fronter = self.fronter.clone();
-        let stats_task = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            ticker.tick().await;
-            loop {
+        let stats_task = if let Some(stats_fronter) = self.fronter.clone() {
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 ticker.tick().await;
-                let s = stats_fronter.snapshot_stats();
-                if s.relay_calls > 0 || s.cache_hits > 0 {
-                    tracing::info!("{}", s.fmt_line());
+                loop {
+                    ticker.tick().await;
+                    let s = stats_fronter.snapshot_stats();
+                    if s.relay_calls > 0 || s.cache_hits > 0 {
+                        tracing::info!("{}", s.fmt_line());
+                    }
                 }
-            }
-        });
+            })
+        } else {
+            tokio::spawn(async move { std::future::pending::<()>().await })
+        };
 
         let http_fronter = self.fronter.clone();
         let http_mitm = self.mitm.clone();
@@ -325,7 +348,7 @@ async fn accept_backoff(kind: &str, err: &std::io::Error, count: &mut u64) {
 
 async fn handle_http_client(
     mut sock: TcpStream,
-    fronter: Arc<DomainFronter>,
+    fronter: Option<Arc<DomainFronter>>,
     mitm: Arc<Mutex<MitmCertManager>>,
     rewrite_ctx: Arc<RewriteCtx>,
 ) -> std::io::Result<()> {
@@ -344,7 +367,26 @@ async fn handle_http_client(
         sock.flush().await?;
         dispatch_tunnel(sock, host, port, fronter, mitm, rewrite_ctx).await
     } else {
-        do_plain_http(sock, &head, &leftover, fronter).await
+        // Plain HTTP proxy request (e.g. `GET http://…`). The Apps Script
+        // relay is the only code path that can fulfil this, so in google_only
+        // bootstrap mode we return a clear 502 instead.
+        match fronter {
+            Some(f) => do_plain_http(sock, &head, &leftover, f).await,
+            None => {
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 502 Bad Gateway\r\n\
+                          Content-Type: text/plain; charset=utf-8\r\n\
+                          Content-Length: 128\r\n\
+                          Connection: close\r\n\r\n\
+                          google_only mode: plain HTTP proxy requests are not supported. \
+                          Browse https over CONNECT, or switch to apps_script mode.",
+                    )
+                    .await;
+                let _ = sock.flush().await;
+                Ok(())
+            }
+        }
     }
 }
 
@@ -352,7 +394,7 @@ async fn handle_http_client(
 
 async fn handle_socks5_client(
     mut sock: TcpStream,
-    fronter: Arc<DomainFronter>,
+    fronter: Option<Arc<DomainFronter>>,
     mitm: Arc<Mutex<MitmCertManager>>,
     rewrite_ctx: Arc<RewriteCtx>,
 ) -> std::io::Result<()> {
@@ -444,7 +486,7 @@ async fn dispatch_tunnel(
     sock: TcpStream,
     host: String,
     port: u16,
-    fronter: Arc<DomainFronter>,
+    fronter: Option<Arc<DomainFronter>>,
     mitm: Arc<Mutex<MitmCertManager>>,
     rewrite_ctx: Arc<RewriteCtx>,
 ) -> std::io::Result<()> {
@@ -455,7 +497,39 @@ async fn dispatch_tunnel(
         return do_sni_rewrite_tunnel_from_tcp(sock, &host, port, mitm, rewrite_ctx).await;
     }
 
-    // 2. Peek at the first byte to detect TLS vs plain. Time-bounded — if the
+    // 2. google_only bootstrap: no Apps Script relay exists. Anything that
+    //    isn't SNI-rewrite-matched gets direct TCP passthrough so the user's
+    //    browser still works while they're deploying Code.gs. They'd switch
+    //    to apps_script mode for the real DPI bypass.
+    if rewrite_ctx.mode == Mode::GoogleOnly {
+        let via = rewrite_ctx.upstream_socks5.as_deref();
+        tracing::info!(
+            "dispatch {}:{} -> raw-tcp ({}) (google_only: no relay)",
+            host,
+            port,
+            via.unwrap_or("direct")
+        );
+        plain_tcp_passthrough(sock, &host, port, via).await;
+        return Ok(());
+    }
+
+    // From here on we know mode == AppsScript, so `fronter` is Some.
+    let fronter = match fronter {
+        Some(f) => f,
+        None => {
+            // Defensive: mode says apps_script but the fronter is missing.
+            // Fall back to raw TCP rather than panicking.
+            tracing::error!(
+                "dispatch {}:{} -> raw-tcp (unexpected: apps_script mode with no fronter)",
+                host,
+                port
+            );
+            plain_tcp_passthrough(sock, &host, port, rewrite_ctx.upstream_socks5.as_deref()).await;
+            return Ok(());
+        }
+    };
+
+    // 3. Peek at the first byte to detect TLS vs plain. Time-bounded — if the
     //    client doesn't send anything within 300ms, assume server-first
     //    protocol (SMTP, POP3, FTP banner) and jump straight to plain TCP.
     let mut peek_buf = [0u8; 8];
@@ -496,7 +570,7 @@ async fn dispatch_tunnel(
         return Ok(());
     }
 
-    // 3. Not TLS. If bytes look like HTTP, relay on scheme=http. Otherwise
+    // 4. Not TLS. If bytes look like HTTP, relay on scheme=http. Otherwise
     //    fall back to plain TCP passthrough.
     if peek_n > 0 && looks_like_http(&peek_buf[..peek_n]) {
         let scheme = if port == 443 { "https" } else { "http" };

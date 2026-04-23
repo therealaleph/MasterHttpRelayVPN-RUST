@@ -12,6 +12,27 @@ pub enum ConfigError {
     Invalid(String),
 }
 
+/// Operating mode. `AppsScript` is the full client — MITMs TLS locally and
+/// relays HTTP/HTTPS through a user-deployed Apps Script endpoint.
+/// `GoogleOnly` is a bootstrap: no relay, no Apps Script config needed,
+/// only the SNI-rewrite tunnel to the Google edge is active. Intended for
+/// users who need to reach `script.google.com` to deploy `Code.gs` in the
+/// first place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    AppsScript,
+    GoogleOnly,
+}
+
+impl Mode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::AppsScript => "apps_script",
+            Mode::GoogleOnly => "google_only",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum ScriptId {
@@ -39,6 +60,7 @@ pub struct Config {
     pub script_id: Option<ScriptId>,
     #[serde(default)]
     pub script_ids: Option<ScriptId>,
+    #[serde(default)]
     pub auth_key: String,
     #[serde(default = "default_listen_host")]
     pub listen_host: String,
@@ -141,28 +163,25 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
-        if self.mode != "apps_script" {
-            return Err(ConfigError::Invalid(format!(
-                "only 'apps_script' mode is supported in this build (got '{}')",
-                self.mode
-            )));
-        }
-        if self.auth_key.trim().is_empty() || self.auth_key == "CHANGE_ME_TO_A_STRONG_SECRET" {
-            return Err(ConfigError::Invalid(
-                "auth_key must be set to a strong secret".into(),
-            ));
-        }
-        let ids = self.script_ids_resolved();
-        if ids.is_empty() {
-            return Err(ConfigError::Invalid(
-                "script_id (or script_ids) is required".into(),
-            ));
-        }
-        for id in &ids {
-            if id.is_empty() || id == "YOUR_APPS_SCRIPT_DEPLOYMENT_ID" {
+        let mode = self.mode_kind()?;
+        if mode == Mode::AppsScript {
+            if self.auth_key.trim().is_empty() || self.auth_key == "CHANGE_ME_TO_A_STRONG_SECRET" {
                 return Err(ConfigError::Invalid(
-                    "script_id is not set — deploy Code.gs and paste its Deployment ID".into(),
+                    "auth_key must be set to a strong secret".into(),
                 ));
+            }
+            let ids = self.script_ids_resolved();
+            if ids.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "script_id (or script_ids) is required".into(),
+                ));
+            }
+            for id in &ids {
+                if id.is_empty() || id == "YOUR_APPS_SCRIPT_DEPLOYMENT_ID" {
+                    return Err(ConfigError::Invalid(
+                        "script_id is not set — deploy Code.gs and paste its Deployment ID".into(),
+                    ));
+                }
             }
         }
         if self.scan_batch_size == 0 {
@@ -171,6 +190,17 @@ impl Config {
             ));
         }
         Ok(())
+    }
+
+    pub fn mode_kind(&self) -> Result<Mode, ConfigError> {
+        match self.mode.as_str() {
+            "apps_script" => Ok(Mode::AppsScript),
+            "google_only" => Ok(Mode::GoogleOnly),
+            other => Err(ConfigError::Invalid(format!(
+                "unknown mode '{}' (expected 'apps_script' or 'google_only')",
+                other
+            ))),
+        }
     }
 
     pub fn script_ids_resolved(&self) -> Vec<String> {
@@ -227,6 +257,42 @@ mod tests {
         let s = r#"{
             "mode": "domain_fronting",
             "auth_key": "SECRET",
+            "script_id": "X"
+        }"#;
+        let cfg: Config = serde_json::from_str(s).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn parses_google_only_without_script_id() {
+        // Bootstrap mode: no script_id, no auth_key — both are only meaningful
+        // once the Apps Script relay exists.
+        let s = r#"{
+            "mode": "google_only"
+        }"#;
+        let cfg: Config = serde_json::from_str(s).unwrap();
+        cfg.validate().expect("google_only must validate without script_id / auth_key");
+        assert_eq!(cfg.mode_kind().unwrap(), Mode::GoogleOnly);
+    }
+
+    #[test]
+    fn google_only_ignores_placeholder_script_id() {
+        // UI round-trip: user saved config in apps_script with the placeholder,
+        // then switched mode to google_only. The placeholder should not block
+        // validation in the bootstrap mode.
+        let s = r#"{
+            "mode": "google_only",
+            "script_id": "YOUR_APPS_SCRIPT_DEPLOYMENT_ID"
+        }"#;
+        let cfg: Config = serde_json::from_str(s).unwrap();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_unknown_mode_value() {
+        let s = r#"{
+            "mode": "hybrid",
+            "auth_key": "X",
             "script_id": "X"
         }"#;
         let cfg: Config = serde_json::from_str(s).unwrap();
