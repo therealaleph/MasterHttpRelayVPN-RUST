@@ -402,6 +402,7 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          INCLUDE_CHANGELOG: ${{ vars.TELEGRAM_INCLUDE_CHANGELOG }}
         # Python over curl/bash so we don't have to fight curl's -F
         # value-interpretation rules. curl treats `-F "caption=<..."`
         # as "read the caption from file named ..." when the value
@@ -424,8 +425,18 @@ jobs:
             exit 1
           fi
 
+          # --with-changelog is opt-in. Default post is just the APK
+          # plus a short caption with the SHA-256, repo URL, and release
+          # URL — no long body. To include the Persian/English bullets
+          # for a specific tag, set the repo variable
+          # TELEGRAM_INCLUDE_CHANGELOG=true before pushing that tag.
+          INCLUDE_CHANGELOG_FLAG=""
+          if [ "${INCLUDE_CHANGELOG:-}" = "true" ]; then
+            INCLUDE_CHANGELOG_FLAG="--with-changelog"
+          fi
           python3 .github/scripts/telegram_release_notify.py \
             --apk "$APK" \
             --version "$VER" \
             --repo "$GITHUB_REPOSITORY" \
-            --changelog "docs/changelog/v${VER}.md"
+            --changelog "docs/changelog/v${VER}.md" \
+            $INCLUDE_CHANGELOG_FLAG
