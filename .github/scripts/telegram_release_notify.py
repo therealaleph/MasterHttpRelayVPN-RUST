@@ -159,7 +159,16 @@ def main() -> int:
     ap.add_argument("--apk", required=True)
     ap.add_argument("--version", required=True)
     ap.add_argument("--repo", required=True)
-    ap.add_argument("--changelog", required=True)
+    ap.add_argument("--changelog", required=True,
+                    help="Path to docs/changelog/vX.Y.Z.md; only read when --with-changelog is passed.")
+    # Default: just the APK + short caption (title + SHA-256 + repo URL +
+    # release URL). The per-release Persian/English blockquote reply is
+    # opt-in via `--with-changelog` so routine releases don't flood the
+    # channel with bullet-point bodies. To re-enable for a specific tag:
+    # set the repo variable TELEGRAM_INCLUDE_CHANGELOG=true before pushing
+    # the tag (the workflow converts that into --with-changelog).
+    ap.add_argument("--with-changelog", action="store_true",
+                    help="Include the Persian+English changelog as a reply-threaded message.")
     args = ap.parse_args()
 
     token = os.environ.get("BOT_TOKEN", "")
@@ -179,6 +188,10 @@ def main() -> int:
 
     doc_mid = send_document(token, chat_id, args.apk, caption)
     print(f"sendDocument OK, message_id={doc_mid}")
+
+    if not args.with_changelog:
+        print("Changelog reply disabled (default). Pass --with-changelog to include.")
+        return 0
 
     fa, en = parse_changelog(args.changelog)
     if not fa and not en:
