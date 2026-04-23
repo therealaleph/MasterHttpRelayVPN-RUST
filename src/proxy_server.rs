@@ -377,7 +377,7 @@ async fn handle_http_client(
                     .write_all(
                         b"HTTP/1.1 502 Bad Gateway\r\n\
                           Content-Type: text/plain; charset=utf-8\r\n\
-                          Content-Length: 128\r\n\
+                          Content-Length: 120\r\n\
                           Connection: close\r\n\r\n\
                           google_only mode: plain HTTP proxy requests are not supported. \
                           Browse https over CONNECT, or switch to apps_script mode.",
