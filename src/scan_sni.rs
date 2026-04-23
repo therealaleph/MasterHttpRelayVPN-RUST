@@ -279,6 +279,84 @@ fn truncate_reason(s: &str, max: usize) -> String {
     }
 }
 
+fn parse_http_response_body(raw: &[u8]) -> Result<Vec<u8>, &'static str> {
+    let header_end = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or("No HTTP header/body separator found")?;
+    let header_block = std::str::from_utf8(&raw[..header_end]).map_err(|_| "Bad HTTP headers")?;
+    let body = &raw[header_end + 4..];
+
+    let mut transfer_encoding = None;
+    let mut content_length = None;
+    for line in header_block.lines().skip(1) {
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        if k.eq_ignore_ascii_case("transfer-encoding") {
+            transfer_encoding = Some(v.trim().to_string());
+        } else if k.eq_ignore_ascii_case("content-length") {
+            content_length = v.trim().parse::<usize>().ok();
+        }
+    }
+
+    if transfer_encoding
+        .as_deref()
+        .map(|v| {
+            v.split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("chunked"))
+        })
+        .unwrap_or(false)
+    {
+        return decode_chunked_http_body(body);
+    }
+
+    if let Some(len) = content_length {
+        if body.len() < len {
+            return Err("HTTP body shorter than Content-Length");
+        }
+        return Ok(body[..len].to_vec());
+    }
+
+    Ok(body.to_vec())
+}
+
+fn decode_chunked_http_body(mut body: &[u8]) -> Result<Vec<u8>, &'static str> {
+    let mut out = Vec::new();
+    loop {
+        let line_end = body
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .ok_or("truncated chunk size line")?;
+        let size_line = std::str::from_utf8(&body[..line_end]).map_err(|_| "bad chunk size line")?;
+        let size = usize::from_str_radix(size_line.trim().split(';').next().unwrap_or(""), 16)
+            .map_err(|_| "bad chunk size")?;
+        body = &body[line_end + 2..];
+
+        if size == 0 {
+            loop {
+                let trailer_end = body
+                    .windows(2)
+                    .position(|w| w == b"\r\n")
+                    .ok_or("truncated chunk trailer")?;
+                if trailer_end == 0 {
+                    return Ok(out);
+                }
+                body = &body[trailer_end + 2..];
+            }
+        }
+
+        if body.len() < size + 2 {
+            return Err("truncated chunk body");
+        }
+        if &body[size..size + 2] != b"\r\n" {
+            return Err("chunk missing trailing CRLF");
+        }
+        out.extend_from_slice(&body[..size]);
+        body = &body[size + 2..];
+    }
+}
+
 #[derive(Deserialize)]
 struct DnsResponse {
     #[serde(rename = "Answer")]
@@ -289,6 +367,21 @@ struct DnsResponse {
 struct DnsAnswer {
     data: String,
 }
+
+fn is_public_google_sni_candidate(domain: &str) -> bool {
+    let public_suffixes = [
+        "google.com",
+        "youtube.com",
+        "googleapis.com",
+        "gstatic.com",
+        "ggpht.com",
+        "withgoogle.com",
+    ];
+    public_suffixes.iter().any(|suffix| {
+        domain == *suffix || domain.strip_suffix(suffix).is_some_and(|prefix| prefix.ends_with('.'))
+    })
+}
+
 pub async fn discover_snis_from_google_ips(config: &Config) -> bool {
     let ips = fetch_google_ips(config).await;
     println!(
@@ -356,16 +449,28 @@ pub async fn discover_snis_from_google_ips(config: &Config) -> bool {
         }
     }
 
-    let discovered: Vec<String> = all_domains.into_iter().collect();
+    let mut discovered: Vec<String> = all_domains
+        .into_iter()
+        .filter(|d| is_public_google_sni_candidate(d))
+        .collect();
+
+    // PTRs on Google frontend IPs usually resolve to infrastructure names
+    // like `*.1e100.net`, which are useful as edge hints but not usable as
+    // fronting SNIs with normal certificate validation. Always validate the
+    // public Google domain pool too, then add any public PTR-derived names on
+    // top.
+    discovered.extend(FAMOUS_GOOGLE_DOMAINS.iter().map(|d| d.to_string()));
+    discovered.sort();
+    discovered.dedup();
 
     if discovered.is_empty() {
-        println!("No SNI domains discovered.");
+        println!("No public SNI candidates discovered.");
         println!();
         return false;
     }
 
     println!(
-        "Validating {} SNIs against DPI (IP: {})...",
+        "Validating {} public SNI candidates against DPI (IP: {})...",
         discovered.len(),
         config.google_ip
     );
@@ -499,13 +604,8 @@ pub async fn fetch_dns_info(url_addr: &str) -> Result<String, Box<dyn std::error
     })
     .await?;
 
-    let response_str = String::from_utf8_lossy(&response);
-    let body = response_str
-        .split("\r\n\r\n")
-        .nth(1)
-        .ok_or("No HTTP body found")?;
-
-    Ok(body.to_string())
+    let body = parse_http_response_body(&response)?;
+    Ok(String::from_utf8_lossy(&body).to_string())
 }
 
 #[derive(Debug)]
@@ -550,5 +650,41 @@ impl ServerCertVerifier for NoVerify {
             SignatureScheme::RSA_PSS_SHA512,
             SignatureScheme::ED25519,
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_public_google_sni_candidate, parse_http_response_body};
+
+    #[test]
+    fn parses_chunked_http_body_for_dns_json() {
+        let raw = b"HTTP/1.1 200 OK\r\n\
+Transfer-Encoding: chunked\r\n\
+Content-Type: application/json\r\n\
+\r\n\
+5\r\n\
+{\"Sta\r\n\
+7\r\n\
+tus\":0}\r\n\
+0\r\n\
+\r\n";
+        let body = parse_http_response_body(raw).unwrap();
+        assert_eq!(body, br#"{"Status":0}"#);
+    }
+
+    #[test]
+    fn parses_content_length_http_body() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\n{\"Status\":0}";
+        let body = parse_http_response_body(raw).unwrap();
+        assert_eq!(body, br#"{"Status":0}"#);
+    }
+
+    #[test]
+    fn only_public_google_hostnames_are_scan_sni_candidates() {
+        assert!(is_public_google_sni_candidate("www.google.com"));
+        assert!(is_public_google_sni_candidate("fonts.googleapis.com"));
+        assert!(!is_public_google_sni_candidate("ams15s21-in-f14.1e100.net"));
+        assert!(!is_public_google_sni_candidate("82.221.107.34.bc.googleusercontent.com"));
     }
 }
