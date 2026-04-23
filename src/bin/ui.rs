@@ -49,11 +49,26 @@ fn main() -> eframe::Result<()> {
     let (form, load_err) = load_form();
     let initial_toast = load_err.map(|e| (e, Instant::now()));
 
+    // Pick the renderer. Default is `glow` (OpenGL 2+) because that's
+    // what we shipped through v1.0.x and it has the least binary-size
+    // overhead. Users on older Windows boxes / RDP sessions / headless
+    // VMs that crashed with `egui_glow requires opengl 2.0+` (issue
+    // #28) can force the wgpu backend — DX12 on Windows, Vulkan on
+    // Linux, Metal on macOS — by setting the env var:
+    //
+    //     MHRV_RENDERER=wgpu mhrv-rs-ui
+    //
+    // The launcher scripts (run.bat / run.command / run.sh) honour
+    // the same variable and forward it through.
+    let use_wgpu = std::env::var("MHRV_RENDERER")
+        .map(|v| v.eq_ignore_ascii_case("wgpu"))
+        .unwrap_or(false);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([WIN_WIDTH, WIN_HEIGHT])
             .with_min_inner_size([420.0, 400.0])
             .with_title(format!("mhrv-rs {}", VERSION)),
+        renderer: if use_wgpu { eframe::Renderer::Wgpu } else { eframe::Renderer::Glow },
         ..Default::default()
     };
 
@@ -458,6 +473,15 @@ struct ConfigWire<'a> {
     sni_hosts: Option<Vec<&'a str>>,
     #[serde(skip_serializing_if = "is_false")]
     normalize_x_graphql: bool,
+    // IP-scan knobs. These used to be missing from the wire struct, so
+    // every Save-config silently dropped them — the user would toggle
+    // "fetch from API" on, save, reopen, and find it off again. Add
+    // them here and keep them in sync if Config ever grows more.
+    #[serde(skip_serializing_if = "is_false")]
+    fetch_ips_from_api: bool,
+    max_ips_to_scan: usize,
+    scan_batch_size: usize,
+    google_ip_validation: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -500,6 +524,10 @@ impl<'a> From<&'a Config> for ConfigWire<'a> {
                 .as_ref()
                 .map(|v| v.iter().map(String::as_str).collect()),
             normalize_x_graphql: c.normalize_x_graphql,
+            fetch_ips_from_api: c.fetch_ips_from_api,
+            max_ips_to_scan: c.max_ips_to_scan,
+            scan_batch_size: c.scan_batch_size,
+            google_ip_validation: c.google_ip_validation,
         }
     }
 }

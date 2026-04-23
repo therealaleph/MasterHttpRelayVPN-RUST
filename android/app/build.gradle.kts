@@ -14,8 +14,8 @@ android {
         applicationId = "com.therealaleph.mhrv"
         minSdk = 24 // Android 7.0 — covers 99%+ of live devices.
         targetSdk = 34
-        versionCode = 102
-        versionName = "1.0.2"
+        versionCode = 110
+        versionName = "1.1.0"
 
         // Ship all four mainstream Android ABIs:
         //   - arm64-v8a      — 95%+ of real-world Android phones since 2019
@@ -102,6 +102,10 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.9.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.2")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.2")
+    // AppCompatDelegate.setApplicationLocales is the only thing we need
+    // out of AppCompat — lets us flip the whole app locale at runtime
+    // from MhrvApp.onCreate without touching every composable.
+    implementation("androidx.appcompat:appcompat:1.7.0")
 
     // Compose UI.
     implementation("androidx.compose.ui:ui")

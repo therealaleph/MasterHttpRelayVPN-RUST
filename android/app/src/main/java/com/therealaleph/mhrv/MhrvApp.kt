@@ -2,6 +2,8 @@ package com.therealaleph.mhrv
 
 import android.app.Application
 import android.util.Log
+import androidx.appcompat.app.AppCompatDelegate
+import androidx.core.os.LocaleListCompat
 
 /**
  * Application-level setup. The only job here right now is to catch
@@ -20,6 +22,24 @@ import android.util.Log
 class MhrvApp : Application() {
     override fun onCreate() {
         super.onCreate()
+
+        // Apply the saved UI-language preference before any UI class
+        // loads. AppCompatDelegate propagates locale changes to the whole
+        // process, including Compose text rendering and
+        // LocalLayoutDirection (which becomes RTL when Persian is
+        // selected), without us having to thread it through every
+        // composable.
+        val cfg = ConfigStore.load(this)
+        val tag = when (cfg.uiLang) {
+            UiLang.FA -> "fa"
+            UiLang.EN -> "en"
+            UiLang.AUTO -> ""  // empty list = follow system locale
+        }
+        Log.i(APP_TAG, "applying ui_lang=${cfg.uiLang} (tag='$tag')")
+        AppCompatDelegate.setApplicationLocales(
+            if (tag.isEmpty()) LocaleListCompat.getEmptyLocaleList()
+            else LocaleListCompat.forLanguageTags(tag),
+        )
         val previous = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
             Log.e(
@@ -36,5 +56,6 @@ class MhrvApp : Application() {
 
     companion object {
         private const val CRASH_TAG = "mhrv-crash"
+        private const val APP_TAG = "MhrvApp"
     }
 }

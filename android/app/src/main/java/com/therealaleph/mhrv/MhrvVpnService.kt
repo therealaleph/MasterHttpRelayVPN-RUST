@@ -110,6 +110,21 @@ class MhrvVpnService : VpnService() {
 
         val socks5Port = cfg.socks5Port ?: (cfg.listenPort + 1)
 
+        // PROXY_ONLY mode: the user wants just the 127.0.0.1 HTTP + SOCKS5
+        // listeners up, with no VpnService / no TUN. Typical reasons:
+        // another VPN app already owns the system VPN slot, the user
+        // wants per-app opt-in via Wi-Fi proxy settings, or the device
+        // is a sandboxed/rooted setup where VpnService is unwelcome.
+        // We still run as a foreground service (required for the native
+        // listener thread to survive backgrounding), we just skip every
+        // VPN-specific step below. Issue #37.
+        if (cfg.connectionMode == ConnectionMode.PROXY_ONLY) {
+            Log.i(TAG, "PROXY_ONLY mode: listeners up, skipping VpnService/TUN")
+            startForeground(NOTIF_ID, buildNotif(cfg.listenPort))
+            VpnState.setRunning(true)
+            return
+        }
+
         // 2) Establish the TUN. Key Builder calls:
         //    - addAddress(10.0.0.2/32): our local IP inside the tunnel.
         //    - addRoute(0.0.0.0/0): capture ALL IPv4 traffic. IPv6 isn't added,
@@ -133,6 +148,47 @@ class MhrvVpnService : VpnService() {
         } catch (e: Throwable) {
             // Shouldn't happen for our own package, but don't hard-fail.
             Log.w(TAG, "addDisallowedApplication failed: ${e.message}")
+        }
+
+        // Apply user-chosen app splitting on top of the mandatory
+        // self-exclusion above.
+        //
+        //   ALL    — no extra restriction; every other app routes through
+        //            us. Matches pre-splitting behaviour.
+        //   ONLY   — allow-list. addAllowedApplication() for each chosen
+        //            package; anything missing from the list bypasses the
+        //            VPN on the OS-native route. Note that ONLY and the
+        //            mandatory self-exclude are mutually exclusive in the
+        //            VpnService API, so if the user also put us in the
+        //            allow-list we skip the self-exclude (it's already
+        //            implicit via "we're not in the list").
+        //   EXCEPT — deny-list. addDisallowedApplication() for each chosen
+        //            package, additive with our self-exclude.
+        //
+        // Packages that are not installed (leftover selections from a
+        // previous device) throw PackageManager.NameNotFoundException —
+        // we log and skip rather than aborting the whole VPN start.
+        when (cfg.splitMode) {
+            SplitMode.ALL -> { /* no-op */ }
+            SplitMode.ONLY -> {
+                if (cfg.splitApps.isEmpty()) {
+                    Log.w(TAG, "ONLY mode with empty splitApps list — no app would get the VPN; falling back to ALL")
+                } else {
+                    for (pkg in cfg.splitApps) {
+                        try { builder.addAllowedApplication(pkg) } catch (e: Throwable) {
+                            Log.w(TAG, "addAllowedApplication($pkg) failed: ${e.message}")
+                        }
+                    }
+                }
+            }
+            SplitMode.EXCEPT -> {
+                for (pkg in cfg.splitApps) {
+                    if (pkg == packageName) continue  // already self-excluded above
+                    try { builder.addDisallowedApplication(pkg) } catch (e: Throwable) {
+                        Log.w(TAG, "addDisallowedApplication($pkg) failed: ${e.message}")
+                    }
+                }
+            }
         }
 
         val parcelFd = try {
@@ -177,6 +233,12 @@ class MhrvVpnService : VpnService() {
         }, "tun2proxy").apply { start() }
 
         startForeground(NOTIF_ID, buildNotif(cfg.listenPort))
+
+        // Publish "running" state for the UI's Connect/Disconnect button
+        // to observe. Only flipped true once everything above succeeded —
+        // if we'd flipped it earlier the button would light up green for
+        // a failed-to-establish run.
+        VpnState.setRunning(true)
     }
 
     /**
@@ -255,6 +317,9 @@ class MhrvVpnService : VpnService() {
                 Log.e(TAG, "Native.stopProxy threw: ${t.message}", t)
             }
         }
+        // Flip UI state last — the button reverts to Connect only after
+        // the native-side cleanup actually happened, not optimistically.
+        VpnState.setRunning(false)
         Log.i(TAG, "teardown: done")
     }
 
