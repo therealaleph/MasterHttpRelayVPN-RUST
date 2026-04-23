@@ -147,19 +147,26 @@ object CaInstall {
     }
 
     /**
-     * Intent that opens the system "Security" settings screen. The exact
-     * landing page depends on OEM and Android version:
-     *   - Pixel / stock AOSP: Settings → Security
-     *   - from there the user navigates Encryption & credentials →
-     *     Install a certificate → CA certificate → pick our .crt file.
+     * Intent that opens the TOP-LEVEL system Settings app. The Settings
+     * search bar is the most portable way to get users to the CA-install
+     * screen across OEMs — every Android vendor ships the CA install
+     * flow under a subtly different menu path (Encryption & credentials,
+     * Other security settings, Privacy → Credentials, etc.), but they
+     * all respond to a search for "CA certificate".
      *
-     * We tried KeyChain.createInstallIntent first (nicer flow) but on
-     * Android 11+ that intent just opens a dialog saying "Install CA
-     * certificates in Settings" with a Close button and no path forward —
-     * Google intentionally removed the inline install path. Settings is
-     * the fallback Google themselves point users at.
+     * Earlier versions used `Settings.ACTION_SECURITY_SETTINGS` which
+     * landed on Security & privacy directly, but on some OEMs (Samsung,
+     * Xiaomi, newer Pixel builds) that screen doesn't have the cert
+     * install entry one tap away and users got stuck. Top-level Settings
+     * + "search for CA certificate" is the instruction that actually
+     * works everywhere.
+     *
+     * We DO NOT use KeyChain.createInstallIntent — on Android 11+ that
+     * intent opens a dialog that just says "Install CA certificates in
+     * Settings" with a Close button and no forward path. Google
+     * intentionally removed the inline install flow in that release.
      */
-    fun buildSettingsIntent(): Intent = Intent(Settings.ACTION_SECURITY_SETTINGS)
+    fun buildSettingsIntent(): Intent = Intent(Settings.ACTION_SETTINGS)
         .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
 
     /**

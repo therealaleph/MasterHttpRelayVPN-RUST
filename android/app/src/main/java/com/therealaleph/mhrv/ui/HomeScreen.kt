@@ -115,7 +115,7 @@ fun HomeScreen(
                 append("Certificate not yet installed.")
                 if (!o.downloadPath.isNullOrBlank()) {
                     append(" Saved to ${o.downloadPath}. ")
-                    append("In Settings: Encryption & credentials → Install a certificate → \"CA certificate\" (not VPN, not Wi-Fi) → pick that file.")
+                    append("In Settings, search for \"CA certificate\" and install from there — NOT \"VPN & app user certificate\" or \"Wi-Fi\".")
                 } else {
                     append(" Tap Install again to retry.")
                 }
@@ -374,11 +374,13 @@ fun HomeScreen(
                     Text(
                         "On Android 11+ the system removed the inline install path, so " +
                         "tapping Install will: (1) save a PEM copy to Downloads/mhrv-ca.crt, " +
-                        "(2) open Security settings. From there navigate to Encryption & " +
-                        "credentials → Install a certificate → pick \"CA certificate\" (NOT " +
-                        "\"VPN & app user certificate\" or \"Wi-Fi certificate\") → select " +
-                        "mhrv-ca.crt from Downloads. If you don't have a screen lock, Android " +
-                        "will ask you to add one first."
+                        "(2) open the Settings app.\n\n" +
+                        "Inside Settings, tap the search bar and type \"CA certificate\". " +
+                        "Open the result labelled \"CA certificate\" (NOT \"VPN & app user " +
+                        "certificate\" or \"Wi-Fi certificate\"). Pick mhrv-ca.crt from " +
+                        "Downloads when prompted. If you don't have a screen lock, Android " +
+                        "will ask you to add one first — that's an OS requirement for " +
+                        "installing any user CA."
                     )
                     if (fp != null) {
                         Text("Subject: ${cn ?: "(unknown)"}", style = MaterialTheme.typography.labelMedium)
@@ -911,10 +913,10 @@ private fun HowToUseCard(listenPort: Int) {
             Text(
                 "1. Paste one or more Apps Script deployment URLs (or bare IDs) and your auth_key.\n" +
                 "2. Tap Install MITM certificate. Confirm the dialog — the cert is saved to " +
-                "Downloads/mhrv-ca.crt and Security settings opens. Navigate: Encryption & " +
-                "credentials → Install a certificate → \"CA certificate\" (NOT \"VPN & app user " +
-                "certificate\" or \"Wi-Fi\"). Pick mhrv-ca.crt from Downloads. You'll be asked to " +
-                "set a screen lock if you don't have one (Android requirement).\n" +
+                "Downloads/mhrv-ca.crt and the Settings app opens. Use Settings' search bar " +
+                "to find \"CA certificate\", tap that result (NOT \"VPN & app user certificate\" " +
+                "or \"Wi-Fi\"), and pick mhrv-ca.crt from Downloads. You'll be asked to set a " +
+                "screen lock if you don't have one (Android requirement).\n" +
                 "3. Before tapping Start, expand \"SNI pool + tester\" and hit \"Test all\". If " +
                 "every entry times out, your google_ip is unreachable — replace it with one that " +
                 "resolves locally (e.g. `nslookup www.google.com` on any working device).\n" +

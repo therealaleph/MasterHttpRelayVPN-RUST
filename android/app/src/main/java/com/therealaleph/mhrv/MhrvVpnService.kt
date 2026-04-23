@@ -36,6 +36,18 @@ class MhrvVpnService : VpnService() {
     private var tun2proxyThread: Thread? = null
     private val tun2proxyRunning = AtomicBoolean(false)
 
+    // Idempotency guard. teardown() is reachable from three paths:
+    //   1. ACTION_STOP onStartCommand branch (background thread)
+    //   2. onDestroy() (main thread, fires whenever stopSelf resolves
+    //      OR Android decides to kill the service)
+    //   3. Android revoking the VPN profile out-of-band (also onDestroy)
+    // Running the full native cleanup sequence twice races two threads
+    // through Tun2proxy.stop(), fd.close(), Native.stopProxy() on state
+    // that's already been nullified — the second pass was the
+    // SIGSEGV-or-zombie source. This flag makes the second call a
+    // no-op.
+    private val tornDown = AtomicBoolean(false)
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.i(TAG, "onStartCommand action=${intent?.action ?: "<null>"} startId=$startId")
         return when (intent?.action) {
@@ -187,7 +199,21 @@ class MhrvVpnService : VpnService() {
      *   4. Shut down the Rust proxy runtime (nothing left to forward to).
      */
     private fun teardown() {
-        Log.i(TAG, "teardown: begin (tun2proxy running=${tun2proxyRunning.get()}, proxyHandle=$proxyHandle)")
+        // Idempotency guard. Without this, onDestroy racing the
+        // ACTION_STOP background thread has been observed to crash the
+        // process — two threads into Tun2proxy.stop() and
+        // Native.stopProxy(handle) where handle has already been zeroed
+        // is a SIGSEGV waiting to happen. First caller wins, subsequent
+        // callers return immediately.
+        if (!tornDown.compareAndSet(false, true)) {
+            Log.i(TAG, "teardown: already done, skipping (caller=${Thread.currentThread().name})")
+            return
+        }
+        Log.i(
+            TAG,
+            "teardown: begin caller=${Thread.currentThread().name} " +
+            "(tun2proxy running=${tun2proxyRunning.get()}, proxyHandle=$proxyHandle)",
+        )
 
         // 1. Cooperative stop signal.
         if (tun2proxyRunning.get()) {
@@ -200,7 +226,9 @@ class MhrvVpnService : VpnService() {
         //    ParcelFileDescriptor no longer owns the fd and close() here
         //    is a no-op; the real fd is owned by tun2proxy (closeFdOnDrop
         //    = true), which closes it on return from run().
-        try { tun?.close() } catch (_: Throwable) {}
+        try { tun?.close() } catch (t: Throwable) {
+            Log.w(TAG, "tun.close: ${t.message}")
+        }
         tun = null
 
         // 3. Join the worker. 4s is enough in the happy case; if tun2proxy
@@ -219,19 +247,31 @@ class MhrvVpnService : VpnService() {
         //    on the Rust side, so this is bounded even if the runtime
         //    has in-flight tasks (common when the Apps Script relay has
         //    piled up pending 30s timeouts).
-        if (proxyHandle != 0L) {
-            Log.i(TAG, "teardown: stopping proxy handle=$proxyHandle")
-            try { Native.stopProxy(proxyHandle) } catch (t: Throwable) {
+        val handle = proxyHandle
+        proxyHandle = 0L
+        if (handle != 0L) {
+            Log.i(TAG, "teardown: stopping proxy handle=$handle")
+            try { Native.stopProxy(handle) } catch (t: Throwable) {
                 Log.e(TAG, "Native.stopProxy threw: ${t.message}", t)
             }
-            proxyHandle = 0L
         }
         Log.i(TAG, "teardown: done")
     }
 
     override fun onDestroy() {
-        teardown()
+        Log.i(TAG, "onDestroy entered")
+        try {
+            teardown()
+        } catch (t: Throwable) {
+            // Belt-and-suspenders. Crashing out of onDestroy takes the
+            // whole process with it — user-visible as the app closing
+            // right when they tap Stop, which is exactly the symptom we
+            // are trying to fix. Anything that gets here is logged and
+            // swallowed.
+            Log.e(TAG, "onDestroy teardown threw: ${t.message}", t)
+        }
         super.onDestroy()
+        Log.i(TAG, "onDestroy done")
     }
 
     private fun buildNotif(proxyPort: Int): Notification {

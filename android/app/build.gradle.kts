@@ -14,8 +14,8 @@ android {
         applicationId = "com.therealaleph.mhrv"
         minSdk = 24 // Android 7.0 — covers 99%+ of live devices.
         targetSdk = 34
-        versionCode = 101
-        versionName = "1.0.1"
+        versionCode = 102
+        versionName = "1.0.2"
 
         // Ship all four mainstream Android ABIs:
         //   - arm64-v8a      — 95%+ of real-world Android phones since 2019
@@ -30,6 +30,31 @@ android {
         }
     }
 
+    signingConfigs {
+        create("release") {
+            // Committed keystore — fixed signature across machines and
+            // across CI runs. Using the auto-generated debug keystore
+            // (as v1.0.0 / v1.0.1 did) makes every release APK fail to
+            // install over the previous one with
+            // INSTALL_FAILED_UPDATE_INCOMPATIBLE, because Android treats
+            // a signature change as "different app": the user has to
+            // uninstall first. That's awful UX.
+            //
+            // The password is in plaintext because this is an
+            // open-source project without Play Store identity. A
+            // forked/rebuilt APK signed with a different key is
+            // fundamentally a different install path anyway — the
+            // protection model here is "trust the source tree you
+            // pulled from," not "trust that we hold a key you can't
+            // see." If you're forking, generate your own key, commit
+            // it, and ship.
+            storeFile = file("release.jks")
+            storePassword = "mhrv-rs-release"
+            keyAlias = "mhrv-rs"
+            keyPassword = "mhrv-rs-release"
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
@@ -37,15 +62,7 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
             )
-            // Sign release builds with the debug keystore so users can
-            // sideload the APK without us shipping a proper release key.
-            // The project has no Play Store presence, so signature
-            // identity per-build doesn't matter — installability does.
-            // Gradle auto-creates `~/.android/debug.keystore` on first use;
-            // CI runners inherit that behaviour. Anyone rebuilding from
-            // source gets their own signature, which is what we want for
-            // an open-source project: trust the source, not a key we hold.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("release")
         }
     }
 

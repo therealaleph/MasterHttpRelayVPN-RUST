@@ -89,12 +89,9 @@ This step is annoying but unavoidable: the proxy terminates TLS on your behalf s
 
 1. In the app, tap **Install MITM certificate**.
 2. Read the confirmation dialog — it shows the certificate fingerprint (handy to verify later). Tap **Install**.
-3. The app saves `Downloads/mhrv-ca.crt` and deep-links Android into **Settings → Security & privacy** (or similar; wording varies by OEM).
+3. The app saves `Downloads/mhrv-ca.crt` and opens the top-level **Settings** app.
 4. If you don't have a screen lock: Android will prompt you to set one. **You have to.** User CAs require a screen lock, period. Set PIN/pattern/password. You can remove it after install if you really want; the cert stays installed.
-5. In Settings, navigate: **Encryption & credentials → Install a certificate → "CA certificate"**.
-   - On Pixel / stock Android: `Security → More security settings → Encryption & credentials → Install a certificate → CA certificate`.
-   - On Samsung: `Biometrics and security → Other security settings → Install from device storage → CA certificate`.
-   - On Xiaomi/MIUI: `Passwords & Security → Privacy → Encryption & credentials → Install a certificate → CA certificate`.
+5. In Settings, tap the **search bar at the top** and type `CA certificate`. Pick the result labelled **"CA certificate"** (or on some OEMs "Install CA certificate"). The menu path varies wildly between Pixel / Samsung / Xiaomi / etc., which is why searching beats navigating.
    - **Do NOT** pick "VPN & app user certificate" or "Wi-Fi certificate" — wrong category, won't work.
 6. Android warns you: **"Your network may be monitored by an unknown third party"**. That's us. Tap **Install anyway**.
 7. Pick **Downloads** → tap **mhrv-ca.crt**. Give it a friendly name (or accept the default). Tap **OK**.
