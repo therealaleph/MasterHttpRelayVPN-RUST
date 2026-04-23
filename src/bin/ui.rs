@@ -387,6 +387,9 @@ impl FormState {
                     .map_err(|_| "SOCKS5 port must be a number".to_string())?,
             )
         };
+        if socks5_port == Some(listen_port) {
+            return Err("HTTP and SOCKS5 ports must be different".into());
+        }
         let ids: Vec<String> = self
             .script_id
             .split(|c: char| c == '\n' || c == ',')

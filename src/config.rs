@@ -189,6 +189,11 @@ impl Config {
                 "scan_batch_size must be greater than 0".into(),
             ));
         }
+        if self.socks5_port == Some(self.listen_port) {
+            return Err(ConfigError::Invalid(
+                "listen_port and socks5_port must be different".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -306,6 +311,19 @@ mod tests {
             "auth_key": "SECRET",
             "script_id": "X",
             "scan_batch_size": 0
+        }"#;
+        let cfg: Config = serde_json::from_str(s).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_same_http_and_socks5_port() {
+        let s = r#"{
+            "mode": "apps_script",
+            "auth_key": "SECRET",
+            "script_id": "X",
+            "listen_port": 8085,
+            "socks5_port": 8085
         }"#;
         let cfg: Config = serde_json::from_str(s).unwrap();
         assert!(cfg.validate().is_err());
