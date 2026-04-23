@@ -1,197 +1,280 @@
-# Android app — installation & first-run guide
+# Android app
 
-This is the one-stop guide for running **mhrv-rs on your Android phone**. It covers the APK install, the MITM certificate dance (which changed a lot on Android 11+), the VPN permission, the first-time Apps Script deployment, and the common "why doesn't this site load" failure modes.
+Full guide for the mhrv-rs Android app: install, first-run setup, troubleshooting, known limits.
 
-Estimated time: ~10 minutes if the Apps Script deployment already exists, ~15 if you're deploying it fresh.
-
-> **Scope note.** mhrv-rs relays through Google Apps Script. That's what makes it cheap and firewall-resilient, but it's also what imposes the limits documented under [Known limitations](#known-limitations). If you're evaluating this against "a real VPN" — WireGuard, Tailscale, OpenVPN — read that section first.
-
----
-
-## What you'll need
-
-- An Android phone running **Android 7.0 (API 24)** or later. Arm64, armv7, x86_64, and x86 all ship in one APK.
-- A **Google account** (you'll deploy the Apps Script under it). Any account works; a throwaway Gmail is fine.
-- About **5 MB of mobile data** for the APK download, **2 MB/day** of relay traffic per GB of browsing (overhead from base64 + JSON wrapping).
-- A way to set a **screen lock** (PIN, pattern, password, or biometric + fallback) — this is an Android OS requirement for installing any user CA certificate. You can remove the lock later if you want.
-
----
-
-## Step 1 — Install the APK
-
-1. On your phone, open the browser and go to: `https://github.com/therealaleph/MasterHttpRelayVPN-RUST/tree/main/releases`
-2. Tap `mhrv-rs-android-universal-v1.0.0.apk` → **View raw** (or **Download**).
-3. When the browser finishes the download, tap the notification to open the APK.
-4. Android will ask: **"Allow this source to install apps?"** — tap **Settings**, toggle **Allow from this source**, then tap **← Back**. Tap **Install**.
-5. Tap **Open** once install finishes. You should see the **mhrv-rs** main screen.
-
-> **Why "unknown source" is necessary.** The app isn't on Play Store (it's not the kind of app Google will accept — explicit VPN with MITM). Every Android phone ships with sideload capability for exactly this situation; you're just toggling the permission for the one app that's delivering the APK (Chrome, Files, etc.).
-
-If Android refuses to install with "App not installed" or similar, 99% of the time it's because a different mhrv-rs build is already installed signed with a different key. Uninstall the old one first: `Settings → Apps → mhrv-rs → Uninstall`.
+- [Overview](#overview)
+- [Requirements](#requirements)
+- [1. Install the APK](#1-install-the-apk)
+- [2. Deploy the Apps Script](#2-deploy-the-apps-script)
+- [3. Enter your config in the app](#3-enter-your-config-in-the-app)
+- [4. Run the SNI tester](#4-run-the-sni-tester)
+- [5. Install the MITM certificate](#5-install-the-mitm-certificate)
+- [6. Start the tunnel](#6-start-the-tunnel)
+- [UI quick reference](#ui-quick-reference)
+- [Known limitations](#known-limitations)
+- [Troubleshooting](#troubleshooting)
+- [Uninstall](#uninstall)
 
 ---
 
-## Step 2 — Deploy the Apps Script
+## Overview
 
-Skip this step if you already have a working `/exec` URL from a previous install.
+The Android app is the exact same `mhrv-rs` Rust crate that powers the desktop build, wrapped in a Compose UI and fed a TUN file descriptor via `VpnService` + [`tun2proxy`](https://crates.io/crates/tun2proxy). Every app on the device is routed through the proxy — no per-app setup.
 
-1. On your laptop (easier than on phone), go to <https://script.google.com> and sign in.
-2. Click **New project**. You'll land in the script editor.
-3. Open [`assets/apps_script/Code.gs`](../assets/apps_script/Code.gs) in this repo, copy the **entire** contents.
-4. Back in the script editor, select ALL of the default code (`function myFunction() {}`) and paste over it.
-5. Find this line near the top:
+```
+Any app on the device
+        │
+        ▼
+VpnService TUN  ──► tun2proxy (in-process)
+                        │
+                        ▼
+                Local SOCKS5 listener  ──► mhrv-rs dispatcher
+                                                 │
+                         ┌───────────────────────┤
+                         ▼                       ▼
+               sni-rewrite tunnel        Apps Script relay
+               (Google-owned hosts       (everything else,
+                direct to google_ip)     via your /exec URL)
+```
+
+Setup time: **~10 minutes** if your Apps Script deployment already exists, ~15 min if you're deploying fresh.
+
+---
+
+## Requirements
+
+| | |
+|---|---|
+| **Android version** | 7.0 (API 24) or later |
+| **Device architecture** | Any. The APK is universal: arm64-v8a, armeabi-v7a, x86_64, x86 |
+| **Google account** | Yes — you'll deploy the Apps Script under it. A throwaway Gmail works |
+| **Screen lock** | PIN, pattern, password, or biometric + fallback. **Required by Android for user-CA install.** Can be removed after install; the cert stays trusted |
+| **Data usage** | ~5 MB for the APK, then ~2 MB overhead per GB of browsing (base64 + JSON wrapping) |
+
+> **Scope note.** mhrv-rs relays through Apps Script. That's what makes it cheap and DPI-resilient, but it's also what imposes the [known limitations](#known-limitations) below. If you're evaluating against a real VPN (WireGuard/Tailscale/OpenVPN), skim that section first.
+
+---
+
+## 1. Install the APK
+
+1. On your phone, open the browser and go to <https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases/latest>.
+2. Download `mhrv-rs-android-universal-v*.apk`.
+3. Tap the download to open the installer.
+4. When Android asks **"Allow this source to install apps?"**:
+   - Tap **Settings**
+   - Toggle **Allow from this source**
+   - Tap **← Back** → **Install**
+5. Tap **Open** once install finishes.
+
+> If Android refuses with "App not installed": an old build signed with a different key is still present. `Settings → Apps → mhrv-rs → Uninstall`, then try again. (From v1.0.2 onward this is a one-time thing — updates are signed with a stable key.)
+
+---
+
+## 2. Deploy the Apps Script
+
+Skip this step if you already have a working `/exec` URL.
+
+Do this on a laptop — it's a browser-heavy flow that's painful on a phone.
+
+1. Go to <https://script.google.com> → **New project**.
+2. Copy the full contents of [`assets/apps_script/Code.gs`](../assets/apps_script/Code.gs) from this repo.
+3. In the script editor, select the default `function myFunction() {}` and paste over it.
+4. Find the line near the top:
    ```js
    const AUTH_KEY = "CHANGE_ME_TO_A_STRONG_SECRET";
    ```
-   Replace the placeholder with a **strong random secret** (20+ characters, letters + digits). Save a copy somewhere — you'll paste the exact same string into the app.
-6. Save the file (⌘S or Ctrl+S). Name the project something like `mhrv-relay`.
-7. Top-right, click **Deploy → New deployment**.
-8. Click the gear icon → **Web app**.
-9. Fill in:
-   - **Description**: `mhrv-relay v1` (or whatever)
-   - **Execute as**: **Me**
-   - **Who has access**: **Anyone**
-   - Click **Deploy**.
-10. First time only: Google asks for permissions. Click **Authorize access** → pick your account → on the "Google hasn't verified this app" screen click **Advanced → Go to <project name> (unsafe)** → **Allow**. This is the standard Apps Script deployment flow — the script runs under your account only, Google just hasn't manually audited it.
-11. Copy the **Web app URL**. It looks like `https://script.google.com/macros/s/AKfyc.../exec`.
+   Replace the placeholder with a strong random secret (20+ chars, letters + digits). Save this value — you'll paste it into the app too.
+5. **File → Save** (⌘S / Ctrl+S). Name the project something like `mhrv-relay`.
+6. **Deploy → New deployment**.
+7. Click the gear icon → **Web app**. Fill in:
 
-> **What the script actually does.** It receives POST requests from our proxy containing `{ method, url, headers, body_base64 }`, calls `UrlFetchApp.fetch(url, ...)` inside Google's datacenter, and returns `{ status, headers, body_base64 }` back. The "DPI bypass" comes from our proxy connecting to `script.google.com` using a different SNI than the Host header — we hit Google's edge under one name and then funnel traffic to Apps Script under another. Your ISP sees a plain TLS handshake to `www.google.com`.
+   | Field | Value |
+   |---|---|
+   | Description | `mhrv-relay v1` (or whatever) |
+   | Execute as | **Me** |
+   | Who has access | **Anyone** |
 
----
+8. Click **Deploy**. First time only: Google asks for permissions.
+   - Click **Authorize access** → pick your account
+   - On "Google hasn't verified this app" → **Advanced** → **Go to &lt;project name&gt; (unsafe)** → **Allow**
+9. Copy the **Web app URL**. It looks like `https://script.google.com/macros/s/AKfyc.../exec`.
 
-## Step 3 — Fill in the app's config
+<details>
+<summary>What the script does</summary>
 
-Back on the phone in the mhrv-rs app:
-
-1. Paste the `/exec` URL (or just the `AKfyc...` ID) into **Deployment URL(s) or script ID(s)**. You can paste multiple — one per line — and the proxy will round-robin between them. Useful later when you hit the 20k/day per-script quota.
-2. Paste your **auth_key** — the exact same string you put in `AUTH_KEY` inside `Code.gs`.
-3. Leave **google_ip** at the default for now. You'll verify it in step 4.
-4. Leave **front_domain** at `www.google.com` — that's the SNI we present on the outbound leg.
+It receives `POST { method, url, headers, body_base64 }` from our proxy, calls `UrlFetchApp.fetch(url, ...)` inside Google's datacenter, and returns `{ status, headers, body_base64 }`. DPI bypass comes from us connecting to `script.google.com` using a different TLS SNI than the HTTP `Host` header — the ISP sees `www.google.com`, Google's edge routes by the Host header inside the encrypted stream.
+</details>
 
 ---
 
-## Step 4 — Test SNI reachability (strongly recommended)
+## 3. Enter your config in the app
 
-Before you tap Start, expand the **SNI pool + tester** card and tap **Test all**.
+Back on the phone:
 
-- ✅ **Green check + latency** — your `google_ip` is reachable and accepts the SNI. Proceed.
-- ❌ **connect timeout** on every row — your configured `google_ip` is unreachable from your network. Fix by running `nslookup www.google.com` on any working device and pasting the resulting IP into **google_ip**. Then Test all again.
-- ❌ **connect timeout** only on some rows — the blocked SNIs are DPI-filtered on your network. Leave them unchecked; the rotation pool only uses the ticked boxes.
-- ❌ **dns: …** — your device can't resolve `www.google.com` at all. Switch WiFi or check airplane mode.
+| Field | What to enter |
+|---|---|
+| **Deployment URL(s) or script ID(s)** | The `/exec` URL you copied. You can paste multiple — one per line — and the proxy will round-robin between them (useful when you hit the 20k/day per-script quota) |
+| **auth_key** | The exact string you put in `AUTH_KEY` inside `Code.gs` |
+| **google_ip** | Leave the default. The next step will auto-populate it |
+| **front_domain** | Leave at `www.google.com` |
 
-Why this matters: if `google_ip` is wrong, the proxy will boot fine but every request will silently time out and you'll chase red herrings.
+Tap anywhere outside the text fields to dismiss the keyboard.
 
 ---
 
-## Step 5 — Install the MITM certificate
+## 4. Run the SNI tester
 
-This step is annoying but unavoidable: the proxy terminates TLS on your behalf so it can re-encrypt to the Apps Script relay, which means your phone needs to trust a cert we minted locally.
+Before starting the tunnel, verify the outbound leg works. Expand **SNI pool + tester** and tap **Test all**.
+
+| Result | Meaning | Action |
+|---|---|---|
+| ✅ Green check + `NNN ms` | `google_ip` is reachable + accepts the SNI | Proceed |
+| ❌ `connect timeout` on every row | Configured `google_ip` is unreachable | Tap **Auto-detect google_ip** under the Network card, then Test all again |
+| ❌ `connect timeout` on some rows | Those specific SNIs are DPI-filtered on your network | Leave them unchecked; rotation pool uses only ticked boxes |
+| ❌ `dns: ...` | Device can't resolve `www.google.com` at all | Fix Wi-Fi / airplane mode |
+
+If you tap Auto-detect and it still fails on every row, your network is blocking Google's edge entirely — mhrv-rs can't help there.
+
+---
+
+## 5. Install the MITM certificate
+
+The proxy terminates TLS locally (re-encrypts before routing through Apps Script), so your phone needs to trust a cert we minted on first run.
 
 1. In the app, tap **Install MITM certificate**.
-2. Read the confirmation dialog — it shows the certificate fingerprint (handy to verify later). Tap **Install**.
-3. The app saves `Downloads/mhrv-ca.crt` and opens the top-level **Settings** app.
-4. If you don't have a screen lock: Android will prompt you to set one. **You have to.** User CAs require a screen lock, period. Set PIN/pattern/password. You can remove it after install if you really want; the cert stays installed.
-5. In Settings, tap the **search bar at the top** and type `CA certificate`. Pick the result labelled **"CA certificate"** (or on some OEMs "Install CA certificate"). The menu path varies wildly between Pixel / Samsung / Xiaomi / etc., which is why searching beats navigating.
-   - **Do NOT** pick "VPN & app user certificate" or "Wi-Fi certificate" — wrong category, won't work.
-6. Android warns you: **"Your network may be monitored by an unknown third party"**. That's us. Tap **Install anyway**.
-7. Pick **Downloads** → tap **mhrv-ca.crt**. Give it a friendly name (or accept the default). Tap **OK**.
-8. Return to the mhrv-rs app. A snackbar at the bottom will say **Certificate installed ✓** (the app verifies by fingerprint against AndroidCAStore). If it says "not yet installed", go back to step 5 and try again.
+2. The confirmation dialog shows the certificate fingerprint. Tap **Install**.
+3. The app:
+   - saves a PEM copy to `Downloads/mhrv-ca.crt`
+   - opens the Android **Settings** app
+4. **If you don't have a screen lock** — Android will prompt you to set one now. You have to. User CAs require it. You can remove it after install; the cert stays trusted.
+5. In Settings, tap the **search bar** at the top and type `CA certificate`. Open the result labelled **"CA certificate"** (or "Install CA certificate" on some OEMs).
 
-> **Why the dance and not an inline KeyChain flow?** Android 11 removed the inline `KeyChain.createInstallIntent` path — tapping Install MITM used to open a category picker directly, but it now opens a dead-end dialog with just a Close button. Google wants CA installs to be intentional, so they funnel you through Settings. We do the grunt work (save the file, deep-link Settings, verify afterwards) but the manual nav is unavoidable on current Android.
+   > **Don't** pick "VPN & app user certificate" or "Wi-Fi certificate" — wrong category, won't work.
+
+   Searching is more reliable than navigating menus: Pixel/Samsung/Xiaomi all bury CA install under different paths, but all of them index it under "CA certificate" in search.
+
+6. Android warns **"Your network may be monitored by an unknown third party"**. That's us. Tap **Install anyway**.
+7. Pick **Downloads** → tap **mhrv-ca.crt**. Give it a friendly name (or accept the default). Tap **OK**.
+8. Switch back to the mhrv-rs app. A snackbar confirms **Certificate installed ✓** — the app verifies by fingerprint against `AndroidCAStore`.
+
+   If it says "not yet installed", repeat step 5.
+
+<details>
+<summary>Why can't the app install the cert directly?</summary>
+
+Android 11 removed the inline `KeyChain.createInstallIntent` flow. That intent used to open a category picker directly inside the app. On current Android it opens a dead-end dialog with just a Close button — Google wants CA installs to be deliberate. We do the grunt work (save file, open Settings, verify afterwards), but the manual navigation step is unavoidable.
+</details>
 
 ---
 
-## Step 6 — Start the proxy
+## 6. Start the tunnel
 
 1. Tap **Start**.
-2. Android shows the **VPN connection request** dialog: *"mhrv-rs wants to set up a VPN connection..."*. Tap **OK**.
+2. Android shows the VPN-permission dialog: *"mhrv-rs wants to set up a VPN connection..."*. Tap **OK**.
 3. A key icon appears in the status bar. That's your VPN indicator.
-4. Open Chrome and visit any site. It should load normally — JavaScript, images, everything. Try `https://www.cloudflare.com`, `https://yahoo.com`, `https://discord.com` as stress tests.
-5. If you expand **Live logs** in the mhrv-rs app you'll see:
-   - `SOCKS5 CONNECT -> <hostname>:443` — browser asking the TUN layer to open a flow
-   - `dispatch <hostname>:443 -> MITM + Apps Script relay (TLS detected)` — routing decision
-   - `MITM TLS -> <hostname>:443 (sni=<hostname>)` — we minted the leaf cert and the browser accepted it
-   - `relay GET https://<hostname>/...` — forwarded to Apps Script
-   - `preflight 204 https://...` — a CORS preflight we answered ourselves (don't worry about these)
+4. Open Chrome. Try `https://www.cloudflare.com`, `https://yahoo.com`, `https://discord.com` as stress tests — all should render normally.
+
+Expand **Live logs** to watch the traffic flow:
+
+| Log line | What it means |
+|---|---|
+| `SOCKS5 CONNECT -> <host>:443` | Browser opened a TCP flow; TUN captured it |
+| `dispatch <host>:443 -> MITM + Apps Script relay` | Routing decision |
+| `MITM TLS -> <host>:443 (sni=<host>)` | Our leaf cert was accepted by the browser |
+| `relay GET https://<host>/...` | Forwarded to Apps Script |
+| `preflight 204 <url>` | CORS preflight we answered ourselves (normal, don't worry about these) |
+
+---
+
+## UI quick reference
+
+| Control | Location | Notes |
+|---|---|---|
+| **Deployment URL(s) or script ID(s)** | Apps Script relay section | One per line; round-robin dispatch |
+| **auth_key** | Apps Script relay section | Must match `AUTH_KEY` in `Code.gs` |
+| **google_ip** / **front_domain** | Network section | Auto-detect button fills google_ip via DNS |
+| **Auto-detect google_ip** | Under the Network row | Re-resolves `www.google.com` + repairs `front_domain` if corrupted to an IP |
+| **SNI pool + tester** | Collapsible | Checkboxes for rotation; per-row Test + Test all |
+| **Advanced** | Collapsible | verify_ssl, log_level, parallel_relay, upstream_socks5 |
+| **Start / Stop** | Bottom row | 2-second debounce between taps |
+| **Install MITM certificate** | Below Start/Stop | Save PEM → open Settings → search "CA certificate" |
+| **Live logs** | Collapsible (below the Install button) | 500ms poll of the proxy's log ring buffer |
+| **v1.0.x (version badge)** | Top bar, right | Tap to check GitHub for a newer release |
 
 ---
 
 ## Known limitations
 
-Read this before reporting a bug — most "it doesn't work" reports land in one of these buckets.
+Read this before reporting a bug — most "it doesn't work" reports fall into one of these.
 
-### Cloudflare Turnstile (the "Verify you are human" checkbox) loops
+### Cloudflare Turnstile ("Verify you are human") loops
 
-On Cloudflare-protected sites that challenge every request (not just the first), **you'll solve the challenge, reach the page, then get challenged again on the next click**. This is fundamental to the Apps Script relay model and cannot be fixed in the app:
+On Cloudflare-protected sites that challenge **every** request, you'll solve the Turnstile, reach the page, then get challenged again on the next click. This is inherent to the Apps Script relay model:
 
 | Factor | Normal browser | Apps Script relay |
 |---|---|---|
 | Egress IP | Stable (your ISP) | Rotates across Google's datacenter pool per request |
-| User-Agent | Chrome's | Fixed `Google-Apps-Script` (Google overrides it) |
+| User-Agent | Chrome's | Fixed `Google-Apps-Script` (locked by Google; we can't override) |
 | TLS JA3/JA4 | Chrome's | Google-datacenter's |
 
-CF's `cf_clearance` cookie is bound to the `(IP, UA, JA3)` tuple the challenge was solved against. Different IP next request → re-challenge. No amount of cookie forwarding fixes this.
+Cloudflare's `cf_clearance` cookie is bound to the `(IP, UA, JA3)` tuple the challenge was solved against. Different IP next request → re-challenge.
 
-**Sites that only gate the first page load** (most of CF's Bot Fight Mode customers) work fine after one solve. Sites that challenge every request (cryptocurrency, adult, some forums) won't work through this architecture. Use a different tunnel for those.
+**Sites that only gate the first page load** (most of CF's Bot Fight Mode customers) work fine after one solve. Sites that challenge every request (crypto exchanges, adult, some forums) fundamentally can't hold a session through this architecture — use a different tunnel for those.
 
 ### UDP / QUIC (HTTP/3) doesn't go through
 
-Our SOCKS5 listener only handles `CONNECT`, not `UDP ASSOCIATE`. Chrome tries HTTP/3 first and falls back to HTTP/2 over TCP, which works through the proxy. Effect: slightly slower connects on first visit, everything else fine.
+The SOCKS5 listener only handles `CONNECT`, not `UDP ASSOCIATE`. Chrome tries HTTP/3 first and falls back to HTTP/2 over TCP, which works fine. Effect: slightly slower first connect, everything else normal.
 
 ### IPv6 leaks
 
-The TUN only routes IPv4 (`0.0.0.0/0`). IPv6 traffic goes out your normal interface, including WebRTC. If you're using mhrv-rs for privacy rather than DPI bypass, disable IPv6 on your WiFi network entirely.
+The TUN only routes IPv4 (`addRoute 0.0.0.0/0`). IPv6 goes out your normal interface, including WebRTC. If you're using mhrv-rs for privacy rather than DPI bypass, disable IPv6 on your Wi-Fi network entirely.
 
 ### Apps Script daily quota
 
-Each deployment URL has a daily execution limit (20k/day for consumer Google accounts, higher for Workspace). Heavy streaming or infinite-scroll sites will burn through it. Mitigation: deploy 2–3 scripts and paste all their `/exec` URLs (one per line) into the app — the proxy round-robins across them.
+Each `/exec` has a daily execution limit (20k/day for consumer Google accounts, higher for Workspace). Heavy streaming or infinite-scroll sites burn through it. Mitigation: deploy 2–3 scripts, paste all their `/exec` URLs into the app, one per line — the proxy round-robins.
 
-### The MITM cert has no Play Store signature
+### Most non-browser apps ignore user CAs
 
-We ship the APK signed with the standard Gradle debug keystore. Android installs it fine, but you'll see "app is from an unknown developer" warnings, and `Play Protect` may flag it on some devices. That's accurate — the tradeoff is that the build is reproducible from source without us holding a secret key.
+By default, Android apps opt out of trusting user-installed CAs (Android 7+ `Network Security Config` default). Banking apps, Netflix, Spotify, most messengers — they'll fail with cert errors through mhrv-rs. The TUN routes their traffic to us; they just refuse our leaf. Only apps that explicitly opt in (browsers, curl, some developer tools) will work. This is a general MITM-proxy limitation.
 
 ---
 
 ## Troubleshooting
 
-### "504 Relay timeout" in Chrome
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `504 Relay timeout` in Chrome | Apps Script deployment not responding | Re-check the `/exec` URL (must end in `/exec`, not `/dev`). Watch Live logs for `Relay timeout` vs `connect:` errors |
+| `NET::ERR_CERT_AUTHORITY_INVALID` | MITM CA not installed / not found | Redo [step 5](#5-install-the-mitm-certificate). Make sure you picked "CA certificate" in Settings, not VPN or Wi-Fi |
+| `NET::ERR_CERT_COMMON_NAME_INVALID` on Cloudflare sites | Pre-v1.0 bug | Upgrade to v1.0.0 or later |
+| JS parts of a site don't load | Pre-v1.0 OPTIONS rejection | Upgrade to v1.0.0+. If still present: Live logs → grep for `Relay failed`, report |
+| All SNIs time out in the tester | `google_ip` is stale (Google rotated the A record) | Tap **Auto-detect google_ip** |
+| SNI tester red on some rows only | Those SNIs are DPI-filtered on your network | Uncheck the failing ones in the rotation pool |
+| App closes when tapping Stop | Was a v1.0.0/1.0.1 race bug | Upgrade to v1.0.2. If still present on v1.0.2+: `adb logcat -s MhrvVpnService mhrv-crash mhrv_rs` and report |
+| `INSTALL_FAILED_UPDATE_INCOMPATIBLE` when upgrading | Old APK signed with a different key (pre-v1.0.2) | Uninstall first, then install the new APK. Only a one-time thing — v1.0.2 onward has a stable signature |
+| Chrome white-pages with no error | Often a rendering bug on the emulator with software GPU | Test on real hardware. Check `Live logs` to verify the relay is actually making requests |
+| Cloudflare Turnstile loop | [Known limitation](#cloudflare-turnstile-verify-you-are-human-loops) | No fix inside this architecture |
+| Banking/streaming apps show cert errors | [Known limitation](#most-non-browser-apps-ignore-user-cas) | No fix — app chose not to trust user CAs |
 
-- Your Apps Script deployment isn't responding. Re-check the `/exec` URL (must end in `/exec`, not `/dev`). Watch Live logs for `Relay timeout` vs `connect:` — the former is the Apps Script leg, the latter is the outbound leg from Google to the origin.
+### Collecting a useful log
 
-### "Your connection is not private — NET::ERR_CERT_AUTHORITY_INVALID"
+If you need to report a bug:
 
-- The MITM CA isn't installed, or Chrome doesn't see it. Go back to Step 5. If the snackbar confirmed install but Chrome still complains: clear Chrome's data for the site, or tap Advanced → Proceed anyway for testing, then install the cert properly.
+```sh
+adb logcat -c                              # clear
+# reproduce the issue in the app
+adb logcat -d | grep -E "MhrvVpnService|mhrv_rs|mhrv-crash|tun2proxy" > mhrv.log
+```
 
-### "NET::ERR_CERT_COMMON_NAME_INVALID" on Cloudflare sites
-
-- You're on a version before v1.0. Upgrade — this was fixed by peeking the TLS ClientHello.
-
-### JavaScript parts of a site don't load
-
-- Pre-v1.0 Apps Script rejected `OPTIONS` CORS preflights, which silently broke `fetch()`. Fixed in v1.0 by short-circuiting preflights at the MITM boundary. If you're on v1.0 and still seeing this: open Live logs, look for `Relay failed` errors, report them.
-
-### The app closes after tapping Stop then Start quickly
-
-- Emulator-specific EGL renderer crash on rapid UI transitions. The VPN service itself survives; only the Compose UI process died. Debounced in v1.0 — buttons disable for 2 seconds after tap. On real hardware this rarely happens.
-
-### Chrome shows a white page with no error
-
-- Very common on emulator with software rendering. Check `adb logcat | grep mhrv_rs` to see if the relay is actually making requests. If yes → Chrome's renderer has issues on the emulator, try a real device. If no → the proxy isn't running; check that the VPN key icon is in the status bar.
-
-### Apps that ignore user CAs
-
-Most non-browser Android apps opt out of trusting user CAs by default (Google's Network Security Config default as of API 24). Banking apps, Netflix, Spotify, most messengers — they'll fail through mhrv-rs with cert errors. The full TUN bridge routes their traffic to us, but their TLS stack refuses our cert. Only Chrome, Firefox, and apps that explicitly opt in will work. This is a general MITM limitation, not an mhrv-rs bug.
+Attach `mhrv.log` to your issue. Also include:
+- Android version (Settings → About phone → Android version)
+- OEM (Pixel / Samsung / Xiaomi / …)
+- App version (tap the version badge in the top bar)
+- What you did, what you expected, what happened
 
 ---
 
 ## Uninstall
 
 1. `Settings → Apps → mhrv-rs → Uninstall`.
-2. Optionally remove the MITM CA: `Settings → Security → Encryption & credentials → User credentials → mhrv-rs MITM CA → Remove`.
-3. The VPN profile is automatically revoked on uninstall.
-
----
-
-## راهنمای فارسی
-
-این فایل به انگلیسی نوشته شده تا با باقی مستندات پروژه هماهنگ باشد. اگر راهنمای فارسی می‌خواهید، لطفاً [issue بسازید](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/issues) تا ترجمه کنیم.
+2. Optional: remove the MITM CA — `Settings → Security → Encryption & credentials → User credentials → mhrv-rs MITM CA → Remove`. (On OEMs where that path is buried, search Settings for `user credentials`.)
+3. The VPN profile is auto-revoked on uninstall — nothing to clean up there.
