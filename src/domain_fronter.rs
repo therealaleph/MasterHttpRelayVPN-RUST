@@ -542,9 +542,9 @@ impl DomainFronter {
     ///   5. Else: compute the remaining ranges, fetch them with
     ///      bounded concurrency, stitch, return as 200.
     ///
-    /// If any chunk fails after retries, we fall back to the probe's
-    /// single-chunk response as a graceful-degradation — better a
-    /// truncated video than a blank one.
+    /// If any later chunk fails validation or fetch, we fall back to the
+    /// probe's single-chunk response as a graceful-degradation, but we do
+    /// not stitch unchecked bytes into a fake full-success response.
     pub async fn relay_parallel_range(
         &self,
         method: &str,
@@ -580,18 +580,26 @@ impl DomainFronter {
             return first;
         }
 
-        let total = match parse_content_range_total(&resp_headers) {
-            Some(t) => t,
-            None => return rewrite_206_to_200(&first),
+        let probe_range = match validate_probe_range(status, &resp_headers, resp_body, CHUNK - 1)
+        {
+            Some(r) => r,
+            None => {
+                tracing::warn!(
+                    "range-parallel: probe returned invalid 206 for {}; falling back to single GET",
+                    url,
+                );
+                return self.relay(method, url, headers, body).await;
+            }
         };
+        let total = probe_range.total;
 
-        if total <= CHUNK || (resp_body.len() as u64) >= total {
+        if total <= CHUNK || (probe_range.end + 1) >= total {
             return rewrite_206_to_200(&first);
         }
 
         // Plan remaining ranges after what the probe already returned.
         let mut ranges: Vec<(u64, u64)> = Vec::new();
-        let mut start = resp_body.len() as u64;
+        let mut start = probe_range.end + 1;
         while start < total {
             let end = (start + CHUNK - 1).min(total - 1);
             ranges.push((start, end));
@@ -622,28 +630,36 @@ impl DomainFronter {
                 h.push(("Range".into(), format!("bytes={}-{}", s, e)));
                 async move {
                     let raw = self.relay("GET", &url, &h, &[]).await;
-                    split_response(&raw).map(|(_, _, b)| b.to_vec()).unwrap_or_default()
+                    (s, e, extract_exact_range_body(&raw, s, e, total))
                 }
             })
             .buffered(MAX_PARALLEL)
-            .collect::<Vec<Vec<u8>>>()
+            .collect::<Vec<_>>()
             .await;
 
         // Stitch: probe body first, then the chunks in order.
         let mut full = Vec::with_capacity(total as usize);
         full.extend_from_slice(resp_body);
-        for chunk in &fetches {
-            full.extend_from_slice(chunk);
+        for (start, end, chunk) in fetches {
+            match chunk {
+                Ok(chunk) => full.extend_from_slice(&chunk),
+                Err(reason) => {
+                    tracing::warn!(
+                        "range-parallel: invalid chunk {}-{} for {} ({}); falling back to probe response",
+                        start,
+                        end,
+                        url,
+                        reason,
+                    );
+                    return rewrite_206_to_200(&first);
+                }
+            }
         }
 
-        // If any chunk came back empty (relay failure) we've now got a
-        // short body. Better to ship the probe-only 200 than a silently
-        // truncated 200 — the player will display a clear error or
-        // retry, vs rendering half the movie and cutting.
-        if (full.len() as u64) < total {
+        if (full.len() as u64) != total {
             tracing::warn!(
-                "range-parallel: stitched {}/{} bytes, some chunks failed; falling back to probe response",
-                full.len(), total,
+                "range-parallel: stitched {}/{} bytes for {}; falling back to probe response",
+                full.len(), total, url,
             );
             return rewrite_206_to_200(&first);
         }
@@ -961,13 +977,74 @@ fn split_response(raw: &[u8]) -> Option<(u16, Vec<(String, String)>, &[u8])> {
     Some((code, headers, body))
 }
 
-/// Pull the total size out of a `Content-Range: bytes 0-NNN/TOTAL` header.
-fn parse_content_range_total(headers: &[(String, String)]) -> Option<u64> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContentRange {
+    start: u64,
+    end: u64,
+    total: u64,
+}
+
+/// Parse `Content-Range: bytes START-END/TOTAL`.
+fn parse_content_range(headers: &[(String, String)]) -> Option<ContentRange> {
     let cr = headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("content-range"))?;
-    let slash = cr.1.rfind('/')?;
-    cr.1[slash + 1..].trim().parse::<u64>().ok()
+    let value = cr.1.trim();
+    let rest = value.strip_prefix("bytes ")?;
+    let (range, total) = rest.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let start = start.trim().parse::<u64>().ok()?;
+    let end = end.trim().parse::<u64>().ok()?;
+    let total = total.trim().parse::<u64>().ok()?;
+    if start > end || total == 0 || end >= total {
+        return None;
+    }
+    Some(ContentRange { start, end, total })
+}
+
+/// Pull the total size out of a valid `Content-Range: bytes START-END/TOTAL` header.
+fn parse_content_range_total(headers: &[(String, String)]) -> Option<u64> {
+    parse_content_range(headers).map(|r| r.total)
+}
+
+fn content_range_matches_body(range: ContentRange, body_len: usize) -> bool {
+    body_len > 0 && (range.end - range.start + 1) == body_len as u64
+}
+
+fn validate_probe_range(
+    status: u16,
+    headers: &[(String, String)],
+    body: &[u8],
+    requested_end: u64,
+) -> Option<ContentRange> {
+    if status != 206 {
+        return None;
+    }
+    let range = parse_content_range(headers)?;
+    if range.start != 0 || range.end > requested_end || !content_range_matches_body(range, body.len()) {
+        return None;
+    }
+    Some(range)
+}
+
+fn extract_exact_range_body(
+    raw: &[u8],
+    start: u64,
+    end: u64,
+    total: u64,
+) -> Result<Vec<u8>, &'static str> {
+    let (status, headers, body) = split_response(raw).ok_or("malformed HTTP response")?;
+    if status != 206 {
+        return Err("expected 206 Partial Content");
+    }
+    let range = parse_content_range(&headers).ok_or("missing or invalid Content-Range")?;
+    if range.start != start || range.end != end || range.total != total {
+        return Err("unexpected Content-Range");
+    }
+    if !content_range_matches_body(range, body.len()) {
+        return Err("Content-Range/body length mismatch");
+    }
+    Ok(body.to_vec())
 }
 
 /// Rewrite a 206 response to a 200 OK, dropping Content-Range and
@@ -1773,6 +1850,22 @@ mod tests {
     fn parse_content_range_total_rejects_end_past_total() {
         let headers = vec![("Content-Range".to_string(), "bytes 0-20/20".to_string())];
         assert_eq!(parse_content_range_total(&headers), None);
+    }
+
+    #[test]
+    fn validate_probe_range_rejects_body_length_mismatch() {
+        let headers = vec![("Content-Range".to_string(), "bytes 0-4/20".to_string())];
+        assert!(validate_probe_range(206, &headers, b"hey", 4).is_none());
+    }
+
+    #[test]
+    fn extract_exact_range_body_rejects_mismatched_content_range() {
+        let raw = b"HTTP/1.1 206 Partial Content\r\n\
+Content-Range: bytes 5-9/20\r\n\
+Content-Length: 5\r\n\r\n\
+hello";
+        let err = extract_exact_range_body(raw, 10, 14, 20).unwrap_err();
+        assert_eq!(err, "unexpected Content-Range");
     }
 
     #[test]
