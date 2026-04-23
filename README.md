@@ -49,7 +49,7 @@ For a handful of Google-owned domains (`google.com`, `youtube.com`, `fonts.googl
 
 Linux (x86_64, aarch64), macOS (x86_64, aarch64), Windows (x86_64), **Android 7.0+** (universal APK covering arm64, armv7, x86_64, x86). Prebuilt binaries on the [releases page](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases).
 
-**Android users** — grab `mhrv-rs-android-universal-v*.apk` and follow the full walk-through in [docs/android.md](docs/android.md). The Android build runs the exact same `mhrv-rs` crate as the desktop (via JNI) and adds a TUN bridge via `tun2proxy`, so every app on the device routes through the proxy without per-app configuration.
+**Android users** — grab `mhrv-rs-android-universal-v*.apk` and follow the full walk-through in [docs/android.md](docs/android.md) (English) or [docs/android.fa.md](docs/android.fa.md) (فارسی). The Android build runs the exact same `mhrv-rs` crate as the desktop (via JNI) and adds a TUN bridge via `tun2proxy`, so every app on the device routes through the proxy without per-app configuration.
 
 ## What's in a release
 
@@ -558,6 +558,26 @@ logread -e mhrv-rs -f
 در فایل `config.json`، مقدار `listen_host` را به `0.0.0.0` تغییر دهید تا روتر از همهٔ دستگاه‌های `LAN` اتصال بپذیرد. بعد در هر دستگاه، `HTTP proxy` را روی آی‌پی روتر پورت `8085` (یا `SOCKS5` روی `8086`) تنظیم کنید.
 
 مصرف حافظه حدود ۱۵ تا ۲۰ مگابایت است — روی هر روتری با حداقل ۱۲۸ مگابایت `RAM` اجرا می‌شود.
+
+### اجرا روی اندروید
+
+یک نسخهٔ اندروید هم داریم — همان `mhrv-rs` ولی داخل یک برنامهٔ `Compose` با پل `TUN` از طریق [`tun2proxy`](https://crates.io/crates/tun2proxy). تمام ترافیک دستگاه (مرورگر، تلگرام، هر برنامه‌ای) خودکار از پروکسی رد می‌شود، بدون نیاز به تنظیم per-app.
+
+**دانلود:** `mhrv-rs-android-universal-v*.apk` از [صفحهٔ Releases](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases/latest) (یک APK جهانی، روی اندروید ۷.۰ و بالاتر، همهٔ معماری‌ها).
+
+**راهنمای کامل فارسی:** [**`docs/android.fa.md`**](docs/android.fa.md) — نصب APK، دیپلوی `Apps Script`، تست `SNI`، نصب گواهی `MITM`، رفع اشکال و محدودیت‌ها.
+
+راهنمای انگلیسی هم در [`docs/android.md`](docs/android.md) است.
+
+جمعبندی سریع:
+
+۱. APK را از `Releases` دانلود و نصب کنید (اگر اندروید «منبع ناشناس» گفت، در همان دیالوگ اجازه بدهید)
+۲. `Apps Script` را طبق [مرحلهٔ ۱ بالا](#مرحلهٔ-۱--ساخت-اسکریپت-در-گوگل-فقط-یک-بار) دیپلوی کنید (همان `Code.gs` + `AUTH_KEY`)
+۳. `/exec URL` و `auth_key` را در برنامه وارد کنید، **Auto-detect google_ip** را بزنید
+۴. **Install MITM certificate** — برنامه گواهی را در `Downloads` ذخیره می‌کند و `Settings` را باز می‌کند. در `Settings` عبارت `CA certificate` را جست‌وجو و از `Downloads` نصب کنید
+۵. **Start** → مجوز `VPN` را تأیید کنید → همه‌چیز کار می‌کند
+
+محدودیت‌های اندروید همان محدودیت‌های دسکتاپ + دو مورد اضافه: `IPv6` از `TUN` رد نمی‌شود (فقط `IPv4` روت می‌شود) و اکثر برنامه‌های غیر مرورگری (بانکی، `Netflix`، پیام‌رسان‌ها) به `CA` کاربری اعتماد نمی‌کنند. جزئیات در [`docs/android.fa.md`](docs/android.fa.md#محدودیت‌های-شناخته‌شده).
 
 ### سوالات رایج
 
