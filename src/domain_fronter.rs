@@ -1161,15 +1161,14 @@ pub const DEFAULT_GOOGLE_SNI_POOL: &[&str] = &[
     "drive.google.com",
     "docs.google.com",
     "calendar.google.com",
-    // accounts.googl.com is a Google-owned alias (googl.com redirects
-    // to Google properties) whose cert is served off the same GFE IP
-    // pool. Reported in issue #42 as passing DPI on Samantel / MCI
-    // (Iranian carriers) specifically, where some of the longer
-    // `*.google.com` names are selectively SNI-blocked. Rotation-only
-    // use: we never actually HTTP-to it, just present it in the TLS
-    // handshake.
-    "accounts.googl.com",
-    // scholar.google.com — same logic as accounts.googl.com, reported
+    // accounts.google.com — standard Google account service, covered by
+    // the *.google.com wildcard cert. Previously listed as
+    // accounts.googl.com (issue #42), but googl.com is NOT in the SAN
+    // list of Google's GFE certificate — connections with verify_ssl=true
+    // fail with "certificate not valid for name" when the round-robin
+    // lands on it.
+    "accounts.google.com",
+    // scholar.google.com — reported
     // in #47 as a DPI-passing SNI on MCI / Samantel. Covered by the
     // core *.google.com cert so it handshakes normally against
     // google_ip:443.
