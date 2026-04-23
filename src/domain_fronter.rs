@@ -839,6 +839,14 @@ pub const DEFAULT_GOOGLE_SNI_POOL: &[&str] = &[
     "drive.google.com",
     "docs.google.com",
     "calendar.google.com",
+    // accounts.googl.com is a Google-owned alias (googl.com redirects
+    // to Google properties) whose cert is served off the same GFE IP
+    // pool. Reported in issue #42 as passing DPI on Samantel / MCI
+    // (Iranian carriers) specifically, where some of the longer
+    // `*.google.com` names are selectively SNI-blocked. Rotation-only
+    // use: we never actually HTTP-to it, just present it in the TLS
+    // handshake.
+    "accounts.googl.com",
 ];
 
 /// Build the pool of SNI hosts used for outbound connections to the Google

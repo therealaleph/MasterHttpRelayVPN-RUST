@@ -261,4 +261,8 @@ val DEFAULT_SNI_POOL: List<String> = listOf(
     "drive.google.com",
     "docs.google.com",
     "calendar.google.com",
+    // Issue #42: passes DPI on Samantel / MCI where the longer google.com
+    // subdomains are selectively SNI-blocked. Must mirror the Rust list
+    // in src/domain_fronter.rs exactly.
+    "accounts.googl.com",
 )

@@ -14,8 +14,8 @@ android {
         applicationId = "com.therealaleph.mhrv"
         minSdk = 24 // Android 7.0 — covers 99%+ of live devices.
         targetSdk = 34
-        versionCode = 110
-        versionName = "1.1.0"
+        versionCode = 111
+        versionName = "1.1.1"
 
         // Ship all four mainstream Android ABIs:
         //   - arm64-v8a      — 95%+ of real-world Android phones since 2019
