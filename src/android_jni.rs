@@ -342,6 +342,68 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_drainLogs<'a>(
     env.new_string(out).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
 
+/// `Native.checkUpdate()` -> String. Runs the same `update_check::check`
+/// the desktop UI uses, serializes the outcome as JSON so Kotlin can
+/// pattern-match without needing its own GitHub client.
+///
+/// Returned shape, one of:
+///   {"kind":"upToDate","current":"1.0.0","latest":"1.0.0"}
+///   {"kind":"updateAvailable","current":"1.0.0","latest":"1.1.0","url":"https://..."}
+///   {"kind":"offline","reason":"..."}
+///   {"kind":"error","reason":"..."}
+///
+/// Blocking — hit from a background dispatcher.
+#[no_mangle]
+pub extern "system" fn Java_com_therealaleph_mhrv_Native_checkUpdate<'a>(
+    env: JNIEnv<'a>,
+    _class: JClass,
+) -> jstring {
+    let result_json = safe(
+        r#"{"kind":"error","reason":"panic"}"#.to_string(),
+        AssertUnwindSafe(|| {
+            install_logging_once();
+            let Some(rt) = one_shot_runtime() else {
+                return r#"{"kind":"error","reason":"tokio init failed"}"#.to_string();
+            };
+            let outcome = rt.block_on(crate::update_check::check(
+                crate::update_check::Route::Direct,
+            ));
+            update_check_to_json(&outcome)
+        }),
+    );
+    env.new_string(result_json)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+fn update_check_to_json(u: &crate::update_check::UpdateCheck) -> String {
+    // Hand-serialized to keep the JNI side free of serde derive noise on
+    // the inner enum (which would need `#[derive(Serialize)]`). Short
+    // enough that the hand-rolled version is simpler than pulling
+    // serde_json in here for one call.
+    fn esc(s: &str) -> String {
+        s.replace('\\', "\\\\").replace('"', "\\\"")
+    }
+    match u {
+        crate::update_check::UpdateCheck::UpToDate { current, latest } => format!(
+            r#"{{"kind":"upToDate","current":"{}","latest":"{}"}}"#,
+            esc(current), esc(latest),
+        ),
+        crate::update_check::UpdateCheck::UpdateAvailable { current, latest, release_url, .. } => format!(
+            r#"{{"kind":"updateAvailable","current":"{}","latest":"{}","url":"{}"}}"#,
+            esc(current), esc(latest), esc(release_url),
+        ),
+        crate::update_check::UpdateCheck::Offline(reason) => format!(
+            r#"{{"kind":"offline","reason":"{}"}}"#,
+            esc(reason),
+        ),
+        crate::update_check::UpdateCheck::Error(reason) => format!(
+            r#"{{"kind":"error","reason":"{}"}}"#,
+            esc(reason),
+        ),
+    }
+}
+
 /// `Native.testSni(googleIp, sni)` -> String. Returns a small JSON blob
 /// like `{"ok":true,"latencyMs":123}` or `{"ok":false,"error":"..."}`.
 /// Blocking call — Kotlin side should invoke on a background coroutine.

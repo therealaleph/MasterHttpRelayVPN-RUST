@@ -34,6 +34,7 @@ import com.therealaleph.mhrv.ConfigStore
 import com.therealaleph.mhrv.DEFAULT_SNI_POOL
 import com.therealaleph.mhrv.MhrvConfig
 import com.therealaleph.mhrv.Native
+import com.therealaleph.mhrv.NetworkDetect
 import com.therealaleph.mhrv.ui.theme.OkGreen
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -130,11 +131,32 @@ fun HomeScreen(
             TopAppBar(
                 title = { Text("mhrv-rs") },
                 actions = {
-                    Text(
-                        text = "v" + runCatching { Native.version() }.getOrDefault("?"),
-                        style = MaterialTheme.typography.labelMedium,
-                        modifier = Modifier.padding(end = 12.dp),
-                    )
+                    // Tap the version label to check for updates. Keeps
+                    // the top bar visually quiet (no explicit menu) but
+                    // is discoverable because the cursor-style ripple
+                    // makes it obvious it's interactive.
+                    var checking by remember { mutableStateOf(false) }
+                    TextButton(
+                        onClick = {
+                            if (checking) return@TextButton
+                            checking = true
+                            scope.launch {
+                                val json = withContext(Dispatchers.IO) {
+                                    runCatching { Native.checkUpdate() }.getOrNull()
+                                }
+                                val msg = summarizeUpdateCheck(json)
+                                snackbar.showSnackbar(msg, withDismissAction = true)
+                                checking = false
+                            }
+                        },
+                        modifier = Modifier.padding(end = 4.dp),
+                    ) {
+                        Text(
+                            text = if (checking) "checking…"
+                                   else "v" + runCatching { Native.version() }.getOrDefault("?"),
+                            style = MaterialTheme.typography.labelMedium,
+                        )
+                    }
                 },
             )
         },
@@ -191,6 +213,43 @@ fun HomeScreen(
                     modifier = Modifier.weight(1f),
                 )
             }
+            // "Auto-detect" forces a fresh DNS resolution now. Start also
+            // auto-resolves transparently, but exposing a button makes the
+            // "I'm getting connect timeouts, is my google_ip stale?" case
+            // a one-tap fix without needing to look up nslookup output.
+            TextButton(
+                onClick = {
+                    scope.launch {
+                        val fresh = withContext(Dispatchers.IO) {
+                            NetworkDetect.resolveGoogleIp()
+                        }
+                        if (!fresh.isNullOrBlank()) {
+                            var updated = cfg
+                            if (fresh != updated.googleIp) {
+                                updated = updated.copy(googleIp = fresh)
+                            }
+                            // Same repair logic as the Start button —
+                            // if front_domain has been corrupted into an
+                            // IP we can't use it for SNI, so put the
+                            // default hostname back.
+                            if (updated.frontDomain.isBlank() ||
+                                updated.frontDomain.parseAsIpOrNull() != null
+                            ) {
+                                updated = updated.copy(frontDomain = "www.google.com")
+                            }
+                            if (updated !== cfg) {
+                                persist(updated)
+                                snackbar.showSnackbar("google_ip updated to $fresh")
+                            } else {
+                                snackbar.showSnackbar("google_ip already current ($fresh)")
+                            }
+                        } else {
+                            snackbar.showSnackbar("DNS lookup failed — check network")
+                        }
+                    }
+                },
+                modifier = Modifier.align(Alignment.End),
+            ) { Text("Auto-detect google_ip") }
 
             // SNI pool: collapsed by default. Users without a reason to
             // touch it should leave Rust's auto-expansion to handle it.
@@ -217,8 +276,42 @@ fun HomeScreen(
             ) {
                 Button(
                     onClick = {
+                        // Start flow: (1) auto-resolve google_ip so we
+                        // don't hand the proxy a stale anycast target,
+                        // (2) repair front_domain if it got corrupted into
+                        // an IP (has to be a hostname — that's what goes
+                        // into the TLS SNI on the outbound leg),
+                        // (3) fire the VpnService. All three steps live
+                        // here (rather than in MainActivity) so they go
+                        // through the same persist() used for text edits
+                        // — otherwise the Compose cfg would go stale and
+                        // a subsequent field edit would overwrite our
+                        // fresh values with the pre-resolve ones.
                         transitionCooldown = true
-                        onStart()
+                        scope.launch {
+                            val fresh = withContext(Dispatchers.IO) {
+                                NetworkDetect.resolveGoogleIp()
+                            }
+                            var updated = cfg
+                            if (!fresh.isNullOrBlank() && fresh != updated.googleIp) {
+                                updated = updated.copy(googleIp = fresh)
+                            }
+                            // Defensive front_domain repair. An IP literal
+                            // here breaks the outbound leg: TLS SNI
+                            // must be a hostname, and the Apps Script
+                            // dispatcher uses front_domain as the SNI
+                            // when rewriting www.google.com-bound TCP
+                            // flows. If the field got corrupted (bad
+                            // paste, previous bug, etc.) reset to the
+                            // safe default.
+                            if (updated.frontDomain.isBlank() ||
+                                updated.frontDomain.parseAsIpOrNull() != null
+                            ) {
+                                updated = updated.copy(frontDomain = "www.google.com")
+                            }
+                            if (updated !== cfg) persist(updated)
+                            onStart()
+                        }
                     },
                     enabled = cfg.hasDeploymentId && cfg.authKey.isNotBlank() && !transitionCooldown,
                     modifier = Modifier.weight(1f),
@@ -533,6 +626,57 @@ private fun ProbeBadge(state: ProbeState) {
                 modifier = Modifier.size(16.dp),
             )
         }
+    }
+}
+
+/**
+ * Turn the JSON blob from `Native.checkUpdate()` into a one-line
+ * snackbar message. Parsing is lenient — if the shape is anything other
+ * than what we expect we fall back to "check failed" rather than
+ * spewing the raw JSON at the user.
+ */
+private fun summarizeUpdateCheck(json: String?): String {
+    if (json.isNullOrBlank()) return "Update check failed (no response)"
+    return try {
+        val obj = JSONObject(json)
+        when (obj.optString("kind")) {
+            "upToDate" -> "Up to date (running v${obj.optString("current")})"
+            "updateAvailable" -> {
+                val cur = obj.optString("current")
+                val latest = obj.optString("latest")
+                val url = obj.optString("url")
+                "Update available: v$cur → v$latest   $url"
+            }
+            "offline" -> "Offline: ${obj.optString("reason", "no details")}"
+            "error" -> "Check failed: ${obj.optString("reason", "no details")}"
+            else -> "Check failed (unknown response)"
+        }
+    } catch (_: Throwable) {
+        "Check failed (bad json)"
+    }
+}
+
+/**
+ * Try to parse a string as an IPv4 or IPv6 literal. Returns null if it
+ * looks like a hostname (or bogus) — which is what we want for
+ * front_domain, where a hostname is required (goes into the TLS SNI on
+ * the outbound leg).
+ *
+ * Intentionally strict: must be a valid literal AND must not contain a
+ * letter anywhere. Plain `InetAddress.getByName(...)` would succeed for
+ * hostnames too (it'd do a DNS lookup and return an IP), which would
+ * false-positive every normal value like "www.google.com".
+ */
+private fun String.parseAsIpOrNull(): java.net.InetAddress? {
+    val s = trim()
+    if (s.isEmpty() || s.any { it.isLetter() }) return null
+    return try {
+        // Literal-only parse: rejects anything that would need DNS.
+        java.net.InetAddress.getByName(s).takeIf {
+            it.hostAddress?.let { addr -> addr == s || addr.contains(s) } == true
+        }
+    } catch (_: Throwable) {
+        null
     }
 }
 

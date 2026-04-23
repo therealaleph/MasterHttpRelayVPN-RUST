@@ -65,4 +65,17 @@ object Native {
      * BLOCKS (does a TLS handshake); call from a background dispatcher.
      */
     external fun testSni(googleIp: String, sni: String): String
+
+    /**
+     * Ask GitHub's Releases API whether a newer version of mhrv-rs is
+     * out. Returns a JSON blob, one of:
+     *   - `{"kind":"upToDate","current":"1.0.0","latest":"1.0.0"}`
+     *   - `{"kind":"updateAvailable","current":"1.0.0","latest":"1.1.0","url":"https://..."}`
+     *   - `{"kind":"offline","reason":"..."}`
+     *   - `{"kind":"error","reason":"..."}`
+     *
+     * BLOCKS (HTTPS round-trip); call from a background dispatcher.
+     * Same check the desktop UI runs — same result format.
+     */
+    external fun checkUpdate(): String
 }
