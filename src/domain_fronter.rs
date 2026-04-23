@@ -57,7 +57,7 @@ pub enum FronterError {
 
 type PooledStream = TlsStream<TcpStream>;
 const POOL_TTL_SECS: u64 = 45;
-const POOL_MAX: usize = 50;
+const POOL_MAX: usize = 80;
 const REQUEST_TIMEOUT_SECS: u64 = 25;
 
 struct PoolEntry {
@@ -278,6 +278,10 @@ impl DomainFronter {
             blacklisted_scripts: bl.len(),
             total_scripts: self.script_ids.len(),
         }
+    }
+
+    pub fn num_scripts(&self) -> usize {
+        self.script_ids.len()
     }
 
     pub fn cache(&self) -> &ResponseCache {
