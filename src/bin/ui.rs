@@ -208,6 +208,7 @@ struct FormState {
     scan_batch_size:usize,
     google_ip_validation: bool,
     normalize_x_graphql: bool,
+    skip_youtube_sni_rewrite: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -284,6 +285,7 @@ fn load_form() -> (FormState, Option<String>) {
             google_ip_validation: c.google_ip_validation,
             scan_batch_size:c.scan_batch_size,
             normalize_x_graphql: c.normalize_x_graphql,
+            skip_youtube_sni_rewrite: c.skip_youtube_sni_rewrite,
         }
     } else {
         FormState {
@@ -308,6 +310,7 @@ fn load_form() -> (FormState, Option<String>) {
             google_ip_validation:true,
             scan_batch_size:500,
             normalize_x_graphql: false,
+            skip_youtube_sni_rewrite: false,
         }
     };
     (form, load_err)
@@ -435,6 +438,7 @@ impl FormState {
             google_ip_validation:self.google_ip_validation,
             scan_batch_size:self.scan_batch_size,
             normalize_x_graphql: self.normalize_x_graphql,
+            skip_youtube_sni_rewrite: self.skip_youtube_sni_rewrite,
         })
     }
 }
@@ -473,6 +477,8 @@ struct ConfigWire<'a> {
     sni_hosts: Option<Vec<&'a str>>,
     #[serde(skip_serializing_if = "is_false")]
     normalize_x_graphql: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    skip_youtube_sni_rewrite: bool,
     // IP-scan knobs. These used to be missing from the wire struct, so
     // every Save-config silently dropped them — the user would toggle
     // "fetch from API" on, save, reopen, and find it off again. Add
@@ -524,6 +530,7 @@ impl<'a> From<&'a Config> for ConfigWire<'a> {
                 .as_ref()
                 .map(|v| v.iter().map(String::as_str).collect()),
             normalize_x_graphql: c.normalize_x_graphql,
+            skip_youtube_sni_rewrite: c.skip_youtube_sni_rewrite,
             fetch_ips_from_api: c.fetch_ips_from_api,
             max_ips_to_scan: c.max_ips_to_scan,
             scan_batch_size: c.scan_batch_size,
@@ -830,6 +837,19 @@ impl eframe::App for App {
                                  Twitter/X. Off by default — some endpoints may reject trimmed requests. \
                                  Credit: seramo_ir + Persian Python community (issue #16).",
                             );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_space(120.0 + 8.0);
+                        ui.checkbox(
+                            &mut self.form.skip_youtube_sni_rewrite,
+                            "Send YouTube through relay (no SNI rewrite)",
+                        )
+                        .on_hover_text(
+                            "YouTube normally uses the same direct Google-edge tunnel as google.com (TLS SNI is \
+                             the front domain, not youtube.com). That can trigger restricted mode or sign-out \
+                             prompts. Enable this to route youtube.com / youtu.be / ytimg.com through the Apps \
+                             Script relay instead — slower for video, but the visible SNI matches the site.",
+                        );
                     });
                 });
             });

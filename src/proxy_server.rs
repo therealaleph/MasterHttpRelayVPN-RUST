@@ -30,29 +30,39 @@ use crate::mitm::MitmCertManager;
 // User-Agent locking and no Apps Script quota.
 // When in doubt leave it out: sites that aren't actually on GFE will 404 or
 // return a wrong-cert error instead of loading.
-const SNI_REWRITE_SUFFIXES: &[&str] = &[
-    // Core Google
+const SNI_REWRITE_CORE_SUFFIXES: &[&str] = &[
     "google.com",
     "gstatic.com",
     "googleusercontent.com",
     "googleapis.com",
     "ggpht.com",
-    // YouTube family
-    "youtube.com",
-    "youtu.be",
-    "youtube-nocookie.com",
-    "ytimg.com",
-    // Blogger / Blog.google
     "blogspot.com",
     "blogger.com",
 ];
 
-fn matches_sni_rewrite(host: &str) -> bool {
+const SNI_REWRITE_YOUTUBE_SUFFIXES: &[&str] = &[
+    "youtube.com",
+    "youtu.be",
+    "youtube-nocookie.com",
+    "ytimg.com",
+];
+
+fn host_matches_sni_suffixes(host: &str, suffixes: &[&str]) -> bool {
     let h = host.to_ascii_lowercase();
     let h = h.trim_end_matches('.');
-    SNI_REWRITE_SUFFIXES
+    suffixes
         .iter()
         .any(|s| h == *s || h.ends_with(&format!(".{}", s)))
+}
+
+fn matches_sni_rewrite(host: &str, skip_youtube_sni_rewrite: bool) -> bool {
+    if host_matches_sni_suffixes(host, SNI_REWRITE_CORE_SUFFIXES) {
+        return true;
+    }
+    if skip_youtube_sni_rewrite {
+        return false;
+    }
+    host_matches_sni_suffixes(host, SNI_REWRITE_YOUTUBE_SUFFIXES)
 }
 
 fn hosts_override<'a>(
@@ -95,6 +105,7 @@ pub struct RewriteCtx {
     pub hosts: std::collections::HashMap<String, String>,
     pub tls_connector: TlsConnector,
     pub upstream_socks5: Option<String>,
+    pub skip_youtube_sni_rewrite: bool,
 }
 
 impl ProxyServer {
@@ -122,6 +133,7 @@ impl ProxyServer {
             hosts: config.hosts.clone(),
             tls_connector,
             upstream_socks5: config.upstream_socks5.clone(),
+            skip_youtube_sni_rewrite: config.skip_youtube_sni_rewrite,
         });
 
         let socks5_port = config.socks5_port.unwrap_or(config.listen_port + 1);
@@ -416,7 +428,9 @@ async fn dispatch_tunnel(
     rewrite_ctx: Arc<RewriteCtx>,
 ) -> std::io::Result<()> {
     // 1. Explicit hosts override or SNI-rewrite suffix: always use the tunnel.
-    if matches_sni_rewrite(&host) || hosts_override(&rewrite_ctx.hosts, &host).is_some() {
+    if matches_sni_rewrite(&host, rewrite_ctx.skip_youtube_sni_rewrite)
+        || hosts_override(&rewrite_ctx.hosts, &host).is_some()
+    {
         tracing::info!("dispatch {}:{} -> sni-rewrite tunnel (Google edge direct)", host, port);
         return do_sni_rewrite_tunnel_from_tcp(sock, &host, port, mitm, rewrite_ctx).await;
     }

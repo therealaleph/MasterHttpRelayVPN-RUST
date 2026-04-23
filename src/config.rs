@@ -105,6 +105,12 @@ pub struct Config {
     /// features. Turn on and observe.
     #[serde(default)]
     pub normalize_x_graphql: bool,
+    /// When true, YouTube hostnames (`youtube.com`, `youtu.be`, …) are not
+    /// routed through the direct SNI-rewrite tunnel; they use the Apps Script
+    /// relay like other domains. Helps avoid YouTube restricted / logged-out
+    /// treatment that can occur when TLS SNI does not match the real host.
+    #[serde(default)]
+    pub skip_youtube_sni_rewrite: bool,
 }
 
 fn default_fetch_ips_from_api() -> bool { false }
