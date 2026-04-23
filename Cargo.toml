@@ -1,6 +1,6 @@
 [package]
 name = "mhrv-rs"
-version = "1.1.2"
+version = "1.1.3"
 edition = "2021"
 description = "Rust port of MasterHttpRelayVPN -- DPI bypass via Google Apps Script relay with domain fronting"
 license = "MIT"
@@ -49,6 +49,14 @@ http = "1"
 flate2 = "1"
 directories = "5"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# 64-bit atomics on 32-bit MIPS/ARMv5 targets. Rust's std AtomicU64 is
+# only available on targets that expose native 64-bit atomics, which
+# mipsel-unknown-linux-musl does not — `AtomicU64` resolves to "no
+# such name in sync::atomic" and the whole crate fails to build. The
+# `fallback` feature uses a global spinlock when the target can't do
+# 64-bit atomically; on x86_64 / aarch64 / armv7 / etc. it compiles
+# down to the native instructions with no overhead.
+portable-atomic = { version = "1", features = ["fallback"] }
 
 # Optional UI dep: only pulled in when --features ui is set.
 # Both `glow` (OpenGL 2+) and `wgpu` (DX12/Vulkan/Metal) are compiled in;

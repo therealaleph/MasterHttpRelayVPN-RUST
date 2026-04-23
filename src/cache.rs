@@ -1,5 +1,11 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+// AtomicU64 polyfill via portable-atomic — mipsel is MIPS32 with no
+// native 64-bit atomic instructions, so std::sync::atomic::AtomicU64
+// doesn't exist on that target. portable-atomic falls back to a
+// global spinlock on 32-bit MIPS; compiles to native insns on x86_64
+// and aarch64.
+use portable_atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 

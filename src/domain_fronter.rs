@@ -10,7 +10,12 @@
 //! TODO: add parallel range-based downloads.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+// AtomicU64 via portable-atomic: native on 64-bit / armv7, spinlock-
+// backed on mipsel (MIPS32 has no 64-bit atomic instructions). API
+// is identical to std::sync::atomic::AtomicU64 so call sites need
+// no other changes.
+use portable_atomic::AtomicU64;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

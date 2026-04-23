@@ -2199,6 +2199,7 @@ dependencies = [
  "httparse",
  "jni 0.21.1",
  "libc",
+ "portable-atomic",
  "rand 0.8.6",
  "rcgen",
  "rustls",
