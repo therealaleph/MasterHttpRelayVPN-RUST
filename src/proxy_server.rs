@@ -42,6 +42,26 @@ const SNI_REWRITE_SUFFIXES: &[&str] = &[
     "youtu.be",
     "youtube-nocookie.com",
     "ytimg.com",
+    // Google Video Transport CDN — YouTube video chunks, Chrome
+    // auto-updates, Google Play Store downloads. The single biggest
+    // gap vs the upstream Python port: without these in the list
+    // YouTube video playback stalls because every chunk tries to
+    // traverse Apps Script instead of the direct GFE tunnel.
+    "gvt1.com",
+    "gvt2.com",
+    // Ad + analytics infra. All on GFE, all previously broken the
+    // same way YouTube was: SNI-blocked on Iranian DPI, but reachable
+    // via `google_ip` with SNI rewritten.
+    "doubleclick.net",
+    "googlesyndication.com",
+    "googleadservices.com",
+    "google-analytics.com",
+    "googletagmanager.com",
+    "googletagservices.com",
+    // fonts.googleapis.com is technically covered by the googleapis.com
+    // suffix above, but mirroring Python's explicit listing makes the
+    // intent obvious at a glance.
+    "fonts.googleapis.com",
     // Blogger / Blog.google
     "blogspot.com",
     "blogger.com",
@@ -1047,7 +1067,19 @@ where
 
     tracing::info!("relay {} {}", method, url);
 
-    let response = fronter.relay(&method, &url, &headers, &body).await;
+    // For GETs without a body, take the range-parallel path — probes
+    // with `Range: bytes=0-<chunk>`, and if the origin supports ranges,
+    // fetches the rest in parallel 256 KB chunks. This is what lets
+    // YouTube video streaming / gvt1.com Chrome-updates / big static
+    // files not stall waiting on one ~2s Apps Script call per MB.
+    // Anything with a body (POST/PUT/PATCH) goes through the normal
+    // relay path — range semantics on mutating requests are undefined
+    // and would break form submissions.
+    let response = if method.eq_ignore_ascii_case("GET") && body.is_empty() {
+        fronter.relay_parallel_range(&method, &url, &headers, &body).await
+    } else {
+        fronter.relay(&method, &url, &headers, &body).await
+    };
     stream.write_all(&response).await?;
     stream.flush().await?;
 
@@ -1290,7 +1322,15 @@ async fn do_plain_http(
     };
 
     tracing::info!("HTTP {} {}", method, url);
-    let response = fronter.relay(&method, &url, &headers, &body).await;
+    // Plain HTTP proxy path — same range-parallel strategy as the
+    // MITM-HTTPS path above. Large downloads on port 80 (package
+    // mirrors, video poster streams, etc.) need the same acceleration
+    // or the relay stalls per-chunk.
+    let response = if method.eq_ignore_ascii_case("GET") && body.is_empty() {
+        fronter.relay_parallel_range(&method, &url, &headers, &body).await
+    } else {
+        fronter.relay(&method, &url, &headers, &body).await
+    };
     sock.write_all(&response).await?;
     sock.flush().await?;
     Ok(())
