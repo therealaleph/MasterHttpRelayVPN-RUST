@@ -91,6 +91,14 @@ class MainActivity : ComponentActivity() {
         }
 
         HomeScreen(
+            // MainActivity's onStart is intentionally dumb: it only
+            // launches the VpnService. The auto-resolve that used to
+            // live here ran load-modify-save directly on disk, which
+            // left HomeScreen's in-memory Compose `cfg` stale — a
+            // subsequent UI edit would then persist the stale cfg back
+            // over the fresh IP we just wrote. HomeScreen now owns the
+            // auto-resolve (it uses the same persist() flow the UI uses
+            // for text-field edits, so there's one source of truth).
             onStart = {
                 val prepareIntent = VpnService.prepare(this)
                 if (prepareIntent == null) {
@@ -100,9 +108,30 @@ class MainActivity : ComponentActivity() {
                 }
             },
             onStop = {
-                val i = Intent(this, MhrvVpnService::class.java)
+                // Three-step teardown. Each step is defensive against a
+                // different failure mode we've actually hit in testing:
+                //
+                //   1. ACTION_STOP — graceful path. The service receives it,
+                //      runs its teardown (stops tun2proxy, closes the TUN
+                //      fd, shuts down the Rust runtime) and stopSelf()'s.
+                //      This is what we want 99% of the time.
+                //
+                //   2. stopService() — covers the "force-closed then
+                //      reopened" zombie case. Android may auto-restart our
+                //      START_STICKY service in a fresh process after the
+                //      user swipes us away from Recents, and the user's
+                //      next Stop tap needs to actually unbind even if our
+                //      in-memory TUN fd reference is gone. stopService is
+                //      idempotent so it's safe to follow the graceful path.
+                //
+                //   3. We do NOT touch the VpnService permission — that's
+                //      the OS-wide VPN grant and the user approved it
+                //      deliberately. Revoking it would force a re-prompt
+                //      on next Start, which is worse UX.
+                val stopAction = Intent(this, MhrvVpnService::class.java)
                     .setAction(MhrvVpnService.ACTION_STOP)
-                startService(i)
+                startService(stopAction)
+                stopService(Intent(this, MhrvVpnService::class.java))
             },
             onInstallCaConfirmed = {
                 // The flow is (1) export cert, (2) copy it to Downloads so
