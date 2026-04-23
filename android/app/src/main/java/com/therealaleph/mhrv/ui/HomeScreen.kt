@@ -34,7 +34,14 @@ import com.therealaleph.mhrv.ConfigStore
 import com.therealaleph.mhrv.DEFAULT_SNI_POOL
 import com.therealaleph.mhrv.MhrvConfig
 import com.therealaleph.mhrv.Native
+import com.therealaleph.mhrv.ConnectionMode
 import com.therealaleph.mhrv.NetworkDetect
+import com.therealaleph.mhrv.R
+import com.therealaleph.mhrv.SplitMode
+import com.therealaleph.mhrv.UiLang
+import com.therealaleph.mhrv.VpnState
+import androidx.compose.ui.res.stringResource
+import com.therealaleph.mhrv.ui.theme.ErrRed
 import com.therealaleph.mhrv.ui.theme.OkGreen
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -73,6 +80,7 @@ fun HomeScreen(
     onInstallCaConfirmed: () -> Unit,
     caOutcome: CaInstallOutcome?,
     onCaOutcomeConsumed: () -> Unit,
+    onLangChange: (UiLang) -> Unit = {},
 ) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -88,6 +96,30 @@ fun HomeScreen(
 
     // CA install dialog visibility.
     var showInstallDialog by rememberSaveable { mutableStateOf(false) }
+
+    // One-shot auto update check on first composition. Silent if we're
+    // already on the latest (no point nagging about a network miss or an
+    // up-to-date install); surfaces a snackbar only when a newer tag is
+    // available. rememberSaveable so it doesn't re-fire on every config
+    // change / rotation.
+    var autoUpdateChecked by rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(autoUpdateChecked) {
+        if (autoUpdateChecked) return@LaunchedEffect
+        autoUpdateChecked = true
+        val json = withContext(Dispatchers.IO) {
+            runCatching { Native.checkUpdate() }.getOrNull()
+        }
+        if (json != null) {
+            val obj = runCatching { JSONObject(json) }.getOrNull()
+            if (obj?.optString("kind") == "updateAvailable") {
+                snackbar.showSnackbar(
+                    "Update available: v${obj.optString("current")} → " +
+                    "v${obj.optString("latest")}  ${obj.optString("url")}",
+                    withDismissAction = true,
+                )
+            }
+        }
+    }
 
     // Cooldown on Start/Stop. Rapid taps during a VPN transition trigger
     // an emulator-specific EGL renderer crash
@@ -131,10 +163,35 @@ fun HomeScreen(
             TopAppBar(
                 title = { Text("mhrv-rs") },
                 actions = {
-                    // Tap the version label to check for updates. Keeps
-                    // the top bar visually quiet (no explicit menu) but
-                    // is discoverable because the cursor-style ripple
-                    // makes it obvious it's interactive.
+                    // Language toggle — cycles AUTO → FA → EN → AUTO.
+                    // Saving writes to config.json and triggers activity
+                    // recreate, which re-applies the AppCompatDelegate
+                    // locale (and flips LTR ↔ RTL accordingly). Kept as
+                    // a small label button instead of an icon because
+                    // "AUTO/FA/EN" communicates the current state at a
+                    // glance; a flag icon alone would be ambiguous.
+                    TextButton(
+                        onClick = {
+                            val next = when (cfg.uiLang) {
+                                UiLang.AUTO -> UiLang.FA
+                                UiLang.FA -> UiLang.EN
+                                UiLang.EN -> UiLang.AUTO
+                            }
+                            persist(cfg.copy(uiLang = next))
+                            onLangChange(next)
+                        },
+                    ) {
+                        Text(
+                            text = when (cfg.uiLang) {
+                                UiLang.AUTO -> "AUTO"
+                                UiLang.FA -> "FA"
+                                UiLang.EN -> "EN"
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                        )
+                    }
+
+                    // Tap the version label to check for updates.
                     var checking by remember { mutableStateOf(false) }
                     TextButton(
                         onClick = {
@@ -152,8 +209,9 @@ fun HomeScreen(
                         modifier = Modifier.padding(end = 4.dp),
                     ) {
                         Text(
-                            text = if (checking) "checking…"
-                                   else "v" + runCatching { Native.version() }.getOrDefault("?"),
+                            text = if (checking) stringResource(R.string.tb_check_update_checking)
+                                   else stringResource(R.string.tb_version_prefix) +
+                                        runCatching { Native.version() }.getOrDefault("?"),
                             style = MaterialTheme.typography.labelMedium,
                         )
                     }
@@ -170,7 +228,7 @@ fun HomeScreen(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            SectionHeader("Apps Script relay")
+            SectionHeader(stringResource(R.string.sec_apps_script_relay))
 
             DeploymentIdsField(
                 urls = cfg.appsScriptUrls,
@@ -180,17 +238,24 @@ fun HomeScreen(
             OutlinedTextField(
                 value = cfg.authKey,
                 onValueChange = { persist(cfg.copy(authKey = it)) },
-                label = { Text("auth_key") },
+                label = { Text(stringResource(R.string.field_auth_key)) },
                 singleLine = true,
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
                 modifier = Modifier.fillMaxWidth(),
                 supportingText = {
-                    Text("The shared secret you set in the Apps Script.")
+                    Text(stringResource(R.string.help_auth_key))
                 },
             )
 
             Spacer(Modifier.height(4.dp))
-            SectionHeader("Network")
+            SectionHeader(stringResource(R.string.sec_network))
+
+            ConnectionModeDropdown(
+                mode = cfg.connectionMode,
+                onChange = { persist(cfg.copy(connectionMode = it)) },
+                httpPort = cfg.listenPort,
+                socks5Port = cfg.socks5Port ?: (cfg.listenPort + 1),
+            )
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -199,7 +264,7 @@ fun HomeScreen(
                 OutlinedTextField(
                     value = cfg.googleIp,
                     onValueChange = { persist(cfg.copy(googleIp = it)) },
-                    label = { Text("google_ip") },
+                    label = { Text(stringResource(R.string.field_google_ip)) },
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
                     modifier = Modifier.weight(1f),
@@ -207,7 +272,7 @@ fun HomeScreen(
                 OutlinedTextField(
                     value = cfg.frontDomain,
                     onValueChange = { persist(cfg.copy(frontDomain = it)) },
-                    label = { Text("front_domain") },
+                    label = { Text(stringResource(R.string.field_front_domain)) },
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
                     modifier = Modifier.weight(1f),
@@ -237,23 +302,38 @@ fun HomeScreen(
                             ) {
                                 updated = updated.copy(frontDomain = "www.google.com")
                             }
+                            // Captured up-front so the lambda has access
+                            // to the format-string resources via context
+                            // before running on the IO dispatcher.
                             if (updated !== cfg) {
                                 persist(updated)
-                                snackbar.showSnackbar("google_ip updated to $fresh")
+                                snackbar.showSnackbar(
+                                    ctx.getString(R.string.snack_google_ip_updated, fresh),
+                                )
                             } else {
-                                snackbar.showSnackbar("google_ip already current ($fresh)")
+                                snackbar.showSnackbar(
+                                    ctx.getString(R.string.snack_google_ip_current, fresh),
+                                )
                             }
                         } else {
-                            snackbar.showSnackbar("DNS lookup failed — check network")
+                            snackbar.showSnackbar(ctx.getString(R.string.snack_dns_lookup_failed))
                         }
                     }
                 },
                 modifier = Modifier.align(Alignment.End),
-            ) { Text("Auto-detect google_ip") }
+            ) { Text(stringResource(R.string.btn_auto_detect_google_ip)) }
+
+            // App splitting — only makes sense in VPN_TUN mode.
+            // PROXY_ONLY has no system-level routing to partition.
+            if (cfg.connectionMode == ConnectionMode.VPN_TUN) {
+                CollapsibleSection(title = stringResource(R.string.sec_app_splitting)) {
+                    AppSplittingEditor(cfg = cfg, onChange = ::persist)
+                }
+            }
 
             // SNI pool: collapsed by default. Users without a reason to
             // touch it should leave Rust's auto-expansion to handle it.
-            CollapsibleSection(title = "SNI pool + tester") {
+            CollapsibleSection(title = stringResource(R.string.sec_sni_pool_tester)) {
                 SniPoolEditor(
                     cfg = cfg,
                     onChange = ::persist,
@@ -261,7 +341,7 @@ fun HomeScreen(
             }
 
             // Advanced settings: collapsed by default.
-            CollapsibleSection(title = "Advanced") {
+            CollapsibleSection(title = stringResource(R.string.sec_advanced)) {
                 AdvancedSettings(
                     cfg = cfg,
                     onChange = ::persist,
@@ -270,24 +350,29 @@ fun HomeScreen(
 
             Spacer(Modifier.height(8.dp))
 
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                Button(
-                    onClick = {
-                        // Start flow: (1) auto-resolve google_ip so we
-                        // don't hand the proxy a stale anycast target,
-                        // (2) repair front_domain if it got corrupted into
-                        // an IP (has to be a hostname — that's what goes
-                        // into the TLS SNI on the outbound leg),
-                        // (3) fire the VpnService. All three steps live
-                        // here (rather than in MainActivity) so they go
-                        // through the same persist() used for text edits
-                        // — otherwise the Compose cfg would go stale and
-                        // a subsequent field edit would overwrite our
-                        // fresh values with the pre-resolve ones.
-                        transitionCooldown = true
+            // Unified Connect/Disconnect button. Color + label track the
+            // service's real "is it running right now" state (via
+            // `VpnState.isRunning`), so the UI never shows "Connect" while
+            // the tunnel is still up or "Disconnect" after the service
+            // finished tearing down. Two tap paths, one button:
+            //   - running=false → green "Connect" → runs the auto-resolve
+            //     + persist + onStart() sequence we used to hang off the
+            //     old Start button.
+            //   - running=true  → red "Disconnect" → fires onStop().
+            val isVpnRunning by VpnState.isRunning.collectAsState()
+            Button(
+                onClick = {
+                    transitionCooldown = true
+                    if (isVpnRunning) {
+                        onStop()
+                    } else {
+                        // Connect flow: auto-resolve google_ip so we don't
+                        // hand the proxy a stale anycast target; repair
+                        // front_domain if it got corrupted into an IP
+                        // (SNI has to be a hostname); then fire onStart.
+                        // All three steps go through the Compose persist()
+                        // so a subsequent field edit can't overwrite the
+                        // fresh values with pre-resolve ones.
                         scope.launch {
                             val fresh = withContext(Dispatchers.IO) {
                                 NetworkDetect.resolveGoogleIp()
@@ -296,14 +381,6 @@ fun HomeScreen(
                             if (!fresh.isNullOrBlank() && fresh != updated.googleIp) {
                                 updated = updated.copy(googleIp = fresh)
                             }
-                            // Defensive front_domain repair. An IP literal
-                            // here breaks the outbound leg: TLS SNI
-                            // must be a hostname, and the Apps Script
-                            // dispatcher uses front_domain as the SNI
-                            // when rewriting www.google.com-bound TCP
-                            // flows. If the field got corrupted (bad
-                            // paste, previous bug, etc.) reset to the
-                            // safe default.
                             if (updated.frontDomain.isBlank() ||
                                 updated.frontDomain.parseAsIpOrNull() != null
                             ) {
@@ -312,22 +389,27 @@ fun HomeScreen(
                             if (updated !== cfg) persist(updated)
                             onStart()
                         }
+                    }
+                },
+                enabled = (isVpnRunning ||
+                    (cfg.hasDeploymentId && cfg.authKey.isNotBlank())) && !transitionCooldown,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (isVpnRunning) ErrRed else OkGreen,
+                    contentColor = androidx.compose.ui.graphics.Color.White,
+                    disabledContainerColor = MaterialTheme.colorScheme.surfaceVariant,
+                ),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 52.dp),
+            ) {
+                Text(
+                    when {
+                        transitionCooldown -> "…"
+                        isVpnRunning -> stringResource(R.string.btn_disconnect)
+                        else -> stringResource(R.string.btn_connect)
                     },
-                    enabled = cfg.hasDeploymentId && cfg.authKey.isNotBlank() && !transitionCooldown,
-                    modifier = Modifier.weight(1f),
-                ) {
-                    Text(if (transitionCooldown) "…" else "Start")
-                }
-                OutlinedButton(
-                    onClick = {
-                        transitionCooldown = true
-                        onStop()
-                    },
-                    enabled = !transitionCooldown,
-                    modifier = Modifier.weight(1f),
-                ) {
-                    Text(if (transitionCooldown) "…" else "Stop")
-                }
+                    style = MaterialTheme.typography.titleMedium,
+                )
             }
 
             Spacer(Modifier.height(4.dp))
@@ -339,15 +421,24 @@ fun HomeScreen(
                 onClick = { showInstallDialog = true },
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Text("Install MITM certificate")
+                Text(stringResource(R.string.btn_install_mitm))
             }
 
-            CollapsibleSection(title = "Live logs", initiallyExpanded = false) {
+            CollapsibleSection(title = stringResource(R.string.sec_live_logs), initiallyExpanded = false) {
                 LiveLogPane()
             }
 
             Spacer(Modifier.height(16.dp))
-            HowToUseCard(cfg.listenPort)
+            // Wrapped in a collapsible so the big prose block doesn't
+            // dominate the form after the user has learned the flow.
+            // Starts expanded once for a fresh install so the first-run
+            // instructions are immediately visible.
+            CollapsibleSection(
+                title = stringResource(R.string.sec_how_to_use),
+                initiallyExpanded = cfg.appsScriptUrls.isEmpty() || cfg.authKey.isBlank(),
+            ) {
+                HowToUseBody(cfg.listenPort)
+            }
         }
     }
 
@@ -362,7 +453,7 @@ fun HomeScreen(
 
         AlertDialog(
             onDismissRequest = { showInstallDialog = false },
-            title = { Text("Install MITM certificate?") },
+            title = { Text(stringResource(R.string.dialog_install_mitm_title)) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
@@ -415,6 +506,162 @@ fun HomeScreen(
 }
 
 // =========================================================================
+// App splitting — ALL / ONLY / EXCEPT, plus a picker for the package list.
+// =========================================================================
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AppSplittingEditor(
+    cfg: MhrvConfig,
+    onChange: (MhrvConfig) -> Unit,
+) {
+    val ctx = LocalContext.current
+    var pickerOpen by remember { mutableStateOf(false) }
+
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text(
+            stringResource(R.string.help_app_splitting),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        // Radio-style mode selector. Using Column-of-Row-with-RadioButton
+        // instead of a dropdown because all three options deserve to be
+        // visible simultaneously — the labels explain the contract.
+        SplitModeRow(
+            label = stringResource(R.string.split_all),
+            selected = cfg.splitMode == SplitMode.ALL,
+            onClick = { onChange(cfg.copy(splitMode = SplitMode.ALL)) },
+        )
+        SplitModeRow(
+            label = stringResource(R.string.split_only),
+            selected = cfg.splitMode == SplitMode.ONLY,
+            onClick = { onChange(cfg.copy(splitMode = SplitMode.ONLY)) },
+        )
+        SplitModeRow(
+            label = stringResource(R.string.split_except),
+            selected = cfg.splitMode == SplitMode.EXCEPT,
+            onClick = { onChange(cfg.copy(splitMode = SplitMode.EXCEPT)) },
+        )
+
+        if (cfg.splitMode != SplitMode.ALL) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    stringResource(R.string.sni_selected_count, cfg.splitApps.size),
+                    style = MaterialTheme.typography.labelMedium,
+                    modifier = Modifier.weight(1f),
+                )
+                TextButton(onClick = { pickerOpen = true }) {
+                    Text(stringResource(R.string.split_pick_apps))
+                }
+            }
+        }
+    }
+
+    if (pickerOpen) {
+        AppPickerDialog(
+            initial = cfg.splitApps.toSet(),
+            ownPackage = ctx.packageName,
+            onSave = { picked ->
+                onChange(cfg.copy(splitApps = picked))
+                pickerOpen = false
+            },
+            onDismiss = { pickerOpen = false },
+        )
+    }
+}
+
+@Composable
+private fun SplitModeRow(label: String, selected: Boolean, onClick: () -> Unit) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        RadioButton(selected = selected, onClick = onClick)
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.weight(1f),
+        )
+    }
+}
+
+// =========================================================================
+// Connection mode — VPN (TUN) vs Proxy-only.
+// =========================================================================
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ConnectionModeDropdown(
+    mode: ConnectionMode,
+    onChange: (ConnectionMode) -> Unit,
+    httpPort: Int,
+    socks5Port: Int,
+) {
+    val labelVpn = stringResource(R.string.mode_vpn_tun)
+    val labelProxy = stringResource(R.string.mode_proxy_only)
+    val currentLabel = when (mode) {
+        ConnectionMode.VPN_TUN -> labelVpn
+        ConnectionMode.PROXY_ONLY -> labelProxy
+    }
+    var expanded by remember { mutableStateOf(false) }
+
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        ExposedDropdownMenuBox(
+            expanded = expanded,
+            onExpandedChange = { expanded = !expanded },
+        ) {
+            OutlinedTextField(
+                value = currentLabel,
+                onValueChange = {},
+                readOnly = true,
+                label = { Text(stringResource(R.string.field_connection_mode)) },
+                trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+                modifier = Modifier.fillMaxWidth().menuAnchor(),
+            )
+            ExposedDropdownMenu(
+                expanded = expanded,
+                onDismissRequest = { expanded = false },
+            ) {
+                DropdownMenuItem(
+                    text = { Text(labelVpn) },
+                    onClick = {
+                        onChange(ConnectionMode.VPN_TUN)
+                        expanded = false
+                    },
+                )
+                DropdownMenuItem(
+                    text = { Text(labelProxy) },
+                    onClick = {
+                        onChange(ConnectionMode.PROXY_ONLY)
+                        expanded = false
+                    },
+                )
+            }
+        }
+
+        // Helper text under the dropdown explains what the user is
+        // signing up for in each mode — especially important for
+        // PROXY_ONLY, where "tap Connect" alone doesn't route anything
+        // until they set the Wi-Fi proxy themselves.
+        val help = when (mode) {
+            ConnectionMode.VPN_TUN ->
+                stringResource(R.string.help_mode_vpn_tun)
+            ConnectionMode.PROXY_ONLY ->
+                stringResource(R.string.help_mode_proxy_only, httpPort, socks5Port)
+        }
+        Text(
+            help,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+// =========================================================================
 // Deployment IDs editor (multi-line, one URL/ID per line).
 // =========================================================================
 
@@ -434,15 +681,12 @@ private fun DeploymentIdsField(
             val parsed = it.split("\n").map(String::trim).filter(String::isNotBlank)
             onChange(parsed)
         },
-        label = { Text("Deployment URL(s) or script ID(s)") },
+        label = { Text(stringResource(R.string.field_deployment_urls)) },
         modifier = Modifier.fillMaxWidth(),
         minLines = 2,
         maxLines = 6,
         supportingText = {
-            Text(
-                "One per line. Full URLs (https://script.google.com/macros/s/.../exec) " +
-                "or bare IDs — mix as you like. Multiple IDs are rotated round-robin.",
-            )
+            Text(stringResource(R.string.help_deployment_urls))
         },
     )
 }
@@ -498,8 +742,7 @@ private fun SniPoolEditor(
 
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         Text(
-            "Enabled SNIs are rotated when connecting to google_ip. Leaving all unchecked " +
-            "lets Rust auto-expand the default Google pool.",
+            stringResource(R.string.help_sni_pool),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -533,7 +776,7 @@ private fun SniPoolEditor(
             OutlinedTextField(
                 value = custom,
                 onValueChange = { custom = it },
-                label = { Text("Add custom SNI") },
+                label = { Text(stringResource(R.string.field_add_custom_sni)) },
                 singleLine = true,
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
                 modifier = Modifier.weight(1f),
@@ -548,13 +791,13 @@ private fun SniPoolEditor(
                     }
                 },
                 enabled = custom.isNotBlank(),
-            ) { Text("Add") }
+            ) { Text(stringResource(R.string.btn_add)) }
         }
 
         TextButton(
             onClick = { displayed.forEach { probe(it) } },
             modifier = Modifier.align(Alignment.End),
-        ) { Text("Test all") }
+        ) { Text(stringResource(R.string.btn_test_all)) }
     }
 }
 
@@ -580,7 +823,7 @@ private fun SniRow(
             ProbeBadge(state)
             Spacer(Modifier.width(4.dp))
             TextButton(onClick = onTest, enabled = state !is ProbeState.InFlight) {
-                Text("Test")
+                Text(stringResource(R.string.btn_test))
             }
         }
         // Show the error reason on its own line when the probe failed —
@@ -713,9 +956,9 @@ private fun AdvancedSettings(
             modifier = Modifier.fillMaxWidth(),
         ) {
             Column(modifier = Modifier.weight(1f)) {
-                Text("Verify upstream TLS", style = MaterialTheme.typography.bodyMedium)
+                Text(stringResource(R.string.adv_verify_tls), style = MaterialTheme.typography.bodyMedium)
                 Text(
-                    "Off disables cert checks for the Google edge. Only useful for debugging.",
+                    stringResource(R.string.adv_verify_tls_help),
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -737,7 +980,7 @@ private fun AdvancedSettings(
                 value = cfg.logLevel,
                 onValueChange = {},
                 readOnly = true,
-                label = { Text("log_level") },
+                label = { Text(stringResource(R.string.adv_log_level)) },
                 trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
                 modifier = Modifier.fillMaxWidth().menuAnchor(),
             )
@@ -760,7 +1003,7 @@ private fun AdvancedSettings(
         // parallel_relay slider
         Column {
             Text(
-                "parallel_relay: ${cfg.parallelRelay}",
+                stringResource(R.string.adv_parallel_relay, cfg.parallelRelay),
                 style = MaterialTheme.typography.bodyMedium,
             )
             Slider(
@@ -770,7 +1013,7 @@ private fun AdvancedSettings(
                 steps = 3,  // yields 1,2,3,4,5 positions
             )
             Text(
-                "Fan-out per request. 1 is normal; bump to 2-3 on lossy links.",
+                stringResource(R.string.adv_parallel_relay_help),
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -779,12 +1022,12 @@ private fun AdvancedSettings(
         OutlinedTextField(
             value = cfg.upstreamSocks5,
             onValueChange = { onChange(cfg.copy(upstreamSocks5 = it)) },
-            label = { Text("upstream_socks5 (optional)") },
+            label = { Text(stringResource(R.string.adv_upstream_socks5)) },
             placeholder = { Text("host:port") },
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
             supportingText = {
-                Text("If set, route upstream via this SOCKS5. Leave blank for direct.")
+                Text(stringResource(R.string.adv_upstream_socks5_help))
             },
         )
     }
@@ -906,11 +1149,12 @@ private fun CollapsibleSection(
 }
 
 @Composable
-private fun HowToUseCard(listenPort: Int) {
-    OutlinedCard(modifier = Modifier.fillMaxWidth()) {
-        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("How to use", style = MaterialTheme.typography.titleMedium)
-            Text(
+private fun HowToUseBody(listenPort: Int) {
+    // Used inside the collapsible "How to use" CollapsibleSection. The
+    // card + title are provided by the section wrapper, so this body
+    // just renders the body text.
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
                 "1. Paste one or more Apps Script deployment URLs (or bare IDs) and your auth_key.\n" +
                 "2. Tap Install MITM certificate. Confirm the dialog — the cert is saved to " +
                 "Downloads/mhrv-ca.crt and the Settings app opens. Use Settings' search bar " +
@@ -935,8 +1179,7 @@ private fun HowToUseCard(listenPort: Int) {
                 "egress IP — gets re-challenged. Nothing in this app can fix that; it's inherent " +
                 "to Apps Script as a relay. Sites that only gate the initial page load (not every " +
                 "request) will work after one solve.",
-                style = MaterialTheme.typography.bodyMedium,
-            )
-        }
+            style = MaterialTheme.typography.bodyMedium,
+        )
     }
 }

@@ -43,16 +43,28 @@ if not "%UI_EXIT%"=="0" (
     echo ---------------------------------------------------
     echo UI exited with error code %UI_EXIT%.
     echo.
-    echo If this is the first time and you just saw the UI crash immediately,
-    echo common causes on Windows are:
-    echo   - missing or outdated graphics drivers (try updating)
-    echo   - running inside RDP or a VM without GPU acceleration
-    echo   - antivirus blocking the exe — whitelist the folder and retry
+    echo If this is the first time and you saw "egui_glow requires opengl 2.0+"
+    echo or "PainterError" above, your machine doesn't have a usable OpenGL
+    echo driver. Retrying once with the DirectX/Vulkan backend...
     echo.
-    echo Copy everything above and open an issue on:
-    echo   https://github.com/therealaleph/MasterHttpRelayVPN-RUST/issues
-    echo ---------------------------------------------------
-    pause
+    set MHRV_RENDERER=wgpu
+    "%~dp0mhrv-rs-ui.exe"
+    set UI_EXIT=%ERRORLEVEL%
+    set MHRV_RENDERER=
+    if not "%UI_EXIT%"=="0" (
+        echo.
+        echo ---------------------------------------------------
+        echo UI still failed with error code %UI_EXIT% even with the DX/Vulkan
+        echo backend. Likely causes:
+        echo   - missing or outdated graphics drivers (try updating)
+        echo   - running inside RDP or a VM without GPU acceleration
+        echo   - antivirus blocking the exe — whitelist the folder and retry
+        echo.
+        echo Copy everything above and open an issue on:
+        echo   https://github.com/therealaleph/MasterHttpRelayVPN-RUST/issues
+        echo ---------------------------------------------------
+        pause
+    )
 )
 
 endlocal

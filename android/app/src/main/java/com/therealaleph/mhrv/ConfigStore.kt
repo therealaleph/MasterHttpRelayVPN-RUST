@@ -17,6 +17,48 @@ import java.io.File
  *   - log level / verify_ssl / parallel_relay knobs
  * Anything else gets phone-appropriate defaults.
  */
+/**
+ * How the foreground service exposes the proxy to the rest of the device.
+ *
+ * - [VPN_TUN] — the default; `VpnService` claims a TUN interface and every
+ *   app's traffic goes through `tun2proxy` → our SOCKS5 → Apps Script.
+ *   Requires the user to accept the system "VPN connection request"
+ *   dialog on first Start.
+ *
+ * - [PROXY_ONLY] — just runs the HTTP (`127.0.0.1:8080`) and SOCKS5
+ *   (`127.0.0.1:1081`) listeners; no VpnService, no TUN. The user sets
+ *   their Wi-Fi proxy (or a per-app proxy setting) to those addresses.
+ *   Useful when the device already has another VPN up, or the user
+ *   specifically wants per-app opt-in, or on rooted/specialized devices
+ *   where VpnService is unwelcome. Closes issue #37.
+ */
+enum class ConnectionMode { VPN_TUN, PROXY_ONLY }
+
+/**
+ * App-splitting policy when in VPN_TUN mode.
+ *
+ * - [ALL]  — tunnel every app (default; the package list is ignored).
+ * - [ONLY] — allow-list: tunnel ONLY the apps in `splitApps`. Everything
+ *   else bypasses the VPN. Useful when you want mhrv-rs for a specific
+ *   browser / messenger and nothing else.
+ * - [EXCEPT] — deny-list: tunnel everything EXCEPT the apps in
+ *   `splitApps`. Useful for excluding a banking app that would break
+ *   under MITM anyway, or a self-updater you don't want going through
+ *   the quota-limited relay.
+ *
+ * Our own package (`packageName`) is always excluded regardless of mode
+ * — that's the loop-avoidance rule from day one, not a user toggle.
+ */
+enum class SplitMode { ALL, ONLY, EXCEPT }
+
+/**
+ * UI language preference. AUTO respects the device locale; FA / EN
+ * force the app into Persian / English with proper RTL / LTR layout
+ * on next app launch (AppCompatDelegate.setApplicationLocales is
+ * applied at Application.onCreate).
+ */
+enum class UiLang { AUTO, FA, EN }
+
 data class MhrvConfig(
     val listenHost: String = "127.0.0.1",
     val listenPort: Int = 8080,
@@ -35,6 +77,17 @@ data class MhrvConfig(
     val logLevel: String = "info",
     val parallelRelay: Int = 1,
     val upstreamSocks5: String = "",
+
+    /** VPN_TUN (everything routed) vs PROXY_ONLY (user configures per-app). */
+    val connectionMode: ConnectionMode = ConnectionMode.VPN_TUN,
+
+    /** ALL / ONLY / EXCEPT — scope of app splitting inside VPN_TUN mode. */
+    val splitMode: SplitMode = SplitMode.ALL,
+    /** Package names used by ONLY and EXCEPT. Empty under ALL. */
+    val splitApps: List<String> = emptyList(),
+
+    /** UI language toggle. Non-Rust; honoured only by the Android wrapper. */
+    val uiLang: UiLang = UiLang.AUTO,
 ) {
     /**
      * Extract just the deployment ID from either a full
@@ -103,6 +156,28 @@ data class MhrvConfig(
             // who need it can do that on the desktop UI and paste the IP.
             put("fetch_ips_from_api", false)
             put("max_ips_to_scan", 20)
+
+            // Android-only: surfaced in the UI dropdown. The Rust side
+            // doesn't read this key (serde ignores unknown fields), which
+            // is intentional — proxy-vs-TUN is a service-layer decision
+            // that belongs to the Android wrapper, not the crate.
+            put("connection_mode", when (connectionMode) {
+                ConnectionMode.VPN_TUN -> "vpn_tun"
+                ConnectionMode.PROXY_ONLY -> "proxy_only"
+            })
+            put("split_mode", when (splitMode) {
+                SplitMode.ALL -> "all"
+                SplitMode.ONLY -> "only"
+                SplitMode.EXCEPT -> "except"
+            })
+            if (splitApps.isNotEmpty()) {
+                put("split_apps", JSONArray().apply { splitApps.forEach { put(it) } })
+            }
+            put("ui_lang", when (uiLang) {
+                UiLang.AUTO -> "auto"
+                UiLang.FA -> "fa"
+                UiLang.EN -> "en"
+            })
         }
         return obj.toString(2)
     }
@@ -146,6 +221,23 @@ object ConfigStore {
                 logLevel = obj.optString("log_level", "info"),
                 parallelRelay = obj.optInt("parallel_relay", 1),
                 upstreamSocks5 = obj.optString("upstream_socks5", ""),
+                connectionMode = when (obj.optString("connection_mode", "vpn_tun")) {
+                    "proxy_only" -> ConnectionMode.PROXY_ONLY
+                    else -> ConnectionMode.VPN_TUN  // default for unknown/missing
+                },
+                splitMode = when (obj.optString("split_mode", "all")) {
+                    "only" -> SplitMode.ONLY
+                    "except" -> SplitMode.EXCEPT
+                    else -> SplitMode.ALL
+                },
+                splitApps = obj.optJSONArray("split_apps")?.let { arr ->
+                    buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }
+                }?.filter { it.isNotBlank() }.orEmpty(),
+                uiLang = when (obj.optString("ui_lang", "auto")) {
+                    "fa" -> UiLang.FA
+                    "en" -> UiLang.EN
+                    else -> UiLang.AUTO
+                },
             )
         } catch (_: Throwable) {
             MhrvConfig()

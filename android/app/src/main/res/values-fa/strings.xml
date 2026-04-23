@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">mhrv-rs</string>
+
+    <!-- Top-bar -->
+    <string name="tb_check_update_checking">در حال بررسی…</string>
+    <string name="tb_version_prefix">نسخهٔ </string>
+
+    <!-- Section headers -->
+    <string name="sec_apps_script_relay">رلهٔ Apps Script</string>
+    <string name="sec_network">شبکه</string>
+    <string name="sec_sni_pool_tester">مجموعهٔ SNI + تستر</string>
+    <string name="sec_advanced">پیشرفته</string>
+    <string name="sec_live_logs">لاگ زنده</string>
+    <string name="sec_how_to_use">راهنمای استفاده</string>
+    <string name="sec_app_splitting">تقسیم برنامه‌ها</string>
+
+    <!-- Primary actions -->
+    <string name="btn_connect">اتصال</string>
+    <string name="btn_disconnect">قطع</string>
+    <string name="btn_install_mitm">نصب گواهی MITM</string>
+    <string name="btn_auto_detect_google_ip">تشخیص خودکار google_ip</string>
+    <string name="btn_test_all">تست همه</string>
+    <string name="btn_test">تست</string>
+    <string name="btn_add">افزودن</string>
+    <string name="btn_clear">پاک</string>
+    <string name="btn_install">نصب</string>
+    <string name="btn_cancel">انصراف</string>
+
+    <!-- Field labels -->
+    <string name="field_deployment_urls">آدرس‌(های) Deployment یا Script ID</string>
+    <string name="field_auth_key">کلید احراز (auth_key)</string>
+    <string name="field_google_ip">google_ip</string>
+    <string name="field_front_domain">دامنهٔ فرانت</string>
+    <string name="field_connection_mode">نوع اتصال</string>
+    <string name="field_add_custom_sni">افزودن SNI سفارشی</string>
+
+    <!-- Connection mode -->
+    <string name="mode_vpn_tun">VPN (TUN) — همهٔ برنامه‌ها رد می‌شوند</string>
+    <string name="mode_proxy_only">فقط پروکسی — تنظیم per-app توسط کاربر</string>
+
+    <!-- App splitting -->
+    <string name="split_all">همهٔ برنامه‌ها</string>
+    <string name="split_only">فقط برنامه‌های انتخاب‌شده</string>
+    <string name="split_except">همه به‌جز برنامه‌های انتخاب‌شده</string>
+    <string name="split_pick_apps">انتخاب برنامه‌ها…</string>
+
+    <!-- Install dialog title -->
+    <string name="dialog_install_mitm_title">نصب گواهی MITM؟</string>
+
+    <!-- Language toggle -->
+    <string name="lang_toggle_cd">تغییر زبان</string>
+
+    <!-- Supporting / helper text -->
+    <string name="help_deployment_urls">یکی در هر خط. می‌توانید URL کامل (https://script.google.com/macros/s/.../exec) یا فقط ID خام بگذارید — ترکیبی هم قبول است. چند ID به‌صورت چرخشی (round-robin) استفاده می‌شوند.</string>
+    <string name="help_auth_key">همان رمز مشترکی که داخل Apps Script گذاشتید.</string>
+    <string name="help_mode_vpn_tun">هنگام اتصال، مجوز VPN سیستم درخواست می‌شود. تمام ترافیک دستگاه به‌صورت خودکار رد می‌شود.</string>
+    <string name="help_mode_proxy_only">بدون VPN سیستم. بعد از اتصال، پروکسی Wi-Fi را روی 127.0.0.1:%1$d (HTTP) یا %2$d (SOCKS5) تنظیم کنید. فقط برنامه‌هایی که تنظیمات پروکسی را رعایت می‌کنند رد می‌شوند.</string>
+    <string name="help_sni_pool">SNIهای فعال‌شده هنگام اتصال به google_ip به‌صورت چرخشی استفاده می‌شوند. اگر همه را غیرفعال بگذارید، Rust خودکار مجموعهٔ پیش‌فرض گوگل را باز می‌کند.</string>
+    <string name="help_app_splitting">انتخاب کنید چه برنامه‌هایی از VPN استفاده کنند. فقط در حالت VPN (TUN) اعمال می‌شود. برنامهٔ خودمان همیشه مستثنی است تا ترافیک خودش دوباره از تونل رد نشود.</string>
+
+    <!-- SNI pool extras -->
+    <string name="sni_selected_count">%1$d برنامه انتخاب شده</string>
+
+    <!-- Advanced section -->
+    <string name="adv_verify_tls">بررسی TLS طرف مقابل</string>
+    <string name="adv_verify_tls_help">خاموش کردن، بررسی گواهی را برای لبهٔ گوگل غیرفعال می‌کند. فقط برای اشکال‌زدایی کاربرد دارد.</string>
+    <string name="adv_log_level">log_level</string>
+    <string name="adv_parallel_relay">parallel_relay: %1$d</string>
+    <string name="adv_parallel_relay_help">تعداد درخواست‌های موازی هر بار. ۱ عادی است؛ روی لینک‌های با افت، ۲-۳ را امتحان کنید.</string>
+    <string name="adv_upstream_socks5">upstream_socks5 (اختیاری)</string>
+    <string name="adv_upstream_socks5_help">اگر تنظیم شود، ترافیک خروجی از این SOCKS5 رد می‌شود. خالی بگذارید برای اتصال مستقیم.</string>
+
+    <!-- Live logs -->
+    <string name="logs_lines_count">%1$d خط</string>
+
+    <!-- Snackbar -->
+    <string name="snack_google_ip_updated">google_ip به %1$s به‌روزرسانی شد</string>
+    <string name="snack_google_ip_current">google_ip قبلاً به‌روز است (%1$s)</string>
+    <string name="snack_dns_lookup_failed">خطای DNS — اتصال شبکه را بررسی کنید</string>
+</resources>

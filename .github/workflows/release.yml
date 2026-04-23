@@ -44,8 +44,24 @@ jobs:
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             name: mhrv-rs-linux-musl-arm64
+          # OpenWRT MT7621 (soft-float mipsel 32-bit). Dozens of cheap
+          # home routers run this chipset and they *specifically* need
+          # the soft-float variant — MT7621 has no hardware FPU and a
+          # hard-float binary segfaults on the first fp op. Tier-3 in
+          # Rust since 1.72; we build it via messense's musl-cross
+          # docker image which still has a mipsel-softfloat toolchain.
+          # `continue-on-error: true` so a regression here doesn't block
+          # the rest of the release. Issue #26.
+          - target: mipsel-unknown-linux-musl
+            os: ubuntu-latest
+            name: mhrv-rs-openwrt-mipsel-softfloat
+            mipsel_softfloat: true
 
     runs-on: ${{ matrix.os }}
+    # mipsel-softfloat is best-effort: the Rust tier-3 target occasionally
+    # regresses. Letting it fail keeps the main release going so
+    # desktop/Android users aren't blocked by MT7621 router support.
+    continue-on-error: ${{ matrix.mipsel_softfloat == true }}
 
     steps:
       - uses: actions/checkout@v4
@@ -123,6 +139,23 @@ jobs:
           docker run --rm -v "$PWD":/src -w /src \
             messense/rust-musl-cross:aarch64-musl \
             cargo build --release --target aarch64-unknown-linux-musl --bin mhrv-rs
+          sudo chown -R "$(id -u):$(id -g)" target
+
+      # OpenWRT MT7621 / mipsel-softfloat. The messense image tag
+      # `mipsel-musl-softfloat` ships a toolchain that emits soft-float
+      # insn exclusively — matches the MT7621's FPU-less reality.
+      # Requires Rust nightly + -Z build-std because mipsel is tier 3
+      # in the stable channel, which means no pre-built std.
+      - name: Build CLI (mipsel-softfloat via docker)
+        if: matrix.target == 'mipsel-unknown-linux-musl' && matrix.mipsel_softfloat == true
+        run: |
+          docker run --rm -v "$PWD":/src -w /src \
+            messense/rust-musl-cross:mipsel-musl-softfloat \
+            sh -c "rustup toolchain install nightly --profile minimal --component rust-src && \
+                   cargo +nightly build --release \
+                     -Z build-std=std,panic_abort \
+                     --target mipsel-unknown-linux-musl \
+                     --bin mhrv-rs"
           sudo chown -R "$(id -u):$(id -g)" target
 
       # UI build: we try to build the UI binary on every platform. If it fails

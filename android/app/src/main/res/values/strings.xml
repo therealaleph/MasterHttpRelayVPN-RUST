@@ -1,4 +1,81 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">mhrv-rs</string>
+
+    <!-- Top-bar -->
+    <string name="tb_check_update_checking">checking…</string>
+    <string name="tb_version_prefix">v</string>
+
+    <!-- Section headers -->
+    <string name="sec_apps_script_relay">Apps Script relay</string>
+    <string name="sec_network">Network</string>
+    <string name="sec_sni_pool_tester">SNI pool + tester</string>
+    <string name="sec_advanced">Advanced</string>
+    <string name="sec_live_logs">Live logs</string>
+    <string name="sec_how_to_use">How to use</string>
+    <string name="sec_app_splitting">App splitting</string>
+
+    <!-- Primary actions -->
+    <string name="btn_connect">Connect</string>
+    <string name="btn_disconnect">Disconnect</string>
+    <string name="btn_install_mitm">Install MITM certificate</string>
+    <string name="btn_auto_detect_google_ip">Auto-detect google_ip</string>
+    <string name="btn_test_all">Test all</string>
+    <string name="btn_test">Test</string>
+    <string name="btn_add">Add</string>
+    <string name="btn_clear">Clear</string>
+    <string name="btn_install">Install</string>
+    <string name="btn_cancel">Cancel</string>
+
+    <!-- Field labels -->
+    <string name="field_deployment_urls">Deployment URL(s) or script ID(s)</string>
+    <string name="field_auth_key">auth_key</string>
+    <string name="field_google_ip">google_ip</string>
+    <string name="field_front_domain">front_domain</string>
+    <string name="field_connection_mode">Connection mode</string>
+    <string name="field_add_custom_sni">Add custom SNI</string>
+
+    <!-- Connection mode -->
+    <string name="mode_vpn_tun">VPN (TUN) — routes every app</string>
+    <string name="mode_proxy_only">Proxy only — configure per-app</string>
+
+    <!-- App splitting -->
+    <string name="split_all">All apps</string>
+    <string name="split_only">Only selected apps</string>
+    <string name="split_except">All except selected</string>
+    <string name="split_pick_apps">Pick apps…</string>
+
+    <!-- Install dialog title -->
+    <string name="dialog_install_mitm_title">Install MITM certificate?</string>
+
+    <!-- Language toggle -->
+    <string name="lang_toggle_cd">Switch language</string>
+
+    <!-- Supporting / helper text -->
+    <string name="help_deployment_urls">One per line. Full URLs (https://script.google.com/macros/s/.../exec) or bare IDs — mix as you like. Multiple IDs are rotated round-robin.</string>
+    <string name="help_auth_key">The shared secret you set in the Apps Script.</string>
+    <string name="help_mode_vpn_tun">Requests the OS VPN grant on Connect. All device traffic is routed automatically.</string>
+    <string name="help_mode_proxy_only">No OS VPN. Set your Wi-Fi proxy to 127.0.0.1:%1$d (HTTP) or %2$d (SOCKS5) after Connect. Only apps that honour the proxy settings will tunnel.</string>
+    <string name="help_sni_pool">Enabled SNIs are rotated when connecting to google_ip. Leaving all unchecked lets Rust auto-expand the default Google pool.</string>
+    <string name="help_app_splitting">Choose which apps go through the VPN. Only applies in VPN (TUN) mode. Our own app is always excluded to avoid routing its own traffic back through the tunnel.</string>
+
+    <!-- SNI pool extras -->
+    <string name="sni_selected_count">%1$d app(s) selected</string>
+
+    <!-- Advanced section -->
+    <string name="adv_verify_tls">Verify upstream TLS</string>
+    <string name="adv_verify_tls_help">Off disables cert checks for the Google edge. Only useful for debugging.</string>
+    <string name="adv_log_level">log_level</string>
+    <string name="adv_parallel_relay">parallel_relay: %1$d</string>
+    <string name="adv_parallel_relay_help">Fan-out per request. 1 is normal; bump to 2-3 on lossy links.</string>
+    <string name="adv_upstream_socks5">upstream_socks5 (optional)</string>
+    <string name="adv_upstream_socks5_help">If set, route upstream via this SOCKS5. Leave blank for direct.</string>
+
+    <!-- Live logs -->
+    <string name="logs_lines_count">%1$d lines</string>
+
+    <!-- Snackbar -->
+    <string name="snack_google_ip_updated">google_ip updated to %1$s</string>
+    <string name="snack_google_ip_current">google_ip already current (%1$s)</string>
+    <string name="snack_dns_lookup_failed">DNS lookup failed — check network</string>
 </resources>

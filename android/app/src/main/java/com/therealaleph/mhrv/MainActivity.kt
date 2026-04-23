@@ -7,9 +7,12 @@ import android.content.pm.PackageManager
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
-import androidx.activity.ComponentActivity
+import android.content.Context
+import android.content.res.Configuration
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.appcompat.app.AppCompatActivity
+import java.util.Locale
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -22,7 +25,41 @@ import com.therealaleph.mhrv.ui.CaInstallOutcome
 import com.therealaleph.mhrv.ui.HomeScreen
 import com.therealaleph.mhrv.ui.theme.MhrvTheme
 
-class MainActivity : ComponentActivity() {
+// UiLang is in the outer package namespace already.
+
+
+// AppCompatActivity (not plain ComponentActivity) because it's what picks
+// up AppCompatDelegate.setApplicationLocales() and swaps per-activity
+// Configuration + LayoutDirection on recreate(). Compose works fine on
+// top — setContent / rememberLauncherForActivityResult live on
+// ComponentActivity and AppCompatActivity inherits from it.
+class MainActivity : AppCompatActivity() {
+
+    override fun attachBaseContext(newBase: Context) {
+        // Force the persisted ui_lang into the Activity's Configuration
+        // before it's constructed. AppCompatDelegate.setApplicationLocales
+        // schedules a locale change but only takes effect on the NEXT
+        // process, so on cold start with a saved preference the activity
+        // would render in the device-default locale until recreate().
+        // Overriding attachBaseContext wraps `newBase` with the correct
+        // locale at the earliest possible moment — what AppCompat did
+        // internally before the setApplicationLocales API existed. This
+        // path is reliable across all Android versions we support.
+        val cfg = ConfigStore.load(newBase)
+        val tag = when (cfg.uiLang) {
+            UiLang.FA -> "fa"
+            UiLang.EN -> "en"
+            UiLang.AUTO -> null
+        }
+        val wrapped = if (tag != null) {
+            val config = Configuration(newBase.resources.configuration)
+            val locale = Locale.forLanguageTag(tag)
+            Locale.setDefault(locale)
+            config.setLocale(locale)
+            newBase.createConfigurationContext(config)
+        } else newBase
+        super.attachBaseContext(wrapped)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -100,11 +137,21 @@ class MainActivity : ComponentActivity() {
             // auto-resolve (it uses the same persist() flow the UI uses
             // for text-field edits, so there's one source of truth).
             onStart = {
-                val prepareIntent = VpnService.prepare(this)
-                if (prepareIntent == null) {
-                    startVpnService()
+                // Only ask for the VPN-consent grant when the user has
+                // opted into VPN_TUN mode. In PROXY_ONLY we don't touch
+                // VpnService.prepare — firing the consent dialog there
+                // would be wrong (user said "no VPN") and MhrvVpnService
+                // wouldn't call establish() anyway.
+                val cfg = ConfigStore.load(this)
+                if (cfg.connectionMode == ConnectionMode.VPN_TUN) {
+                    val prepareIntent = VpnService.prepare(this)
+                    if (prepareIntent == null) {
+                        startVpnService()
+                    } else {
+                        vpnPrepareLauncher.launch(prepareIntent)
+                    }
                 } else {
-                    vpnPrepareLauncher.launch(prepareIntent)
+                    startVpnService()
                 }
             },
             onStop = {
@@ -157,6 +204,29 @@ class MainActivity : ComponentActivity() {
             },
             caOutcome = caOutcome,
             onCaOutcomeConsumed = { caOutcome = null },
+            onLangChange = { lang ->
+                // Re-apply the new locale to the running process. AppCompatDelegate
+                // picks it up from MhrvApp.onCreate on process restart, so we
+                // recreate() the activity to take effect immediately — otherwise
+                // the user would have to swipe the app away and reopen it for
+                // RTL/LTR to swap.
+                val tag = when (lang) {
+                    UiLang.FA -> "fa"
+                    UiLang.EN -> "en"
+                    UiLang.AUTO -> ""
+                }
+                androidx.appcompat.app.AppCompatDelegate.setApplicationLocales(
+                    if (tag.isEmpty())
+                        androidx.core.os.LocaleListCompat.getEmptyLocaleList()
+                    else
+                        androidx.core.os.LocaleListCompat.forLanguageTags(tag),
+                )
+                // AppCompatDelegate triggers recreate internally on API 33+
+                // via the per-app language OS setting, but on older API
+                // levels it doesn't — call it explicitly for consistent
+                // behaviour across the minSdk=24 range.
+                recreate()
+            },
         )
     }
 

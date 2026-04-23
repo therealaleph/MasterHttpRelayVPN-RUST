@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Declares the locales this app ships translations for. On API 33+ this
+  file is what enables Android's per-app language Settings entry and
+  what AppCompatDelegate.setApplicationLocales() reconciles against;
+  locales NOT listed here are silently dropped from the UI preference.
+-->
+<locale-config xmlns:android="http://schemas.android.com/apk/res/android">
+    <locale android:name="en" />
+    <locale android:name="fa" />
+</locale-config>
