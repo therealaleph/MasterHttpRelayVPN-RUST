@@ -990,8 +990,11 @@ fn parse_content_range(headers: &[(String, String)]) -> Option<ContentRange> {
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("content-range"))?;
     let value = cr.1.trim();
-    let rest = value.strip_prefix("bytes ")?;
-    let (range, total) = rest.split_once('/')?;
+    let (unit, rest) = value.split_once(' ')?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+    let (range, total) = rest.trim_start().split_once('/')?;
     let (start, end) = range.split_once('-')?;
     let start = start.trim().parse::<u64>().ok()?;
     let end = end.trim().parse::<u64>().ok()?;
@@ -1838,6 +1841,12 @@ mod tests {
         assert!(s.contains("Content-Type: text/plain\r\n"));
         assert!(s.contains("Content-Length: 5\r\n"));
         assert!(s.ends_with("Hello"));
+    }
+
+    #[test]
+    fn parse_content_range_total_accepts_mixed_case_unit() {
+        let headers = vec![("Content-Range".to_string(), "Bytes 0-4/20".to_string())];
+        assert_eq!(parse_content_range_total(&headers), Some(20));
     }
 
     #[test]
