@@ -407,6 +407,19 @@ async fn handle_socks5_client(
 
 // ---------- Smart dispatch (used by both HTTP CONNECT and SOCKS5) ----------
 
+fn should_use_sni_rewrite(
+    hosts: &std::collections::HashMap<String, String>,
+    host: &str,
+    port: u16,
+) -> bool {
+    // The SNI-rewrite path expects TLS from the client: it accepts inbound
+    // TLS, then opens a second TLS connection to the Google edge with a front
+    // SNI. Auto-forcing that path for non-TLS ports (for example a SOCKS5
+    // CONNECT to google.com:80) makes the proxy wait for a ClientHello that
+    // will never arrive.
+    port == 443 && (matches_sni_rewrite(host) || hosts_override(hosts, host).is_some())
+}
+
 async fn dispatch_tunnel(
     sock: TcpStream,
     host: String,
@@ -415,8 +428,9 @@ async fn dispatch_tunnel(
     mitm: Arc<Mutex<MitmCertManager>>,
     rewrite_ctx: Arc<RewriteCtx>,
 ) -> std::io::Result<()> {
-    // 1. Explicit hosts override or SNI-rewrite suffix: always use the tunnel.
-    if matches_sni_rewrite(&host) || hosts_override(&rewrite_ctx.hosts, &host).is_some() {
+    // 1. Explicit hosts override or SNI-rewrite suffix: for HTTPS targets,
+    //    always use the TLS SNI-rewrite tunnel.
+    if should_use_sni_rewrite(&rewrite_ctx.hosts, &host, port) {
         tracing::info!("dispatch {}:{} -> sni-rewrite tunnel (Google edge direct)", host, port);
         return do_sni_rewrite_tunnel_from_tcp(sock, &host, port, mitm, rewrite_ctx).await;
     }
@@ -1360,4 +1374,14 @@ mod tests {
         assert_eq!(body, b"hello");
     }
 
+    #[test]
+    fn sni_rewrite_is_only_for_port_443() {
+        let mut hosts = std::collections::HashMap::new();
+        hosts.insert("example.com".to_string(), "1.2.3.4".to_string());
+
+        assert!(should_use_sni_rewrite(&hosts, "google.com", 443));
+        assert!(!should_use_sni_rewrite(&hosts, "google.com", 80));
+        assert!(should_use_sni_rewrite(&hosts, "www.example.com", 443));
+        assert!(!should_use_sni_rewrite(&hosts, "www.example.com", 80));
+    }
 }
