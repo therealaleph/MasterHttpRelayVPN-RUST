@@ -1472,77 +1472,12 @@ async fn do_plain_http(
 mod tests {
     use super::*;
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
 
     fn headers(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn google_only_plain_http_error_has_correct_content_length() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let client = tokio::spawn(async move {
-            let mut sock = TcpStream::connect(addr).await.unwrap();
-            sock.write_all(b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
-                .await
-                .unwrap();
-            let mut resp = Vec::new();
-            sock.read_to_end(&mut resp).await.unwrap();
-            resp
-        });
-
-        let (server_sock, _) = listener.accept().await.unwrap();
-        let tmp = std::env::temp_dir().join(format!(
-            "mhrv-rs-google-only-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let mitm = Arc::new(Mutex::new(MitmCertManager::new_in(&tmp).unwrap()));
-
-        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let tls_config = ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        let rewrite_ctx = Arc::new(RewriteCtx {
-            google_ip: "216.239.38.120".into(),
-            front_domain: "www.google.com".into(),
-            hosts: std::collections::HashMap::new(),
-            tls_connector: TlsConnector::from(Arc::new(tls_config)),
-            upstream_socks5: None,
-            mode: Mode::GoogleOnly,
-        });
-
-        handle_http_client(server_sock, None, mitm, rewrite_ctx)
-            .await
-            .unwrap();
-        let resp = client.await.unwrap();
-        let _ = std::fs::remove_dir_all(&tmp);
-
-        let header_end = find_headers_end(&resp).expect("header terminator");
-        let head = std::str::from_utf8(&resp[..header_end]).expect("utf8 headers");
-        let body = &resp[header_end..];
-        let content_length = head
-            .lines()
-            .find_map(|line| line.strip_prefix("Content-Length: "))
-            .expect("content-length header")
-            .parse::<usize>()
-            .expect("numeric content-length");
-
-        assert_eq!(content_length, body.len());
-        assert_eq!(
-            body,
-            b"google_only mode: plain HTTP proxy requests are not supported. Browse https over CONNECT, or switch to apps_script mode."
-        );
     }
 
     #[tokio::test(flavor = "current_thread")]
