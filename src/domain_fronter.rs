@@ -1014,7 +1014,9 @@ where
             let n = timeout(Duration::from_secs(20), stream.read(&mut tmp[..want])).await
                 .map_err(|_| FronterError::Timeout)??;
             if n == 0 {
-                break;
+                return Err(FronterError::BadResponse(
+                    "connection closed before full response body".into(),
+                ));
             }
             body.extend_from_slice(&tmp[..n]);
         }
@@ -1563,5 +1565,23 @@ mod tests {
         let (status2, _headers2, body2) = read_http_response(&mut server).await.unwrap();
         assert_eq!(status2, 200);
         assert_eq!(body2, b"OK");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn content_length_reader_rejects_truncated_body() {
+        let (mut client, mut server) = duplex(1024);
+        client
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHel")
+            .await
+            .unwrap();
+        drop(client);
+
+        let err = read_http_response(&mut server).await.unwrap_err();
+        match err {
+            FronterError::BadResponse(msg) => {
+                assert!(msg.contains("full response body"), "unexpected error: {}", msg);
+            }
+            other => panic!("unexpected error: {}", other),
+        }
     }
 }
