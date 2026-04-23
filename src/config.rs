@@ -127,6 +127,23 @@ pub struct Config {
     /// features. Turn on and observe.
     #[serde(default)]
     pub normalize_x_graphql: bool,
+
+    /// Route YouTube traffic through the Apps Script relay instead of
+    /// the direct SNI-rewrite tunnel. Ported from upstream Python
+    /// `youtube_via_relay` (issue #102).
+    ///
+    /// Why this exists: when YouTube is SNI-rewritten to `google_ip`
+    /// with `SNI=www.google.com`, Google's frontend can enforce
+    /// SafeSearch / Restricted Mode based on the SNI → some videos show
+    /// as "restricted." Routing through Apps Script bypasses that check
+    /// (it hits YouTube from Google's own backend, not via www.google.com
+    /// SNI) but introduces the UrlFetchApp User-Agent and quota costs.
+    ///
+    /// Trade-off: enabling removes SafeSearch-on-SNI, adds `User-Agent:
+    /// Google-Apps-Script` header and counts YouTube traffic against
+    /// your Apps Script quota. Off by default.
+    #[serde(default)]
+    pub youtube_via_relay: bool,
 }
 
 fn default_fetch_ips_from_api() -> bool { false }

@@ -67,11 +67,27 @@ const SNI_REWRITE_SUFFIXES: &[&str] = &[
     "blogger.com",
 ];
 
-fn matches_sni_rewrite(host: &str) -> bool {
+/// YouTube-family suffixes. Extracted so `youtube_via_relay` config can
+/// pull them out of the SNI-rewrite dispatch at runtime.
+const YOUTUBE_SNI_SUFFIXES: &[&str] = &[
+    "youtube.com",
+    "youtu.be",
+    "youtube-nocookie.com",
+    "ytimg.com",
+];
+
+fn matches_sni_rewrite(host: &str, youtube_via_relay: bool) -> bool {
     let h = host.to_ascii_lowercase();
     let h = h.trim_end_matches('.');
     SNI_REWRITE_SUFFIXES
         .iter()
+        .filter(|s| {
+            // If the user opted into youtube_via_relay, skip YouTube
+            // suffixes so they fall through to the Apps Script relay
+            // path. See config.rs `youtube_via_relay` docs for the
+            // trade-off. Issue #102.
+            !(youtube_via_relay && YOUTUBE_SNI_SUFFIXES.contains(s))
+        })
         .any(|s| h == *s || h.ends_with(&format!(".{}", s)))
 }
 
@@ -118,6 +134,10 @@ pub struct RewriteCtx {
     pub tls_connector: TlsConnector,
     pub upstream_socks5: Option<String>,
     pub mode: Mode,
+    /// If true, YouTube traffic bypasses the SNI-rewrite tunnel and
+    /// goes through the Apps Script relay instead. See config.rs for
+    /// the trade-off. Issue #102.
+    pub youtube_via_relay: bool,
 }
 
 impl ProxyServer {
@@ -160,6 +180,7 @@ impl ProxyServer {
             tls_connector,
             upstream_socks5: config.upstream_socks5.clone(),
             mode,
+            youtube_via_relay: config.youtube_via_relay,
         });
 
         let socks5_port = config.socks5_port.unwrap_or(config.listen_port + 1);
@@ -473,13 +494,20 @@ fn should_use_sni_rewrite(
     hosts: &std::collections::HashMap<String, String>,
     host: &str,
     port: u16,
+    youtube_via_relay: bool,
 ) -> bool {
     // The SNI-rewrite path expects TLS from the client: it accepts inbound
     // TLS, then opens a second TLS connection to the Google edge with a front
     // SNI. Auto-forcing that path for non-TLS ports (for example a SOCKS5
     // CONNECT to google.com:80) makes the proxy wait for a ClientHello that
     // will never arrive.
-    port == 443 && (matches_sni_rewrite(host) || hosts_override(hosts, host).is_some())
+    //
+    // youtube_via_relay=true removes YouTube suffixes from the match so
+    // YouTube traffic falls through to the Apps Script relay path instead
+    // of the SNI-rewrite tunnel. An explicit hosts override still wins
+    // over the config toggle.
+    port == 443
+        && (matches_sni_rewrite(host, youtube_via_relay) || hosts_override(hosts, host).is_some())
 }
 
 async fn dispatch_tunnel(
@@ -492,7 +520,12 @@ async fn dispatch_tunnel(
 ) -> std::io::Result<()> {
     // 1. Explicit hosts override or SNI-rewrite suffix: for HTTPS targets,
     //    always use the TLS SNI-rewrite tunnel.
-    if should_use_sni_rewrite(&rewrite_ctx.hosts, &host, port) {
+    if should_use_sni_rewrite(
+        &rewrite_ctx.hosts,
+        &host,
+        port,
+        rewrite_ctx.youtube_via_relay,
+    ) {
         tracing::info!("dispatch {}:{} -> sni-rewrite tunnel (Google edge direct)", host, port);
         return do_sni_rewrite_tunnel_from_tcp(sock, &host, port, mitm, rewrite_ctx).await;
     }
@@ -1537,9 +1570,42 @@ mod tests {
         let mut hosts = std::collections::HashMap::new();
         hosts.insert("example.com".to_string(), "1.2.3.4".to_string());
 
-        assert!(should_use_sni_rewrite(&hosts, "google.com", 443));
-        assert!(!should_use_sni_rewrite(&hosts, "google.com", 80));
-        assert!(should_use_sni_rewrite(&hosts, "www.example.com", 443));
-        assert!(!should_use_sni_rewrite(&hosts, "www.example.com", 80));
+        assert!(should_use_sni_rewrite(&hosts, "google.com", 443, false));
+        assert!(!should_use_sni_rewrite(&hosts, "google.com", 80, false));
+        assert!(should_use_sni_rewrite(&hosts, "www.example.com", 443, false));
+        assert!(!should_use_sni_rewrite(&hosts, "www.example.com", 80, false));
+    }
+
+    #[test]
+    fn youtube_via_relay_routes_youtube_through_relay_path() {
+        // Issue #102. When youtube_via_relay=true, YouTube suffixes
+        // must NOT match the SNI-rewrite path, so traffic falls
+        // through to Apps Script relay. Other Google suffixes are
+        // unaffected.
+        let hosts = std::collections::HashMap::new();
+
+        // Default behaviour: everything in the pool rewrites.
+        assert!(should_use_sni_rewrite(&hosts, "www.youtube.com", 443, false));
+        assert!(should_use_sni_rewrite(&hosts, "i.ytimg.com", 443, false));
+        assert!(should_use_sni_rewrite(&hosts, "youtu.be", 443, false));
+        assert!(should_use_sni_rewrite(&hosts, "www.google.com", 443, false));
+
+        // With the toggle on: YouTube opts out, Google stays.
+        assert!(!should_use_sni_rewrite(&hosts, "www.youtube.com", 443, true));
+        assert!(!should_use_sni_rewrite(&hosts, "i.ytimg.com", 443, true));
+        assert!(!should_use_sni_rewrite(&hosts, "youtu.be", 443, true));
+        assert!(should_use_sni_rewrite(&hosts, "www.google.com", 443, true));
+        assert!(should_use_sni_rewrite(&hosts, "fonts.gstatic.com", 443, true));
+    }
+
+    #[test]
+    fn hosts_override_beats_youtube_via_relay() {
+        // If the user added an explicit hosts override for a YouTube
+        // subdomain, it should win — the override is a deliberate
+        // user choice, the toggle is a default policy.
+        let mut hosts = std::collections::HashMap::new();
+        hosts.insert("rr4.googlevideo.com".to_string(), "1.2.3.4".to_string());
+
+        assert!(should_use_sni_rewrite(&hosts, "rr4.googlevideo.com", 443, true));
     }
 }
