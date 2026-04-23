@@ -454,7 +454,15 @@ impl DomainFronter {
             url
         };
 
-        let coalescible = is_cacheable_method(method) && body.is_empty();
+        // Range requests are partial-content responses; caching or
+        // coalescing them against a non-range key would be catastrophic
+        // (wrong bytes for the wrong consumer). The range-parallel
+        // downloader calls `relay()` concurrently with N different Range
+        // headers for the same URL, and absolutely needs each call to go
+        // to the relay independently. Simplest correct answer: if any
+        // Range header is present, skip cache and coalesce entirely.
+        let has_range = headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("range"));
+        let coalescible = is_cacheable_method(method) && body.is_empty() && !has_range;
         let key = if coalescible { Some(cache_key(method, url)) } else { None };
         let t_start = Instant::now();
 
@@ -505,6 +513,146 @@ impl DomainFronter {
 
         self.record_site(url, false, bytes.len() as u64, t_start.elapsed().as_nanos() as u64);
         bytes
+    }
+
+    /// Range-parallel relay — the big difference between this port and
+    /// the upstream Python version. Apps Script's per-call cost is
+    /// ~flat (1-2s regardless of payload), so a 10MB single GET is
+    /// ~10s round-trip; the same 10MB sliced into 40 x 256KB chunks
+    /// and fetched 16-at-a-time is 3-4 round-trips, total ~6-8s, and
+    /// the client sees the first byte in 1-2s instead of 10. This is
+    /// what actually makes YouTube video playback viable through the
+    /// relay — without it, googlevideo.com chunks timeout or stall
+    /// while the player waits for the next 10s-away Apps Script call
+    /// to finish.
+    ///
+    /// Flow (mirrors upstream `relay_parallel`):
+    ///   1. For anything other than GET-without-body, defer to
+    ///      `relay()` — range requests on POSTs / PUTs aren't well
+    ///      defined, and the user-sent-Range-header case is handled
+    ///      by relay() already (we skip cache for it).
+    ///   2. Probe with `Range: bytes=0-<chunk-1>`.
+    ///   3. 200 back (origin doesn't support ranges) → return as-is.
+    ///   4. 206 back → parse Content-Range total. If the body fits in
+    ///      the first probe (total <= chunk or body >= total), rewrite
+    ///      the 206 to a 200 so the client — which never asked for a
+    ///      range — doesn't choke on a stray Partial Content. (x.com
+    ///      and Cloudflare turnstile in particular reject unsolicited
+    ///      206 on XHR/fetch.)
+    ///   5. Else: compute the remaining ranges, fetch them with
+    ///      bounded concurrency, stitch, return as 200.
+    ///
+    /// If any chunk fails after retries, we fall back to the probe's
+    /// single-chunk response as a graceful-degradation — better a
+    /// truncated video than a blank one.
+    pub async fn relay_parallel_range(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Vec<u8> {
+        const CHUNK: u64 = 256 * 1024;
+        const MAX_PARALLEL: usize = 16;
+
+        if method != "GET" || !body.is_empty() {
+            return self.relay(method, url, headers, body).await;
+        }
+        // If the client already sent a Range header, honour it as-is —
+        // don't second-guess a caller that knows what bytes they want.
+        if headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("range")) {
+            return self.relay(method, url, headers, body).await;
+        }
+
+        // Probe with the first chunk.
+        let mut probe_headers: Vec<(String, String)> = headers.to_vec();
+        probe_headers.push(("Range".into(), format!("bytes=0-{}", CHUNK - 1)));
+        let first = self.relay(method, url, &probe_headers, body).await;
+
+        let (status, resp_headers, resp_body) = match split_response(&first) {
+            Some(v) => v,
+            None => return first,
+        };
+
+        if status != 206 {
+            // Origin returned the whole thing (or an error). Either way,
+            // pass through.
+            return first;
+        }
+
+        let total = match parse_content_range_total(&resp_headers) {
+            Some(t) => t,
+            None => return rewrite_206_to_200(&first),
+        };
+
+        if total <= CHUNK || (resp_body.len() as u64) >= total {
+            return rewrite_206_to_200(&first);
+        }
+
+        // Plan remaining ranges after what the probe already returned.
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        let mut start = resp_body.len() as u64;
+        while start < total {
+            let end = (start + CHUNK - 1).min(total - 1);
+            ranges.push((start, end));
+            start = end + 1;
+        }
+
+        tracing::info!(
+            "range-parallel: {} bytes total, {} chunks remaining after probe, up to {} in flight",
+            total, ranges.len(), MAX_PARALLEL,
+        );
+
+        // Concurrent fetch with `buffered` — preserves input order
+        // (important for stitching) and caps in-flight count. Each task
+        // calls back into `relay()`, which already has retry + fan-out
+        // wiring on single-request granularity; we don't duplicate
+        // those here.
+        use futures_util::stream::{self, StreamExt};
+        let url_owned = url.to_string();
+        let base_headers = headers.to_vec();
+        let fetches = stream::iter(ranges.into_iter())
+            .map(|(s, e)| {
+                let url = url_owned.clone();
+                let mut h = base_headers.clone();
+                // Force a single Range header — if the caller's headers
+                // somehow already had one we wouldn't be here, but be
+                // defensive anyway.
+                h.retain(|(k, _)| !k.eq_ignore_ascii_case("range"));
+                h.push(("Range".into(), format!("bytes={}-{}", s, e)));
+                async move {
+                    let raw = self.relay("GET", &url, &h, &[]).await;
+                    split_response(&raw).map(|(_, _, b)| b.to_vec()).unwrap_or_default()
+                }
+            })
+            .buffered(MAX_PARALLEL)
+            .collect::<Vec<Vec<u8>>>()
+            .await;
+
+        // Stitch: probe body first, then the chunks in order.
+        let mut full = Vec::with_capacity(total as usize);
+        full.extend_from_slice(resp_body);
+        for chunk in &fetches {
+            full.extend_from_slice(chunk);
+        }
+
+        // If any chunk came back empty (relay failure) we've now got a
+        // short body. Better to ship the probe-only 200 than a silently
+        // truncated 200 — the player will display a clear error or
+        // retry, vs rendering half the movie and cutting.
+        if (full.len() as u64) < total {
+            tracing::warn!(
+                "range-parallel: stitched {}/{} bytes, some chunks failed; falling back to probe response",
+                full.len(), total,
+            );
+            return rewrite_206_to_200(&first);
+        }
+
+        // Build a 200 OK with Content-Length = full body length. Drop
+        // the Content-Range header (no longer applicable) and
+        // Transfer-Encoding/Content-Encoding (origin already decoded
+        // what we got; we ship plain bytes).
+        assemble_full_200(&resp_headers, &full)
     }
 
     async fn relay_uncoalesced(
@@ -779,6 +927,95 @@ impl DomainFronter {
 /// pattern the input is returned unchanged (as an owned String — the
 /// allocation is cheap on the slow path and keeps the caller's
 /// type-signature-juggling simple).
+// ─── HTTP response helpers used by relay_parallel_range ──────────────────
+
+/// Split an HTTP/1.x response blob into `(status, headers, body)`.
+/// Returns `None` if the buffer doesn't even have a status line + CRLFCRLF
+/// separator — the caller should then pass the bytes through unchanged.
+fn split_response(raw: &[u8]) -> Option<(u16, Vec<(String, String)>, &[u8])> {
+    // Locate end-of-headers.
+    let sep = b"\r\n\r\n";
+    let sep_pos = raw.windows(sep.len()).position(|w| w == sep)?;
+    let head = &raw[..sep_pos];
+    let body = &raw[sep_pos + sep.len()..];
+
+    let mut lines = head.split(|&b| b == b'\n');
+    let status_line = lines.next()?;
+    // Status line: "HTTP/1.1 206 Partial Content"
+    let status_line = std::str::from_utf8(status_line).ok()?.trim_end_matches('\r');
+    let mut parts = status_line.splitn(3, ' ');
+    let _version = parts.next()?;
+    let code = parts.next()?.parse::<u16>().ok()?;
+
+    let mut headers: Vec<(String, String)> = Vec::new();
+    for line in lines {
+        let line = std::str::from_utf8(line).ok()?.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            headers.push((k.trim().to_string(), v.trim().to_string()));
+        }
+    }
+
+    Some((code, headers, body))
+}
+
+/// Pull the total size out of a `Content-Range: bytes 0-NNN/TOTAL` header.
+fn parse_content_range_total(headers: &[(String, String)]) -> Option<u64> {
+    let cr = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-range"))?;
+    let slash = cr.1.rfind('/')?;
+    cr.1[slash + 1..].trim().parse::<u64>().ok()
+}
+
+/// Rewrite a 206 response to a 200 OK, dropping Content-Range and
+/// recomputing Content-Length. Used when we probed with a synthetic
+/// Range header but the client sent a plain GET — handing a 206 back to
+/// XHR/fetch code on some sites (x.com, Cloudflare Turnstile) makes them
+/// treat the response as aborted. Same rationale as the upstream Python
+/// `_rewrite_206_to_200`.
+fn rewrite_206_to_200(raw: &[u8]) -> Vec<u8> {
+    let (_status, headers, body) = match split_response(raw) {
+        Some(v) => v,
+        None => return raw.to_vec(),
+    };
+    assemble_full_200(&headers, body)
+}
+
+/// Build a complete `HTTP/1.1 200 OK` response with the given header
+/// set + body. Skips headers the caller shouldn't be forwarding
+/// verbatim (content-length/range/encoding, transfer-encoding, hop-by-hop
+/// wire-level stuff) — we set Content-Length from the body we're
+/// actually shipping.
+fn assemble_full_200(src_headers: &[(String, String)], body: &[u8]) -> Vec<u8> {
+    let skip = |k: &str| {
+        matches!(
+            k.to_ascii_lowercase().as_str(),
+            "content-length"
+                | "content-range"
+                | "content-encoding"
+                | "transfer-encoding"
+                | "connection"
+                | "keep-alive",
+        )
+    };
+    let mut out: Vec<u8> = b"HTTP/1.1 200 OK\r\n".to_vec();
+    for (k, v) in src_headers {
+        if skip(k) {
+            continue;
+        }
+        out.extend_from_slice(k.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(v.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+    out.extend_from_slice(body);
+    out
+}
+
 fn normalize_x_graphql_url(url: &str) -> String {
     // Split host from the rest. We accept both "x.com" and common legacy
     // forms; the Python patch only checks x.com so we do the same to be
