@@ -106,10 +106,19 @@ jobs:
       # `git clean -ffdx` wipes target/ between runs and every build is
       # cold. With it, warm builds are sub-minute even for the full
       # release profile.
+      #
+      # cache-bin: false is MANDATORY on our self-hosted runners. With
+      # the default (true), rust-cache aggressively prunes $CARGO_HOME/bin
+      # of binaries it didn't install via `cargo install`, including the
+      # `rustup` binary that cargo/rustc/etc. are symlinked to. The next
+      # job then hits "command not found" or a broken-symlink TOML parse
+      # error from a stale cargo. We want target/ + registry caching, NOT
+      # bin pruning. rustup is pre-installed on the runners anyway.
       - uses: Swatinem/rust-cache@v2
         if: matrix.mipsel_softfloat != true
         with:
           key: ${{ matrix.target }}
+          cache-bin: "false"
 
       # eframe needs a few system libs on Linux for window management, keyboard,
       # and OpenGL/X11/Wayland. Gated to GitHub-hosted runners only — the
@@ -343,9 +352,14 @@ jobs:
       # Cache cargo + target/ across Android release builds. Four cargo-ndk
       # release builds back-to-back with LTO is where the cold cost comes
       # from; rust-cache brings warm runs down to ~3–4 min from ~9 min cold.
+      # cache-bin: false — see the rationale on the matrix build job above.
+      # On top of that, `cargo-ndk` lives in /usr/local/bin/ on our runners
+      # (not $CARGO_HOME/bin), specifically so rust-cache's default bin
+      # pruning can't delete it.
       - uses: Swatinem/rust-cache@v2
         with:
           key: android-universal
+          cache-bin: "false"
           # cargo-ndk writes into `target/<android-triple>/release/`, all
           # four of which we want to cache.
           workspaces: |
