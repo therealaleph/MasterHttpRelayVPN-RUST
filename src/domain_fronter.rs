@@ -1311,10 +1311,16 @@ where
             let n = timeout(Duration::from_secs(20), stream.read(&mut tmp)).await
                 .map_err(|_| FronterError::Timeout)??;
             if n == 0 {
-                out.extend_from_slice(&buf[..buf.len().min(size)]);
-                return Ok(out);
+                return Err(FronterError::BadResponse(
+                    "connection closed mid-chunked response".into(),
+                ));
             }
             buf.extend_from_slice(&tmp[..n]);
+        }
+        if &buf[size..size + 2] != b"\r\n" {
+            return Err(FronterError::BadResponse(
+                "chunk missing trailing CRLF".into(),
+            ));
         }
         out.extend_from_slice(&buf[..size]);
         buf.drain(..size + 2);
@@ -1817,6 +1823,42 @@ mod tests {
         match err {
             FronterError::BadResponse(msg) => {
                 assert!(msg.contains("full response body"), "unexpected error: {}", msg);
+            }
+            other => panic!("unexpected error: {}", other),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn chunked_reader_rejects_truncated_chunk_body() {
+        let (mut client, mut server) = duplex(1024);
+        client
+            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nHel")
+            .await
+            .unwrap();
+        drop(client);
+
+        let err = read_http_response(&mut server).await.unwrap_err();
+        match err {
+            FronterError::BadResponse(msg) => {
+                assert!(msg.contains("mid-chunked"), "unexpected error: {}", msg);
+            }
+            other => panic!("unexpected error: {}", other),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn chunked_reader_rejects_missing_chunk_crlf() {
+        let (mut client, mut server) = duplex(1024);
+        client
+            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nHelloXX")
+            .await
+            .unwrap();
+        drop(client);
+
+        let err = read_http_response(&mut server).await.unwrap_err();
+        match err {
+            FronterError::BadResponse(msg) => {
+                assert!(msg.contains("trailing CRLF"), "unexpected error: {}", msg);
             }
             other => panic!("unexpected error: {}", other),
         }
