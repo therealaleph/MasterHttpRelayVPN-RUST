@@ -6,7 +6,14 @@
 //! 30 in-flight requests — matching the per-account Apps Script limit.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+// `AtomicU64` from `std::sync::atomic` requires hardware-backed 64-bit
+// atomics, which 32-bit MIPS (`mipsel-unknown-linux-musl` — our OpenWRT
+// router target) does not provide — the std type isn't even defined
+// there, so the build fails with `no AtomicU64 in sync::atomic`. We
+// already pull `portable-atomic` for `domain_fronter.rs` for the same
+// reason; reuse it here. `AtomicBool` works fine in std on every target.
+use portable_atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
