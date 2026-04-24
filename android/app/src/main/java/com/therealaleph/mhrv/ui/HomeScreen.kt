@@ -418,7 +418,6 @@ fun HomeScreen(
                 },
                 enabled = (isVpnRunning ||
                     cfg.mode == Mode.GOOGLE_ONLY ||
-                    cfg.mode == Mode.FULL ||
                     (cfg.hasDeploymentId && cfg.authKey.isNotBlank())) && !transitionCooldown,
                 colors = ButtonDefaults.buttonColors(
                     containerColor = if (isVpnRunning) ErrRed else OkGreen,
@@ -689,7 +688,7 @@ private fun ConnectionModeDropdown(
 }
 
 // =========================================================================
-// Deployment IDs editor (multi-line, one URL/ID per line).
+// Deployment IDs editor — one row per ID, with add/remove buttons.
 // =========================================================================
 
 @Composable
@@ -698,26 +697,79 @@ private fun DeploymentIdsField(
     onChange: (List<String>) -> Unit,
     enabled: Boolean = true,
 ) {
-    // Treat the list as newline-joined text. Keep trailing newlines so the
-    // cursor behaves naturally while the user is adding a new entry.
-    var raw by remember(urls) { mutableStateOf(urls.joinToString("\n")) }
+    var newEntry by remember { mutableStateOf("") }
 
-    OutlinedTextField(
-        value = raw,
-        onValueChange = {
-            raw = it
-            val parsed = it.split("\n").map(String::trim).filter(String::isNotBlank)
-            onChange(parsed)
-        },
-        label = { Text(stringResource(R.string.field_deployment_urls)) },
-        enabled = enabled,
-        modifier = Modifier.fillMaxWidth(),
-        minLines = 2,
-        maxLines = 6,
-        supportingText = {
-            Text(stringResource(R.string.help_deployment_urls))
-        },
-    )
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(
+            stringResource(R.string.field_deployment_urls),
+            style = MaterialTheme.typography.labelLarge,
+        )
+
+        // Existing entries — each with its own row and a remove button.
+        urls.forEachIndexed { index, url ->
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                OutlinedTextField(
+                    value = url,
+                    onValueChange = { edited ->
+                        val updated = urls.toMutableList()
+                        updated[index] = edited
+                        onChange(updated)
+                    },
+                    enabled = enabled,
+                    modifier = Modifier.weight(1f),
+                    singleLine = true,
+                    textStyle = MaterialTheme.typography.bodySmall,
+                    label = { Text("#${index + 1}") },
+                )
+                IconButton(
+                    onClick = {
+                        onChange(urls.filterIndexed { i, _ -> i != index })
+                    },
+                    enabled = enabled,
+                ) {
+                    Text("✕", color = MaterialTheme.colorScheme.error)
+                }
+            }
+        }
+
+        // "Add" row: text field + button.
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            OutlinedTextField(
+                value = newEntry,
+                onValueChange = { newEntry = it },
+                enabled = enabled,
+                modifier = Modifier.weight(1f),
+                singleLine = true,
+                placeholder = { Text("Paste URL or ID") },
+            )
+            Spacer(Modifier.width(8.dp))
+            Button(
+                onClick = {
+                    val trimmed = newEntry.trim()
+                    if (trimmed.isNotBlank()) {
+                        onChange(urls + trimmed)
+                        newEntry = ""
+                    }
+                },
+                enabled = enabled && newEntry.isNotBlank(),
+                contentPadding = PaddingValues(horizontal = 12.dp),
+            ) {
+                Text("+ Add")
+            }
+        }
+
+        Text(
+            stringResource(R.string.help_deployment_urls),
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
 }
 
 // =========================================================================

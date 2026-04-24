@@ -93,11 +93,13 @@ class MhrvVpnService : VpnService() {
         // the instant I tap Start". See issue #73.
         startForeground(NOTIF_ID, buildNotif(cfg.listenPort))
 
-        // Deployment ID + auth key are only required in apps_script mode.
-        // google_only (bootstrap) and full (tunnel) modes run without them.
-        val needsAppsScriptCreds = cfg.mode == Mode.APPS_SCRIPT
-        if (needsAppsScriptCreds && (!cfg.hasDeploymentId || cfg.authKey.isBlank())) {
-            Log.e(TAG, "Config is incomplete — can't start proxy in apps_script mode")
+        // Deployment ID + auth key are required for apps_script and full
+        // modes — both talk to Apps Script. Only google_only (bootstrap)
+        // runs without them. Closes #73 regression where google_only
+        // users hit this branch and crashed on startForeground timeout.
+        val needsCreds = cfg.mode != Mode.GOOGLE_ONLY
+        if (needsCreds && (!cfg.hasDeploymentId || cfg.authKey.isBlank())) {
+            Log.e(TAG, "Config is incomplete — deployment ID + auth key required for ${cfg.mode}")
             try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Throwable) {}
             stopSelf()
             return

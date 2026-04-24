@@ -52,7 +52,7 @@
     <string name="lang_toggle_cd">تغییر زبان</string>
 
     <!-- Supporting / helper text -->
-    <string name="help_deployment_urls">یکی در هر خط. می‌توانید URL کامل (https://script.google.com/macros/s/.../exec) یا فقط ID خام بگذارید — ترکیبی هم قبول است. چند ID به‌صورت چرخشی (round-robin) استفاده می‌شوند.</string>
+    <string name="help_deployment_urls">URL کامل (https://script.google.com/macros/s/.../exec) یا فقط ID خام. چند ID به‌صورت چرخشی استفاده می‌شوند — بیشتر ID = سرعت بیشتر در حالت تونل کامل.</string>
     <string name="help_auth_key">همان رمز مشترکی که داخل Apps Script گذاشتید.</string>
     <string name="help_mode_vpn_tun">هنگام اتصال، مجوز VPN سیستم درخواست می‌شود. تمام ترافیک دستگاه به‌صورت خودکار رد می‌شود.</string>
     <string name="help_mode_proxy_only">بدون VPN سیستم. بعد از اتصال، پروکسی Wi-Fi را روی 127.0.0.1:%1$d (HTTP) یا %2$d (SOCKS5) تنظیم کنید. فقط برنامه‌هایی که تنظیمات پروکسی را رعایت می‌کنند رد می‌شوند.</string>
