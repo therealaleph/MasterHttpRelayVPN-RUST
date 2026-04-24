@@ -191,11 +191,21 @@ class MhrvVpnService : VpnService() {
                         builder.addDisallowedApplication(packageName)
                     } catch (_: Throwable) {}
                 } else {
+                    var allowed = 0
                     for (pkg in cfg.splitApps) {
                         if (pkg == packageName) continue  // can't tunnel ourselves
-                        try { builder.addAllowedApplication(pkg) } catch (e: Throwable) {
+                        try {
+                            builder.addAllowedApplication(pkg)
+                            allowed++
+                        } catch (e: Throwable) {
                             Log.w(TAG, "addAllowedApplication($pkg) failed: ${e.message}")
                         }
+                    }
+                    if (allowed == 0) {
+                        Log.w(TAG, "ONLY mode had no usable apps — falling back to ALL")
+                        try {
+                            builder.addDisallowedApplication(packageName)
+                        } catch (_: Throwable) {}
                     }
                 }
             }
