@@ -77,30 +77,18 @@ pub fn reconcile_sudo_environment() {
 
 #[cfg(unix)]
 mod unix {
-    use super::sudo_parse_passwd_home;
+    use super::{should_reconcile_for, sudo_parse_passwd_home};
     use std::path::Path;
     use std::process::Command;
 
     pub(super) fn reconcile_sudo_home() {
-        // EUID gate: only act when we are *actually* running with root
-        // privileges. A process running as a normal user might have
-        // SUDO_USER exported (inherited from a shell init, set in
-        // user env, or via `sudo -E`) — without the EUID check we'd
-        // happily rewrite HOME to another user's dir and redirect
-        // every subsequent data_dir / cert path there. `geteuid()` is
-        // the cheap, reliable discriminator.
-        //
         // SAFETY: geteuid() is async-signal-safe and cannot fail.
         let euid = unsafe { libc::geteuid() };
-        if euid != 0 {
-            return;
-        }
-        let Ok(sudo_user) = std::env::var("SUDO_USER") else {
+        let sudo_user_raw = std::env::var("SUDO_USER").ok();
+        let Some(sudo_user) = should_reconcile_for(euid, sudo_user_raw.as_deref()) else {
             return;
         };
-        if sudo_user.is_empty() || sudo_user == "root" {
-            return;
-        }
+        let sudo_user = sudo_user.to_string();
         match resolve_home(&sudo_user) {
             Some(home) => {
                 tracing::info!(
@@ -153,6 +141,34 @@ mod unix {
         }
         None
     }
+}
+
+/// Decide whether to re-root HOME for a sudo-style invocation, given a
+/// process's effective UID and the value of the `SUDO_USER` env var.
+/// Returns `Some(user)` if and only if we should re-root HOME to that
+/// user's dir; `None` in every other case (normal user, real root
+/// login without sudo, SUDO_USER missing / empty / literally "root").
+///
+/// Extracted as a pure function so every branch — including the
+/// load-bearing `euid == 0 && SUDO_USER unset` path that must leave
+/// HOME as root's own /root — can be asserted with unit tests.
+/// Always compiled so the tests run on every host.
+fn should_reconcile_for<'a>(euid: u32, sudo_user: Option<&'a str>) -> Option<&'a str> {
+    // EUID gate: if we're not actually root, `SUDO_USER` could be
+    // anything (inherited from a shell init, explicitly exported,
+    // set via `sudo -E`) and rewriting HOME based on it would let a
+    // normal-user process redirect cert paths to someone else's files.
+    if euid != 0 {
+        return None;
+    }
+    // Real root login (no sudo) — SUDO_USER is simply unset. Do NOT
+    // re-root: root's own /root is the correct HOME for that process.
+    let user = sudo_user?;
+    // Empty string or literal "root" also mean "nothing to reconcile".
+    if user.is_empty() || user == "root" {
+        return None;
+    }
+    Some(user)
 }
 
 /// Pure parser for a single-line `getent passwd` entry.
@@ -1035,6 +1051,21 @@ fn contains_our_block(existing: &str) -> bool {
     false
 }
 
+/// True iff `existing` has our exact pref line but NOT inside our
+/// marker+pref block — i.e. an orphan `security.enterprise_roots.enabled
+/// = true` whose provenance we can't prove. Used by
+/// `disable_firefox_enterprise_roots` to surface a one-line hint on
+/// uninstall so users upgrading from pre-v1.2.13 installs know their
+/// Firefox user.js still has a cosmetic orphan pref from the old app
+/// (not broken, just left in place because we can't distinguish it
+/// from a user-authored line).
+fn has_bare_enterprise_roots(existing: &str) -> bool {
+    if contains_our_block(existing) {
+        return false;
+    }
+    existing.lines().any(|l| l.trim() == FX_PREF)
+}
+
 fn has_nss_certutil() -> bool {
     // We want NSS's `certutil` (from libnss3-tools), not Windows's
     // built-in `certutil.exe` which shares the binary name but has
@@ -1310,6 +1341,24 @@ fn disable_firefox_enterprise_roots() {
         };
         if let Some(new) = strip_enterprise_roots_block(&existing) {
             let _ = std::fs::write(&user_js, new);
+            continue;
+        }
+        // No marker block to strip, but an orphan pref is present.
+        // Surface it so the user isn't left wondering why user.js
+        // still has an enterprise_roots line after --remove-cert.
+        // The orphan is harmless (Firefox falls back to its built-in
+        // root store once the CA leaves the OS store), but silent
+        // leftovers feel like half-done removals.
+        if has_bare_enterprise_roots(&existing) {
+            tracing::info!(
+                "Firefox profile {}: `security.enterprise_roots.enabled` pref \
+                 present without our marker — left in place. If it was written \
+                 by a pre-v1.2.13 install it's a cosmetic orphan (harmless, \
+                 Firefox falls back to its built-in root store); remove it \
+                 manually from user.js if it bothers you. If you set it \
+                 yourself, leave it.",
+                profile.display()
+            );
         }
     }
 }
@@ -1558,6 +1607,70 @@ ID_LIKE=debian
         };
         let stripped = strip_enterprise_roots_block(&added).expect("should strip");
         assert_eq!(stripped, "");
+    }
+
+    // ── has_bare_enterprise_roots ──
+
+    #[test]
+    fn bare_enterprise_roots_detected_when_no_marker_present() {
+        let content = "user_pref(\"security.enterprise_roots.enabled\", true);\n";
+        assert!(has_bare_enterprise_roots(content));
+    }
+
+    #[test]
+    fn bare_enterprise_roots_not_detected_when_marker_block_present() {
+        // Our marker+pref block — strip handles this; has_bare_ must
+        // return false so we don't double-warn about a line we own.
+        let content = format!("{}\n{}\n", FX_MARKER, FX_PREF);
+        assert!(!has_bare_enterprise_roots(&content));
+    }
+
+    #[test]
+    fn bare_enterprise_roots_not_detected_when_pref_absent() {
+        let content = "user_pref(\"other\", 1);\n";
+        assert!(!has_bare_enterprise_roots(content));
+    }
+
+    #[test]
+    fn bare_enterprise_roots_ignores_false_variant() {
+        // User explicitly set enterprise_roots = false — not our line
+        // and not the pre-marker legacy write (which only ever wrote
+        // true). No orphan to warn about.
+        let content = "user_pref(\"security.enterprise_roots.enabled\", false);\n";
+        assert!(!has_bare_enterprise_roots(content));
+    }
+
+    // ── should_reconcile_for ──
+
+    #[test]
+    fn reconcile_skipped_for_normal_user() {
+        // euid != 0 — even with SUDO_USER set we must NOT re-root HOME.
+        // A non-root process that happened to inherit SUDO_USER (or
+        // used `sudo -E`) shouldn't get to redirect cert paths.
+        assert_eq!(should_reconcile_for(1000, Some("alice")), None);
+        assert_eq!(should_reconcile_for(1000, None), None);
+    }
+
+    #[test]
+    fn reconcile_skipped_for_real_root_login_without_sudo() {
+        // Load-bearing case the maintainer asked to pin: euid == 0
+        // AND no SUDO_USER means the process is a real root login,
+        // not a sudo elevation. HOME should stay as /root; we must
+        // not try to resolve some other user's home.
+        assert_eq!(should_reconcile_for(0, None), None);
+    }
+
+    #[test]
+    fn reconcile_skipped_when_sudo_user_is_empty_or_root() {
+        assert_eq!(should_reconcile_for(0, Some("")), None);
+        assert_eq!(should_reconcile_for(0, Some("root")), None);
+    }
+
+    #[test]
+    fn reconcile_triggers_for_real_sudo_invocation() {
+        // euid == 0 AND SUDO_USER points to a non-root user — this is
+        // the sudo case we do want to reconcile.
+        assert_eq!(should_reconcile_for(0, Some("alice")), Some("alice"));
     }
 
     // ── sudo_parse_passwd_home ──
