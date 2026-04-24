@@ -96,6 +96,26 @@ jobs:
     continue-on-error: ${{ matrix.mipsel_softfloat == true }}
 
     steps:
+      # Heal any root-owned leftovers from a previous mipsel docker
+      # build that failed before its post-step chown could run. The
+      # docker container writes target/ as root, and if cargo errors
+      # inside the container the outer `sudo chown -R` line never
+      # executes (bash -e exits on the docker non-zero), leaving root-
+      # owned files that fail every subsequent `actions/checkout@v4`
+      # workspace clean with `EACCES: permission denied unlink`. This
+      # step is a no-op on a clean runner, so cheap to keep always-on.
+      # Self-hosted only; GitHub-hosted runners get a fresh VM each run.
+      - name: Pre-checkout — clean root-owned files (self-hosted only)
+        if: contains(matrix.os, 'self-hosted')
+        run: |
+          if [ -d "$GITHUB_WORKSPACE/target" ]; then
+            sudo rm -rf "$GITHUB_WORKSPACE/target" || true
+          fi
+          # Stale .rustc_info.json at the workspace root is the
+          # specific file `actions/checkout` errors on; nuke any
+          # other root-owned scraps that may be sitting there too.
+          sudo find "$GITHUB_WORKSPACE" -maxdepth 2 -uid 0 -exec rm -rf {} + 2>/dev/null || true
+
       - uses: actions/checkout@v4
 
       # Skip the host-level rustup install for mipsel-softfloat — that
@@ -234,6 +254,16 @@ jobs:
         # silently at the post-docker chown. Heredoc-style single
         # quotes preserve newlines verbatim; no comment collapse.
         run: |
+          # Always chown back, even if docker exits non-zero. The previous
+          # form (`docker run …; sudo chown …`) ran chown only on success
+          # because bash -e short-circuits on the docker failure; that
+          # left target/ root-owned and broke `actions/checkout@v4` on
+          # every subsequent self-hosted run with EACCES on
+          # target/.rustc_info.json. The `trap … EXIT` runs the chown
+          # whether docker succeeded or failed, so a transient mipsel
+          # compile regression never poisons the runner workspace.
+          set +e
+          trap 'sudo chown -R "$(id -u):$(id -g)" target 2>/dev/null || true' EXIT
           docker run --rm -v "$PWD":/src -w /src \
             -e RUSTFLAGS='-C target-feature=+soft-float' \
             messense/rust-musl-cross:mipsel-musl \
@@ -252,7 +282,11 @@ jobs:
                 --target mipsel-unknown-linux-musl \
                 --bin mhrv-rs
             '
-          sudo chown -R "$(id -u):$(id -g)" target
+          rc=$?
+          # `trap … EXIT` will fire the chown on shell exit — the explicit
+          # exit here just propagates the docker exit code as the step
+          # status (success vs continue-on-error path).
+          exit $rc
 
       # UI build: we try to build the UI binary on every platform. If it fails
       # on cross-compile for linux-arm64 (missing arm64 system libs cross),
