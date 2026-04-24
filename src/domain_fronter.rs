@@ -59,6 +59,11 @@ type PooledStream = TlsStream<TcpStream>;
 const POOL_TTL_SECS: u64 = 45;
 const POOL_MAX: usize = 80;
 const REQUEST_TIMEOUT_SECS: u64 = 25;
+const RANGE_PARALLEL_CHUNK_BYTES: u64 = 256 * 1024;
+// Keep synthetic range stitching bounded. Without this, a buggy or hostile
+// origin can advertise `Content-Range: bytes 0-1/<huge>` and make us build a
+// massive range plan or preallocate an enormous response buffer.
+const MAX_STITCHED_RANGE_BYTES: u64 = 64 * 1024 * 1024;
 
 struct PoolEntry {
     stream: PooledStream,
@@ -648,8 +653,8 @@ impl DomainFronter {
         headers: &[(String, String)],
         body: &[u8],
     ) -> Vec<u8> {
-        const CHUNK: u64 = 256 * 1024;
         const MAX_PARALLEL: usize = 16;
+        let chunk = RANGE_PARALLEL_CHUNK_BYTES;
 
         if method != "GET" || !body.is_empty() {
             return self.relay(method, url, headers, body).await;
@@ -662,7 +667,7 @@ impl DomainFronter {
 
         // Probe with the first chunk.
         let mut probe_headers: Vec<(String, String)> = headers.to_vec();
-        probe_headers.push(("Range".into(), format!("bytes=0-{}", CHUNK - 1)));
+        probe_headers.push(("Range".into(), format!("bytes=0-{}", chunk - 1)));
         let first = self.relay(method, url, &probe_headers, body).await;
 
         let (status, resp_headers, resp_body) = match split_response(&first) {
@@ -676,7 +681,7 @@ impl DomainFronter {
             return first;
         }
 
-        let probe_range = match validate_probe_range(status, &resp_headers, resp_body, CHUNK - 1)
+        let probe_range = match validate_probe_range(status, &resp_headers, resp_body, chunk - 1)
         {
             Some(r) => r,
             None => {
@@ -689,15 +694,27 @@ impl DomainFronter {
         };
         let total = probe_range.total;
 
-        if total <= CHUNK || (probe_range.end + 1) >= total {
+        if total <= chunk || (probe_range.end + 1) >= total {
             return rewrite_206_to_200(&first);
         }
+
+        let total_usize = match checked_stitched_range_capacity(total) {
+            Some(v) => v,
+            None => {
+                tracing::warn!(
+                    "range-parallel: Content-Range total {} for {} is too large; falling back to single GET",
+                    total,
+                    url,
+                );
+                return self.relay(method, url, headers, body).await;
+            }
+        };
 
         // Plan remaining ranges after what the probe already returned.
         let mut ranges: Vec<(u64, u64)> = Vec::new();
         let mut start = probe_range.end + 1;
         while start < total {
-            let end = (start + CHUNK - 1).min(total - 1);
+            let end = (start + chunk - 1).min(total - 1);
             ranges.push((start, end));
             start = end + 1;
         }
@@ -734,7 +751,7 @@ impl DomainFronter {
             .await;
 
         // Stitch: probe body first, then the chunks in order.
-        let mut full = Vec::with_capacity(total as usize);
+        let mut full = Vec::with_capacity(total_usize);
         full.extend_from_slice(resp_body);
         for (start, end, chunk) in fetches {
             match chunk {
@@ -1372,6 +1389,13 @@ fn validate_probe_range(
         return None;
     }
     Some(range)
+}
+
+fn checked_stitched_range_capacity(total: u64) -> Option<usize> {
+    if total > MAX_STITCHED_RANGE_BYTES {
+        return None;
+    }
+    usize::try_from(total).ok()
 }
 
 fn extract_exact_range_body(
@@ -2400,6 +2424,16 @@ mod tests {
     fn validate_probe_range_rejects_body_length_mismatch() {
         let headers = vec![("Content-Range".to_string(), "bytes 0-4/20".to_string())];
         assert!(validate_probe_range(206, &headers, b"hey", 4).is_none());
+    }
+
+    #[test]
+    fn stitched_range_capacity_rejects_absurd_total() {
+        assert_eq!(
+            checked_stitched_range_capacity(MAX_STITCHED_RANGE_BYTES),
+            Some(MAX_STITCHED_RANGE_BYTES as usize),
+        );
+        assert_eq!(checked_stitched_range_capacity(MAX_STITCHED_RANGE_BYTES + 1), None);
+        assert_eq!(checked_stitched_range_capacity(u64::MAX), None);
     }
 
     #[test]
