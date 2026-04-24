@@ -5,6 +5,7 @@
 [![CI](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/actions/workflows/release.yml/badge.svg)](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/github/license/therealaleph/MasterHttpRelayVPN-RUST?color=blue)](LICENSE)
 [![Stars](https://img.shields.io/github/stars/therealaleph/MasterHttpRelayVPN-RUST?style=flat&logo=github)](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/stargazers)
+[![Support](https://img.shields.io/badge/❤️_Support-sh1n.org-red?style=flat)](https://sh1n.org/donate)
 
 Rust port of [@masterking32's MasterHttpRelayVPN](https://github.com/masterking32/MasterHttpRelayVPN). **All credit for the original idea and the Python implementation goes to [@masterking32](https://github.com/masterking32).** This is a faithful reimplementation of the `apps_script` mode, packaged as two tiny binaries (CLI + desktop UI) with no runtime dependencies.
 
@@ -413,6 +414,14 @@ MIT. See [LICENSE](LICENSE).
 
 Original project: <https://github.com/masterking32/MasterHttpRelayVPN> by [@masterking32](https://github.com/masterking32). The idea, the Google Apps Script protocol, the proxy architecture, and the ongoing maintenance are all his. This Rust port exists purely to make client-side distribution easier.
 
+## Support this project
+
+If `mhrv-rs` has been useful to you and you'd like to support continued development:
+
+### [❤️ Support on sh1n.org](https://sh1n.org/donate)
+
+Donations cover hosting, self-hosted CI runner costs, and continued maintenance. Starring the repo also helps signal that the project is worth keeping alive.
+
 ---
 
 <div dir="rtl">
@@ -736,5 +745,13 @@ logread -e mhrv-rs -f
 ### اعتبار
 
 پروژهٔ اصلی: <https://github.com/masterking32/MasterHttpRelayVPN> توسط [@masterking32](https://github.com/masterking32). ایده، پروتکل `Apps Script`، و معماری پروکسی همه متعلق به ایشان است. این پورت `Rust` فقط برای ساده‌تر کردن توزیع سمت کلاینت درست شده.
+
+### حمایت از پروژه
+
+اگر `mhrv-rs` برای شما مفید بوده و می‌خواهید از ادامهٔ توسعه حمایت کنید:
+
+### [❤️ حمایت در sh1n.org](https://sh1n.org/donate)
+
+کمک‌ها صرف هزینه‌های میزبانی، سرور `CI` اختصاصی، و ادامهٔ نگهداری پروژه می‌شود. ستاره دادن به ریپو هم یک راه رایگان برای نشان دادن اینه که پروژه ارزش ادامه دادن داره.
 
 </div>
