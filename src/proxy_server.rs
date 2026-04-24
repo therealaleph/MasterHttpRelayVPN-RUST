@@ -35,6 +35,12 @@ const SNI_REWRITE_CORE_SUFFIXES: &[&str] = &[
     "gstatic.com",
     "googleusercontent.com",
     "googleapis.com",
+    "doubleclick.net",
+    "googlesyndication.com",
+    "googleadservices.com",
+    "google-analytics.com",
+    "googletagmanager.com",
+    "googletagservices.com",
     "ggpht.com",
     "blogspot.com",
     "blogger.com",
@@ -52,15 +58,6 @@ const SNI_REWRITE_YOUTUBE_SUFFIXES: &[&str] = &[
     // traverse Apps Script instead of the direct GFE tunnel.
     "gvt1.com",
     "gvt2.com",
-    // Ad + analytics infra. All on GFE, all previously broken the
-    // same way YouTube was: SNI-blocked on Iranian DPI, but reachable
-    // via `google_ip` with SNI rewritten.
-    "doubleclick.net",
-    "googlesyndication.com",
-    "googleadservices.com",
-    "google-analytics.com",
-    "googletagmanager.com",
-    "googletagservices.com",
     // fonts.googleapis.com is technically covered by the googleapis.com
     // suffix above, but mirroring Python's explicit listing makes the
     // intent obvious at a glance.
