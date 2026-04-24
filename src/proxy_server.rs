@@ -140,6 +140,35 @@ pub struct RewriteCtx {
     /// goes through the Apps Script relay instead. See config.rs for
     /// the trade-off. Issue #102.
     pub youtube_via_relay: bool,
+    /// User-configured hostnames that should skip the relay entirely
+    /// and pass through as plain TCP (optionally via upstream_socks5).
+    /// See config.rs `passthrough_hosts` for matching rules. Issues #39, #127.
+    pub passthrough_hosts: Vec<String>,
+}
+
+/// True if `host` matches any entry in the user's passthrough list.
+/// Match is case-insensitive. Entries match either exactly, or as a
+/// suffix if they start with "." (e.g. ".internal.example" matches
+/// "a.b.internal.example" and the bare "internal.example"). Bare
+/// entries like "example.com" only match the exact hostname — users
+/// who want subdomains included should use ".example.com".
+pub fn matches_passthrough(host: &str, list: &[String]) -> bool {
+    if list.is_empty() {
+        return false;
+    }
+    let h = host.to_ascii_lowercase();
+    let h = h.trim_end_matches('.');
+    list.iter().any(|entry| {
+        let e = entry.trim().trim_end_matches('.').to_ascii_lowercase();
+        if e.is_empty() {
+            return false;
+        }
+        if let Some(suffix) = e.strip_prefix('.') {
+            h == suffix || h.ends_with(&format!(".{}", suffix))
+        } else {
+            h == e
+        }
+    })
 }
 
 impl ProxyServer {
@@ -183,6 +212,7 @@ impl ProxyServer {
             upstream_socks5: config.upstream_socks5.clone(),
             mode,
             youtube_via_relay: config.youtube_via_relay,
+            passthrough_hosts: config.passthrough_hosts.clone(),
         });
 
         let socks5_port = config.socks5_port.unwrap_or(config.listen_port + 1);
@@ -557,6 +587,24 @@ async fn dispatch_tunnel(
     rewrite_ctx: Arc<RewriteCtx>,
     tunnel_mux: Option<Arc<TunnelMux>>,
 ) -> std::io::Result<()> {
+    // 0. User-configured passthrough list wins over every other path.
+    //    If the host matches `passthrough_hosts`, we raw-TCP it (through
+    //    upstream_socks5 if set) and never touch Apps Script, SNI-rewrite,
+    //    or MITM. Point: saves Apps Script quota on hosts the user already
+    //    has reachability to, and avoids MITM-breaking cert pinning on
+    //    hosts the user knows are cert-pinned. Issues #39, #127.
+    if matches_passthrough(&host, &rewrite_ctx.passthrough_hosts) {
+        let via = rewrite_ctx.upstream_socks5.as_deref();
+        tracing::info!(
+            "dispatch {}:{} -> raw-tcp ({}) (passthrough_hosts match)",
+            host,
+            port,
+            via.unwrap_or("direct")
+        );
+        plain_tcp_passthrough(sock, &host, port, via).await;
+        return Ok(());
+    }
+
     // 1. Full tunnel mode: ALL traffic goes through the batch multiplexer
     //    (Apps Script → tunnel node → real TCP). No MITM, no cert.
     if rewrite_ctx.mode == Mode::Full {
@@ -1676,5 +1724,48 @@ mod tests {
         hosts.insert("rr4.googlevideo.com".to_string(), "1.2.3.4".to_string());
 
         assert!(should_use_sni_rewrite(&hosts, "rr4.googlevideo.com", 443, true));
+    }
+
+    #[test]
+    fn passthrough_hosts_exact_match() {
+        let list = vec!["example.com".to_string(), "banking.local".to_string()];
+        assert!(matches_passthrough("example.com", &list));
+        assert!(matches_passthrough("banking.local", &list));
+        assert!(matches_passthrough("EXAMPLE.COM", &list)); // case-insensitive
+        assert!(!matches_passthrough("notexample.com", &list));
+        assert!(!matches_passthrough("sub.example.com", &list)); // exact only, not suffix
+    }
+
+    #[test]
+    fn passthrough_hosts_dot_prefix_is_suffix_match() {
+        let list = vec![".internal.example".to_string()];
+        assert!(matches_passthrough("internal.example", &list)); // bare parent matches
+        assert!(matches_passthrough("a.internal.example", &list));
+        assert!(matches_passthrough("a.b.c.internal.example", &list));
+        assert!(!matches_passthrough("internal.exampleX", &list));
+        assert!(!matches_passthrough("fakeinternal.example", &list));
+    }
+
+    #[test]
+    fn passthrough_hosts_empty_list_never_matches() {
+        let list: Vec<String> = vec![];
+        assert!(!matches_passthrough("anything.com", &list));
+        assert!(!matches_passthrough("", &list));
+    }
+
+    #[test]
+    fn passthrough_hosts_ignores_empty_and_whitespace_entries() {
+        let list = vec!["".to_string(), "   ".to_string(), "real.com".to_string()];
+        assert!(!matches_passthrough("", &list));
+        assert!(matches_passthrough("real.com", &list));
+    }
+
+    #[test]
+    fn passthrough_hosts_trailing_dot_normalized() {
+        // FQDNs sometimes have a trailing dot; both entry-side and host-side
+        // trailing dots should be treated as equivalent to the un-dotted form.
+        let list = vec!["example.com.".to_string()];
+        assert!(matches_passthrough("example.com", &list));
+        assert!(matches_passthrough("example.com.", &list));
     }
 }

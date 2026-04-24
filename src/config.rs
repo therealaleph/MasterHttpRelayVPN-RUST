@@ -146,6 +146,23 @@ pub struct Config {
     /// your Apps Script quota. Off by default.
     #[serde(default)]
     pub youtube_via_relay: bool,
+
+    /// User-configurable passthrough list. Any host whose name matches
+    /// one of these entries bypasses the Apps Script relay entirely and
+    /// is plain-TCP-passthroughed (optionally through `upstream_socks5`).
+    ///
+    /// Accepts exact hostnames ("example.com") and leading-dot suffixes
+    /// (".internal.example" matches "a.b.internal.example"). Matches are
+    /// case-insensitive.
+    ///
+    /// Dispatched BEFORE SNI-rewrite and Apps Script, so a passthrough
+    /// entry wins over the default Google-edge routing. Useful for
+    /// sites where you already have reachability without the relay
+    /// (saving Apps Script quota) or for hosts that break under MITM.
+    ///
+    /// Issues #39, #127.
+    #[serde(default)]
+    pub passthrough_hosts: Vec<String>,
 }
 
 fn default_fetch_ips_from_api() -> bool { false }
