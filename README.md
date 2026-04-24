@@ -290,7 +290,7 @@ More deployments = more concurrent batches = lower per-session latency. Each bat
 
 ### Quick start
 
-1. Deploy [`CodeFull.gs`](assets/apps_script/CodeFull.gs) to 3–12 Google accounts (same steps as `Code.gs`, but use the full-mode script that forwards to your tunnel-node)
+1. Deploy [`CodeFull.gs`](assets/apps_script/CodeFull.gs) 3–12 times (same steps as `Code.gs`, but use the full-mode script that forwards to your tunnel-node). You can create multiple deployments on the **same** Google account — each "New deployment" gets its own ID, and same-account deployments tend to have better bandwidth since they share the same Apps Script instance pool. Spreading across multiple accounts gives you more daily quota (each account has its own 20k calls/day limit) at the cost of slightly higher per-request latency.
 2. Deploy the [tunnel-node](tunnel-node/) on a VPS
 3. Set `"mode": "full"` in your config with all deployment IDs:
 
@@ -684,7 +684,7 @@ logread -e mhrv-rs -f
 - **لینوکس:** فایل `/usr/local/share/ca-certificates/mhrv-rs.crt` را حذف و `sudo update-ca-certificates` اجرا کنید
 
 **چند `Deployment ID` لازم دارم؟**
-یکی برای استفادهٔ عادی کافی است. سهمیهٔ روزانه `UrlFetchApp` برای حساب رایگان گوگل **۲۰٬۰۰۰ درخواست در روز** است (برای `Workspace` پولی ۱۰۰٬۰۰۰)، با محدودیت پاسخ ۵۰ مگابایت به ازای هر `fetch`. برای اکثر کاربران چند ساعت یوتیوب هم با یک `Deployment` کافی است. اگر مصرف بالا دارید، در حساب‌های گوگل دیگر `Deployment` بسازید و همهٔ `Deployment ID`ها را در فیلد `Apps Script ID(s)` یک در هر خط وارد کنید — برنامه خودکار بینشان می‌چرخد. مرجع: <https://developers.google.com/apps-script/guides/services/quotas>
+یکی برای استفادهٔ عادی کافی است. سهمیهٔ روزانه `UrlFetchApp` برای حساب رایگان گوگل **۲۰٬۰۰۰ درخواست در روز** است (برای `Workspace` پولی ۱۰۰٬۰۰۰)، با محدودیت پاسخ ۵۰ مگابایت به ازای هر `fetch`. برای اکثر کاربران چند ساعت یوتیوب هم با یک `Deployment` کافی است. می‌توانید چند `Deployment` **در همان حساب** بسازید (هر بار `New deployment` یک `ID` جدید می‌دهد) — این روش پهنای باند بهتری دارد چون همه از یک `instance pool` استفاده می‌کنند. یا در حساب‌های مختلف بسازید تا سهمیهٔ روزانه بیشتری داشته باشید (هر حساب ۲۰ هزار درخواست جداگانه). همهٔ `ID`ها را وارد کنید — برنامه خودکار بینشان می‌چرخد. در حالت `full` تعداد بیشتر `ID` = سرعت بیشتر. مرجع: <https://developers.google.com/apps-script/guides/services/quotas>
 
 **یوتوب کار می‌کند؟ ویدیو پخش می‌شود؟**
 صفحهٔ یوتوب سریع باز می‌شود (چون مستقیم از لبهٔ گوگل می‌آید). اما `chunk`های ویدیوی اصلی از `googlevideo.com` از طریق `Apps Script` می‌آیند و روزانه سهمیه دارند. برای تماشای گاه‌به‌گاه خوب است، برای ۱۰۸۰p پخش طولانی دردناک.
