@@ -14,6 +14,7 @@ use tokio_rustls::{LazyConfigAcceptor, TlsAcceptor, TlsConnector};
 use crate::config::{Config, Mode};
 use crate::domain_fronter::DomainFronter;
 use crate::mitm::MitmCertManager;
+use crate::tunnel_client::TunnelMux;
 
 // Domains that are served from Google's core frontend IP pool and therefore
 // respond correctly when we connect to `google_ip` with SNI=`front_domain`
@@ -125,6 +126,7 @@ pub struct ProxyServer {
     fronter: Option<Arc<DomainFronter>>,
     mitm: Arc<Mutex<MitmCertManager>>,
     rewrite_ctx: Arc<RewriteCtx>,
+    tunnel_mux: Option<Arc<TunnelMux>>,
 }
 
 pub struct RewriteCtx {
@@ -150,7 +152,7 @@ impl ProxyServer {
         // not try to construct the DomainFronter — it errors on a missing
         // `script_id`, which is exactly the state a bootstrapping user is in.
         let fronter = match mode {
-            Mode::AppsScript => {
+            Mode::AppsScript | Mode::Full => {
                 let f = DomainFronter::new(config).map_err(|e| {
                     std::io::Error::new(std::io::ErrorKind::Other, format!("{e}"))
                 })?;
@@ -192,6 +194,7 @@ impl ProxyServer {
             fronter,
             mitm,
             rewrite_ctx,
+            tunnel_mux: None, // initialized in run() inside the tokio runtime
         })
     }
 
@@ -199,9 +202,16 @@ impl ProxyServer {
         self.fronter.clone()
     }
     pub async fn run(
-        self,
+        mut self,
         mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     ) -> Result<(), ProxyError> {
+        // Initialize TunnelMux inside the runtime (tokio::spawn requires it).
+        if self.rewrite_ctx.mode == Mode::Full {
+            if let Some(f) = self.fronter.as_ref() {
+                self.tunnel_mux = Some(TunnelMux::start(f.clone()));
+            }
+        }
+
         let http_addr = format!("{}:{}", self.host, self.port);
         let socks_addr = format!("{}:{}", self.host, self.socks5_port);
         let http_listener = TcpListener::bind(&http_addr).await?;
@@ -244,6 +254,7 @@ impl ProxyServer {
         let http_fronter = self.fronter.clone();
         let http_mitm = self.mitm.clone();
         let http_ctx = self.rewrite_ctx.clone();
+        let http_mux = self.tunnel_mux.clone();
         let mut http_task = tokio::spawn(async move {
             let mut fd_exhaust_count: u64 = 0;
             // Track every per-client child task in a JoinSet so that when
@@ -277,8 +288,9 @@ impl ProxyServer {
                 let fronter = http_fronter.clone();
                 let mitm = http_mitm.clone();
                 let rewrite_ctx = http_ctx.clone();
+                let mux = http_mux.clone();
                 children.spawn(async move {
-                    if let Err(e) = handle_http_client(sock, fronter, mitm, rewrite_ctx).await {
+                    if let Err(e) = handle_http_client(sock, fronter, mitm, rewrite_ctx, mux).await {
                         tracing::debug!("http client {} closed: {}", peer, e);
                     }
                 });
@@ -288,6 +300,7 @@ impl ProxyServer {
         let socks_fronter = self.fronter.clone();
         let socks_mitm = self.mitm.clone();
         let socks_ctx = self.rewrite_ctx.clone();
+        let socks_mux = self.tunnel_mux.clone();
         let mut socks_task = tokio::spawn(async move {
             let mut fd_exhaust_count: u64 = 0;
             // Same pattern as http_task above — JoinSet so shutdown
@@ -311,8 +324,9 @@ impl ProxyServer {
                 let fronter = socks_fronter.clone();
                 let mitm = socks_mitm.clone();
                 let rewrite_ctx = socks_ctx.clone();
+                let mux = socks_mux.clone();
                 children.spawn(async move {
-                    if let Err(e) = handle_socks5_client(sock, fronter, mitm, rewrite_ctx).await {
+                    if let Err(e) = handle_socks5_client(sock, fronter, mitm, rewrite_ctx, mux).await {
                         tracing::debug!("socks client {} closed: {}", peer, e);
                     }
                 });
@@ -394,6 +408,7 @@ async fn handle_http_client(
     fronter: Option<Arc<DomainFronter>>,
     mitm: Arc<Mutex<MitmCertManager>>,
     rewrite_ctx: Arc<RewriteCtx>,
+    tunnel_mux: Option<Arc<TunnelMux>>,
 ) -> std::io::Result<()> {
     let (head, leftover) = match read_http_head(&mut sock).await? {
         Some(v) => v,
@@ -408,7 +423,7 @@ async fn handle_http_client(
         sock.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
         sock.flush().await?;
-        dispatch_tunnel(sock, host, port, fronter, mitm, rewrite_ctx).await
+        dispatch_tunnel(sock, host, port, fronter, mitm, rewrite_ctx, tunnel_mux).await
     } else {
         // Plain HTTP proxy request (e.g. `GET http://…`). The Apps Script
         // relay is the only code path that can fulfil this, so in google_only
@@ -440,6 +455,7 @@ async fn handle_socks5_client(
     fronter: Option<Arc<DomainFronter>>,
     mitm: Arc<Mutex<MitmCertManager>>,
     rewrite_ctx: Arc<RewriteCtx>,
+    tunnel_mux: Option<Arc<TunnelMux>>,
 ) -> std::io::Result<()> {
     // RFC 1928 handshake: VER=5, NMETHODS, METHODS...
     let mut hdr = [0u8; 2];
@@ -507,7 +523,7 @@ async fn handle_socks5_client(
         .await?;
     sock.flush().await?;
 
-    dispatch_tunnel(sock, host, port, fronter, mitm, rewrite_ctx).await
+    dispatch_tunnel(sock, host, port, fronter, mitm, rewrite_ctx, tunnel_mux).await
 }
 
 // ---------- Smart dispatch (used by both HTTP CONNECT and SOCKS5) ----------
@@ -539,9 +555,31 @@ async fn dispatch_tunnel(
     fronter: Option<Arc<DomainFronter>>,
     mitm: Arc<Mutex<MitmCertManager>>,
     rewrite_ctx: Arc<RewriteCtx>,
+    tunnel_mux: Option<Arc<TunnelMux>>,
 ) -> std::io::Result<()> {
-    // 1. Explicit hosts override or SNI-rewrite suffix: for HTTPS targets,
-    //    always use the TLS SNI-rewrite tunnel.
+    // 1. Full tunnel mode: ALL traffic goes through the batch multiplexer
+    //    (Apps Script → tunnel node → real TCP). No MITM, no cert.
+    if rewrite_ctx.mode == Mode::Full {
+        let mux = match tunnel_mux {
+            Some(m) => m,
+            None => {
+                tracing::error!(
+                    "dispatch {}:{} -> full mode but no tunnel mux (should not happen)",
+                    host, port
+                );
+                return Ok(());
+            }
+        };
+        tracing::info!(
+            "dispatch {}:{} -> full tunnel (via batch mux)",
+            host, port
+        );
+        crate::tunnel_client::tunnel_connection(sock, &host, port, &mux).await?;
+        return Ok(());
+    }
+
+    // 2. Explicit hosts override or SNI-rewrite suffix: for HTTPS targets,
+    //    use the TLS SNI-rewrite tunnel (skipped in full mode above).
     if should_use_sni_rewrite(
         &rewrite_ctx.hosts,
         &host,
@@ -552,7 +590,7 @@ async fn dispatch_tunnel(
         return do_sni_rewrite_tunnel_from_tcp(sock, &host, port, mitm, rewrite_ctx).await;
     }
 
-    // 2. google_only bootstrap: no Apps Script relay exists. Anything that
+    // 3. google_only bootstrap: no Apps Script relay exists. Anything that
     //    isn't SNI-rewrite-matched gets direct TCP passthrough so the user's
     //    browser still works while they're deploying Code.gs. They'd switch
     //    to apps_script mode for the real DPI bypass.

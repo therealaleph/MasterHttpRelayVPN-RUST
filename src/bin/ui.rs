@@ -694,21 +694,26 @@ impl eframe::App for App {
             // apps_script.
             section(ui, "Mode", |ui| {
                 form_row(ui, "Mode", Some(
-                    "apps_script: full DPI bypass via your Apps Script relay.\n\
-                     google_only: bootstrap — direct SNI-rewrite tunnel to *.google.com \
-                     only (no relay, no script_id needed). Use this just long enough to \
-                     open https://script.google.com and deploy Code.gs."
+                    "apps_script: DPI bypass via Apps Script relay (needs cert).\n\
+                     full: tunnel ALL traffic through Apps Script + tunnel node (no cert needed).\n\
+                     google_only: bootstrap — direct SNI-rewrite tunnel to *.google.com only."
                 ), |ui| {
                     egui::ComboBox::from_id_source("mode")
                         .selected_text(match self.form.mode.as_str() {
                             "google_only" => "Google-only (bootstrap)",
-                            _ => "Apps Script (full)",
+                            "full" => "Full tunnel (no cert)",
+                            _ => "Apps Script (MITM)",
                         })
                         .show_ui(ui, |ui| {
                             ui.selectable_value(
                                 &mut self.form.mode,
                                 "apps_script".into(),
-                                "Apps Script (full)",
+                                "Apps Script (MITM)",
+                            );
+                            ui.selectable_value(
+                                &mut self.form.mode,
+                                "full".into(),
+                                "Full tunnel (no cert)",
                             );
                             ui.selectable_value(
                                 &mut self.form.mode,
@@ -722,6 +727,15 @@ impl eframe::App for App {
                         ui.add_space(120.0 + 8.0);
                         ui.small(egui::RichText::new(
                             "Bootstrap mode — reach script.google.com to deploy Code.gs, then switch back to Apps Script.",
+                        )
+                        .color(OK_GREEN));
+                    });
+                }
+                if self.form.mode == "full" {
+                    ui.horizontal(|ui| {
+                        ui.add_space(120.0 + 8.0);
+                        ui.small(egui::RichText::new(
+                            "Full tunnel — all traffic tunneled end-to-end via Apps Script + remote tunnel node. No certificate needed.",
                         )
                         .color(OK_GREEN));
                     });
