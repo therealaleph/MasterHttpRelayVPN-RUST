@@ -271,7 +271,7 @@ Full tunnel mode (`"mode": "full"`) routes **all** traffic end-to-end through Ap
 Each Apps Script batch request takes ~2 seconds round-trip. In full mode, `mhrv-rs` runs a **pipelined batch multiplexer** that fires multiple batch requests concurrently without waiting for the previous one to return. The number of in-flight batches (the *pipeline depth*) scales directly with the number of deployment IDs you configure:
 
 ```
-pipeline_depth = number_of_script_ids  (clamped to 2..12)
+pipeline_depth = number_of_script_ids  (minimum 2)
 ```
 
 | Deployments | Pipeline depth | Effective batch interval | Notes |
@@ -279,7 +279,8 @@ pipeline_depth = number_of_script_ids  (clamped to 2..12)
 | 1 | 2 | ~1.0s | Minimum — still pipelines 2 batches |
 | 3 | 3 | ~0.7s | Good for light browsing |
 | 6 | 6 | ~0.3s | Recommended for daily use |
-| 12 | 12 | ~0.17s | Maximum — diminishing returns past this |
+| 12 | 12 | ~0.17s | Sweet spot for most users |
+| 20 | 20 | ~0.10s | Multi-account setups |
 
 More deployments = more concurrent batches = lower per-session latency. Each batch round-robins across your deployment IDs, so the load is spread evenly and you're less likely to hit a single deployment's quota ceiling.
 
@@ -618,7 +619,7 @@ Original project: <https://github.com/masterking32/MasterHttpRelayVPN> by [@mast
 هر درخواست دسته‌ای (`batch`) به `Apps Script` حدود ۲ ثانیه طول می‌کشد. در حالت `full`، برنامه یک **لولهٔ موازی** (`pipeline`) اجرا می‌کند که چند درخواست دسته‌ای را همزمان می‌فرستد بدون اینکه منتظر پاسخ قبلی بماند. تعداد درخواست‌های همزمان مستقیماً با تعداد `Deployment ID`ها رابطه دارد:
 
 ```
-عمق لوله = تعداد Deployment IDها  (حداقل ۲، حداکثر ۱۲)
+عمق لوله = تعداد Deployment IDها  (حداقل ۲)
 ```
 
 | تعداد Deployment | عمق لوله | فاصلهٔ مؤثر بین دسته‌ها | |
@@ -626,7 +627,8 @@ Original project: <https://github.com/masterking32/MasterHttpRelayVPN> by [@mast
 | ۱ | ۲ | ~۱ ثانیه | حداقل |
 | ۳ | ۳ | ~۰.۷ ثانیه | مناسب مرور سبک |
 | ۶ | ۶ | ~۰.۳ ثانیه | توصیه‌شده برای استفادهٔ روزانه |
-| ۱۲ | ۱۲ | ~۰.۱۷ ثانیه | حداکثر |
+| ۱۲ | ۱۲ | ~۰.۱۷ ثانیه | نقطهٔ بهینه |
+| ۲۰ | ۲۰ | ~۰.۱ ثانیه | چند حساب |
 
 بیشتر `Deployment` = بیشتر درخواست همزمان = تأخیر کمتر برای هر نشست. هر دسته بین `ID`ها چرخش می‌کند (`round-robin`)، پس بار به‌طور یکنواخت توزیع می‌شود.
 

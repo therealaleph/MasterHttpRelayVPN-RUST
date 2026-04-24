@@ -2,9 +2,8 @@
 //!
 //! A central multiplexer collects pending data from ALL active sessions
 //! and fires batch requests without waiting for the previous one to return.
-//! Pipeline depth scales with the number of script deployments (1 per
-//! script, clamped to 2..12), so users with more deployments get lower
-//! latency automatically.
+//! Pipeline depth equals the number of script deployments (minimum 2),
+//! so users with more deployments get lower latency automatically.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,8 +16,6 @@ use tokio::sync::{mpsc, oneshot, Semaphore};
 
 use crate::domain_fronter::{BatchOp, DomainFronter, TunnelResponse};
 
-/// Hard ceiling on pipeline depth regardless of script count.
-const MAX_PIPELINE_DEPTH: usize = 12;
 /// Minimum pipeline depth even with a single script.
 const MIN_PIPELINE_DEPTH: usize = 2;
 
@@ -69,8 +66,7 @@ pub struct TunnelMux {
 
 impl TunnelMux {
     pub fn start(fronter: Arc<DomainFronter>) -> Arc<Self> {
-        let pipeline_depth =
-            fronter.num_scripts().clamp(MIN_PIPELINE_DEPTH, MAX_PIPELINE_DEPTH);
+        let pipeline_depth = fronter.num_scripts().max(MIN_PIPELINE_DEPTH);
         tracing::info!(
             "tunnel mux: pipeline_depth={} (from {} script deployments)",
             pipeline_depth,
