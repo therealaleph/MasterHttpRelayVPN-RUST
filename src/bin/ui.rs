@@ -924,6 +924,19 @@ impl eframe::App for App {
                                  Credit: seramo_ir + Persian Python community (issue #16).",
                             );
                     });
+                    ui.horizontal(|ui| {
+                        ui.add_space(120.0 + 8.0);
+                        ui.checkbox(
+                            &mut self.form.youtube_via_relay,
+                            "Send YouTube through relay (no SNI rewrite)",
+                        )
+                        .on_hover_text(
+                            "YouTube normally uses the same direct Google-edge tunnel as google.com (TLS SNI is \
+                             the front domain, not youtube.com). That can trigger restricted mode or sign-out \
+                             prompts. Enable this to route youtube.com / youtu.be / ytimg.com through the Apps \
+                             Script relay instead — slower for video, but the visible SNI matches the site.",
+                        );
+                    });
                 });
             });
 
