@@ -79,3 +79,11 @@ TUNNEL_AUTH_KEY=your-secret PORT=8080 ./target/release/tunnel-node
 ```
 
 ### Health check: `GET /health` → `ok`
+
+## Performance: deployment count and pipeline depth
+
+The mhrv-rs client runs a pipelined batch multiplexer in full mode. Each Apps Script round-trip takes ~2s, so the client fires multiple batch requests concurrently — the pipeline depth equals the number of configured script deployment IDs (clamped 2..12).
+
+More deployments = more concurrent batches hitting the tunnel-node = lower per-session latency. With 6 deployments, a new batch arrives every ~0.3s instead of every 2s.
+
+The tunnel-node itself is stateless per-request (sessions are keyed by UUID), so it handles concurrent batches naturally. For best results, deploy 3–12 Apps Script instances across separate Google accounts and list all their deployment IDs in the client config.

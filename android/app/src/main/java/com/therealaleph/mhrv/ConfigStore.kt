@@ -68,8 +68,10 @@ enum class UiLang { AUTO, FA, EN }
  *   Google edge is active, so the user can reach `script.google.com` to
  *   deploy Code.gs in the first place. No Deployment ID / Auth key needed.
  *   Non-Google traffic goes direct (no relay).
+ * - [FULL] — full tunnel mode. ALL traffic is tunneled end-to-end through
+ *   Apps Script + a remote tunnel node. No certificate installation needed.
  */
-enum class Mode { APPS_SCRIPT, GOOGLE_ONLY }
+enum class Mode { APPS_SCRIPT, GOOGLE_ONLY, FULL }
 
 data class MhrvConfig(
     val mode: Mode = Mode.APPS_SCRIPT,
@@ -147,6 +149,7 @@ data class MhrvConfig(
             put("mode", when (mode) {
                 Mode.APPS_SCRIPT -> "apps_script"
                 Mode.GOOGLE_ONLY -> "google_only"
+                Mode.FULL -> "full"
             })
             put("listen_host", listenHost)
             put("listen_port", listenPort)
@@ -231,6 +234,7 @@ object ConfigStore {
             MhrvConfig(
                 mode = when (obj.optString("mode", "apps_script")) {
                     "google_only" -> Mode.GOOGLE_ONLY
+                    "full" -> Mode.FULL
                     else -> Mode.APPS_SCRIPT
                 },
                 listenHost = obj.optString("listen_host", "127.0.0.1"),

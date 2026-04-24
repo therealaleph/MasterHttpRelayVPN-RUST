@@ -8,6 +8,7 @@ pub mod domain_fronter;
 pub mod mitm;
 pub mod proxy_server;
 pub mod rlimit;
+pub mod tunnel_client;
 pub mod scan_ips;
 pub mod scan_sni;
 pub mod test_cmd;

@@ -360,13 +360,6 @@ async fn handle_batch(
     (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], json)
 }
 
-fn compress_gzip(data: &[u8]) -> Vec<u8> {
-    use std::io::Write;
-    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-    let _ = encoder.write_all(data);
-    encoder.finish().unwrap_or_else(|_| data.to_vec())
-}
-
 fn decompress_gzip(data: &[u8]) -> Result<Vec<u8>, String> {
     use std::io::Read;
     let mut decoder = flate2::read::GzDecoder::new(data);

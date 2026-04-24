@@ -22,6 +22,7 @@ pub enum ConfigError {
 pub enum Mode {
     AppsScript,
     GoogleOnly,
+    Full,
 }
 
 impl Mode {
@@ -29,6 +30,7 @@ impl Mode {
         match self {
             Mode::AppsScript => "apps_script",
             Mode::GoogleOnly => "google_only",
+            Mode::Full => "full",
         }
     }
 }
@@ -181,7 +183,7 @@ impl Config {
 
     fn validate(&self) -> Result<(), ConfigError> {
         let mode = self.mode_kind()?;
-        if mode == Mode::AppsScript {
+        if mode == Mode::AppsScript || mode == Mode::Full {
             if self.auth_key.trim().is_empty() || self.auth_key == "CHANGE_ME_TO_A_STRONG_SECRET" {
                 return Err(ConfigError::Invalid(
                     "auth_key must be set to a strong secret".into(),
@@ -218,8 +220,9 @@ impl Config {
         match self.mode.as_str() {
             "apps_script" => Ok(Mode::AppsScript),
             "google_only" => Ok(Mode::GoogleOnly),
+            "full" => Ok(Mode::Full),
             other => Err(ConfigError::Invalid(format!(
-                "unknown mode '{}' (expected 'apps_script' or 'google_only')",
+                "unknown mode '{}' (expected 'apps_script', 'google_only', or 'full')",
                 other
             ))),
         }
@@ -308,6 +311,28 @@ mod tests {
         }"#;
         let cfg: Config = serde_json::from_str(s).unwrap();
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn parses_full_mode() {
+        let s = r#"{
+            "mode": "full",
+            "auth_key": "MY_SECRET_KEY_123",
+            "script_id": "ABCDEF"
+        }"#;
+        let cfg: Config = serde_json::from_str(s).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.mode_kind().unwrap(), Mode::Full);
+    }
+
+    #[test]
+    fn full_mode_requires_script_id() {
+        let s = r#"{
+            "mode": "full",
+            "auth_key": "SECRET"
+        }"#;
+        let cfg: Config = serde_json::from_str(s).unwrap();
+        assert!(cfg.validate().is_err());
     }
 
     #[test]
