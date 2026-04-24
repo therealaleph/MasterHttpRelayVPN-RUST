@@ -290,7 +290,10 @@ More deployments = more concurrent batches = lower per-session latency. Each bat
 
 ### Quick start
 
-1. Deploy [`CodeFull.gs`](assets/apps_script/CodeFull.gs) to 3–12 Google accounts (same steps as `Code.gs`, but use the full-mode script that forwards to your tunnel-node)
+1. Deploy [`CodeFull.gs`](assets/apps_script/CodeFull.gs) as **3–12 Web App deployments** (same steps as `Code.gs`, but use the full-mode script that forwards to your tunnel-node). You can create multiple deployments on a single Google account — each "New deployment" produces its own ID. Going multi-account only matters for the daily quota (each Google account gets its own 20 000 `UrlFetchApp` calls/day on the free tier / 100 000 on Workspace); the pipeline depth itself scales fine on one account up to Apps Script's simultaneous-execution ceiling. Rule of thumb:
+   - **Solo use** → 3–6 deployments on one account is plenty
+   - **Shared with ~3 people** → 6 deployments on one account, bump to multi-account only if you start hitting quota alerts
+   - **Shared with a group** → one account per heavy user (each with 1–2 deployments) is the clean scaling path
 2. Deploy the [tunnel-node](tunnel-node/) on a VPS
 3. Set `"mode": "full"` in your config with all deployment IDs:
 
