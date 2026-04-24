@@ -33,6 +33,7 @@ import com.therealaleph.mhrv.CaInstall
 import com.therealaleph.mhrv.ConfigStore
 import com.therealaleph.mhrv.DEFAULT_SNI_POOL
 import com.therealaleph.mhrv.MhrvConfig
+import com.therealaleph.mhrv.Mode
 import com.therealaleph.mhrv.Native
 import com.therealaleph.mhrv.ConnectionMode
 import com.therealaleph.mhrv.NetworkDetect
@@ -228,11 +229,20 @@ fun HomeScreen(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
+            SectionHeader("Mode")
+            ModeDropdown(
+                mode = cfg.mode,
+                onChange = { persist(cfg.copy(mode = it)) },
+            )
+
+            Spacer(Modifier.height(4.dp))
             SectionHeader(stringResource(R.string.sec_apps_script_relay))
 
+            val appsScriptEnabled = cfg.mode == Mode.APPS_SCRIPT
             DeploymentIdsField(
                 urls = cfg.appsScriptUrls,
                 onChange = { persist(cfg.copy(appsScriptUrls = it)) },
+                enabled = appsScriptEnabled,
             )
 
             OutlinedTextField(
@@ -240,6 +250,7 @@ fun HomeScreen(
                 onValueChange = { persist(cfg.copy(authKey = it)) },
                 label = { Text(stringResource(R.string.field_auth_key)) },
                 singleLine = true,
+                enabled = appsScriptEnabled,
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
                 modifier = Modifier.fillMaxWidth(),
                 supportingText = {
@@ -374,12 +385,26 @@ fun HomeScreen(
                         // so a subsequent field edit can't overwrite the
                         // fresh values with pre-resolve ones.
                         scope.launch {
-                            val fresh = withContext(Dispatchers.IO) {
-                                NetworkDetect.resolveGoogleIp()
-                            }
+                            // Only auto-fill google_ip if it's empty.
+                            // Issue #71: some Iranian ISPs return
+                            // poisoned A records for www.google.com that
+                            // resolve but then refuse TLS (or route to a
+                            // Google IP that's not on the GFE and can't
+                            // handle our SNI-rewrite). If the user has
+                            // manually set a working IP
+                            // (e.g. 216.239.38.120), we must NOT
+                            // overwrite it with a poisoned fresh lookup
+                            // just because the two values differ. They
+                            // can still force a re-resolve via the
+                            // explicit "Auto-detect" button above.
                             var updated = cfg
-                            if (!fresh.isNullOrBlank() && fresh != updated.googleIp) {
-                                updated = updated.copy(googleIp = fresh)
+                            if (updated.googleIp.isBlank()) {
+                                val fresh = withContext(Dispatchers.IO) {
+                                    NetworkDetect.resolveGoogleIp()
+                                }
+                                if (!fresh.isNullOrBlank()) {
+                                    updated = updated.copy(googleIp = fresh)
+                                }
                             }
                             if (updated.frontDomain.isBlank() ||
                                 updated.frontDomain.parseAsIpOrNull() != null
@@ -392,6 +417,7 @@ fun HomeScreen(
                     }
                 },
                 enabled = (isVpnRunning ||
+                    cfg.mode == Mode.GOOGLE_ONLY ||
                     (cfg.hasDeploymentId && cfg.authKey.isNotBlank())) && !transitionCooldown,
                 colors = ButtonDefaults.buttonColors(
                     containerColor = if (isVpnRunning) ErrRed else OkGreen,
@@ -669,6 +695,7 @@ private fun ConnectionModeDropdown(
 private fun DeploymentIdsField(
     urls: List<String>,
     onChange: (List<String>) -> Unit,
+    enabled: Boolean = true,
 ) {
     // Treat the list as newline-joined text. Keep trailing newlines so the
     // cursor behaves naturally while the user is adding a new entry.
@@ -682,6 +709,7 @@ private fun DeploymentIdsField(
             onChange(parsed)
         },
         label = { Text(stringResource(R.string.field_deployment_urls)) },
+        enabled = enabled,
         modifier = Modifier.fillMaxWidth(),
         minLines = 2,
         maxLines = 6,
@@ -689,6 +717,66 @@ private fun DeploymentIdsField(
             Text(stringResource(R.string.help_deployment_urls))
         },
     )
+}
+
+// =========================================================================
+// Mode dropdown: apps_script (default) vs google_only (bootstrap).
+// =========================================================================
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ModeDropdown(
+    mode: Mode,
+    onChange: (Mode) -> Unit,
+) {
+    val labelApps = "Apps Script (full)"
+    val labelGoogle = "Google-only (bootstrap)"
+    val currentLabel = when (mode) {
+        Mode.APPS_SCRIPT -> labelApps
+        Mode.GOOGLE_ONLY -> labelGoogle
+    }
+    var expanded by remember { mutableStateOf(false) }
+
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        ExposedDropdownMenuBox(
+            expanded = expanded,
+            onExpandedChange = { expanded = !expanded },
+        ) {
+            OutlinedTextField(
+                value = currentLabel,
+                onValueChange = {},
+                readOnly = true,
+                label = { Text("Mode") },
+                trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+                modifier = Modifier.fillMaxWidth().menuAnchor(),
+            )
+            ExposedDropdownMenu(
+                expanded = expanded,
+                onDismissRequest = { expanded = false },
+            ) {
+                DropdownMenuItem(
+                    text = { Text(labelApps) },
+                    onClick = { onChange(Mode.APPS_SCRIPT); expanded = false },
+                )
+                DropdownMenuItem(
+                    text = { Text(labelGoogle) },
+                    onClick = { onChange(Mode.GOOGLE_ONLY); expanded = false },
+                )
+            }
+        }
+
+        val help = when (mode) {
+            Mode.APPS_SCRIPT ->
+                "Full DPI bypass through your deployed Apps Script relay."
+            Mode.GOOGLE_ONLY ->
+                "Bootstrap: reach *.google.com directly so you can open script.google.com and deploy Code.gs. Non-Google traffic goes direct."
+        }
+        Text(
+            help,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
 }
 
 // =========================================================================
@@ -777,16 +865,30 @@ private fun SniPoolEditor(
                 value = custom,
                 onValueChange = { custom = it },
                 label = { Text(stringResource(R.string.field_add_custom_sni)) },
-                singleLine = true,
+                // Accept a pasted list — users (issue #47) want to dump a
+                // whole list of subdomains in one go. We split on newlines,
+                // commas, semicolons, and whitespace so formats like
+                //   www.google.com\nmail.google.com\ndrive.google.com
+                //   www.google.com, mail.google.com
+                //   www.google.com mail.google.com
+                // all do the right thing on Add.
+                singleLine = false,
+                maxLines = 6,
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
                 modifier = Modifier.weight(1f),
             )
             TextButton(
                 onClick = {
-                    val s = custom.trim()
-                    if (s.isNotEmpty()) {
-                        val next = (cfg.sniHosts.takeIf { it.isNotEmpty() } ?: enabledSet.toList()) + s
-                        onChange(cfg.copy(sniHosts = next.distinct()))
+                    // Tokenise on any whitespace, comma, or semicolon so one
+                    // Add click absorbs a pasted list. Deduplicate within
+                    // the paste before merging into the existing list.
+                    val tokens = custom.split(Regex("[\\s,;]+"))
+                        .map { it.trim() }
+                        .filter { it.isNotEmpty() }
+                    if (tokens.isNotEmpty()) {
+                        val base = cfg.sniHosts.takeIf { it.isNotEmpty() } ?: enabledSet.toList()
+                        val next = (base + tokens).distinct()
+                        onChange(cfg.copy(sniHosts = next))
                         custom = ""
                     }
                 },

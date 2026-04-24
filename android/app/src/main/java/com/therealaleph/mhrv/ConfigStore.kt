@@ -59,7 +59,21 @@ enum class SplitMode { ALL, ONLY, EXCEPT }
  */
 enum class UiLang { AUTO, FA, EN }
 
+/**
+ * Operating mode. Mirrors the Rust-side `Mode` enum.
+ *
+ * - [APPS_SCRIPT] (default) — full DPI bypass through the user's deployed
+ *   Apps Script relay. Requires a Deployment ID + Auth key.
+ * - [GOOGLE_ONLY] — bootstrap mode. Only the SNI-rewrite tunnel to the
+ *   Google edge is active, so the user can reach `script.google.com` to
+ *   deploy Code.gs in the first place. No Deployment ID / Auth key needed.
+ *   Non-Google traffic goes direct (no relay).
+ */
+enum class Mode { APPS_SCRIPT, GOOGLE_ONLY }
+
 data class MhrvConfig(
+    val mode: Mode = Mode.APPS_SCRIPT,
+
     val listenHost: String = "127.0.0.1",
     val listenPort: Int = 8080,
     val socks5Port: Int? = 1081,
@@ -130,11 +144,17 @@ data class MhrvConfig(
         val obj = JSONObject().apply {
             // `mode` is required — without it serde errors with
             // "missing field `mode`" and startProxy silently returns 0.
-            put("mode", "apps_script")
+            put("mode", when (mode) {
+                Mode.APPS_SCRIPT -> "apps_script"
+                Mode.GOOGLE_ONLY -> "google_only"
+            })
             put("listen_host", listenHost)
             put("listen_port", listenPort)
             socks5Port?.let { put("socks5_port", it) }
 
+            // In google_only mode these are unused by the Rust side, but we
+            // still persist whatever the user typed so flipping back to
+            // apps_script mode doesn't wipe their settings.
             put("script_ids", JSONArray().apply { ids.forEach { put(it) } })
             put("auth_key", authKey)
 
@@ -209,6 +229,10 @@ object ConfigStore {
             }?.filter { it.isNotBlank() }.orEmpty()
 
             MhrvConfig(
+                mode = when (obj.optString("mode", "apps_script")) {
+                    "google_only" -> Mode.GOOGLE_ONLY
+                    else -> Mode.APPS_SCRIPT
+                },
                 listenHost = obj.optString("listen_host", "127.0.0.1"),
                 listenPort = obj.optInt("listen_port", 8080),
                 socks5Port = obj.optInt("socks5_port", 1081).takeIf { it > 0 },
@@ -261,8 +285,21 @@ val DEFAULT_SNI_POOL: List<String> = listOf(
     "drive.google.com",
     "docs.google.com",
     "calendar.google.com",
-    // Issue #42: passes DPI on Samantel / MCI where the longer google.com
-    // subdomains are selectively SNI-blocked. Must mirror the Rust list
-    // in src/domain_fronter.rs exactly.
-    "accounts.googl.com",
+    // accounts.google.com — originally listed as accounts.googl.com per
+    // issue #42, but googl.com is NOT in Google's GFE cert SAN so TLS
+    // validation fails with verify_ssl=true (PR #92). Replaced with
+    // accounts.google.com which is covered by the *.google.com wildcard.
+    "accounts.google.com",
+    // Issue #47: same DPI-passing behaviour on MCI / Samantel.
+    "scholar.google.com",
+    // Ported from upstream Python FRONT_SNI_POOL_GOOGLE (commit 57738ec);
+    // more rotation material for DPI-fingerprint spread and a couple of
+    // SNIs (maps/play) that pass DPI where shorter *.google.com names don't.
+    "maps.google.com",
+    "chat.google.com",
+    "translate.google.com",
+    "play.google.com",
+    "lens.google.com",
+    // Issue #75.
+    "chromewebstore.google.com",
 )

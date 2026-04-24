@@ -11,7 +11,7 @@ use mhrv_rs::cert_installer::{install_ca, is_ca_trusted};
 use mhrv_rs::config::Config;
 use mhrv_rs::mitm::{MitmCertManager, CA_CERT_FILE};
 use mhrv_rs::proxy_server::ProxyServer;
-use mhrv_rs::{scan_ips, test_cmd};
+use mhrv_rs::{scan_ips, scan_sni, test_cmd};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -27,6 +27,7 @@ enum Command {
     Test,
     ScanIps,
     TestSni,
+    ScanSni,
 }
 
 fn print_help() {
@@ -37,6 +38,7 @@ USAGE:
     mhrv-rs [OPTIONS]                  Start the proxy server (default)
     mhrv-rs test [OPTIONS]             Probe the Apps Script relay end-to-end
     mhrv-rs scan-ips [OPTIONS]         Scan Google frontend IPs for reachability + latency
+    mhrv-rs scan-sni         Scan Google SNI name using Google frontend IPs found in 'scan-ips' command
     mhrv-rs test-sni [OPTIONS]         Probe each SNI name in the rotation pool against google_ip
 
 OPTIONS:
@@ -68,6 +70,10 @@ fn parse_args() -> Result<Args, String> {
             }
             "scan-ips" => {
                 command = Command::ScanIps;
+                raw.remove(0);
+            }
+            "scan-sni" => {
+                command = Command::ScanSni;
                 raw.remove(0);
             }
             "test-sni" => {
@@ -190,8 +196,17 @@ async fn main() -> ExitCode {
                 ExitCode::FAILURE
             };
         }
+        Command::ScanSni => {
+            let ok = scan_sni::discover_snis_from_google_ips(&config).await;
+            return if ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            };
+        }
+
         Command::TestSni => {
-            let ok = mhrv_rs::scan_sni::run(&config).await;
+            let ok = scan_sni::run(&config).await;
             return if ok {
                 ExitCode::SUCCESS
             } else {
@@ -202,23 +217,44 @@ async fn main() -> ExitCode {
     }
 
     let socks5_port = config.socks5_port.unwrap_or(config.listen_port + 1);
-    tracing::warn!("mhrv-rs {} starting (mode: apps_script)", VERSION);
+    let mode = match config.mode_kind() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("config: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+    tracing::warn!("mhrv-rs {} starting (mode: {})", VERSION, mode.as_str());
     tracing::info!(
         "HTTP proxy   : {}:{}",
         config.listen_host,
         config.listen_port
     );
     tracing::info!("SOCKS5 proxy : {}:{}", config.listen_host, socks5_port);
-    tracing::info!(
-        "Apps Script relay: SNI={} -> script.google.com (via {})",
-        config.front_domain,
-        config.google_ip
-    );
-    let sids = config.script_ids_resolved();
-    if sids.len() > 1 {
-        tracing::info!("Script IDs: {} (round-robin)", sids.len());
-    } else {
-        tracing::info!("Script ID: {}", sids[0]);
+    match mode {
+        mhrv_rs::config::Mode::AppsScript => {
+            tracing::info!(
+                "Apps Script relay: SNI={} -> script.google.com (via {})",
+                config.front_domain,
+                config.google_ip
+            );
+            let sids = config.script_ids_resolved();
+            if sids.len() > 1 {
+                tracing::info!("Script IDs: {} (round-robin)", sids.len());
+            } else {
+                tracing::info!("Script ID: {}", sids[0]);
+            }
+        }
+        mhrv_rs::config::Mode::GoogleOnly => {
+            tracing::warn!(
+                "google_only bootstrap: direct SNI-rewrite tunnel to {} only. \
+                 Open https://script.google.com in your browser (proxy set to \
+                 {}:{}), deploy Code.gs, then switch to apps_script mode.",
+                config.google_ip,
+                config.listen_host,
+                config.listen_port
+            );
+        }
     }
 
     // Initialize MITM manager (generates CA on first run).

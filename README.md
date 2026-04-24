@@ -49,7 +49,9 @@ For a handful of Google-owned domains (`google.com`, `youtube.com`, `fonts.googl
 
 Linux (x86_64, aarch64), macOS (x86_64, aarch64), Windows (x86_64), **Android 7.0+** (universal APK covering arm64, armv7, x86_64, x86). Prebuilt binaries on the [releases page](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases).
 
-**Android users** — grab `mhrv-rs-android-universal-v*.apk` and follow the full walk-through in [docs/android.md](docs/android.md) (English) or [docs/android.fa.md](docs/android.fa.md) (فارسی). The Android build runs the exact same `mhrv-rs` crate as the desktop (via JNI) and adds a TUN bridge via `tun2proxy`, so every app on the device routes through the proxy without per-app configuration.
+**Android users** — grab `mhrv-rs-android-universal-v*.apk` and follow the full walk-through in [docs/android.md](docs/android.md) (English) or [docs/android.fa.md](docs/android.fa.md) (فارسی). The Android build runs the exact same `mhrv-rs` crate as the desktop (via JNI) and adds a TUN bridge via `tun2proxy`, so every app on the device routes its IP traffic through the proxy without per-app configuration.
+
+> **Important Android caveat (issues #74 / #81):** while TUN captures all IP traffic, _HTTPS_ traffic from third-party apps still only works for apps that trust user-installed CAs. From Android 7 onward (which covers all supported devices — `minSdk = 24`), apps must opt in via `networkSecurityConfig` to trust the MITM CA we install. **Chrome and Firefox do**; **Telegram, WhatsApp, Instagram, YouTube, banking apps, games** do not. For those apps, either use `PROXY_ONLY` mode and point their in-app proxy at `127.0.0.1:1081` (SOCKS5), use `google_only` mode (no CA required, Google services only), or set `upstream_socks5` to an external VPS. This is an Android security design, not a bug in this client — same limit applies to every other MITM proxy on the platform.
 
 ## What's in a release
 
@@ -96,6 +98,19 @@ This part is unchanged from the original project. Follow @masterking32's guide o
    - Execute as: **Me**
    - Who has access: **Anyone**
 6. Copy the **Deployment ID** (the long random string in the URL).
+
+#### Can't reach `script.google.com` from your network?
+
+If your ISP is already blocking Google Apps Script (or all of Google), you need Step 1's browser connection to succeed *before* you have a relay to use. `mhrv-rs` ships a small bootstrap mode for exactly this: `google_only`.
+
+1. Build / download the binary as in Step 2 below.
+2. Copy [`config.google-only.example.json`](config.google-only.example.json) to `config.json` — no `script_id`, no `auth_key` required.
+3. Run `mhrv-rs serve` and set your browser's HTTP proxy to `127.0.0.1:8085`.
+4. In `google_only` mode the proxy only relays `*.google.com`, `*.youtube.com`, and the other Google-edge hosts via the same SNI-rewrite tunnel the full client uses. Other traffic goes direct — no Apps Script relay exists yet.
+5. Do Step 1 in your browser (the connection to `script.google.com` will be SNI-fronted). Deploy Code.gs, copy the Deployment ID.
+6. In the desktop UI or the Android app (or by editing `config.json`) switch the mode back to `apps_script`, paste the Deployment ID and your auth key, and restart.
+
+You can also verify reachability before even starting the proxy: `mhrv-rs test-sni` probes `*.google.com` directly and works without any config beyond `google_ip` + `front_domain`.
 
 ### Step 2 — Download
 
@@ -377,25 +392,44 @@ Original project: <https://github.com/masterking32/MasterHttpRelayVPN> by [@mast
 
 ### چه چیز لازم دارید؟
 
-۱. یک حساب گوگل (همان `Gmail` رایگان کافیست)
-۲. مرورگر (`Firefox`، `Chrome`، `Edge`، …) یا برنامه‌ای که `HTTP proxy` یا `SOCKS5` قبول کند
-۳. دسترسی به سیستم خودتان (مک / لینوکس / ویندوز)
+۱. یک حساب گوگل (همان `Gmail` رایگان کافیست)  
+۲. مرورگر (`Firefox`، `Chrome`، `Edge`، …) یا برنامه‌ای که `HTTP proxy` یا `SOCKS5` قبول کند  
+۳. دسترسی به سیستم خودتان (مک / لینوکس / ویندوز)  
 
 ### پنج مرحله برای راه‌اندازی
 
 #### مرحلهٔ ۱ — ساخت اسکریپت در گوگل (فقط یک بار)
 
-۱. به <https://script.google.com> بروید و با حساب گوگل خودتان وارد شوید
-۲. روی **`New project`** کلیک کنید و کد پیش‌فرض را پاک کنید
-۳. محتوای فایل [`Code.gs`](https://github.com/masterking32/MasterHttpRelayVPN/blob/python_testing/apps_script/Code.gs) را از ریپوی اصلی کپی کنید و داخل ویرایشگر بچسبانید. اگر به آدرس بالا دسترسی ندارید، یک کپی از همین فایل داخل این ریپو هم هست: [`assets/apps_script/Code.gs`](assets/apps_script/Code.gs)
-۴. بالای کد، خط `const AUTH_KEY = "..."` را پیدا کنید و مقدار آن را به یک رمز قوی و خاص خودتان تغییر دهید (یک رشتهٔ تصادفی حداقل ۱۶ کاراکتری کافی است، مثلاً `aK8f3xM9pQ2nL5vR`)
-۵. روی دکمهٔ آبی **`Deploy`** در بالا سمت راست کلیک کنید و **`New deployment`** را بزنید
-۶. **`Type`** را روی **`Web app`** بگذارید و این تنظیمات را اعمال کنید:
-   - **`Execute as`**: **`Me`**
-   - **`Who has access`**: **`Anyone`**
-۷. روی **`Deploy`** کلیک کنید. گوگل یک **`Deployment ID`** نشان می‌دهد — رشتهٔ طولانی تصادفی که داخل آدرس `URL` است. کپی‌اش کنید؛ در برنامه لازم دارید
+۱. به <https://script.google.com> بروید و با حساب گوگل خودتان وارد شوید  
+۲. روی **`New project`** کلیک کنید و کد پیش‌فرض را پاک کنید  
+۳. محتوای فایل [`Code.gs`](https://github.com/masterking32/MasterHttpRelayVPN/blob/python_testing/apps_script/Code.gs) را از ریپوی اصلی کپی کنید و داخل ویرایشگر بچسبانید. اگر به آدرس بالا دسترسی ندارید، یک کپی از همین فایل داخل این ریپو هم هست: [`assets/apps_script/Code.gs`](assets/apps_script/Code.gs)  
+۴. بالای کد، خط `const AUTH_KEY = "..."` را پیدا کنید و مقدار آن را به یک رمز قوی و خاص خودتان تغییر دهید (یک رشتهٔ تصادفی حداقل ۱۶ کاراکتری کافی است، مثلاً `aK8f3xM9pQ2nL5vR`)  
+۵. روی دکمهٔ آبی **`Deploy`** در بالا سمت راست کلیک کنید و **`New deployment`** را بزنید  
+۶. **`Type`** را روی **`Web app`** بگذارید و این تنظیمات را اعمال کنید:  
+- **`Execute as`**: **`Me`**  
+- **`Who has access`**: **`Anyone`**
+
+۷. روی **`Deploy`** کلیک کنید. گوگل یک **`Deployment ID`** نشان می‌دهد — رشتهٔ طولانی تصادفی که داخل آدرس `URL` است. کپی‌اش کنید؛ در برنامه لازم دارید  
 
 > **نکته:** اگر نمی‌دانید رمز `AUTH_KEY` چه بگذارید، یک رشتهٔ تصادفی ۱۶ تا ۲۴ کاراکتری بسازید. مهم فقط این است که **دقیقاً همان رشته** را در برنامه هم وارد کنید.
+
+#### به `script.google.com` هم دسترسی ندارید؟
+
+اگر `ISP` شما از قبل `Apps Script` (یا کل گوگل) را مسدود کرده، برای مرحلهٔ ۱ باید مرورگرتان **اول** به `script.google.com` برسد — قبل از اینکه رله‌ای داشته باشید. `mhrv-rs` یک حالت بوت‌استرپ کوچک دقیقاً برای همین دارد: `google_only`.
+
+۱. برنامه را طبق مرحلهٔ ۲ پایین دانلود کنید
+
+۲. فایل [`config.google-only.example.json`](config.google-only.example.json) را در کنار فایل اجرایی به نام `config.json` کپی کنید — نه `script_id` لازم دارد و نه `auth_key`
+
+۳. برنامه را اجرا کنید و `HTTP proxy` مرورگرتان را روی `127.0.0.1:8085` تنظیم کنید
+
+۴. در حالت `google_only`، پروکسی فقط `*.google.com`، `*.youtube.com` و بقیهٔ میزبان‌های لبهٔ گوگل را از طریق همان تونل بازنویسی `SNI` رد می‌کند. بقیهٔ ترافیک مستقیم می‌رود — هنوز رله‌ای در کار نیست
+
+۵. حالا مرحلهٔ ۱ را در مرورگر انجام دهید (اتصال به `script.google.com` با `SNI` فرونت می‌شود). `Code.gs` را مستقر کنید و `Deployment ID` را کپی کنید
+
+۶. در `UI` دسکتاپ یا اندروید (یا با ویرایش `config.json`) حالت را به `apps_script` برگردانید، `Deployment ID` و `auth_key` را بچسبانید و برنامه را دوباره راه‌اندازی کنید
+
+برای بررسی قابلیت دسترسی قبل از راه‌اندازی پروکسی: دستور `mhrv-rs test-sni` دامنه‌های `*.google.com` را مستقیماً تست می‌کند و فقط به `google_ip` و `front_domain` نیاز دارد.
 
 #### مرحلهٔ ۲ — دانلود برنامه
 
@@ -409,10 +443,9 @@ Original project: <https://github.com/masterking32/MasterHttpRelayVPN> by [@mast
 | لینوکس معمولی (اوبونتو، مینت، دبیان، فدورا، آرچ، …) | `mhrv-rs-linux-amd64.tar.gz` |
 | لینوکس روی روتر (`OpenWRT`) یا `Alpine` | `mhrv-rs-linux-musl-amd64.tar.gz` |
 
-> اگر نمی‌دانید مک شما `M1/M2` است یا اینتل: منوی اپل → `About This Mac` → در خط **`Chip`** اگر **`Apple`** نوشته شده، `arm64` بگیرید؛ اگر **`Intel`**، `amd64`.
->
-> کاربران اوبونتو ۲۰.۰۴ یا سیستم‌های خیلی قدیمی که خطای `GLIBC not found` می‌گیرند: آرشیو `linux-musl-amd64` را دانلود کنید — اجرا می‌شود.
+> اگر نمی‌دانید مک شما `M1/M2` است یا اینتل: منوی اپل → `About This Mac` → در خط **`Chip`** اگر **`Apple`** نوشته شده، `arm64` بگیرید؛ اگر **`Intel`**، `amd64`.  
 
+> کاربران اوبونتو ۲۰.۰۴ یا سیستم‌های خیلی قدیمی که خطای `GLIBC not found` می‌گیرند: آرشیو `linux-musl-amd64` را دانلود کنید — اجرا می‌شود.  
 #### مرحلهٔ ۳ — اجرای بار اول (نصب گواهی محلی)
 
 برای اینکه برنامه بتواند ترافیک `HTTPS` مرورگر شما را باز کند و از طریق `Apps Script` رد کند، یک گواهی امنیتی کوچک **روی سیستم خودتان** می‌سازد و به سیستم‌عامل می‌گوید به آن اعتماد کند.
@@ -487,13 +520,12 @@ Original project: <https://github.com/masterking32/MasterHttpRelayVPN> by [@mast
 با استفاده از این گزینه‌ها ممکن است IPهایی پیدا کنید که سریع‌تر از آرایه ثابت پیش‌فرض هستند اما تضمینی وجود ندارد که این IPها کار کنند.
 
 #### ۵. تنظیم proxy در کلاینت
-۱. منوی `Settings` را باز کنید، در خانهٔ جست‌وجو عبارت `proxy` را تایپ کنید
-۲. روی **`Network Settings`** کلیک کنید
-۳. گزینهٔ **`Manual proxy configuration`** را انتخاب کنید
-۴. در فیلد **`HTTP Proxy`** آدرس `127.0.0.1` و پورت `8085` را بگذارید
-۵. تیک **`Also use this proxy for HTTPS`** را بزنید
-۶. `OK` را بزنید
-
+۱. منوی `Settings` را باز کنید، در خانهٔ جست‌وجو عبارت `proxy` را تایپ کنید  
+۲. روی **`Network Settings`** کلیک کنید  
+۳. گزینهٔ **`Manual proxy configuration`** را انتخاب کنید  
+۴. در فیلد **`HTTP Proxy`** آدرس `127.0.0.1` و پورت `8085` را بگذارید  
+۵. تیک **`Also use this proxy for HTTPS`** را بزنید  
+۶. `OK`  
 **کروم یا Edge:** از تنظیمات `proxy` سیستم‌عامل استفاده می‌کنند. ساده‌ترین راه نصب افزونهٔ **`Proxy SwitchyOmega`** و تنظیم آن روی `127.0.0.1:8085` است.
 
 **تلگرام:**
@@ -514,8 +546,7 @@ Original project: <https://github.com/masterking32/MasterHttpRelayVPN> by [@mast
 
 ### تلگرام و غیره — جفت کردن با xray
 
-`Apps Script` فقط `HTTP` می‌فهمد، پس پروتکل‌های دیگر (مثل `MTProto` تلگرام، `IMAP` ایمیل، `SSH`، …) مستقیماً از آن رد نمی‌شوند. نتیجه: اگر `ISP` تلگرام را با `DPI` بلاک کرده باشد، همچنان بلاک است.
-
+‏ `Apps Script` فقط `HTTP` می‌فهمد، پس پروتکل‌های دیگر (مثل `MTProto` تلگرام، `IMAP` ایمیل، `SSH`، …) مستقیماً از آن رد نمی‌شوند. نتیجه: اگر `ISP` تلگرام را با `DPI` بلاک کرده باشد، همچنان بلاک است.  
 **راه‌حل:** یک [`xray`](https://github.com/XTLS/Xray-core) (یا `v2ray` یا `sing-box`) روی سیستم خودتان اجرا کنید که با `VLESS` / `Trojan` / `Shadowsocks` به یک سرور `VPS` شخصی وصل می‌شود. بعد در برنامهٔ `mhrv-rs`، فیلد **`Upstream SOCKS5`** را با آدرس `xray` پر کنید (مثلاً `127.0.0.1:50529`).
 
 بعد از این کار، ترافیکی که `HTTP` نیست (مثل تلگرام) از `xray` عبور می‌کند و به سرور شما می‌رسد. ترافیک `HTTP/HTTPS` مثل قبل از `Apps Script` می‌رود، پس مرورگر شما دست نخورده کار می‌کند.
@@ -569,13 +600,14 @@ logread -e mhrv-rs -f
 
 راهنمای انگلیسی هم در [`docs/android.md`](docs/android.md) است.
 
-جمعبندی سریع:
+جمع‌بندی سریع:
 
-۱. APK را از `Releases` دانلود و نصب کنید (اگر اندروید «منبع ناشناس» گفت، در همان دیالوگ اجازه بدهید)
-۲. `Apps Script` را طبق [مرحلهٔ ۱ بالا](#مرحلهٔ-۱--ساخت-اسکریپت-در-گوگل-فقط-یک-بار) دیپلوی کنید (همان `Code.gs` + `AUTH_KEY`)
-۳. `/exec URL` و `auth_key` را در برنامه وارد کنید، **Auto-detect google_ip** را بزنید
-۴. **Install MITM certificate** — برنامه گواهی را در `Downloads` ذخیره می‌کند و `Settings` را باز می‌کند. در `Settings` عبارت `CA certificate` را جست‌وجو و از `Downloads` نصب کنید
-۵. **Start** → مجوز `VPN` را تأیید کنید → همه‌چیز کار می‌کند
+۱‏. APK را از `Releases` دانلود و نصب کنید (اگر اندروید «منبع ناشناس» گفت، در همان دیالوگ اجازه بدهید)  
+۲‏. `Apps Script` را طبق [مرحلهٔ ۱ بالا](#مرحلهٔ-۱--ساخت-اسکریپت-در-گوگل-فقط-یک-بار) دیپلوی کنید (همان `Code.gs` + `AUTH_KEY`)  
+۳‏. `/exec URL` و `auth_key` را در برنامه وارد کنید، **Auto-detect google_ip** را بزنید  
+۴‏. **Install MITM certificate** — برنامه گواهی را در `Downloads` ذخیره می‌کند و `Settings` را باز می‌کند. در `Settings` عبارت `CA certificate` را جست‌وجو و از `Downloads` نصب کنید  
+۵‏. **Start** → مجوز `VPN` را تأیید کنید → همه‌چیز کار می‌کند  
+
 
 محدودیت‌های اندروید همان محدودیت‌های دسکتاپ + دو مورد اضافه: `IPv6` از `TUN` رد نمی‌شود (فقط `IPv4` روت می‌شود) و اکثر برنامه‌های غیر مرورگری (بانکی، `Netflix`، پیام‌رسان‌ها) به `CA` کاربری اعتماد نمی‌کنند. جزئیات در [`docs/android.fa.md`](docs/android.fa.md#محدودیت‌های-شناخته‌شده).
 
@@ -591,12 +623,12 @@ logread -e mhrv-rs -f
 - **لینوکس:** فایل `/usr/local/share/ca-certificates/mhrv-rs.crt` را حذف و `sudo update-ca-certificates` اجرا کنید
 
 **چند `Deployment ID` لازم دارم؟**
-یکی برای استفادهٔ عادی کافی است. هر حساب گوگل روزانه حدود ۲ میلیون درخواست سهمیه دارد. اگر مصرف بالا دارید یا سرعت کم شده، در حساب‌های گوگل دیگر `Deployment` بسازید و همهٔ `Deployment ID`ها را در فیلد `Apps Script ID(s)` یک در هر خط وارد کنید — برنامه خودکار بینشان می‌چرخد.
+یکی برای استفادهٔ عادی کافی است. سهمیهٔ روزانه `UrlFetchApp` برای حساب رایگان گوگل **۲۰٬۰۰۰ درخواست در روز** است (برای `Workspace` پولی ۱۰۰٬۰۰۰)، با محدودیت پاسخ ۵۰ مگابایت به ازای هر `fetch`. برای اکثر کاربران چند ساعت یوتیوب هم با یک `Deployment` کافی است. اگر مصرف بالا دارید، در حساب‌های گوگل دیگر `Deployment` بسازید و همهٔ `Deployment ID`ها را در فیلد `Apps Script ID(s)` یک در هر خط وارد کنید — برنامه خودکار بینشان می‌چرخد. مرجع: <https://developers.google.com/apps-script/guides/services/quotas>
 
 **یوتوب کار می‌کند؟ ویدیو پخش می‌شود؟**
 صفحهٔ یوتوب سریع باز می‌شود (چون مستقیم از لبهٔ گوگل می‌آید). اما `chunk`های ویدیوی اصلی از `googlevideo.com` از طریق `Apps Script` می‌آیند و روزانه سهمیه دارند. برای تماشای گاه‌به‌گاه خوب است، برای ۱۰۸۰p پخش طولانی دردناک.
 
-**`ChatGPT` یا `OpenAI` کار می‌کنند؟**
+**‏`ChatGPT` یا `OpenAI` کار می‌کنند؟**
 استریم زنده (`streaming`) آن‌ها کار نمی‌کند چون از `WebSocket` استفاده می‌کنند و `Apps Script` آن را پشتیبانی نمی‌کند. تنها راه‌حل: از `xray` استفاده کنید (بخش **تلگرام و غیره** را ببینید).
 
 **خطای `GLIBC_2.39 not found` در لینوکس می‌گیرم. چه کنم؟**
@@ -624,13 +656,12 @@ logread -e mhrv-rs -f
 
 این محدودیت‌ها ذاتی روش `Apps Script` هستند، نه باگ این برنامه. نسخهٔ اصلی پایتون هم دقیقاً همین محدودیت‌ها را دارد.
 
-- `User-Agent` همهٔ درخواست‌ها ثابت روی `Google-Apps-Script` است (گوگل اجازهٔ تغییر نمی‌دهد). بعضی سایت‌ها به‌خاطر این نسخهٔ ساده‌شدهٔ بدون `JavaScript` نشان می‌دهند
-- پخش ویدیو سهمیه دارد و ممکن است کند باشد (هر حساب گوگل روزانه حدود ۲ میلیون درخواست سهمیه دارد)
-- فشرده‌سازی `Brotli` پشتیبانی نمی‌شود (فقط `gzip`)، سربار حجمی جزئی
-- `WebSocket` از `Apps Script` عبور نمی‌کند (`ChatGPT` استریم، `Discord voice`، …)
-- سایت‌هایی که گواهی خود را `pin` کرده‌اند گواهی `MITM` برنامه را قبول نمی‌کنند (تعداد کمی‌اند)
-- ورود دومرحله‌ای گوگل ممکن است هشدار «دستگاه ناشناس» بدهد — اولین ورود را بدون این ابزار انجام دهید
-
+- ‏`User-Agent` همهٔ درخواست‌ها ثابت روی `Google-Apps-Script` است (گوگل اجازهٔ تغییر نمی‌دهد). بعضی سایت‌ها به‌خاطر این نسخهٔ ساده‌شدهٔ بدون `JavaScript` نشان می‌دهند  
+- پخش ویدیو سهمیه دارد و ممکن است کند باشد (سهمیهٔ `UrlFetchApp` برای حساب رایگان ۲۰٬۰۰۰ درخواست در روز است — چند ساعت یوتیوب برای بیشتر کاربران)  
+- فشرده‌سازی `Brotli` پشتیبانی نمی‌شود (فقط `gzip`)، سربار حجمی جزئی  
+- ‏`WebSocket` از `Apps Script` عبور نمی‌کند (`ChatGPT` استریم، `Discord voice`، …)  
+- سایت‌هایی که گواهی خود را `pin` کرده‌اند گواهی `MITM` برنامه را قبول نمی‌کنند (تعداد کمی‌اند)  
+- ورود دومرحله‌ای گوگل ممکن است هشدار «دستگاه ناشناس» بدهد — اولین ورود را بدون این ابزار انجام دهید  
 ### امنیت
 
 - ریشهٔ `MITM` **فقط روی سیستم شما می‌ماند**. کلید خصوصی هیچ‌وقت از سیستمتان خارج نمی‌شود

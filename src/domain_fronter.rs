@@ -542,9 +542,9 @@ impl DomainFronter {
     ///   5. Else: compute the remaining ranges, fetch them with
     ///      bounded concurrency, stitch, return as 200.
     ///
-    /// If any chunk fails after retries, we fall back to the probe's
-    /// single-chunk response as a graceful-degradation — better a
-    /// truncated video than a blank one.
+    /// If any later chunk fails validation or fetch, we fall back to the
+    /// probe's single-chunk response as a graceful-degradation, but we do
+    /// not stitch unchecked bytes into a fake full-success response.
     pub async fn relay_parallel_range(
         &self,
         method: &str,
@@ -580,18 +580,26 @@ impl DomainFronter {
             return first;
         }
 
-        let total = match parse_content_range_total(&resp_headers) {
-            Some(t) => t,
-            None => return rewrite_206_to_200(&first),
+        let probe_range = match validate_probe_range(status, &resp_headers, resp_body, CHUNK - 1)
+        {
+            Some(r) => r,
+            None => {
+                tracing::warn!(
+                    "range-parallel: probe returned invalid 206 for {}; falling back to single GET",
+                    url,
+                );
+                return self.relay(method, url, headers, body).await;
+            }
         };
+        let total = probe_range.total;
 
-        if total <= CHUNK || (resp_body.len() as u64) >= total {
+        if total <= CHUNK || (probe_range.end + 1) >= total {
             return rewrite_206_to_200(&first);
         }
 
         // Plan remaining ranges after what the probe already returned.
         let mut ranges: Vec<(u64, u64)> = Vec::new();
-        let mut start = resp_body.len() as u64;
+        let mut start = probe_range.end + 1;
         while start < total {
             let end = (start + CHUNK - 1).min(total - 1);
             ranges.push((start, end));
@@ -622,28 +630,36 @@ impl DomainFronter {
                 h.push(("Range".into(), format!("bytes={}-{}", s, e)));
                 async move {
                     let raw = self.relay("GET", &url, &h, &[]).await;
-                    split_response(&raw).map(|(_, _, b)| b.to_vec()).unwrap_or_default()
+                    (s, e, extract_exact_range_body(&raw, s, e, total))
                 }
             })
             .buffered(MAX_PARALLEL)
-            .collect::<Vec<Vec<u8>>>()
+            .collect::<Vec<_>>()
             .await;
 
         // Stitch: probe body first, then the chunks in order.
         let mut full = Vec::with_capacity(total as usize);
         full.extend_from_slice(resp_body);
-        for chunk in &fetches {
-            full.extend_from_slice(chunk);
+        for (start, end, chunk) in fetches {
+            match chunk {
+                Ok(chunk) => full.extend_from_slice(&chunk),
+                Err(reason) => {
+                    tracing::warn!(
+                        "range-parallel: invalid chunk {}-{} for {} ({}); falling back to probe response",
+                        start,
+                        end,
+                        url,
+                        reason,
+                    );
+                    return rewrite_206_to_200(&first);
+                }
+            }
         }
 
-        // If any chunk came back empty (relay failure) we've now got a
-        // short body. Better to ship the probe-only 200 than a silently
-        // truncated 200 — the player will display a clear error or
-        // retry, vs rendering half the movie and cutting.
-        if (full.len() as u64) < total {
+        if (full.len() as u64) != total {
             tracing::warn!(
-                "range-parallel: stitched {}/{} bytes, some chunks failed; falling back to probe response",
-                full.len(), total,
+                "range-parallel: stitched {}/{} bytes for {}; falling back to probe response",
+                full.len(), total, url,
             );
             return rewrite_206_to_200(&first);
         }
@@ -961,13 +977,77 @@ fn split_response(raw: &[u8]) -> Option<(u16, Vec<(String, String)>, &[u8])> {
     Some((code, headers, body))
 }
 
-/// Pull the total size out of a `Content-Range: bytes 0-NNN/TOTAL` header.
-fn parse_content_range_total(headers: &[(String, String)]) -> Option<u64> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContentRange {
+    start: u64,
+    end: u64,
+    total: u64,
+}
+
+/// Parse `Content-Range: bytes START-END/TOTAL`.
+fn parse_content_range(headers: &[(String, String)]) -> Option<ContentRange> {
     let cr = headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("content-range"))?;
-    let slash = cr.1.rfind('/')?;
-    cr.1[slash + 1..].trim().parse::<u64>().ok()
+    let value = cr.1.trim();
+    let (unit, rest) = value.split_once(' ')?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+    let (range, total) = rest.trim_start().split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let start = start.trim().parse::<u64>().ok()?;
+    let end = end.trim().parse::<u64>().ok()?;
+    let total = total.trim().parse::<u64>().ok()?;
+    if start > end || total == 0 || end >= total {
+        return None;
+    }
+    Some(ContentRange { start, end, total })
+}
+
+/// Pull the total size out of a valid `Content-Range: bytes START-END/TOTAL` header.
+fn parse_content_range_total(headers: &[(String, String)]) -> Option<u64> {
+    parse_content_range(headers).map(|r| r.total)
+}
+
+fn content_range_matches_body(range: ContentRange, body_len: usize) -> bool {
+    body_len > 0 && (range.end - range.start + 1) == body_len as u64
+}
+
+fn validate_probe_range(
+    status: u16,
+    headers: &[(String, String)],
+    body: &[u8],
+    requested_end: u64,
+) -> Option<ContentRange> {
+    if status != 206 {
+        return None;
+    }
+    let range = parse_content_range(headers)?;
+    if range.start != 0 || range.end > requested_end || !content_range_matches_body(range, body.len()) {
+        return None;
+    }
+    Some(range)
+}
+
+fn extract_exact_range_body(
+    raw: &[u8],
+    start: u64,
+    end: u64,
+    total: u64,
+) -> Result<Vec<u8>, &'static str> {
+    let (status, headers, body) = split_response(raw).ok_or("malformed HTTP response")?;
+    if status != 206 {
+        return Err("expected 206 Partial Content");
+    }
+    let range = parse_content_range(&headers).ok_or("missing or invalid Content-Range")?;
+    if range.start != start || range.end != end || range.total != total {
+        return Err("unexpected Content-Range");
+    }
+    if !content_range_matches_body(range, body.len()) {
+        return Err("Content-Range/body length mismatch");
+    }
+    Ok(body.to_vec())
 }
 
 /// Rewrite a 206 response to a 200 OK, dropping Content-Range and
@@ -1081,14 +1161,34 @@ pub const DEFAULT_GOOGLE_SNI_POOL: &[&str] = &[
     "drive.google.com",
     "docs.google.com",
     "calendar.google.com",
-    // accounts.googl.com is a Google-owned alias (googl.com redirects
-    // to Google properties) whose cert is served off the same GFE IP
-    // pool. Reported in issue #42 as passing DPI on Samantel / MCI
-    // (Iranian carriers) specifically, where some of the longer
-    // `*.google.com` names are selectively SNI-blocked. Rotation-only
-    // use: we never actually HTTP-to it, just present it in the TLS
-    // handshake.
-    "accounts.googl.com",
+    // accounts.google.com — standard Google account service, covered by
+    // the *.google.com wildcard cert. Previously listed as
+    // accounts.googl.com (issue #42), but googl.com is NOT in the SAN
+    // list of Google's GFE certificate — connections with verify_ssl=true
+    // fail with "certificate not valid for name" when the round-robin
+    // lands on it.
+    "accounts.google.com",
+    // scholar.google.com — reported
+    // in #47 as a DPI-passing SNI on MCI / Samantel. Covered by the
+    // core *.google.com cert so it handshakes normally against
+    // google_ip:443.
+    "scholar.google.com",
+    // Additional Google properties for rotation. Ported from upstream
+    // Python `FRONT_SNI_POOL_GOOGLE` (masterking32/MasterHttpRelayVPN
+    // commit 57738ec, "Add additional Google services to exclusion
+    // lists"). All served off the same GFE IP range, all covered by the
+    // wildcard cert, all give the DPI-fingerprint spread without extra
+    // config. A few of these (maps.google.com, play.google.com) reliably
+    // pass DPI on carriers where the shorter `*.google.com` names don't.
+    "maps.google.com",
+    "chat.google.com",
+    "translate.google.com",
+    "play.google.com",
+    "lens.google.com",
+    // chromewebstore.google.com — reported in issue #75 as a working
+    // SNI. Same family as the rest: wildcard cert, GFE-hosted,
+    // handshake against google_ip:443 with no content negotiation.
+    "chromewebstore.google.com",
 ];
 
 /// Build the pool of SNI hosts used for outbound connections to the Google
@@ -1135,12 +1235,35 @@ fn build_sni_pool(primary: &str) -> Vec<String> {
 
 pub fn filter_forwarded_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
     const SKIP: &[&str] = &[
+        // Hop-by-hop / framing — must not be forwarded across the proxy.
         "host",
         "connection",
         "content-length",
         "transfer-encoding",
         "proxy-connection",
         "proxy-authorization",
+        // Identity-revealing forwarding headers (issue #104).
+        // If the user sits behind another proxy or uses a browser
+        // extension that inserts any of these, they'd normally carry
+        // the client's real IP. We strip every known variant so the
+        // origin server only ever sees whatever source IP the Apps
+        // Script or GFE path terminates on — never the user's home IP.
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "x-forwarded-port",
+        "x-forwarded-server",
+        "x-forwarded-ssl",
+        "forwarded",
+        "via",
+        "x-real-ip",
+        "x-client-ip",
+        "x-originating-ip",
+        "true-client-ip",
+        "cf-connecting-ip",
+        "fastly-client-ip",
+        "x-cluster-client-ip",
+        "client-ip",
     ];
     headers
         .iter()
@@ -1251,7 +1374,9 @@ where
             let n = timeout(Duration::from_secs(20), stream.read(&mut tmp[..want])).await
                 .map_err(|_| FronterError::Timeout)??;
             if n == 0 {
-                break;
+                return Err(FronterError::BadResponse(
+                    "connection closed before full response body".into(),
+                ));
             }
             body.extend_from_slice(&tmp[..n]);
         }
@@ -1309,10 +1434,16 @@ where
             let n = timeout(Duration::from_secs(20), stream.read(&mut tmp)).await
                 .map_err(|_| FronterError::Timeout)??;
             if n == 0 {
-                out.extend_from_slice(&buf[..buf.len().min(size)]);
-                return Ok(out);
+                return Err(FronterError::BadResponse(
+                    "connection closed mid-chunked response".into(),
+                ));
             }
             buf.extend_from_slice(&tmp[..n]);
+        }
+        if &buf[size..size + 2] != b"\r\n" {
+            return Err(FronterError::BadResponse(
+                "chunk missing trailing CRLF".into(),
+            ));
         }
         out.extend_from_slice(&buf[..size]);
         buf.drain(..size + 2);
@@ -1615,6 +1746,59 @@ mod tests {
     use tokio::io::{duplex, AsyncWriteExt};
 
     #[test]
+    fn filter_forwarded_headers_strips_identity_revealing_headers() {
+        // Issue #104: any proxy/extension that inserts these must not
+        // leak the client's real IP to origin via the Apps Script relay.
+        let input: Vec<(String, String)> = vec![
+            ("X-Forwarded-For".into(), "203.0.113.42".into()),
+            ("X-Real-IP".into(), "203.0.113.42".into()),
+            ("Forwarded".into(), "for=203.0.113.42".into()),
+            ("Via".into(), "1.1 squid".into()),
+            ("CF-Connecting-IP".into(), "203.0.113.42".into()),
+            ("True-Client-IP".into(), "203.0.113.42".into()),
+            ("X-Client-IP".into(), "203.0.113.42".into()),
+            ("Fastly-Client-IP".into(), "203.0.113.42".into()),
+            ("X-Cluster-Client-IP".into(), "203.0.113.42".into()),
+            ("Client-IP".into(), "203.0.113.42".into()),
+            ("X-Originating-IP".into(), "203.0.113.42".into()),
+            ("X-Forwarded-Host".into(), "internal.example".into()),
+            ("X-Forwarded-Proto".into(), "https".into()),
+            ("X-Forwarded-Port".into(), "8080".into()),
+            ("X-Forwarded-Server".into(), "lb-01.example".into()),
+            ("X-Forwarded-Ssl".into(), "on".into()),
+            // Mix in a legitimate header that MUST pass through.
+            ("User-Agent".into(), "Mozilla/5.0".into()),
+            ("Accept".into(), "text/html".into()),
+        ];
+        let out = filter_forwarded_headers(&input);
+        let keys: Vec<String> = out.iter().map(|(k, _)| k.to_ascii_lowercase()).collect();
+        // All identity-revealing headers must be dropped.
+        for h in [
+            "x-forwarded-for",
+            "x-real-ip",
+            "forwarded",
+            "via",
+            "cf-connecting-ip",
+            "true-client-ip",
+            "x-client-ip",
+            "fastly-client-ip",
+            "x-cluster-client-ip",
+            "client-ip",
+            "x-originating-ip",
+            "x-forwarded-host",
+            "x-forwarded-proto",
+            "x-forwarded-port",
+            "x-forwarded-server",
+            "x-forwarded-ssl",
+        ] {
+            assert!(!keys.iter().any(|k| k == h), "{} must be stripped", h);
+        }
+        // And legitimate headers must survive.
+        assert!(keys.iter().any(|k| k == "user-agent"));
+        assert!(keys.iter().any(|k| k == "accept"));
+    }
+
+    #[test]
     fn normalize_x_graphql_trims_after_variables() {
         // Real-looking x.com GraphQL URL with variables + features +
         // fieldToggles. Only the variables= prefix should survive.
@@ -1739,6 +1923,40 @@ mod tests {
     }
 
     #[test]
+    fn parse_content_range_total_accepts_mixed_case_unit() {
+        let headers = vec![("Content-Range".to_string(), "Bytes 0-4/20".to_string())];
+        assert_eq!(parse_content_range_total(&headers), Some(20));
+    }
+
+    #[test]
+    fn parse_content_range_total_rejects_descending_range() {
+        let headers = vec![("Content-Range".to_string(), "bytes 10-4/20".to_string())];
+        assert_eq!(parse_content_range_total(&headers), None);
+    }
+
+    #[test]
+    fn parse_content_range_total_rejects_end_past_total() {
+        let headers = vec![("Content-Range".to_string(), "bytes 0-20/20".to_string())];
+        assert_eq!(parse_content_range_total(&headers), None);
+    }
+
+    #[test]
+    fn validate_probe_range_rejects_body_length_mismatch() {
+        let headers = vec![("Content-Range".to_string(), "bytes 0-4/20".to_string())];
+        assert!(validate_probe_range(206, &headers, b"hey", 4).is_none());
+    }
+
+    #[test]
+    fn extract_exact_range_body_rejects_mismatched_content_range() {
+        let raw = b"HTTP/1.1 206 Partial Content\r\n\
+Content-Range: bytes 5-9/20\r\n\
+Content-Length: 5\r\n\r\n\
+hello";
+        let err = extract_exact_range_body(raw, 10, 14, 20).unwrap_err();
+        assert_eq!(err, "unexpected Content-Range");
+    }
+
+    #[test]
     fn parse_relay_error_field() {
         let body = r#"{"e":"unauthorized"}"#;
         let err = parse_relay_json(body.as_bytes()).unwrap_err();
@@ -1800,5 +2018,59 @@ mod tests {
         let (status2, _headers2, body2) = read_http_response(&mut server).await.unwrap();
         assert_eq!(status2, 200);
         assert_eq!(body2, b"OK");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn content_length_reader_rejects_truncated_body() {
+        let (mut client, mut server) = duplex(1024);
+        client
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHel")
+            .await
+            .unwrap();
+        drop(client);
+
+        let err = read_http_response(&mut server).await.unwrap_err();
+        match err {
+            FronterError::BadResponse(msg) => {
+                assert!(msg.contains("full response body"), "unexpected error: {}", msg);
+            }
+            other => panic!("unexpected error: {}", other),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn chunked_reader_rejects_truncated_chunk_body() {
+        let (mut client, mut server) = duplex(1024);
+        client
+            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nHel")
+            .await
+            .unwrap();
+        drop(client);
+
+        let err = read_http_response(&mut server).await.unwrap_err();
+        match err {
+            FronterError::BadResponse(msg) => {
+                assert!(msg.contains("mid-chunked"), "unexpected error: {}", msg);
+            }
+            other => panic!("unexpected error: {}", other),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn chunked_reader_rejects_missing_chunk_crlf() {
+        let (mut client, mut server) = duplex(1024);
+        client
+            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nHelloXX")
+            .await
+            .unwrap();
+        drop(client);
+
+        let err = read_http_response(&mut server).await.unwrap_err();
+        match err {
+            FronterError::BadResponse(msg) => {
+                assert!(msg.contains("trailing CRLF"), "unexpected error: {}", msg);
+            }
+            other => panic!("unexpected error: {}", other),
+        }
     }
 }

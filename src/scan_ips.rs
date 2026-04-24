@@ -44,16 +44,118 @@ const CANDIDATE_IPS: &[&str] = &[
     "142.250.64.206",
     "142.250.72.110",
 ];
-
-const FAMOUS_GOOGLE_DOMAINS: &[&str] = &[
+pub const FAMOUS_GOOGLE_DOMAINS: &[&str] = &[
+    // Core services
     "google.com",
     "www.google.com",
     "youtube.com",
     "www.youtube.com",
     "gmail.com",
+    "www.gmail.com",
     "drive.google.com",
     "docs.google.com",
+    "sheets.google.com",
+    "slides.google.com",
     "maps.google.com",
+    "www.maps.google.com",
+    // Search & Discovery
+    "search.google.com",
+    "images.google.com",
+    "www.images.google.com",
+    "news.google.com",
+    "www.news.google.com",
+    "scholar.google.com",
+    "www.scholar.google.com",
+    "books.google.com",
+    "translate.google.com",
+    "www.translate.google.com",
+    // Communication
+    "mail.google.com",
+    "chat.google.com",
+    "meet.google.com",
+    "hangouts.google.com",
+    "voice.google.com",
+    "allo.google.com",
+    // Media & Entertainment
+    "play.google.com",
+    "music.google.com",
+    "movies.google.com",
+    "video.google.com",
+    "videos.google.com",
+    "photos.google.com",
+    "picasa.google.com",
+    "picasaweb.google.com",
+    // Productivity
+    "calendar.google.com",
+    "keep.google.com",
+    "contacts.google.com",
+    "tasks.google.com",
+    "forms.google.com",
+    "sites.google.com",
+    "www.sites.google.com",
+    // Account & Settings
+    "accounts.google.com",
+    "myaccount.google.com",
+    "myactivity.google.com",
+    "passwords.google.com",
+    "adssettings.google.com",
+    // Business & Ads
+    "ads.google.com",
+    "adwords.google.com",
+    "www.adwords.google.com",
+    "adsense.google.com",
+    "analytics.google.com",
+    "business.google.com",
+    "mybusiness.google.com",
+    "merchants.google.com",
+    // Developer & Cloud
+    "console.cloud.google.com",
+    "cloud.google.com",
+    "firebase.google.com",
+    "console.firebase.google.com",
+    "developers.google.com",
+    "console.developers.google.com",
+    "apis.google.com",
+    "fonts.google.com",
+    // Mobile & Apps
+    "android.google.com",
+    "chrome.google.com",
+    "chromebook.google.com",
+    // Education & Learning
+    "classroom.google.com",
+    "edu.google.com",
+    // Shopping & Payments
+    "shopping.google.com",
+    "pay.google.com",
+    "payments.google.com",
+    "wallet.google.com",
+    "store.google.com",
+    // Travel & Local
+    "flights.google.com",
+    "hotels.google.com",
+    "travel.google.com",
+    // Other Services
+    "blogger.google.com",
+    "domains.google.com",
+    "trends.google.com",
+    "alerts.google.com",
+    "podcasts.google.com",
+    "fit.google.com",
+    "home.google.com",
+    "assistant.google.com",
+    "gemini.google.com",
+    // Support & Info
+    "support.google.com",
+    "policies.google.com",
+    "privacy.google.com",
+    "about.google.com",
+    "blog.google.com",
+    // Legacy/Regional
+    "plus.google.com",
+    "www.plus.google.com",
+    "orkut.google.com",
+    "reader.google.com",
+    "wave.google.com",
 ];
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
@@ -92,7 +194,7 @@ pub async fn run(config: &Config) -> bool {
         let ip = ip.to_string();
         tasks.push(tokio::spawn(async move {
             let _permit: Option<tokio::sync::SemaphorePermit<'_>> = sem.acquire().await.ok();
-            probe(&ip, &sni, connector,google_ip_validation).await
+            probe(&ip, &sni, connector, google_ip_validation).await
         }));
     }
 
@@ -134,7 +236,7 @@ pub async fn run(config: &Config) -> bool {
     }
 }
 
-async fn fetch_google_ips(config: &Config) -> Vec<String> {
+pub async fn fetch_google_ips(config: &Config) -> Vec<String> {
     if !config.fetch_ips_from_api {
         tracing::info!("fetch_ips_from_api disabled, using static fallback");
         return CANDIDATE_IPS.iter().map(|s| s.to_string()).collect();
@@ -144,7 +246,7 @@ async fn fetch_google_ips(config: &Config) -> Vec<String> {
         &config.front_domain,
         config.max_ips_to_scan,
         config.scan_batch_size,
-        config.google_ip_validation
+        config.google_ip_validation,
     )
     .await
     {
@@ -170,7 +272,7 @@ async fn fetch_and_validate_google_ips(
     sni: &str,
     max_ips: usize,
     batch_size: usize,
-     google_ip_validation: bool
+    google_ip_validation: bool,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let famous_ips = resolve_famous_domains().await;
     tracing::info!(
@@ -224,21 +326,32 @@ async fn fetch_and_validate_google_ips(
     if candidate_ips.is_empty() {
         return Err("No valid IPs extracted from CIDRs".into());
     }
-
+    let total_batches = (candidate_ips.len() + batch_size - 1) / batch_size;
     tracing::info!(
-        "Selected {} IPs to test (from {} total), testing in batches...",
+        "Selected {} IPs to test (from {} total), testing in {} batches...",
         candidate_ips.len(),
-        priority_ips_len + other_ips_len
+        priority_ips_len + other_ips_len,
+        total_batches
     );
 
     let mut working_ips = Vec::new();
+    let mut total_tested = 0;
 
     for (i, chunk) in candidate_ips.chunks(batch_size).enumerate() {
-        tracing::debug!("Testing batch {} ({} IPs)...", i + 1, chunk.len());
-        let batch_working = validate_ips(chunk, sni,google_ip_validation).await;
-        working_ips.extend(batch_working);
-    }
+        let batch_working = validate_ips(chunk, sni, google_ip_validation).await;
+        working_ips.extend(batch_working.clone());
+        total_tested += chunk.len();
 
+        tracing::info!(
+            "Batch {}/{}: tested {} IPs, found {} working (total: {}/{})",
+            i + 1,
+            total_batches,
+            chunk.len(),
+            batch_working.len(),
+            total_tested,
+            candidate_ips.len()
+        );
+    }
     tracing::info!(
         "Found {} working IPs from {} tested",
         working_ips.len(),
@@ -415,7 +528,11 @@ fn cidr_to_ips(cidr: &str) -> Vec<String> {
         return Vec::new();
     }
     let host_bits = 32 - prefix_len;
-    let num_hosts: u32 = if host_bits >= 32 { u32::MAX } else { 1u32 << host_bits };
+    let num_hosts: u32 = if host_bits >= 32 {
+        u32::MAX
+    } else {
+        1u32 << host_bits
+    };
 
     let limit = num_hosts.min(256);
     if limit < 2 {
@@ -621,7 +738,7 @@ async fn probe(
             }
 
             let lower = response.to_lowercase();
-            let mut  is_google = true;
+            let mut is_google = true;
             if google_ip_validation {
                 is_google = lower.contains("server: gws")
                     || lower.contains("x-google-")

@@ -8,26 +8,43 @@ on:
 permissions:
   contents: write
 
+# Runner strategy:
+#   - Linux + Android + mipsel:       self-hosted (mhrv-hetzner-*, Hetzner
+#                                     8-core / 31 GB Ubuntu 24.04 box with
+#                                     Rust, Android SDK+NDK, Docker, all
+#                                     cross-compile toolchains pre-installed).
+#                                     Two runners registered for parallelism.
+#   - macOS arm64 + amd64, Windows:   GitHub-hosted (we don't self-host those
+#                                     OSes; the free minutes on a public repo
+#                                     are plenty for those two platforms).
+#
+# Why self-hosted: GH-hosted 2-core runners were spending ~13 min cold per
+# release; on the Hetzner box a cold linux-amd64 build is 1m9s, and warm
+# builds with Swatinem/rust-cache are sub-minute. Keeps the toolchain warm,
+# and more importantly keeps target/ warm via the rust-cache action.
+
 jobs:
   build:
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Pin to Ubuntu 22.04 (GLIBC 2.35) so the glibc builds run on any
-          # distro that's ≥ Ubuntu 22.04 / Debian 12 / Mint 21 / Fedora 36.
-          # ubuntu-latest points at 24.04 (GLIBC 2.39) which bakes in a
-          # too-new GLIBC symbol requirement and rejects loading on older
-          # distros. For users behind tight internet who literally can't
-          # dist-upgrade, this matters.
+          # Pin to Ubuntu 22.04 GLIBC target (GLIBC 2.35) so the glibc builds
+          # load on any distro ≥ Ubuntu 22.04 / Debian 12 / Mint 21 / Fedora 36.
+          # On self-hosted this is a Rust-side choice (cargo target triple),
+          # not an OS-of-the-runner choice — the runner itself is Ubuntu 24.04
+          # (GLIBC 2.39), but we link against the 2.35-era glibc via the
+          # x86_64-unknown-linux-gnu target triple which pins to the oldest
+          # GLIBC symbol version rustc is willing to emit. Users behind tight
+          # internet who can't dist-upgrade keep working.
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-22.04
+            os: [self-hosted, linux, x64, mhrv-build]
             name: mhrv-rs-linux-amd64
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-22.04
+            os: [self-hosted, linux, x64, mhrv-build]
             name: mhrv-rs-linux-arm64
           - target: arm-unknown-linux-gnueabihf
-            os: ubuntu-22.04
+            os: [self-hosted, linux, x64, mhrv-build]
             name: mhrv-rs-raspbian-armhf
           - target: x86_64-apple-darwin
             os: macos-latest
@@ -39,10 +56,10 @@ jobs:
             os: windows-latest
             name: mhrv-rs-windows-amd64
           - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
+            os: [self-hosted, linux, x64, mhrv-build]
             name: mhrv-rs-linux-musl-amd64
           - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
+            os: [self-hosted, linux, x64, mhrv-build]
             name: mhrv-rs-linux-musl-arm64
           # OpenWRT MT7621 (soft-float mipsel 32-bit). Dozens of cheap
           # home routers run this chipset and they *specifically* need
@@ -53,7 +70,7 @@ jobs:
           # `continue-on-error: true` so a regression here doesn't block
           # the rest of the release. Issue #26.
           - target: mipsel-unknown-linux-musl
-            os: ubuntu-latest
+            os: [self-hosted, linux, x64, mhrv-build]
             name: mhrv-rs-openwrt-mipsel-softfloat
             mipsel_softfloat: true
 
@@ -74,16 +91,42 @@ jobs:
       # errors out with "error: component 'rust-std' for target
       # 'mipsel-unknown-linux-musl' is unavailable for download", which
       # fails the job before the docker step ever runs.
+      #
+      # On self-hosted this action is mostly a no-op: rustup is already
+      # installed and the standard target triples are pre-added. It
+      # still verifies the target is present and is cheap enough to keep
+      # as a safety net.
       - uses: dtolnay/rust-toolchain@stable
         if: matrix.mipsel_softfloat != true
         with:
           targets: ${{ matrix.target }}
 
+      # Cache target/ + cargo registry across runs — this is the big
+      # self-hosted speedup. Without it, actions/checkout@v4's default
+      # `git clean -ffdx` wipes target/ between runs and every build is
+      # cold. With it, warm builds are sub-minute even for the full
+      # release profile.
+      #
+      # cache-bin: false is MANDATORY on our self-hosted runners. With
+      # the default (true), rust-cache aggressively prunes $CARGO_HOME/bin
+      # of binaries it didn't install via `cargo install`, including the
+      # `rustup` binary that cargo/rustc/etc. are symlinked to. The next
+      # job then hits "command not found" or a broken-symlink TOML parse
+      # error from a stale cargo. We want target/ + registry caching, NOT
+      # bin pruning. rustup is pre-installed on the runners anyway.
+      - uses: Swatinem/rust-cache@v2
+        if: matrix.mipsel_softfloat != true
+        with:
+          key: ${{ matrix.target }}
+          cache-bin: "false"
+
       # eframe needs a few system libs on Linux for window management, keyboard,
-      # and OpenGL/X11/Wayland. We install them on the Ubuntu runners regardless
-      # of arch so both CLI-only and UI builds succeed.
+      # and OpenGL/X11/Wayland. Gated to GitHub-hosted runners only — the
+      # self-hosted runners pre-install all of these once at setup time, and
+      # letting multiple parallel matrix jobs race on `sudo apt-get install`
+      # fights over /var/lib/apt/lists/lock and fails them all.
       - name: Install Linux eframe system deps
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && runner.environment == 'github-hosted'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -93,8 +136,13 @@ jobs:
             libx11-dev \
             libgl1-mesa-dev libglib2.0-dev libgtk-3-dev
 
+      # Cross-compile toolchains. Same story as above — gated to hosted
+      # runners; self-hosted has gcc-aarch64-linux-gnu + gcc-arm-linux-gnueabihf
+      # pre-installed, and the linker entries live in
+      # /home/ghrunner/cargo-{01,02}/config.toml (seeded once at runner
+      # setup time, picked up via CARGO_HOME env).
       - name: Install aarch64 cross-compile toolchain (Linux only)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        if: matrix.target == 'aarch64-unknown-linux-gnu' && runner.environment == 'github-hosted'
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
@@ -102,7 +150,7 @@ jobs:
           echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
 
       - name: Install armhf cross-compile toolchain (Linux only)
-        if: matrix.target == 'arm-unknown-linux-gnueabihf'
+        if: matrix.target == 'arm-unknown-linux-gnueabihf' && runner.environment == 'github-hosted'
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-arm-linux-gnueabihf
@@ -279,38 +327,48 @@ jobs:
   # x86_64, x86) via cargo-ndk and drops the .so files into the Gradle
   # project's jniLibs/ tree, which then packages them into a single
   # universal APK. Users pick it once, no per-ABI split.
+  #
+  # Runs on self-hosted. The runner has Android SDK + NDK r26c + cargo-ndk
+  # pre-installed under /opt/android-sdk; the env block below points Gradle
+  # at those paths so we don't re-download ~1 GB of SDK per release.
   android:
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, linux, x64, mhrv-build]
+    env:
+      ANDROID_SDK_ROOT: /opt/android-sdk
+      ANDROID_HOME: /opt/android-sdk
+      ANDROID_NDK_HOME: /opt/android-sdk/ndk/26.2.11394342
+      ANDROID_NDK_ROOT: /opt/android-sdk/ndk/26.2.11394342
+      JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 17
-
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          cmdline-tools-version: 11076708
-
-      - name: Install NDK
-        run: |
-          yes | sdkmanager --install "ndk;26.1.10909125" >/dev/null
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/26.1.10909125" >> "$GITHUB_ENV"
-
+      # Rust toolchain: idempotent on self-hosted (targets already present),
+      # kept here so the workflow still works if we ever run it on a GH-hosted
+      # fallback.
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
 
-      - name: Install cargo-ndk
-        run: cargo install cargo-ndk --locked
+      # Cache cargo + target/ across Android release builds. Four cargo-ndk
+      # release builds back-to-back with LTO is where the cold cost comes
+      # from; rust-cache brings warm runs down to ~3–4 min from ~9 min cold.
+      # cache-bin: false — see the rationale on the matrix build job above.
+      # On top of that, `cargo-ndk` lives in /usr/local/bin/ on our runners
+      # (not $CARGO_HOME/bin), specifically so rust-cache's default bin
+      # pruning can't delete it.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-universal
+          cache-bin: "false"
+          # cargo-ndk writes into `target/<android-triple>/release/`, all
+          # four of which we want to cache.
+          workspaces: |
+            . -> target
 
       # `./gradlew :app:assembleRelease` triggers cargoBuildRelease first
       # which invokes cargo-ndk with all four targets, then Gradle packages
-      # the APK (release buildType signed with the debug keystore — see
-      # android/app/build.gradle.kts comment explaining why).
+      # the APK (release buildType signed with the committed release.jks —
+      # see android/app/build.gradle.kts comment explaining why).
       - name: Build release APK
         working-directory: android
         run: |
@@ -339,6 +397,11 @@ jobs:
           path: dist/*.apk
           if-no-files-found: error
 
+  # release + telegram: lightweight aggregation jobs kept on GH-hosted
+  # ubuntu-latest. They only download artifacts and call APIs — no build
+  # tooling needed, no benefit from moving to self-hosted, and keeping them
+  # off the self-hosted runners avoids contention with Linux build jobs from
+  # the next tag if two releases overlap.
   release:
     needs: [build, android]
     runs-on: ubuntu-latest
@@ -402,6 +465,7 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          INCLUDE_CHANGELOG: ${{ vars.TELEGRAM_INCLUDE_CHANGELOG }}
         # Python over curl/bash so we don't have to fight curl's -F
         # value-interpretation rules. curl treats `-F "caption=<..."`
         # as "read the caption from file named ..." when the value
@@ -424,8 +488,18 @@ jobs:
             exit 1
           fi
 
+          # --with-changelog is opt-in. Default post is just the APK
+          # plus a short caption with the SHA-256, repo URL, and release
+          # URL — no long body. To include the Persian/English bullets
+          # for a specific tag, set the repo variable
+          # TELEGRAM_INCLUDE_CHANGELOG=true before pushing that tag.
+          INCLUDE_CHANGELOG_FLAG=""
+          if [ "${INCLUDE_CHANGELOG:-}" = "true" ]; then
+            INCLUDE_CHANGELOG_FLAG="--with-changelog"
+          fi
           python3 .github/scripts/telegram_release_notify.py \
             --apk "$APK" \
             --version "$VER" \
             --repo "$GITHUB_REPOSITORY" \
-            --changelog "docs/changelog/v${VER}.md"
+            --changelog "docs/changelog/v${VER}.md" \
+            $INCLUDE_CHANGELOG_FLAG

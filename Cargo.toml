@@ -1,6 +1,6 @@
 [package]
 name = "mhrv-rs"
-version = "1.1.4"
+version = "1.2.11"
 edition = "2021"
 description = "Rust port of MasterHttpRelayVPN -- DPI bypass via Google Apps Script relay with domain fronting"
 license = "MIT"
@@ -72,6 +72,7 @@ eframe = { version = "0.28", default-features = false, features = [
     "wgpu",
     "persistence",
 ], optional = true }
+url = "2.5.8"
 
 # Unix-only deps. Must come after `[dependencies]` because starting a new
 # table here otherwise ends the main one — anything below it (incl. eframe)

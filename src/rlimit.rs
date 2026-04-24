@@ -7,7 +7,9 @@
 //! SOCKS5 flood from a client like v2ray, fills the limit within seconds.
 //! Once the limit is hit `accept(2)` returns `EMFILE` and the user sees:
 //!
-//!     ERROR accept (socks): No file descriptors available (os error 24)
+//! ```text
+//! ERROR accept (socks): No file descriptors available (os error 24)
+//! ```
 //!
 //! Approach:
 //!   - Try to raise the SOFT limit to a generous target.

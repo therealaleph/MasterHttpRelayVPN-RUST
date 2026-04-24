@@ -181,6 +181,10 @@ struct App {
 
 #[derive(Clone)]
 struct FormState {
+    /// `"apps_script"` (default) or `"google_only"`. Controls whether the
+    /// Apps Script relay is wired up at all. In `google_only`, the form
+    /// tolerates an empty script_id / auth_key.
+    mode: String,
     script_id: String,
     auth_key: String,
     google_ip: String,
@@ -208,7 +212,7 @@ struct FormState {
     scan_batch_size:usize,
     google_ip_validation: bool,
     normalize_x_graphql: bool,
-    skip_youtube_sni_rewrite: bool,
+    youtube_via_relay: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -264,6 +268,7 @@ fn load_form() -> (FormState, Option<String>) {
         };
         let sni_pool = sni_pool_for_form(c.sni_hosts.as_deref(), &c.front_domain);
         FormState {
+            mode: c.mode.clone(),
             script_id: sid,
             auth_key: c.auth_key,
             google_ip: c.google_ip,
@@ -285,10 +290,11 @@ fn load_form() -> (FormState, Option<String>) {
             google_ip_validation: c.google_ip_validation,
             scan_batch_size:c.scan_batch_size,
             normalize_x_graphql: c.normalize_x_graphql,
-            skip_youtube_sni_rewrite: c.skip_youtube_sni_rewrite,
+            youtube_via_relay: c.youtube_via_relay,
         }
     } else {
         FormState {
+            mode: "apps_script".into(),
             script_id: String::new(),
             auth_key: String::new(),
             google_ip: "216.239.38.120".into(),
@@ -310,7 +316,7 @@ fn load_form() -> (FormState, Option<String>) {
             google_ip_validation:true,
             scan_batch_size:500,
             normalize_x_graphql: false,
-            skip_youtube_sni_rewrite: false,
+            youtube_via_relay: false,
         }
     };
     (form, load_err)
@@ -362,11 +368,14 @@ fn sni_pool_for_form(user: Option<&[String]>, front_domain: &str) -> Vec<SniRow>
 
 impl FormState {
     fn to_config(&self) -> Result<Config, String> {
-        if self.script_id.trim().is_empty() {
-            return Err("Apps Script ID is required".into());
-        }
-        if self.auth_key.trim().is_empty() {
-            return Err("Auth key is required".into());
+        let is_google_only = self.mode == "google_only";
+        if !is_google_only {
+            if self.script_id.trim().is_empty() {
+                return Err("Apps Script ID is required".into());
+            }
+            if self.auth_key.trim().is_empty() {
+                return Err("Auth key is required".into());
+            }
         }
         let listen_port: u16 = self
             .listen_port
@@ -381,19 +390,24 @@ impl FormState {
                     .map_err(|_| "SOCKS5 port must be a number".to_string())?,
             )
         };
+        if socks5_port == Some(listen_port) {
+            return Err("HTTP and SOCKS5 ports must be different".into());
+        }
         let ids: Vec<String> = self
             .script_id
             .split(|c: char| c == '\n' || c == ',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
-        let script_id = if ids.len() == 1 {
+        let script_id = if ids.is_empty() {
+            None
+        } else if ids.len() == 1 {
             Some(ScriptId::One(ids[0].clone()))
         } else {
             Some(ScriptId::Many(ids))
         };
         Ok(Config {
-            mode: "apps_script".into(),
+            mode: self.mode.clone(),
             google_ip: self.google_ip.trim().to_string(),
             front_domain: self.front_domain.trim().to_string(),
             script_id,
@@ -438,7 +452,10 @@ impl FormState {
             google_ip_validation:self.google_ip_validation,
             scan_batch_size:self.scan_batch_size,
             normalize_x_graphql: self.normalize_x_graphql,
-            skip_youtube_sni_rewrite: self.skip_youtube_sni_rewrite,
+            // UI form doesn't expose youtube_via_relay yet — it's a
+            // config-only flag for now. Passed through from the loaded
+            // config if set, otherwise defaults to false.
+            youtube_via_relay: self.youtube_via_relay,
         })
     }
 }
@@ -478,7 +495,7 @@ struct ConfigWire<'a> {
     #[serde(skip_serializing_if = "is_false")]
     normalize_x_graphql: bool,
     #[serde(skip_serializing_if = "is_false")]
-    skip_youtube_sni_rewrite: bool,
+    youtube_via_relay: bool,
     // IP-scan knobs. These used to be missing from the wire struct, so
     // every Save-config silently dropped them — the user would toggle
     // "fetch from API" on, save, reopen, and find it off again. Add
@@ -530,7 +547,7 @@ impl<'a> From<&'a Config> for ConfigWire<'a> {
                 .as_ref()
                 .map(|v| v.iter().map(String::as_str).collect()),
             normalize_x_graphql: c.normalize_x_graphql,
-            skip_youtube_sni_rewrite: c.skip_youtube_sni_rewrite,
+            youtube_via_relay: c.youtube_via_relay,
             fetch_ips_from_api: c.fetch_ips_from_api,
             max_ips_to_scan: c.max_ips_to_scan,
             scan_batch_size: c.scan_batch_size,
@@ -669,41 +686,87 @@ impl eframe::App for App {
 
             ui.add_space(2.0);
 
+            // ── Section: Mode ─────────────────────────────────────────────
+            // Surfacing the mode at the top of the form because it changes
+            // which of the sections below are actually used. google_only is
+            // a bootstrap mode for users who don't yet have internet access
+            // to deploy Code.gs — once deployed, they switch back to
+            // apps_script.
+            section(ui, "Mode", |ui| {
+                form_row(ui, "Mode", Some(
+                    "apps_script: full DPI bypass via your Apps Script relay.\n\
+                     google_only: bootstrap — direct SNI-rewrite tunnel to *.google.com \
+                     only (no relay, no script_id needed). Use this just long enough to \
+                     open https://script.google.com and deploy Code.gs."
+                ), |ui| {
+                    egui::ComboBox::from_id_source("mode")
+                        .selected_text(match self.form.mode.as_str() {
+                            "google_only" => "Google-only (bootstrap)",
+                            _ => "Apps Script (full)",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.form.mode,
+                                "apps_script".into(),
+                                "Apps Script (full)",
+                            );
+                            ui.selectable_value(
+                                &mut self.form.mode,
+                                "google_only".into(),
+                                "Google-only (bootstrap)",
+                            );
+                        });
+                });
+                if self.form.mode == "google_only" {
+                    ui.horizontal(|ui| {
+                        ui.add_space(120.0 + 8.0);
+                        ui.small(egui::RichText::new(
+                            "Bootstrap mode — reach script.google.com to deploy Code.gs, then switch back to Apps Script.",
+                        )
+                        .color(OK_GREEN));
+                    });
+                }
+            });
+
+            let google_only = self.form.mode == "google_only";
+
             // ── Section: Apps Script relay ────────────────────────────────
             section(ui, "Apps Script relay", |ui| {
-                form_row(ui, "Deployment IDs", Some(
-                    "One deployment ID per line. Proxy round-robins between them and sidelines \
-                     any ID that hits its daily quota for 10 minutes before retrying."
-                ), |ui| {
-                    ui.add(egui::TextEdit::multiline(&mut self.form.script_id)
-                        .hint_text("one deployment ID per line")
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(3));
-                });
+                ui.add_enabled_ui(!google_only, |ui| {
+                    form_row(ui, "Deployment IDs", Some(
+                        "One deployment ID per line. Proxy round-robins between them and sidelines \
+                         any ID that hits its daily quota for 10 minutes before retrying."
+                    ), |ui| {
+                        ui.add(egui::TextEdit::multiline(&mut self.form.script_id)
+                            .hint_text("one deployment ID per line")
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(3));
+                    });
 
-                let id_count = self.form.script_id
-                    .split(|c: char| c == '\n' || c == ',')
-                    .map(|s| s.trim())
-                    .filter(|s| !s.is_empty())
-                    .count();
-                ui.horizontal(|ui| {
-                    ui.add_space(120.0 + 8.0);
-                    if id_count <= 1 {
-                        ui.small(egui::RichText::new("Tip: add more IDs for round-robin with auto-failover.")
-                            .color(egui::Color32::from_gray(140)));
-                    } else {
-                        ui.small(egui::RichText::new(format!(
-                            "{} IDs — round-robin with auto-failover on quota.", id_count
-                        )).color(OK_GREEN));
-                    }
-                });
+                    let id_count = self.form.script_id
+                        .split(|c: char| c == '\n' || c == ',')
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .count();
+                    ui.horizontal(|ui| {
+                        ui.add_space(120.0 + 8.0);
+                        if id_count <= 1 {
+                            ui.small(egui::RichText::new("Tip: add more IDs for round-robin with auto-failover.")
+                                .color(egui::Color32::from_gray(140)));
+                        } else {
+                            ui.small(egui::RichText::new(format!(
+                                "{} IDs — round-robin with auto-failover on quota.", id_count
+                            )).color(OK_GREEN));
+                        }
+                    });
 
-                form_row(ui, "Auth key", Some(
-                    "Same value as AUTH_KEY inside your Code.gs."
-                ), |ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.form.auth_key)
-                        .password(!self.form.show_auth_key)
-                        .desired_width(f32::INFINITY));
+                    form_row(ui, "Auth key", Some(
+                        "Same value as AUTH_KEY inside your Code.gs."
+                    ), |ui| {
+                        ui.add(egui::TextEdit::singleline(&mut self.form.auth_key)
+                            .password(!self.form.show_auth_key)
+                            .desired_width(f32::INFINITY));
+                    });
                 });
             });
 
@@ -837,19 +900,6 @@ impl eframe::App for App {
                                  Twitter/X. Off by default — some endpoints may reject trimmed requests. \
                                  Credit: seramo_ir + Persian Python community (issue #16).",
                             );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.add_space(120.0 + 8.0);
-                        ui.checkbox(
-                            &mut self.form.skip_youtube_sni_rewrite,
-                            "Send YouTube through relay (no SNI rewrite)",
-                        )
-                        .on_hover_text(
-                            "YouTube normally uses the same direct Google-edge tunnel as google.com (TLS SNI is \
-                             the front domain, not youtube.com). That can trigger restricted mode or sign-out \
-                             prompts. Enable this to route youtube.com / youtu.be / ytimg.com through the Apps \
-                             Script relay instead — slower for video, but the visible SNI matches the site.",
-                        );
                     });
                 });
             });
@@ -1604,7 +1654,9 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                             return;
                         }
                     };
-                    *fronter_slot2.lock().await = Some(server.fronter());
+                    // `fronter()` is `None` in google_only (bootstrap) mode — the
+                    // status panel's relay stats simply show no data in that case.
+                    *fronter_slot2.lock().await = server.fronter();
                     {
                         let mut s = shared2.state.lock().unwrap();
                         s.running = true;

@@ -14,12 +14,20 @@
 
 use std::time::Instant;
 
-use crate::config::Config;
+use crate::config::{Config, Mode};
 use crate::domain_fronter::DomainFronter;
 
 const TEST_URL: &str = "https://api.ipify.org/?format=json";
 
 pub async fn run(config: &Config) -> bool {
+    if matches!(config.mode_kind(), Ok(Mode::GoogleOnly)) {
+        let msg = "`mhrv-rs test` probes the Apps Script relay, which isn't \
+                   wired up in google_only mode. Run `mhrv-rs test-sni` to \
+                   check the direct SNI-rewrite tunnel instead.";
+        println!("{}", msg);
+        tracing::error!("{}", msg);
+        return false;
+    }
     let fronter = match DomainFronter::new(config) {
         Ok(f) => f,
         Err(e) => {
