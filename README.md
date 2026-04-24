@@ -135,7 +135,7 @@ To route your browser's HTTPS traffic through the Apps Script relay, `mhrv-rs` h
 - A fresh CA keypair (`ca/ca.crt` + `ca/ca.key`) is generated **on your machine**, in your user-data dir.
 - The public `ca.crt` is added to your system trust store so browsers accept the per-site certificates `mhrv-rs` mints on the fly. This is the step that needs sudo / Administrator.
 - The private `ca.key` **never leaves your machine**. Nothing uploads it, nothing phones home, and no remote party — including the Apps Script relay — can use it to impersonate sites to you.
-- You can revoke it at any time by deleting the CA from your OS keychain (macOS: Keychain Access → System → delete `mhrv-rs`) / Windows cert store / `/etc/ca-certificates`, and removing the `ca/` folder.
+- You can revoke it at any time with `mhrv-rs --remove-cert` (or the **Remove CA** button in the UI) — it clears the CA from the OS trust store, verifies the revocation by name before touching disk, and deletes the on-disk `ca/` folder. NSS cleanup (Firefox profiles + Chrome/Chromium on Linux) is best-effort: if `certutil` from libnss3-tools isn't on PATH or a browser has the NSS DB locked, the tool logs a manual-cleanup hint. `config.json` and your Apps Script deployment are not touched, so regenerating the CA never requires redeploying `Code.gs`. Manual fallback: the certificate's Common Name is `MasterHttpRelayVPN` (not `mhrv-rs` — that's the app name, not the cert name). Delete by that CN in your OS keychain (macOS: Keychain Access → System → delete `MasterHttpRelayVPN`), Windows `certmgr.msc` → Trusted Root Certification Authorities, or `/usr/local/share/ca-certificates/MasterHttpRelayVPN.crt` + `sudo update-ca-certificates` on Linux; remove the `MasterHttpRelayVPN` entry from each browser's cert settings; and remove the `ca/` folder under the user-data dir.
 
 The launcher does all of this for you and then starts the UI:
 
@@ -197,8 +197,13 @@ Then:
 ./mhrv-rs test              # one-shot end-to-end probe
 ./mhrv-rs scan-ips          # rank Google frontend IPs by latency
 ./mhrv-rs --install-cert    # reinstall the MITM CA
+./mhrv-rs --remove-cert     # clean slate: uninstall + delete the whole ca/ dir
 ./mhrv-rs --help
 ```
+
+`--remove-cert` deletes the CA from the OS trust store, deletes the on-disk `ca/` directory, and verifies the revocation by name — if a system-level delete needed admin you didn't have, it aborts the file deletion and prints an error so you can re-run elevated. NSS cleanup (Firefox profiles + Chrome/Chromium on Linux) is best-effort: if `certutil` isn't on PATH or a browser holds the NSS DB open, the tool logs a manual-cleanup hint. Your `config.json` and the Apps Script deployment at `script.google.com` are untouched, so a fresh CA (generated next time you start the proxy) does not require redeploying `Code.gs`.
+
+> **Upgrading from pre-v1.2.11?** Earlier versions wrote a bare `user_pref("security.enterprise_roots.enabled", true);` into each Firefox profile's `user.js` without a provenance marker. `--remove-cert` intentionally does **not** strip that line — a bare pref is indistinguishable from one authored by the user or a corporate policy, and silently revoking trust behavior is worse than leaving one cosmetic orphan line. Firefox falls back to its built-in Mozilla root store the moment the MITM CA leaves the OS trust store, so this has no functional effect. Delete the line manually if it bothers you.
 
 `script_id` can also be a JSON array: `["id1", "id2", "id3"]`.
 
@@ -710,9 +715,15 @@ logread -e mhrv-rs -f
 
 **چطور گواهی را بعداً حذف کنم؟**
 
-- **مک:** `Keychain Access` را باز کنید، در بخش `System` دنبال `mhrv-rs` بگردید و حذف کنید. سپس پوشهٔ `~/Library/Application Support/mhrv-rs/ca/` را پاک کنید
-- **ویندوز:** `certmgr.msc` را اجرا کنید → `Trusted Root Certification Authorities` → `Certificates` → دنبال `mhrv-rs` بگردید و حذف کنید
-- **لینوکس:** فایل `/usr/local/share/ca-certificates/mhrv-rs.crt` را حذف و `sudo update-ca-certificates` اجرا کنید
+- **ساده‌ترین راه (هر سه سیستم‌عامل):** داخل برنامه روی دکمهٔ **`Remove CA`** بزنید، یا در ترمینال:
+  - مک/لینوکس: `sudo ./mhrv-rs --remove-cert`
+  - ویندوز (با `Run as administrator`): `mhrv-rs.exe --remove-cert`
+  - این دستور گواهی را از `trust store` سیستم و `NSS` (فایرفاکس/کروم) پاک می‌کند و فایل‌های `ca/ca.crt` و `ca/ca.key` را هم روی دیسک حذف می‌کند. فایل `config.json` و `deployment` آپس‌اسکریپت دست‌نخورده می‌مانند — پس لازم نیست `Code.gs` را دوباره دیپلوی کنید.
+- **به‌صورت دستی** (اگر می‌خواهید):
+  - **نکته:** نام گواهی (`Common Name`) در همهٔ مکان‌ها `MasterHttpRelayVPN` است — `mhrv-rs` نام برنامه است، نه نام گواهی.
+  - **مک:** `Keychain Access` را باز کنید، در بخش `System` دنبال `MasterHttpRelayVPN` بگردید و حذف کنید. سپس پوشهٔ `~/Library/Application Support/mhrv-rs/ca/` را پاک کنید
+  - **ویندوز:** `certmgr.msc` را اجرا کنید → `Trusted Root Certification Authorities` → `Certificates` → دنبال `MasterHttpRelayVPN` بگردید و حذف کنید
+  - **لینوکس:** فایل `/usr/local/share/ca-certificates/MasterHttpRelayVPN.crt` را حذف و `sudo update-ca-certificates` اجرا کنید
 
 **چند `Deployment ID` لازم دارم؟**
 یکی برای استفادهٔ عادی کافی است. سهمیهٔ روزانه `UrlFetchApp` برای حساب رایگان گوگل **۲۰٬۰۰۰ درخواست در روز** است (برای `Workspace` پولی ۱۰۰٬۰۰۰)، با محدودیت پاسخ ۵۰ مگابایت به ازای هر `fetch`. از هر حساب گوگل **فقط یک `Deployment`** بسازید — سقف ۳۰ درخواست همزمان به ازای هر حساب است، پس چند `Deployment` روی یک حساب همزمانی اضافه نمی‌کند. برای افزایش همزمانی یا سهمیهٔ روزانه، در حساب‌های گوگل دیگر `Deployment` بسازید — هر حساب سهمیهٔ ۲۰ هزار درخواستی و ۳۰ اجرای همزمان خودش را دارد. همهٔ `ID`ها را در فیلد `Apps Script ID(s)` وارد کنید — برنامه خودکار بینشان می‌چرخد. مرجع: <https://developers.google.com/apps-script/guides/services/quotas>
@@ -735,8 +746,11 @@ logread -e mhrv-rs -f
 ./mhrv-rs scan-ips          # رتبه‌بندی IPهای گوگل بر اساس سرعت
 ./mhrv-rs test-sni          # تست نام‌های SNI در pool
 ./mhrv-rs --install-cert    # نصب مجدد گواهی
+./mhrv-rs --remove-cert     # حذف کامل گواهی: پاک‌سازی trust store و کل پوشهٔ ca/
 ./mhrv-rs --help
 ```
+
+دستور `--remove-cert` گواهی را از `trust store` سیستم پاک می‌کند، با بررسی نام تأیید می‌کند که حذف انجام شده، و سپس پوشهٔ `ca/` روی دیسک را حذف می‌کند — اگر حذف نیاز به دسترسی ادمین داشته باشد که در دسترس نبوده، قبل از پاک کردن فایل‌ها متوقف می‌شود تا بتوانید با دسترسی مدیر دوباره اجرا کنید. پاک‌سازی `NSS` (فایرفاکس/کروم) `best-effort` است: اگر `certutil` نصب نباشد یا یکی از مرورگرها بازِ دیتابیس را قفل کرده باشد، ابزار پیغامی با راهنمای پاک‌سازی دستی نشان می‌دهد. فایل `config.json` شما و `deployment` آپس‌اسکریپت در `script.google.com` دست‌نخورده می‌مانند — یعنی وقتی در اجرای بعدی گواهی تازه تولید می‌شود، نیازی به دیپلوی مجدد `Code.gs` نیست.
 
 **چرا گاهی جست‌وجوی گوگل بدون `JavaScript` نشان داده می‌شود؟**
 `Apps Script` مجبور است `User-Agent` درخواست‌های خود را روی `Google-Apps-Script` بگذارد. بعضی سایت‌ها این را به عنوان ربات شناسایی می‌کنند و نسخهٔ سادهٔ بدون `JavaScript` برمی‌گردانند. دامنه‌هایی که در لیست `SNI-rewrite` قرار گرفته‌اند (مثل `google.com`، `youtube.com`) از این مشکل در امان هستند چون مستقیماً از لبهٔ گوگل می‌آیند، نه از `Apps Script`.

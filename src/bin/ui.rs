@@ -9,7 +9,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 
-use mhrv_rs::cert_installer::install_ca;
+use mhrv_rs::cert_installer::{install_ca, reconcile_sudo_environment, remove_ca};
 use mhrv_rs::config::{Config, ScriptId};
 use mhrv_rs::data_dir;
 use mhrv_rs::domain_fronter::{DomainFronter, DEFAULT_GOOGLE_SNI_POOL};
@@ -24,6 +24,10 @@ const LOG_MAX: usize = 200;
 
 fn main() -> eframe::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
+    // Re-point HOME at the invoking user if this binary was launched
+    // under sudo (see cert_installer::reconcile_sudo_environment). Must
+    // run before any data_dir / firefox_profile_dirs call.
+    reconcile_sudo_environment();
     mhrv_rs::rlimit::raise_nofile_limit_best_effort();
 
     let shared = Arc::new(Shared::default());
@@ -68,7 +72,11 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([WIN_WIDTH, WIN_HEIGHT])
             .with_min_inner_size([420.0, 400.0])
             .with_title(format!("mhrv-rs {}", VERSION)),
-        renderer: if use_wgpu { eframe::Renderer::Wgpu } else { eframe::Renderer::Glow },
+        renderer: if use_wgpu {
+            eframe::Renderer::Wgpu
+        } else {
+            eframe::Renderer::Glow
+        },
         ..Default::default()
     };
 
@@ -116,6 +124,22 @@ struct UiState {
     /// Set while a download of a release asset is in flight. `None` when
     /// idle or after a completed download has been acknowledged.
     download_in_progress: bool,
+    /// Set while an install-or-remove cert op is in flight. Install and
+    /// Remove share this single flag so they can't race each other:
+    /// clicking Install → Remove back-to-back would otherwise leave the
+    /// final trust/file state dependent on thread scheduling — an
+    /// in-flight install could re-trust the CA after Remove had already
+    /// deleted it, or vice versa. Both UI buttons disable while this
+    /// is set, and both handlers gate-and-flip it.
+    cert_op_in_progress: bool,
+    /// Set synchronously when `Cmd::Start` is received by the background
+    /// thread, cleared synchronously when `Cmd::Stop` completes. Broader
+    /// than `running` (which only flips after the MITM manager has
+    /// finished loading). Used to block `Remove CA` during the window
+    /// between start-click and `running = true` — otherwise a queued
+    /// `Cmd::RemoveCa` could delete `ca/` while the server is partway
+    /// through loading the keypair into memory.
+    proxy_active: bool,
     /// One-line status of the most recent download (Ok(path) or Err(msg)).
     last_download: Option<Result<std::path::PathBuf, String>>,
     last_download_at: Option<Instant>,
@@ -139,6 +163,7 @@ enum Cmd {
     Stop,
     Test(Config),
     InstallCa,
+    RemoveCa,
     CheckCaTrusted,
     PollStats,
     /// Probe a single SNI against the given google_ip. Result is written
@@ -209,7 +234,7 @@ struct FormState {
     show_log: bool,
     fetch_ips_from_api: bool,
     max_ips_to_scan: usize,
-    scan_batch_size:usize,
+    scan_batch_size: usize,
     google_ip_validation: bool,
     normalize_x_graphql: bool,
     youtube_via_relay: bool,
@@ -254,7 +279,10 @@ fn load_form() -> (FormState, Option<String>) {
             }
         }
     } else {
-        tracing::info!("config: no config found at {} — starting with defaults", path.display());
+        tracing::info!(
+            "config: no config found at {} — starting with defaults",
+            path.display()
+        );
         (None, None)
     };
     let form = if let Some(c) = existing {
@@ -286,10 +314,10 @@ fn load_form() -> (FormState, Option<String>) {
             sni_custom_input: String::new(),
             sni_editor_open: false,
             show_log: true,
-            fetch_ips_from_api:c.fetch_ips_from_api,
-            max_ips_to_scan:c.max_ips_to_scan,
+            fetch_ips_from_api: c.fetch_ips_from_api,
+            max_ips_to_scan: c.max_ips_to_scan,
             google_ip_validation: c.google_ip_validation,
-            scan_batch_size:c.scan_batch_size,
+            scan_batch_size: c.scan_batch_size,
             normalize_x_graphql: c.normalize_x_graphql,
             youtube_via_relay: c.youtube_via_relay,
             passthrough_hosts: c.passthrough_hosts.clone(),
@@ -313,10 +341,10 @@ fn load_form() -> (FormState, Option<String>) {
             sni_custom_input: String::new(),
             sni_editor_open: false,
             show_log: true,
-            fetch_ips_from_api:false,
-            max_ips_to_scan:100,
-            google_ip_validation:true,
-            scan_batch_size:500,
+            fetch_ips_from_api: false,
+            max_ips_to_scan: 100,
+            google_ip_validation: true,
+            scan_batch_size: 500,
             normalize_x_graphql: false,
             youtube_via_relay: false,
             passthrough_hosts: Vec::new(),
@@ -450,10 +478,10 @@ impl FormState {
                     Some(active)
                 }
             },
-            fetch_ips_from_api:self.fetch_ips_from_api,
+            fetch_ips_from_api: self.fetch_ips_from_api,
             max_ips_to_scan: self.max_ips_to_scan,
-            google_ip_validation:self.google_ip_validation,
-            scan_batch_size:self.scan_batch_size,
+            google_ip_validation: self.google_ip_validation,
+            scan_batch_size: self.scan_batch_size,
             normalize_x_graphql: self.normalize_x_graphql,
             // UI form doesn't expose youtube_via_relay yet — it's a
             // config-only flag for now. Passed through from the loaded
@@ -584,10 +612,7 @@ fn section(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
     ui.add_space(2.0);
     let frame = egui::Frame::none()
         .fill(egui::Color32::from_rgb(28, 30, 34))
-        .stroke(egui::Stroke::new(
-            1.0,
-            egui::Color32::from_rgb(50, 54, 60),
-        ))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 54, 60)))
         .rounding(6.0)
         .inner_margin(egui::Margin::same(10.0));
     frame.show(ui, body);
@@ -596,10 +621,14 @@ fn section(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
 /// A primary accent-filled button. Used for the headline action in a row
 /// (Start / Stop / SNI pool).
 fn primary_button(text: &str) -> egui::Button<'_> {
-    egui::Button::new(egui::RichText::new(text).color(egui::Color32::WHITE).strong())
-        .fill(ACCENT)
-        .min_size(egui::vec2(120.0, 28.0))
-        .rounding(4.0)
+    egui::Button::new(
+        egui::RichText::new(text)
+            .color(egui::Color32::WHITE)
+            .strong(),
+    )
+    .fill(ACCENT)
+    .min_size(egui::vec2(120.0, 28.0))
+    .rounding(4.0)
 }
 
 /// A compact form row: label on the left (fixed width for vertical alignment),
@@ -1209,9 +1238,54 @@ impl eframe::App for App {
             // Secondary actions — smaller, grouped together on their own line.
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if ui.small_button("Install CA").clicked() {
-                    let _ = self.cmd_tx.send(Cmd::InstallCa);
-                }
+                // Install CA and Remove CA share a single in-flight flag
+                // so back-to-back clicks can't race — an in-flight
+                // install would otherwise re-trust the CA after Remove
+                // deleted it (or vice versa). Both buttons disable when
+                // either op is running.
+                let (cert_op_in_flight, proxy_active) = {
+                    let s = self.shared.state.lock().unwrap();
+                    (s.cert_op_in_progress, s.proxy_active)
+                };
+
+                let install_hover = if cert_op_in_flight {
+                    "A cert install/remove is already in progress."
+                } else {
+                    "Install the MITM CA into the OS trust store (and NSS if certutil \
+                     is available)."
+                };
+                ui.add_enabled_ui(!cert_op_in_flight, |ui| {
+                    if ui
+                        .small_button("Install CA")
+                        .on_hover_text(install_hover)
+                        .clicked()
+                    {
+                        let _ = self.cmd_tx.send(Cmd::InstallCa);
+                    }
+                });
+
+                let remove_hover = if proxy_active || running {
+                    "Stop the proxy first — the CA keypair is held in memory by the \
+                     running MITM engine, and removing it now would break HTTPS for \
+                     every site until restart."
+                } else if cert_op_in_flight {
+                    "A cert install/remove is already in progress."
+                } else {
+                    "Remove the MITM CA from the OS trust store (verified by name) \
+                     and delete the on-disk ca/ directory. NSS cleanup (Firefox/Chrome) \
+                     is best-effort and logs a hint if certutil is missing or a browser \
+                     has the DB locked. A fresh CA is generated the next time you start \
+                     the proxy. Your config.json and the Apps Script deployment are NOT \
+                     touched — no need to redeploy Code.gs."
+                };
+                ui.add_enabled_ui(!proxy_active && !running && !cert_op_in_flight, |ui| {
+                    if ui.small_button("Remove CA")
+                        .on_hover_text(remove_hover)
+                        .clicked()
+                    {
+                        let _ = self.cmd_tx.send(Cmd::RemoveCa);
+                    }
+                });
                 if ui.small_button("Check CA").clicked() {
                     let _ = self.cmd_tx.send(Cmd::CheckCaTrusted);
                 }
@@ -1736,13 +1810,16 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                     });
                 }
             }
-            // In background_thread function, modify the Cmd::Start handler:
             Ok(Cmd::Start(cfg)) => {
                 if active.is_some() {
                     push_log(&shared, "[ui] already running");
                     continue;
                 }
                 push_log(&shared, "[ui] starting proxy...");
+                // Flip proxy_active synchronously so a `Remove CA` click
+                // queued in the same frame as Start is rejected before
+                // the MITM manager begins loading.
+                shared.state.lock().unwrap().proxy_active = true;
                 let shared2 = shared.clone();
                 let fronter_slot: Arc<AsyncMutex<Option<Arc<DomainFronter>>>> =
                     Arc::new(AsyncMutex::new(None));
@@ -1756,7 +1833,9 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                         Ok(m) => m,
                         Err(e) => {
                             push_log(&shared2, &format!("[ui] MITM init failed: {}", e));
-                            shared2.state.lock().unwrap().running = false;
+                            let mut s = shared2.state.lock().unwrap();
+                            s.running = false;
+                            s.proxy_active = false;
                             return;
                         }
                     };
@@ -1765,7 +1844,9 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                         Ok(s) => s,
                         Err(e) => {
                             push_log(&shared2, &format!("[ui] proxy build failed: {}", e));
-                            shared2.state.lock().unwrap().running = false;
+                            let mut st = shared2.state.lock().unwrap();
+                            st.running = false;
+                            st.proxy_active = false;
                             return;
                         }
                     };
@@ -1792,8 +1873,15 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                         push_log(&shared2, &format!("[ui] proxy error: {}", e));
                     }
 
-                    shared2.state.lock().unwrap().running = false;
-                    shared2.state.lock().unwrap().started_at = None;
+                    {
+                        let mut st = shared2.state.lock().unwrap();
+                        st.running = false;
+                        st.started_at = None;
+                        // Self-exit path (e.g. bind error after startup,
+                        // or normal shutdown without Cmd::Stop). The
+                        // Stop handler clears this too — either is fine.
+                        st.proxy_active = false;
+                    }
                     push_log(&shared2, "[ui] proxy stopped");
                 });
 
@@ -1819,8 +1907,10 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                         }
                     });
 
-                    shared.state.lock().unwrap().running = false;
-                    shared.state.lock().unwrap().started_at = None;
+                    let mut st = shared.state.lock().unwrap();
+                    st.running = false;
+                    st.started_at = None;
+                    st.proxy_active = false;
                 }
             }
 
@@ -1848,25 +1938,102 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                 });
             }
             Ok(Cmd::InstallCa) => {
+                // Share the cert-op flag with Remove CA so the two
+                // can't race. Gate and flip before spawning; the worker
+                // clears on exit.
+                {
+                    let mut st = shared.state.lock().unwrap();
+                    if st.cert_op_in_progress {
+                        push_log(
+                            &shared,
+                            "[ui] cert op already in progress — ignoring duplicate install",
+                        );
+                        continue;
+                    }
+                    st.cert_op_in_progress = true;
+                }
                 let shared2 = shared.clone();
                 std::thread::spawn(move || {
                     push_log(&shared2, "[ui] installing CA...");
                     let base = data_dir::data_dir();
-                    if let Err(e) = MitmCertManager::new_in(&base) {
-                        push_log(&shared2, &format!("[ui] CA init failed: {}", e));
-                        return;
-                    }
-                    let ca = base.join(CA_CERT_FILE);
-                    match install_ca(&ca) {
-                        Ok(()) => {
-                            push_log(&shared2, "[ui] CA install ok");
-                            let mut st = shared2.state.lock().unwrap();
+                    let result = (|| -> Result<(), String> {
+                        if let Err(e) = MitmCertManager::new_in(&base) {
+                            return Err(format!("CA init failed: {}", e));
+                        }
+                        let ca = base.join(CA_CERT_FILE);
+                        install_ca(&ca).map_err(|e| format!("CA install failed: {}", e))
+                    })();
+                    {
+                        let mut st = shared2.state.lock().unwrap();
+                        st.cert_op_in_progress = false;
+                        if result.is_ok() {
                             st.ca_trusted = Some(true);
                             st.ca_trusted_at = Some(Instant::now());
                         }
-                        Err(e) => {
-                            push_log(&shared2, &format!("[ui] CA install failed: {}", e));
+                    }
+                    match result {
+                        Ok(()) => push_log(&shared2, "[ui] CA install ok"),
+                        Err(msg) => {
+                            push_log(&shared2, &format!("[ui] {}", msg));
                             push_log(&shared2, "[ui] hint: run the terminal binary with sudo/admin: mhrv-rs --install-cert");
+                        }
+                    }
+                });
+            }
+            Ok(Cmd::RemoveCa) => {
+                // Authoritative proxy-active guard: the UI button is
+                // disabled when proxy_active/running is set, but a
+                // Cmd::RemoveCa may already be queued by the time the
+                // Start handler flips the flag. `active` is owned by
+                // this thread so its state is the real source of truth
+                // — reject removal any time a proxy handle is alive,
+                // whether it's still starting or fully running.
+                if active.is_some() {
+                    push_log(
+                        &shared,
+                        "[ui] cannot remove CA: proxy is running or starting — stop it first",
+                    );
+                    continue;
+                }
+                // Shared cert-op gate: covers Install CA too, so back-
+                // to-back Install → Remove clicks can't race. The
+                // button is already disabled while this is set, but a
+                // queued command can still arrive here.
+                {
+                    let mut st = shared.state.lock().unwrap();
+                    if st.cert_op_in_progress {
+                        push_log(
+                            &shared,
+                            "[ui] cert op already in progress — ignoring duplicate remove",
+                        );
+                        continue;
+                    }
+                    st.cert_op_in_progress = true;
+                }
+                let shared2 = shared.clone();
+                std::thread::spawn(move || {
+                    push_log(&shared2, "[ui] removing CA (trust store + files)...");
+                    let base = data_dir::data_dir();
+                    let result = remove_ca(&base);
+                    {
+                        let mut st = shared2.state.lock().unwrap();
+                        st.cert_op_in_progress = false;
+                        if result.is_ok() {
+                            st.ca_trusted = Some(false);
+                            st.ca_trusted_at = Some(Instant::now());
+                        }
+                    }
+                    match result {
+                        Ok(outcome) => {
+                            push_log(&shared2, &format!("[ui] {}", outcome.summary()));
+                            push_log(
+                                &shared2,
+                                "[ui] config.json and Apps Script deployment untouched",
+                            );
+                        }
+                        Err(e) => {
+                            push_log(&shared2, &format!("[ui] CA remove failed: {}", e));
+                            push_log(&shared2, "[ui] hint: run the terminal binary with sudo/admin: mhrv-rs --remove-cert");
                         }
                     }
                 });
@@ -1915,7 +2082,21 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                 std::thread::spawn(move || {
                     let base = data_dir::data_dir();
                     let ca = base.join(CA_CERT_FILE);
-                    let trusted = mhrv_rs::cert_installer::is_ca_trusted(&ca);
+                    let file_exists = ca.exists();
+                    // Probe the trust store by name — independent of
+                    // whether the on-disk ca.crt happens to be there.
+                    // The file and the trust-store entry can be out of
+                    // sync (e.g. after a partial removal), and that
+                    // mismatch is exactly what Check CA must surface.
+                    let trusted = mhrv_rs::cert_installer::is_ca_trusted_by_name();
+                    push_log(
+                        &shared2,
+                        &format!(
+                            "[ui] check CA: file={} trust_store={}",
+                            if file_exists { "present" } else { "missing" },
+                            if trusted { "trusted" } else { "not trusted" },
+                        ),
+                    );
                     let mut st = shared2.state.lock().unwrap();
                     st.ca_trusted = Some(trusted);
                     st.ca_trusted_at = Some(Instant::now());
@@ -1930,7 +2111,10 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                 }
                 rt.spawn(async move {
                     let result = mhrv_rs::update_check::check(route).await;
-                    push_log(&shared2, &format!("[ui] update check: {}", result.summary()));
+                    push_log(
+                        &shared2,
+                        &format!("[ui] update check: {}", result.summary()),
+                    );
                     {
                         let mut st = shared2.state.lock().unwrap();
                         st.last_update_check = Some(UpdateProbeState::Done(result));

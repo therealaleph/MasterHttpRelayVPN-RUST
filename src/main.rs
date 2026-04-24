@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
-use mhrv_rs::cert_installer::{install_ca, is_ca_trusted};
+use mhrv_rs::cert_installer::{install_ca, is_ca_trusted, reconcile_sudo_environment, remove_ca};
 use mhrv_rs::config::Config;
 use mhrv_rs::mitm::{MitmCertManager, CA_CERT_FILE};
 use mhrv_rs::proxy_server::ProxyServer;
@@ -18,6 +18,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 struct Args {
     config_path: Option<PathBuf>,
     install_cert: bool,
+    remove_cert: bool,
     no_cert_check: bool,
     command: Command,
 }
@@ -44,6 +45,11 @@ USAGE:
 OPTIONS:
     -c, --config PATH    Path to config.json (default: ./config.json)
     --install-cert       Install the MITM CA certificate and exit
+    --remove-cert        Remove the MITM CA from the OS trust store (verified by
+                         name), then delete the on-disk ca/ directory and exit.
+                         NSS cleanup (Firefox/Chrome) is best-effort. A fresh CA
+                         is generated on next run. config.json and your Apps
+                         Script deployment are untouched.
     --no-cert-check      Skip the auto-install-if-untrusted check on startup
     -h, --help           Show this message
     -V, --version        Show version
@@ -58,6 +64,7 @@ ENV:
 fn parse_args() -> Result<Args, String> {
     let mut config_path: Option<PathBuf> = None;
     let mut install_cert = false;
+    let mut remove_cert = false;
     let mut no_cert_check = false;
     let mut command = Command::Serve;
 
@@ -102,13 +109,18 @@ fn parse_args() -> Result<Args, String> {
                 config_path = Some(PathBuf::from(v));
             }
             "--install-cert" => install_cert = true,
+            "--remove-cert" => remove_cert = true,
             "--no-cert-check" => no_cert_check = true,
             other => return Err(format!("unknown argument: {}", other)),
         }
     }
+    if install_cert && remove_cert {
+        return Err("--install-cert and --remove-cert cannot be combined".into());
+    }
     Ok(Args {
         config_path,
         install_cert,
+        remove_cert,
         no_cert_check,
         command,
     })
@@ -127,6 +139,14 @@ async fn main() -> ExitCode {
     // Install default rustls crypto provider (ring).
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    // Must run before anything else reads HOME / USER / data_dir — if
+    // the user ran `sudo ./mhrv-rs ...`, this re-points HOME at the
+    // invoking user's home so user-scoped cert paths (Firefox profiles,
+    // macOS login keychain, the mhrv-rs data dir) are not silently
+    // operated against root's home. No-op on Windows and for non-sudo
+    // invocations.
+    reconcile_sudo_environment();
+
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
@@ -135,6 +155,29 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    // --remove-cert runs without a valid config — the CA files may be
+    // the only thing present in the data dir. `config.json` and the
+    // Apps Script deployment are intentionally untouched: the user does
+    // not have to redeploy Code.gs after regenerating the CA.
+    if args.remove_cert {
+        init_logging("info");
+        let base = mhrv_rs::data_dir::data_dir();
+        match remove_ca(&base) {
+            Ok(outcome) => {
+                tracing::info!("{}", outcome.summary());
+                tracing::info!(
+                    "A fresh CA will be generated next time the proxy starts — \
+                     run --install-cert then to re-trust it."
+                );
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => {
+                eprintln!("remove failed: {}", e);
+                return ExitCode::FAILURE;
+            }
+        }
+    }
 
     // --install-cert can run without a valid config — only needs the CA file.
     if args.install_cert {

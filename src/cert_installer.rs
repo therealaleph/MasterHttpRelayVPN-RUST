@@ -1,7 +1,7 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::mitm::CERT_NAME;
+use crate::mitm::{CA_DIR, CERT_NAME};
 
 #[derive(Debug, thiserror::Error)]
 pub enum InstallError {
@@ -11,6 +11,164 @@ pub enum InstallError {
     Failed,
     #[error("unsupported platform: {0}")]
     Unsupported(String),
+    #[error("io {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("CA still trusted after removal — re-run with admin/sudo")]
+    RemovalIncomplete,
+}
+
+/// Structured outcome of a successful `remove_ca` call. The OS trust
+/// store is always fully clean when we return `Ok(_)` (that's verified
+/// by `is_ca_trusted_by_name` before file deletion), but NSS cleanup is
+/// best-effort — callers need the nuance to print accurate status.
+///
+/// UI/CLI should treat `Clean` as "nothing more to do" and
+/// `NssIncomplete` as a non-fatal warning ("OS CA removed, browser
+/// cleanup partial — follow the logged hint").
+#[derive(Debug, Clone, Copy)]
+pub enum RemovalOutcome {
+    Clean,
+    NssIncomplete(NssReport),
+}
+
+impl RemovalOutcome {
+    /// One-line summary suitable for a log line or status banner.
+    pub fn summary(&self) -> String {
+        match self {
+            RemovalOutcome::Clean => "CA removed.".to_string(),
+            RemovalOutcome::NssIncomplete(r) if r.tool_missing_with_stores_present => {
+                "OS CA removed. NSS cleanup skipped — NSS certutil not found.".to_string()
+            }
+            RemovalOutcome::NssIncomplete(r) => format!(
+                "OS CA removed. NSS cleanup partial: {}/{} browser stores updated.",
+                r.ok, r.tried
+            ),
+        }
+    }
+}
+
+/// When running as root via `sudo`, the process's `HOME` / `USER`
+/// environment reflects **root**, not the user who invoked the command.
+/// That breaks every user-scoped cert path this module touches —
+/// `data_dir()` resolves to root's config dir, `firefox_profile_dirs()`
+/// scans root's profiles, macOS `login.keychain-db` is root's. The
+/// removal then operates on paths that probably don't exist, reports
+/// success, and leaves the real user's CA trusted.
+///
+/// This helper detects the real `sudo` case (`geteuid() == 0` AND
+/// `SUDO_USER` set to a non-root user), resolves the invoking user's
+/// home dir (SUDO_HOME, `getent passwd`, or `/Users/$SUDO_USER` /
+/// `/home/$SUDO_USER` fallback), and rewrites `HOME` for the remainder
+/// of the process. The EUID gate is load-bearing: `SUDO_USER` alone is
+/// not proof of elevation (a user can export it, inherit it, or use
+/// `sudo -E`), and blindly trusting it would let a non-root process
+/// redirect config/CA/profile operations to another user's files.
+/// Call once at the top of `main` in every binary (CLI + UI) before
+/// anything else reads HOME. No-op on Windows (UAC keeps the user's
+/// HOME intact) and on non-sudo Unix invocations.
+pub fn reconcile_sudo_environment() {
+    #[cfg(unix)]
+    unix::reconcile_sudo_home();
+}
+
+#[cfg(unix)]
+mod unix {
+    use super::sudo_parse_passwd_home;
+    use std::path::Path;
+    use std::process::Command;
+
+    pub(super) fn reconcile_sudo_home() {
+        // EUID gate: only act when we are *actually* running with root
+        // privileges. A process running as a normal user might have
+        // SUDO_USER exported (inherited from a shell init, set in
+        // user env, or via `sudo -E`) — without the EUID check we'd
+        // happily rewrite HOME to another user's dir and redirect
+        // every subsequent data_dir / cert path there. `geteuid()` is
+        // the cheap, reliable discriminator.
+        //
+        // SAFETY: geteuid() is async-signal-safe and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        if euid != 0 {
+            return;
+        }
+        let Ok(sudo_user) = std::env::var("SUDO_USER") else {
+            return;
+        };
+        if sudo_user.is_empty() || sudo_user == "root" {
+            return;
+        }
+        match resolve_home(&sudo_user) {
+            Some(home) => {
+                tracing::info!(
+                    "Detected sudo invocation (SUDO_USER={}): re-rooting HOME to {} \
+                     so user-scoped cert paths target the real user.",
+                    sudo_user,
+                    home
+                );
+                // SAFETY: reconcile_sudo_environment runs at the top of
+                // main() before any other thread is spawned and before
+                // any code has cached HOME.
+                std::env::set_var("HOME", home);
+            }
+            None => {
+                tracing::warn!(
+                    "Running under sudo (SUDO_USER={}), but could not resolve \
+                     the user's home dir. Cert paths will operate on root's \
+                     HOME — which may NOT match where you installed the CA. \
+                     Prefer running without sudo; the app invokes sudo \
+                     internally for system-level steps.",
+                    sudo_user
+                );
+            }
+        }
+    }
+
+    fn resolve_home(sudo_user: &str) -> Option<String> {
+        // Some sudoers configs export SUDO_HOME; prefer it when present.
+        if let Ok(h) = std::env::var("SUDO_HOME") {
+            if !h.is_empty() {
+                return Some(h);
+            }
+        }
+        // Linux: `getent passwd <user>` returns the full passwd entry.
+        if let Ok(out) = Command::new("getent").args(["passwd", sudo_user]).output() {
+            if out.status.success() {
+                let line = String::from_utf8_lossy(&out.stdout);
+                if let Some(h) = sudo_parse_passwd_home(&line) {
+                    return Some(h);
+                }
+            }
+        }
+        // macOS has no getent. Fall back to the convention for both
+        // platforms — verify the dir actually exists before returning.
+        for root in ["/Users", "/home"] {
+            let candidate = format!("{}/{}", root, sudo_user);
+            if Path::new(&candidate).exists() {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+}
+
+/// Pure parser for a single-line `getent passwd` entry.
+/// Always compiled so unit tests can run on every host.
+fn sudo_parse_passwd_home(content: &str) -> Option<String> {
+    let line = content.lines().next()?;
+    let fields: Vec<&str> = line.split(':').collect();
+    // passwd format: name:pw:uid:gid:gecos:home:shell
+    if fields.len() < 7 {
+        return None;
+    }
+    let home = fields[5].trim();
+    if home.is_empty() {
+        return None;
+    }
+    Some(home.to_string())
 }
 
 /// Install the CA certificate at `path` into the system trust store.
@@ -46,12 +204,108 @@ pub fn install_ca(path: &Path) -> Result<(), InstallError> {
     }
 }
 
+/// Remove the CA from the OS trust store, best-effort NSS stores (Firefox
+/// profiles + Chrome/Chromium on Linux), and delete the on-disk
+/// `ca/ca.crt` + `ca/ca.key`. A fresh CA will be regenerated the next
+/// time the proxy starts — and since the Apps Script deployment lives on
+/// Google's side and `config.json` is never touched here, the user does
+/// not have to redeploy `Code.gs` or re-enter their deployment ID.
+/// Platform-specific — may require admin/sudo for system stores.
+///
+/// Safety property: we verify the OS trust store with `is_ca_trusted`
+/// before deleting `ca/`. If the stale root is still trusted (e.g.
+/// because the system-store delete needed admin and we didn't have it),
+/// we return `RemovalIncomplete` and leave the on-disk files alone — a
+/// regenerated CA with a fresh keypair would otherwise mismatch the
+/// stale trusted root and silently break every HTTPS MITM leaf.
+pub fn remove_ca(base: &Path) -> Result<RemovalOutcome, InstallError> {
+    let os = std::env::consts::OS;
+    tracing::info!("Removing CA certificate on {}...", os);
+
+    // Platforms that merge anchor files into a bundle/database (Linux)
+    // must report whether the refresh step succeeded — the bundle may
+    // still contain the CA even after the anchor file is gone. macOS
+    // and Windows write directly to their stores, so there's nothing
+    // separate to refresh; they rely entirely on the by-name probe.
+    let platform_ok = match os {
+        "macos" => {
+            remove_macos();
+            true
+        }
+        "linux" => remove_linux(),
+        "windows" => {
+            remove_windows();
+            true
+        }
+        other => return Err(InstallError::Unsupported(other.to_string())),
+    };
+
+    // Verify OS trust store removal BEFORE touching browser state. If
+    // the OS removal didn't actually land (e.g. machine-store delete
+    // needed admin we don't have, or a Linux refresh cmd failed), we
+    // must not also strip NSS entries + the Firefox enterprise_roots
+    // pref — that leaves the system in an inconsistent "half-removed"
+    // state (OS still trusts, but Firefox is newly reconfigured) that
+    // only confuses the user. Returning RemovalIncomplete here keeps
+    // the install pristine so a retry is idempotent.
+    //
+    // Must be path-independent — the on-disk cert file may already be
+    // missing for unrelated reasons, and a file-gated check would then
+    // mask a still-trusted stale root.
+    if !platform_ok || is_ca_trusted_by_name() {
+        tracing::error!(
+            "MITM CA is still trusted after OS removal attempt \
+             (platform_ok={}) — refusing to touch browser state or \
+             delete on-disk files. Re-run with admin/sudo to complete \
+             revocation.",
+            platform_ok
+        );
+        return Err(InstallError::RemovalIncomplete);
+    }
+
+    // OS store is clean — only now mutate browser state.
+    let nss = remove_nss_stores();
+
+    let ca_dir = base.join(CA_DIR);
+    if ca_dir.exists() {
+        if let Err(e) = std::fs::remove_dir_all(&ca_dir) {
+            tracing::error!("failed to delete {}: {}", ca_dir.display(), e);
+            return Err(InstallError::Io {
+                path: ca_dir.clone(),
+                source: e,
+            });
+        }
+        tracing::info!("Deleted CA files at {}", ca_dir.display());
+    }
+
+    if nss.is_clean() {
+        Ok(RemovalOutcome::Clean)
+    } else {
+        Ok(RemovalOutcome::NssIncomplete(nss))
+    }
+}
+
 /// Heuristic check: is the CA already in the trust store?
 /// Best-effort — on unknown state we return false to always attempt install.
+///
+/// The `path` guard skips the trust-store probe when the local CA file
+/// is missing, because at install time "no file = nothing to trust" is a
+/// useful shortcut. Revocation uses `is_ca_trusted_by_name` instead —
+/// that path must verify the store regardless of whether the file still
+/// exists, otherwise a pre-deleted `ca.crt` would mask a lingering
+/// trusted root.
 pub fn is_ca_trusted(path: &Path) -> bool {
     if !path.exists() {
         return false;
     }
+    is_ca_trusted_by_name()
+}
+
+/// Path-independent variant of `is_ca_trusted`: queries the OS trust
+/// store by cert name (CERT_NAME) without requiring the on-disk cert
+/// file. Used by `remove_ca` to verify revocation completed even if the
+/// local `ca.crt` was already missing or deleted mid-flight.
+pub fn is_ca_trusted_by_name() -> bool {
     match std::env::consts::OS {
         "macos" => is_trusted_macos(),
         "linux" => is_trusted_linux(),
@@ -115,6 +369,73 @@ fn install_macos(cert_path: &str) -> bool {
     false
 }
 
+/// Delete the CA from the login keychain (no sudo) and, only when a
+/// probe confirms the cert actually lives there, the system keychain
+/// (sudo). Probing first avoids prompting the user — or hanging the
+/// UI's GUI-spawned `sudo` — for a password they don't need when the
+/// cert was only ever installed in the login keychain (the default
+/// path). Exit status is best-effort: `security delete-certificate`
+/// exits non-zero for "not found", which is indistinguishable from
+/// real failures, so the final trust state is verified by the caller
+/// via `is_ca_trusted_by_name`.
+fn remove_macos() {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let login_kc_db = format!("{}/Library/Keychains/login.keychain-db", home);
+    let login_kc = format!("{}/Library/Keychains/login.keychain", home);
+    let login_keychain = if Path::new(&login_kc_db).exists() {
+        login_kc_db
+    } else {
+        login_kc
+    };
+
+    let res = Command::new("security")
+        .args(["delete-certificate", "-c", CERT_NAME, &login_keychain])
+        .status();
+    if matches!(res, Ok(s) if s.success()) {
+        tracing::info!("Removed CA from login keychain.");
+    }
+
+    if macos_system_keychain_has() {
+        let res = Command::new("sudo")
+            .args([
+                "security",
+                "delete-certificate",
+                "-c",
+                CERT_NAME,
+                "/Library/Keychains/System.keychain",
+            ])
+            .status();
+        if matches!(res, Ok(s) if s.success()) {
+            tracing::info!("Removed CA from System keychain.");
+        } else {
+            tracing::warn!(
+                "System keychain still has the CA and the sudo delete did not \
+                 succeed — re-run with an admin password available."
+            );
+        }
+    }
+}
+
+/// Probe-without-sudo: does the System keychain currently contain our
+/// cert? `security find-certificate` against the system keychain path
+/// does not require admin; only `delete-certificate` does. Used to
+/// decide whether to escalate at all.
+fn macos_system_keychain_has() -> bool {
+    let out = Command::new("security")
+        .args([
+            "find-certificate",
+            "-a",
+            "-c",
+            CERT_NAME,
+            "/Library/Keychains/System.keychain",
+        ])
+        .output();
+    match out {
+        Ok(o) => o.status.success() && !o.stdout.is_empty(),
+        Err(_) => false,
+    }
+}
+
 fn is_trusted_macos() -> bool {
     let out = Command::new("security")
         .args(["find-certificate", "-a", "-c", CERT_NAME])
@@ -142,7 +463,10 @@ fn install_linux(cert_path: &str) -> bool {
             try_copy_and_run(cert_path, &dest, &[&["update-ca-trust", "extract"]])
         }
         "arch" => {
-            let dest = format!("/etc/ca-certificates/trust-source/anchors/{}.crt", safe_name);
+            let dest = format!(
+                "/etc/ca-certificates/trust-source/anchors/{}.crt",
+                safe_name
+            );
             try_copy_and_run(cert_path, &dest, &[&["trust", "extract-compat"]])
         }
         "openwrt" => {
@@ -154,7 +478,8 @@ fn install_linux(cert_path: &str) -> bool {
                 "OpenWRT detected: the router doesn't need to trust the MITM CA. \
                  Copy {} to each LAN client (browser / OS trust store) instead. \
                  Example: scp root@<router>:{} ./ and import from there.",
-                cert_path, cert_path
+                cert_path,
+                cert_path
             );
             true
         }
@@ -253,7 +578,11 @@ fn classify_os_release(content: &str) -> String {
             Some(x) => x,
             None => continue,
         };
-        let v = v.trim().trim_matches('"').trim_matches('\'').to_ascii_lowercase();
+        let v = v
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_ascii_lowercase();
         match k.trim() {
             "ID" => id = v,
             "ID_LIKE" => id_like = v,
@@ -281,13 +610,103 @@ fn classify_os_release(content: &str) -> String {
     "unknown".into()
 }
 
+/// Mirror of `install_linux`: for each known anchor dir, delete our cert
+/// file and run the corresponding refresh command. Tries without sudo
+/// first, falls back to sudo. Missing files are silently skipped —
+/// removal is idempotent.
+///
+/// Key safety behavior: we refresh the trust bundle **regardless of
+/// whether we found an anchor file to delete**. The concern is a retry
+/// after a prior run that deleted the anchor but failed to refresh —
+/// leaving the merged bundle still containing our PEM. On the next
+/// invocation the anchor dir is empty, so a "delete file, then refresh"
+/// contract would skip the refresh entirely and `remove_ca` would see
+/// no anchor file left, declare success, and delete `ca/` while the
+/// stale root is still trusted. Running the refresh unconditionally
+/// catches this.
+///
+/// Returns `false` if any refresh command failed — callers must then
+/// abort file deletion so a regenerated CA with a fresh keypair can't
+/// mismatch the stale root.
+fn remove_linux() -> bool {
+    let safe_name = CERT_NAME.replace(' ', "_");
+    let anchors: &[(&str, &[&str])] = &[
+        (
+            "/usr/local/share/ca-certificates",
+            &["update-ca-certificates"],
+        ),
+        (
+            "/etc/pki/ca-trust/source/anchors",
+            &["update-ca-trust", "extract"],
+        ),
+        (
+            "/etc/ca-certificates/trust-source/anchors",
+            &["trust", "extract-compat"],
+        ),
+    ];
+
+    let mut all_ok = true;
+    for (dir, refresh) in anchors {
+        // Skip distros whose anchor dir doesn't exist — running their
+        // refresh tool (e.g. `trust extract-compat` on a Debian host)
+        // would just error out and falsely mark the removal as failed.
+        if !Path::new(dir).exists() {
+            continue;
+        }
+
+        let path = format!("{}/{}.crt", dir, safe_name);
+        let anchor_present = Path::new(&path).exists();
+        if anchor_present {
+            let deleted =
+                std::fs::remove_file(&path).is_ok() || run_cmd(&["sudo", "rm", "-f", &path]);
+            if !deleted {
+                tracing::warn!("failed to remove {}", path);
+                all_ok = false;
+                continue;
+            }
+        }
+
+        // Always refresh — see doc comment for the retry-safety rationale.
+        let refreshed = run_cmd(refresh) || {
+            let mut full: Vec<&str> = vec!["sudo"];
+            full.extend_from_slice(refresh);
+            run_cmd(&full)
+        };
+        if !refreshed {
+            tracing::error!(
+                "refresh {:?} failed for {} — CA may still be trusted via the merged bundle",
+                refresh,
+                dir
+            );
+            all_ok = false;
+        } else if anchor_present {
+            tracing::info!("Removed CA from {} (bundle refreshed).", dir);
+        } else {
+            tracing::debug!("Refreshed {} bundle (nothing to delete here).", dir);
+        }
+    }
+    all_ok
+}
+
 fn is_trusted_linux() -> bool {
-    let anchor_dirs = [
+    // Check both the anchor dirs (what we write into on install) and
+    // the post-extract dirs (where update-ca-certificates / `trust
+    // extract-compat` etc. copy or symlink our PEM after refresh).
+    // Checking the post-extract side catches the "anchor file already
+    // removed but bundle not regenerated" case on a retry — if we only
+    // looked at anchor dirs, a `remove_ca` retry after a prior refresh
+    // failure could declare success while the merged bundle still
+    // contains our stale root.
+    let dirs = [
         "/usr/local/share/ca-certificates",
         "/etc/pki/ca-trust/source/anchors",
         "/etc/ca-certificates/trust-source/anchors",
+        // Post-extract locations:
+        "/etc/ssl/certs",
+        "/etc/pki/ca-trust/extracted/pem/directory-hash",
+        "/etc/ca-certificates/extracted/cadir",
     ];
-    for d in anchor_dirs {
+    for d in dirs {
         if let Ok(entries) = std::fs::read_dir(d) {
             for e in entries.flatten() {
                 let name = e.file_name();
@@ -310,24 +729,33 @@ fn is_trusted_linux() -> bool {
 /// false on Windows, so the Check-CA button was misleading users into
 /// reinstalling a cert that was already trusted.
 fn is_trusted_windows() -> bool {
-    // `certutil -user -store Root <name>` prints the matching cert entries
-    // on success (stdout), and exits with a non-zero code plus a "Not
-    // found" message if nothing matches. We also check stdout for the
-    // cert name because certutil in some locales returns 0 even on no-
-    // match, just with empty output.
-    for args in [
-        vec!["-user", "-store", "Root", CERT_NAME],
-        vec!["-store", "Root", CERT_NAME],
-    ] {
-        let out = Command::new("certutil").args(&args).output();
-        if let Ok(o) = out {
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            if o.status.success() && stdout.to_ascii_lowercase().contains(&CERT_NAME.to_ascii_lowercase()) {
-                return true;
-            }
-        }
+    windows_store_has(true) || windows_store_has(false)
+}
+
+/// Query a single Windows Trusted Root store for our CA.
+/// `user = true` hits the current-user store (no admin needed);
+/// `user = false` hits the machine store. `certutil -store Root <name>`
+/// prints the matching cert entries on success and exits non-zero with
+/// "Not found" if nothing matches — we also check stdout for the cert
+/// name because certutil in some locales returns 0 on no-match with
+/// empty output.
+fn windows_store_has(user: bool) -> bool {
+    let mut args: Vec<&str> = Vec::new();
+    if user {
+        args.push("-user");
     }
-    false
+    args.extend(["-store", "Root", CERT_NAME]);
+    let out = Command::new("certutil").args(&args).output();
+    match out {
+        Ok(o) => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            o.status.success()
+                && stdout
+                    .to_ascii_lowercase()
+                    .contains(&CERT_NAME.to_ascii_lowercase())
+        }
+        Err(_) => false,
+    }
 }
 
 fn install_windows(cert_path: &str) -> bool {
@@ -353,6 +781,47 @@ fn install_windows(cert_path: &str) -> bool {
     }
     tracing::error!("Windows install failed — run as administrator or install manually.");
     false
+}
+
+/// Delete from user and/or machine Trusted Root stores. We probe each
+/// store first with `certutil -store` and only attempt the delete where
+/// the cert actually lives — this avoids the confusing "needs elevation"
+/// error that `-delstore Root` would print when the cert was only ever
+/// installed in the per-user store (the default path for non-admin
+/// runs). Final state is verified by the caller via `is_ca_trusted`.
+fn remove_windows() {
+    let mut any = false;
+
+    if windows_store_has(true) {
+        let res = Command::new("certutil")
+            .args(["-delstore", "-user", "Root", CERT_NAME])
+            .status();
+        if matches!(res, Ok(s) if s.success()) {
+            tracing::info!("Removed CA from Windows user Trusted Root store.");
+            any = true;
+        } else {
+            tracing::warn!("failed to remove CA from Windows user Trusted Root store");
+        }
+    }
+
+    if windows_store_has(false) {
+        let res = Command::new("certutil")
+            .args(["-delstore", "Root", CERT_NAME])
+            .status();
+        if matches!(res, Ok(s) if s.success()) {
+            tracing::info!("Removed CA from Windows machine Trusted Root store.");
+            any = true;
+        } else {
+            tracing::warn!(
+                "failed to remove CA from Windows machine Trusted Root store \
+                 (run as administrator to complete)"
+            );
+        }
+    }
+
+    if !any {
+        tracing::info!("No MITM CA found in Windows Trusted Root stores.");
+    }
 }
 
 // ---------- NSS (Firefox + Chrome/Chromium on Linux) ----------
@@ -440,43 +909,36 @@ fn install_nss_stores(cert_path: &str) {
 /// certutil isn't typically installed so the certutil-based path doesn't
 /// fire there.
 ///
-/// Existing user.js entries for other prefs are preserved by appending
-/// rather than truncating. Idempotent.
+/// We tag the block we write with a sentinel marker comment on the line
+/// above the pref, so uninstall can prove ownership before removing it —
+/// the user may have had `security.enterprise_roots.enabled = true`
+/// before this app existed, and we must not silently revoke their
+/// setting. Idempotent.
 fn enable_firefox_enterprise_roots() {
-    const PREF: &str = r#"user_pref("security.enterprise_roots.enabled", true);"#;
     let mut touched = 0;
     for profile in firefox_profile_dirs() {
         let user_js = profile.join("user.js");
         let existing = std::fs::read_to_string(&user_js).unwrap_or_default();
-        if existing.contains("security.enterprise_roots.enabled") {
-            // Already set by us or the user. Replace-or-keep: if they set it
-            // to false we leave their choice alone. If it's already our line
-            // verbatim, nothing to do.
-            if existing.contains(PREF) {
-                continue;
+        match add_enterprise_roots_block(&existing) {
+            EnterpriseRootsEdit::AddedBlock(new) => {
+                if let Err(e) = std::fs::write(&user_js, new) {
+                    tracing::debug!(
+                        "firefox profile {}: user.js write failed: {}",
+                        profile.display(),
+                        e
+                    );
+                    continue;
+                }
+                touched += 1;
             }
-            // Different value present — don't overwrite.
-            tracing::debug!(
-                "firefox profile {} already has a different enterprise_roots pref; leaving alone",
-                profile.display()
-            );
-            continue;
+            EnterpriseRootsEdit::AlreadyOurs => {}
+            EnterpriseRootsEdit::UserOwned => {
+                tracing::debug!(
+                    "firefox profile {} already has a user-owned enterprise_roots pref; leaving alone",
+                    profile.display()
+                );
+            }
         }
-        let mut out = existing;
-        if !out.is_empty() && !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push_str(PREF);
-        out.push('\n');
-        if let Err(e) = std::fs::write(&user_js, out) {
-            tracing::debug!(
-                "firefox profile {}: user.js write failed: {}",
-                profile.display(),
-                e
-            );
-            continue;
-        }
-        touched += 1;
     }
     if touched > 0 {
         tracing::info!(
@@ -486,16 +948,115 @@ fn enable_firefox_enterprise_roots() {
     }
 }
 
+// ── Firefox enterprise_roots marker-block helpers (pure, testable) ──
+//
+// We write a two-line block into user.js — a sentinel comment followed
+// by the pref itself. The marker proves we wrote it, so uninstall can
+// distinguish our own line from a user-authored one with the same
+// value. Any user-authored `security.enterprise_roots.enabled` line
+// (with or without our marker above it) means "hands off".
+const FX_MARKER: &str = "// mhrv-rs: auto-added, safe to strip with --remove-cert";
+const FX_PREF: &str = r#"user_pref("security.enterprise_roots.enabled", true);"#;
+
+#[derive(Debug, PartialEq, Eq)]
+enum EnterpriseRootsEdit {
+    AddedBlock(String),
+    AlreadyOurs,
+    UserOwned,
+}
+
+/// Append our marker+pref block to `existing` unless (a) it's already
+/// there verbatim (idempotent no-op), or (b) the user has their own
+/// `enterprise_roots` pref that we didn't write — in which case we
+/// leave everything alone.
+fn add_enterprise_roots_block(existing: &str) -> EnterpriseRootsEdit {
+    if contains_our_block(existing) {
+        return EnterpriseRootsEdit::AlreadyOurs;
+    }
+    if existing.contains("security.enterprise_roots.enabled") {
+        return EnterpriseRootsEdit::UserOwned;
+    }
+    let mut out = existing.to_string();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(FX_MARKER);
+    out.push('\n');
+    out.push_str(FX_PREF);
+    out.push('\n');
+    EnterpriseRootsEdit::AddedBlock(out)
+}
+
+/// Strip our marker+pref block from `existing` if present. If the pref
+/// exists without our marker directly above it, the user owns it — we
+/// cannot prove otherwise and leave user.js untouched.
+///
+/// Consequence for upgrades from pre-marker versions of this app: the
+/// legacy bare pref line stays orphaned in user.js after uninstall.
+/// That's cosmetic only (Firefox falls back to its built-in root store
+/// the moment the CA leaves the OS trust store), and it's the
+/// conservative tradeoff — a bare `enterprise_roots = true` line is
+/// indistinguishable from a user- or enterprise-policy-authored one,
+/// and silently revoking that would break unrelated Firefox trust
+/// behavior. README documents the orphan.
+fn strip_enterprise_roots_block(existing: &str) -> Option<String> {
+    if !contains_our_block(existing) {
+        return None;
+    }
+    let lines: Vec<&str> = existing.lines().collect();
+    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let is_marker = lines[i].trim() == FX_MARKER;
+        let next_is_our_pref = lines.get(i + 1).map_or(false, |l| l.trim() == FX_PREF);
+        if is_marker && next_is_our_pref {
+            i += 2;
+            continue;
+        }
+        out.push(lines[i]);
+        i += 1;
+    }
+    let mut joined = out.join("\n");
+    if existing.ends_with('\n') && !joined.is_empty() {
+        joined.push('\n');
+    }
+    Some(joined)
+}
+
+/// True iff `existing` contains our sentinel directly above our pref.
+fn contains_our_block(existing: &str) -> bool {
+    let mut prev: Option<&str> = None;
+    for line in existing.lines() {
+        if prev.map(|p| p.trim()) == Some(FX_MARKER) && line.trim() == FX_PREF {
+            return true;
+        }
+        prev = Some(line);
+    }
+    false
+}
+
 fn has_nss_certutil() -> bool {
+    // We want NSS's `certutil` (from libnss3-tools), not Windows's
+    // built-in `certutil.exe` which shares the binary name but has
+    // completely different semantics. The previous heuristic looked
+    // for "-d" in help output, which false-positived on Windows
+    // because `-dump` / `-dumpPFX` are in the Windows help text.
+    //
+    // "nickname" is an NSS-specific concept (single-letter batch verbs
+    // like `-A`/`-D`/`-n nickname`); the Windows and macOS built-in
+    // certutils don't use that term. Matching on it reliably
+    // discriminates.
     Command::new("certutil")
         .arg("--help")
         .output()
         .ok()
         .map(|o| {
-            // macOS has a different certutil built-in that doesn't support -d.
-            // NSS-specific help output mentions the -d / -n flags.
-            String::from_utf8_lossy(&o.stderr).contains("-d")
-                || String::from_utf8_lossy(&o.stdout).contains("-d")
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stderr),
+                String::from_utf8_lossy(&o.stdout)
+            );
+            combined.to_ascii_lowercase().contains("nickname")
         })
         .unwrap_or(false)
 }
@@ -516,15 +1077,7 @@ fn install_nss_in_dir(dir_arg: &str, cert_path: &str) -> bool {
 
     let res = Command::new("certutil")
         .args([
-            "-A",
-            "-n",
-            CERT_NAME,
-            "-t",
-            "C,,",
-            "-d",
-            dir_arg,
-            "-i",
-            cert_path,
+            "-A", "-n", CERT_NAME, "-t", "C,,", "-d", dir_arg, "-i", cert_path,
         ])
         .output();
     match res {
@@ -559,6 +1112,208 @@ fn install_nss_in_profile(profile: &Path, cert_path: &str) -> bool {
     install_nss_in_dir(&dir_arg, cert_path)
 }
 
+/// Best-effort reverse of `install_nss_stores`: delete our cert from
+/// every Firefox profile NSS DB we can find, plus the shared Chrome/
+/// Chromium NSS DB on Linux, and remove the user.js pref we added.
+///
+/// NSS cleanup is explicitly best-effort — `certutil` from libnss3-tools
+/// may be missing, a DB may be locked by a running Firefox/Chrome, or
+/// the delete may fail for reasons we can't distinguish. When that
+/// happens we log a manual-cleanup hint but don't fail the whole
+/// revocation. Callers of `remove_ca` should convey this to users so
+/// the `--remove-cert` promise is "OS trust store + best-effort NSS",
+/// not "guaranteed NSS".
+/// Outcome of an NSS cleanup pass. `tried` / `ok` let callers render
+/// accurate messages like "NSS cleanup partial: 1/3 stores updated".
+/// `tool_missing_with_stores_present` flags the case where we found
+/// Firefox/Chrome NSS DBs but NSS `certutil` isn't on PATH — surfaced
+/// so the UI/CLI can tell the user why the cleanup is incomplete.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NssReport {
+    pub tried: usize,
+    pub ok: usize,
+    pub tool_missing_with_stores_present: bool,
+}
+
+impl NssReport {
+    pub fn is_clean(&self) -> bool {
+        !self.tool_missing_with_stores_present && self.tried == self.ok
+    }
+}
+
+fn remove_nss_stores() -> NssReport {
+    disable_firefox_enterprise_roots();
+
+    if !has_nss_certutil() {
+        // Only warn if there's actually an NSS store we can see — if the
+        // user never ran Firefox/Chrome on this machine there's nothing
+        // to clean up either way.
+        let profiles = firefox_profile_dirs();
+        let chrome_present: bool;
+        #[cfg(target_os = "linux")]
+        {
+            chrome_present = chrome_nssdb_path()
+                .map(|p| p.join("cert9.db").exists() || p.join("cert8.db").exists())
+                .unwrap_or(false);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            chrome_present = false;
+        }
+        let stores_present = !profiles.is_empty() || chrome_present;
+        if stores_present {
+            tracing::warn!(
+                "NSS certutil not found — cannot automatically remove CA from \
+                 Firefox/Chrome NSS stores. Remove `MasterHttpRelayVPN` manually \
+                 via each browser's certificate settings, or install NSS tools \
+                 (`libnss3-tools` on Debian/Ubuntu, `nss-tools` on Fedora/RHEL) \
+                 and re-run --remove-cert."
+            );
+        }
+        return NssReport {
+            tried: 0,
+            ok: 0,
+            tool_missing_with_stores_present: stores_present,
+        };
+    }
+
+    let mut report = NssReport::default();
+
+    for p in firefox_profile_dirs() {
+        report.tried += 1;
+        if remove_nss_in_profile(&p) {
+            report.ok += 1;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(nssdb) = chrome_nssdb_path() {
+            if nssdb.join("cert9.db").exists() || nssdb.join("cert8.db").exists() {
+                report.tried += 1;
+                let dir_arg = format!("sql:{}", nssdb.display());
+                if remove_nss_in_dir(&dir_arg) {
+                    report.ok += 1;
+                    tracing::info!(
+                        "Removed CA from Chrome/Chromium NSS DB: {}",
+                        nssdb.display()
+                    );
+                }
+            }
+        }
+    }
+
+    if report.tried > 0 {
+        if report.ok == report.tried {
+            tracing::info!("Removed CA from {} NSS store(s).", report.ok);
+        } else {
+            tracing::warn!(
+                "NSS cleanup partial: {}/{} stores updated. If Firefox/Chrome \
+                 was running, close it and re-run --remove-cert. Otherwise \
+                 remove `MasterHttpRelayVPN` manually via each browser's cert \
+                 settings.",
+                report.ok,
+                report.tried
+            );
+        }
+    }
+    report
+}
+
+/// Best-effort remove our cert from one NSS DB.
+///
+/// Idempotent contract: "cert was never in this DB" is success.
+/// Critical distinction from probe *failure*: if `certutil -L` fails
+/// because the DB is locked by a running Firefox/Chrome, corrupt, or
+/// inaccessible, we must NOT return `true` — that would silently mask
+/// an incomplete revocation the user can't see, and NSS would keep
+/// trusting the stale root. We parse stderr: only the specific
+/// "could not find cert" message means absent.
+fn remove_nss_in_dir(dir_arg: &str) -> bool {
+    let list = Command::new("certutil")
+        .args(["-L", "-n", CERT_NAME, "-d", dir_arg])
+        .output();
+    match list {
+        Ok(o) if o.status.success() => {
+            // Cert is present — fall through to delete.
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            if is_nss_not_found(&stderr) {
+                tracing::debug!("NSS {}: no `{}` entry — already clean", dir_arg, CERT_NAME);
+                return true;
+            }
+            tracing::warn!(
+                "NSS {}: probe failed (DB locked / inaccessible / other error): {}",
+                dir_arg,
+                stderr.trim()
+            );
+            return false;
+        }
+        Err(e) => {
+            tracing::warn!("NSS {}: probe exec failed: {}", dir_arg, e);
+            return false;
+        }
+    }
+
+    let res = Command::new("certutil")
+        .args(["-D", "-n", CERT_NAME, "-d", dir_arg])
+        .output();
+    match res {
+        Ok(o) if o.status.success() => true,
+        Ok(o) => {
+            tracing::warn!(
+                "NSS {}: delete failed: {}",
+                dir_arg,
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!("NSS {}: delete exec failed: {}", dir_arg, e);
+            false
+        }
+    }
+}
+
+/// Classify NSS `certutil` stderr as "nickname not present" (idempotent
+/// success signal) vs any other failure mode (DB locked, DB corrupt,
+/// permission, etc.). Exposed for unit testing. Matches only the
+/// specific not-found messages NSS emits — anything else is treated as
+/// a real failure so silent bugs can't hide behind false positives.
+fn is_nss_not_found(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("could not find cert") || s.contains("could not find a certificate")
+}
+
+fn remove_nss_in_profile(profile: &Path) -> bool {
+    let prefix = if profile.join("cert9.db").exists() {
+        "sql:"
+    } else if profile.join("cert8.db").exists() {
+        ""
+    } else {
+        return false;
+    };
+    let dir_arg = format!("{}{}", prefix, profile.display());
+    remove_nss_in_dir(&dir_arg)
+}
+
+/// Undo `enable_firefox_enterprise_roots`: for each profile, strip the
+/// marker+pref block if (and only if) we wrote it. If the user owns
+/// their own `enterprise_roots` pref — indicated by the absence of our
+/// marker line — leave user.js alone entirely.
+fn disable_firefox_enterprise_roots() {
+    for profile in firefox_profile_dirs() {
+        let user_js = profile.join("user.js");
+        let Ok(existing) = std::fs::read_to_string(&user_js) else {
+            continue;
+        };
+        if let Some(new) = strip_enterprise_roots_block(&existing) {
+            let _ = std::fs::write(&user_js, new);
+        }
+    }
+}
+
 fn firefox_profile_dirs() -> Vec<std::path::PathBuf> {
     use std::path::PathBuf;
     let mut roots: Vec<PathBuf> = Vec::new();
@@ -579,7 +1334,10 @@ fn firefox_profile_dirs() -> Vec<std::path::PathBuf> {
         }
         "windows" => {
             if let Ok(appdata) = std::env::var("APPDATA") {
-                roots.push(PathBuf::from(format!("{}\\Mozilla\\Firefox\\Profiles", appdata)));
+                roots.push(PathBuf::from(format!(
+                    "{}\\Mozilla\\Firefox\\Profiles",
+                    appdata
+                )));
             }
         }
         _ => {}
@@ -688,5 +1446,245 @@ ID_LIKE=debian
         // Make sure we don't regress to the old substring-match bug.
         let content = "SOMEFIELD=maybearchived\nFOO=bar\n";
         assert_eq!(classify_os_release(content), "unknown");
+    }
+
+    // ── Firefox user.js block install / uninstall ──
+
+    #[test]
+    fn enterprise_roots_block_added_to_empty_userjs() {
+        let got = add_enterprise_roots_block("");
+        let expected = format!("{}\n{}\n", FX_MARKER, FX_PREF);
+        assert_eq!(got, EnterpriseRootsEdit::AddedBlock(expected));
+    }
+
+    #[test]
+    fn enterprise_roots_block_appended_preserving_existing_prefs() {
+        let existing = "user_pref(\"some.other\", 1);\n";
+        let got = add_enterprise_roots_block(existing);
+        let expected = format!(
+            "user_pref(\"some.other\", 1);\n{}\n{}\n",
+            FX_MARKER, FX_PREF
+        );
+        assert_eq!(got, EnterpriseRootsEdit::AddedBlock(expected));
+    }
+
+    #[test]
+    fn enterprise_roots_block_is_idempotent_when_marker_present() {
+        let existing = format!(
+            "user_pref(\"a\", 1);\n{}\n{}\nuser_pref(\"b\", 2);\n",
+            FX_MARKER, FX_PREF
+        );
+        assert_eq!(
+            add_enterprise_roots_block(&existing),
+            EnterpriseRootsEdit::AlreadyOurs
+        );
+    }
+
+    #[test]
+    fn enterprise_roots_block_respects_user_owned_pref_without_marker() {
+        // User has enterprise_roots set themselves — no marker above it.
+        // We must NOT write our line, and we must NOT claim ownership on
+        // uninstall (tested separately below).
+        let existing = "user_pref(\"security.enterprise_roots.enabled\", true);\n";
+        assert_eq!(
+            add_enterprise_roots_block(existing),
+            EnterpriseRootsEdit::UserOwned
+        );
+    }
+
+    #[test]
+    fn enterprise_roots_block_respects_user_owned_pref_set_to_false() {
+        // User explicitly disabled it — also a user-owned pref, leave alone.
+        let existing = "user_pref(\"security.enterprise_roots.enabled\", false);\n";
+        assert_eq!(
+            add_enterprise_roots_block(existing),
+            EnterpriseRootsEdit::UserOwned
+        );
+    }
+
+    #[test]
+    fn strip_enterprise_roots_removes_our_block_and_preserves_others() {
+        let before = format!(
+            "user_pref(\"a\", 1);\n{}\n{}\nuser_pref(\"b\", 2);\n",
+            FX_MARKER, FX_PREF
+        );
+        let after = strip_enterprise_roots_block(&before).expect("should strip");
+        assert_eq!(after, "user_pref(\"a\", 1);\nuser_pref(\"b\", 2);\n");
+    }
+
+    #[test]
+    fn strip_enterprise_roots_refuses_when_pref_is_bare() {
+        // No marker above — indistinguishable from a user- or
+        // enterprise-policy-authored line. Must return None so caller
+        // leaves user.js untouched. Legacy upgrade users get one
+        // cosmetic orphan line; revoking user-owned Firefox trust
+        // behavior silently is worse.
+        let before = "user_pref(\"security.enterprise_roots.enabled\", true);\n";
+        assert_eq!(strip_enterprise_roots_block(before), None);
+    }
+
+    #[test]
+    fn strip_enterprise_roots_refuses_when_marker_is_elsewhere() {
+        // Marker present but not directly above the pref — user may
+        // have copied our marker line as a comment somewhere else. We
+        // still can't prove ownership of the pref itself, so leave
+        // alone.
+        let before = format!(
+            "{}\nuser_pref(\"unrelated\", 1);\n\
+             user_pref(\"security.enterprise_roots.enabled\", true);\n",
+            FX_MARKER
+        );
+        assert_eq!(strip_enterprise_roots_block(&before), None);
+    }
+
+    #[test]
+    fn strip_enterprise_roots_leaves_user_false_pref_alone() {
+        let before = "user_pref(\"security.enterprise_roots.enabled\", false);\n";
+        assert_eq!(strip_enterprise_roots_block(before), None);
+    }
+
+    #[test]
+    fn strip_enterprise_roots_returns_none_when_pref_absent() {
+        let before = "user_pref(\"other\", 1);\nuser_pref(\"another\", 2);\n";
+        assert_eq!(strip_enterprise_roots_block(before), None);
+    }
+
+    #[test]
+    fn strip_enterprise_roots_roundtrip_from_empty() {
+        // add_block("") -> strip_block(added) -> "" (no trailing garbage).
+        let added = match add_enterprise_roots_block("") {
+            EnterpriseRootsEdit::AddedBlock(s) => s,
+            other => panic!("unexpected: {:?}", other),
+        };
+        let stripped = strip_enterprise_roots_block(&added).expect("should strip");
+        assert_eq!(stripped, "");
+    }
+
+    // ── sudo_parse_passwd_home ──
+
+    #[test]
+    fn parses_debian_passwd_entry() {
+        let line = "liyon:x:1000:1000:Liyon,,,:/home/liyon:/bin/bash\n";
+        assert_eq!(sudo_parse_passwd_home(line), Some("/home/liyon".into()));
+    }
+
+    #[test]
+    fn macos_passwd_format_does_not_parse_and_falls_back_to_convention() {
+        // macOS `dscl`-sourced passwd lines have extra fields
+        // (pw_class, chg, exp) before home, so index 5 lands on a
+        // non-home field. sudo_parse_passwd_home is intentionally
+        // Linux-shaped — the macOS path relies on the `/Users/<user>`
+        // convention in `unix::resolve_home` rather than on this
+        // parser. This test pins that contract.
+        let line = "liyon:*:501:20::0:0:Liyon Bonakdar:/Users/liyon:/bin/zsh";
+        assert_ne!(sudo_parse_passwd_home(line), Some("/Users/liyon".into()));
+    }
+
+    #[test]
+    fn rejects_malformed_passwd_line_too_few_fields() {
+        let line = "liyon:x:1000:1000\n";
+        assert_eq!(sudo_parse_passwd_home(line), None);
+    }
+
+    #[test]
+    fn rejects_empty_home_field() {
+        let line = "svcacct:x:999:999:gecos::/bin/false\n";
+        assert_eq!(sudo_parse_passwd_home(line), None);
+    }
+
+    #[test]
+    fn returns_first_matching_line_when_multiple() {
+        // getent only prints one line, but guard against future change.
+        let content = "liyon:x:1000:1000::/home/liyon:/bin/bash\n\
+                       other:x:1001:1001::/home/other:/bin/bash\n";
+        assert_eq!(sudo_parse_passwd_home(content), Some("/home/liyon".into()));
+    }
+
+    // ── NssReport::is_clean ──
+
+    #[test]
+    fn nss_report_is_clean_when_nothing_tried() {
+        let r = NssReport::default();
+        assert!(r.is_clean());
+    }
+
+    #[test]
+    fn nss_report_is_clean_when_all_attempts_succeeded() {
+        let r = NssReport {
+            tried: 3,
+            ok: 3,
+            tool_missing_with_stores_present: false,
+        };
+        assert!(r.is_clean());
+    }
+
+    #[test]
+    fn nss_report_not_clean_on_partial_failure() {
+        let r = NssReport {
+            tried: 3,
+            ok: 2,
+            tool_missing_with_stores_present: false,
+        };
+        assert!(!r.is_clean());
+    }
+
+    #[test]
+    fn nss_report_not_clean_when_tool_missing_with_stores() {
+        // Even with tried=0 (we couldn't try anything), the presence
+        // of NSS stores plus a missing tool means cleanup is NOT
+        // complete — callers should flag this to the user.
+        let r = NssReport {
+            tried: 0,
+            ok: 0,
+            tool_missing_with_stores_present: true,
+        };
+        assert!(!r.is_clean());
+    }
+
+    // ── is_nss_not_found ──
+
+    #[test]
+    fn nss_not_found_classifies_standard_not_found_message() {
+        // Typical NSS certutil output when the nickname is absent.
+        let stderr = "certutil: Could not find cert: MasterHttpRelayVPN\n";
+        assert!(is_nss_not_found(stderr));
+    }
+
+    #[test]
+    fn nss_not_found_classifies_alt_wording_some_versions_emit() {
+        let stderr = "certutil: could not find a certificate named 'MasterHttpRelayVPN'\n";
+        assert!(is_nss_not_found(stderr));
+    }
+
+    #[test]
+    fn nss_not_found_rejects_locked_database_error() {
+        // Regression guard for the critical bug: DB locked (Firefox
+        // running) must NOT be treated as "cert absent" — that would
+        // silently report clean revocation while NSS keeps trusting
+        // the stale root.
+        let stderr = "certutil: function failed: SEC_ERROR_LOCKED_DATABASE: \
+                      the certificate/key database is locked.\n";
+        assert!(!is_nss_not_found(stderr));
+    }
+
+    #[test]
+    fn nss_not_found_rejects_bad_database_error() {
+        let stderr = "certutil: function failed: SEC_ERROR_BAD_DATABASE: \
+                      security library: bad database.\n";
+        assert!(!is_nss_not_found(stderr));
+    }
+
+    #[test]
+    fn nss_not_found_rejects_permission_error() {
+        let stderr = "certutil: unable to open \"sql:/home/x/.mozilla/firefox/profile\" \
+                      (Permission denied)\n";
+        assert!(!is_nss_not_found(stderr));
+    }
+
+    #[test]
+    fn nss_not_found_rejects_empty_stderr() {
+        // An empty stderr with a non-zero exit is ambiguous — safer
+        // to classify as "not found is NOT proven", i.e. failure.
+        assert!(!is_nss_not_found(""));
     }
 }
