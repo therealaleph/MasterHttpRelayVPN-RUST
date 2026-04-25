@@ -59,6 +59,15 @@ const CLIENT_FIRST_DATA_WAIT: Duration = Duration::from_millis(50);
 /// op (version mismatch). Must match `tunnel-node/src/main.rs`.
 const CODE_UNSUPPORTED_OP: &str = "UNSUPPORTED_OP";
 
+/// Empty poll round-trip latency below which we conclude the tunnel-node
+/// is *not* long-polling (legacy fixed-sleep drain instead). On a
+/// long-poll-capable server an empty poll with no upstream push either
+/// returns near `LONGPOLL_DEADLINE` (~5 s) or comes back early *with*
+/// pushed bytes — neither matches a fast empty reply. Threshold sits
+/// well above the legacy `~350 ms` drain and well below the long-poll
+/// floor, so network jitter on either side won't false-trigger.
+const LEGACY_DETECT_THRESHOLD: Duration = Duration::from_millis(1500);
+
 /// Ports where the *server* speaks first (SMTP banner, SSH identification,
 /// POP3/IMAP greeting, FTP banner). On these, waiting for client bytes
 /// gains nothing and just adds handshake latency — skip the pre-read.
@@ -102,6 +111,16 @@ pub struct TunnelMux {
     /// `connect_data` as unsupported. Subsequent sessions skip the
     /// optimistic path entirely and go straight to plain connect + data.
     connect_data_unsupported: Arc<AtomicBool>,
+    /// Set to `true` after we observe an empty poll round-trip that
+    /// returned in less than `LEGACY_DETECT_THRESHOLD` with no data.
+    /// On a long-poll-capable tunnel-node, an empty poll either returns
+    /// quickly *with data* (push arrived) or holds open until the
+    /// server's `LONGPOLL_DEADLINE`. A fast empty reply means the server
+    /// is doing the legacy fixed-sleep drain — in that mode, hammering
+    /// idle sessions at the new 500 ms cadence wastes Apps Script quota
+    /// for no benefit, so the loop reverts to the pre-long-poll
+    /// "skip empty polls when idle" behavior.
+    server_no_longpoll: Arc<AtomicBool>,
     /// Pre-read observability. Lets an operator see whether the 50 ms
     /// wait-for-first-bytes is pulling its weight:
     ///   * `preread_win` — client sent bytes in time, bundled with connect
@@ -134,6 +153,7 @@ impl TunnelMux {
         Arc::new(Self {
             tx,
             connect_data_unsupported: Arc::new(AtomicBool::new(false)),
+            server_no_longpoll: Arc::new(AtomicBool::new(false)),
             preread_win: AtomicU64::new(0),
             preread_loss: AtomicU64::new(0),
             preread_skip_port: AtomicU64::new(0),
@@ -155,6 +175,19 @@ impl TunnelMux {
         if !self.connect_data_unsupported.swap(true, Ordering::Relaxed) {
             tracing::warn!(
                 "tunnel-node doesn't support connect_data (pre-v1.x); falling back to plain connect + data for all future sessions"
+            );
+        }
+    }
+
+    fn server_no_longpoll(&self) -> bool {
+        self.server_no_longpoll.load(Ordering::Relaxed)
+    }
+
+    fn mark_server_no_longpoll(&self) {
+        if !self.server_no_longpoll.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "tunnel-node returned an empty poll faster than {:?}; assuming legacy (no long-poll) drain — falling back to skip-empty-when-idle to avoid quota waste",
+                LEGACY_DETECT_THRESHOLD,
             );
         }
     }
@@ -649,14 +682,27 @@ async fn tunnel_loop(
     let mut consecutive_empty = 0u32;
 
     loop {
+        // Cadence depends on whether the tunnel-node is doing long-poll
+        // drains. With long-poll, the server holds empty polls open up
+        // to its `LONGPOLL_DEADLINE` (~5 s currently), so the client
+        // can keep this read timeout short — the wait is on the wire,
+        // not here. Against a *legacy* tunnel-node (no long-poll, fast
+        // empty replies), the same short cadence + always-poll behavior
+        // would generate continuous round-trips on idle sessions and
+        // burn Apps Script quota. The `server_no_longpoll` flag detects
+        // the legacy case from reply latency below and reverts to the
+        // pre-long-poll cadence: long sleep on local read, skip empty
+        // polls when sustained-idle.
+        let legacy_mode = mux.server_no_longpoll();
         let client_data = if let Some(data) = pending_client_data.take() {
             Some(data)
         } else {
-            let read_timeout = match consecutive_empty {
-                0 => Duration::from_millis(20),
-                1 => Duration::from_millis(80),
-                2 => Duration::from_millis(200),
-                _ => Duration::from_secs(30),
+            let read_timeout = match (legacy_mode, consecutive_empty) {
+                (_, 0) => Duration::from_millis(20),
+                (_, 1) => Duration::from_millis(80),
+                (_, 2) => Duration::from_millis(200),
+                (false, _) => Duration::from_millis(500),
+                (true, _) => Duration::from_secs(30),
             };
 
             match tokio::time::timeout(read_timeout, reader.read(&mut buf)).await {
@@ -670,13 +716,21 @@ async fn tunnel_loop(
             }
         };
 
-        if client_data.is_none() && consecutive_empty > 3 {
+        // Legacy-server skip: against a non-long-polling tunnel-node,
+        // an empty poll is wasted work — fast-empty reply, no push
+        // delivery benefit. Preserve the pre-long-poll behavior of
+        // going quiet after a few empties. Long-poll-capable servers
+        // skip this branch and always send the empty op so the server
+        // can hold it open.
+        if legacy_mode && client_data.is_none() && consecutive_empty > 3 {
             continue;
         }
 
         let data = client_data.unwrap_or_default();
+        let was_empty_poll = data.is_empty();
 
         let (reply_tx, reply_rx) = oneshot::channel();
+        let send_at = Instant::now();
         mux.send(MuxMsg::Data {
             sid: sid.to_string(),
             data,
@@ -700,6 +754,21 @@ async fn tunnel_loop(
                 continue;
             }
         };
+
+        // Legacy-server detection: an empty-in/empty-out round trip
+        // that finishes well under `LEGACY_DETECT_THRESHOLD` is
+        // structurally impossible on a long-poll-capable tunnel-node
+        // (the server holds the response either until data arrives or
+        // until its long-poll deadline). One observation flips the
+        // sticky flag for the rest of this process. Skip the check
+        // once already in legacy mode — the comparison is cheap, but
+        // calling `mark_server_no_longpoll` repeatedly muddies logs.
+        if !legacy_mode && was_empty_poll {
+            let reply_was_empty = resp.d.as_deref().map(str::is_empty).unwrap_or(true);
+            if reply_was_empty && send_at.elapsed() < LEGACY_DETECT_THRESHOLD {
+                mux.mark_server_no_longpoll();
+            }
+        }
 
         if let Some(ref e) = resp.e {
             tracing::debug!("tunnel error: {}", e);
@@ -844,6 +913,7 @@ mod tests {
         let mux = Arc::new(TunnelMux {
             tx,
             connect_data_unsupported: Arc::new(AtomicBool::new(false)),
+            server_no_longpoll: Arc::new(AtomicBool::new(false)),
             preread_win: AtomicU64::new(0),
             preread_loss: AtomicU64::new(0),
             preread_skip_port: AtomicU64::new(0),
@@ -930,6 +1000,21 @@ mod tests {
         assert!(mux.connect_data_unsupported());
         mux.mark_connect_data_unsupported(); // idempotent
         assert!(mux.connect_data_unsupported());
+    }
+
+    /// `server_no_longpoll` must be sticky too: once we see a legacy
+    /// fast-empty reply, every subsequent session uses the legacy idle
+    /// cadence (long read timeout + skip-empty) for the rest of the
+    /// process. Flipping it back per-session would either thrash the
+    /// cadence or double the detection cost.
+    #[test]
+    fn no_longpoll_cache_is_sticky() {
+        let (mux, _rx) = mux_for_test();
+        assert!(!mux.server_no_longpoll());
+        mux.mark_server_no_longpoll();
+        assert!(mux.server_no_longpoll());
+        mux.mark_server_no_longpoll(); // idempotent
+        assert!(mux.server_no_longpoll());
     }
 
     #[test]
