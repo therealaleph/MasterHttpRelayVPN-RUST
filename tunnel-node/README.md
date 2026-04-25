@@ -19,7 +19,9 @@ The tunnel node manages persistent TCP and UDP sessions. TCP sessions are real T
 
 ## Deployment
 
-### Cloud Run
+> **Cloud Run vs VPS**: Cloud Run works for TCP-only traffic but **does not support UDP responses** — outbound UDP packets are sent but replies never reach the container. If you need UDP forwarding (udpgw for Telegram calls, QUIC, DNS-over-UDP, etc.), deploy on a **VPS** instead. The Docker and direct-binary methods below all work on any VPS with full UDP support.
+
+### Cloud Run (TCP only)
 
 ```bash
 cd tunnel-node
@@ -32,6 +34,8 @@ gcloud run deploy tunnel-node \
   --cpu 1 \
   --max-instances 1
 ```
+
+Cloud Run is the easiest deployment path but UDP-based features (udpgw) will not work. Use a VPS if you need UDP.
 
 ### Docker — prebuilt image (any VPS)
 
@@ -118,6 +122,20 @@ TUNNEL_AUTH_KEY=your-secret PORT=8080 ./target/release/tunnel-node
 ```
 
 ### Health check: `GET /health` → `ok`
+
+## UDP forwarding (udpgw)
+
+The tunnel-node includes a native implementation of the [tun2proxy udpgw](https://github.com/tun2proxy/tun2proxy) wire protocol. When the client opens a tunnel session to the magic address `198.18.0.1:7300`, the tunnel-node creates a virtual session that speaks the udpgw binary protocol instead of raw TCP passthrough. This enables UDP traffic (DNS, QUIC, Telegram VoIP, etc.) to flow through the existing HTTP tunnel.
+
+**Requirements:**
+- **VPS deployment** — Cloud Run does not support inbound UDP responses. Deploy on a VPS (Docker or direct binary) for udpgw to work.
+- **Android client** — the forked tun2proxy with udpgw JNI support passes `--udpgw-server 198.18.0.1:7300` when in full mode. Desktop clients can use any tun2socks/tun2proxy binary with `--udpgw-server`.
+
+**How it works:**
+1. tun2proxy captures a UDP packet and opens a TCP connection to `198.18.0.1:7300` through the SOCKS5 proxy
+2. The TCP connection flows through the tunnel pipeline (mhrv-rs → Apps Script → tunnel-node)
+3. The tunnel-node detects the magic address and creates an in-process udpgw session (no real TCP connection)
+4. UDP datagrams are encapsulated in udpgw frames, sent as real UDP from the VPS, and responses flow back the same path
 
 ## Performance: deployment count and pipeline depth
 

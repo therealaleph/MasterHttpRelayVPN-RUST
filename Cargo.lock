@@ -3892,8 +3892,7 @@ dependencies = [
 [[package]]
 name = "tun2proxy"
 version = "0.7.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0576f75fd691ad86cdc4348f29fb8770037ab8140179f1f9f8f6991f7ebd2176"
+source = "git+https://github.com/yyoyoian-pixel/tun2proxy.git?branch=main#d55e6025cc9953948a87e2be471bf8dd15c4a8f8"
 dependencies = [
  "android_logger",
  "async-trait",

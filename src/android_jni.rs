@@ -482,3 +482,4 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_statsJson<'a>(
     }));
     env.new_string(out).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
+
