@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 #
 # Multi-stage build for the mhrv-tunnel-node service.
 #
@@ -32,13 +31,11 @@ WORKDIR /app
 # Copy lockfile so cargo uses pinned versions identically to local builds.
 COPY Cargo.toml Cargo.lock ./
 COPY src/ ./src/
-# BuildKit cache mounts: cargo's registry/git caches and the target/
-# directory persist across builds, dramatically speeding up rebuilds when
-# only application code changes.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/app/target \
-    cargo build --release --bin tunnel-node && \
+# Plain build without BuildKit cache mounts — Google Cloud Build does not
+# support BuildKit's `--mount=type=cache` syntax, and `gcloud run deploy
+# --source .` uses Cloud Build under the hood. Local `docker build` with
+# BuildKit still works (it just won't cache across builds).
+RUN cargo build --release --bin tunnel-node && \
     cp /app/target/release/tunnel-node /usr/local/bin/tunnel-node
 
 FROM debian:bookworm-slim
