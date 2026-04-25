@@ -354,6 +354,20 @@ async fn handle_frame(
         return;
     };
 
+    // Block QUIC (UDP 443) and DNS (UDP 53) from udpgw:
+    // - QUIC: forces browsers to fall back to TCP/HTTP2 which is much
+    //   faster through the batch tunnel pipeline.
+    // - DNS: let tun2proxy's virtual DNS / SOCKS5 UDP associate handle
+    //   it instead — more reliable on the per-session path.
+    // VoIP (Telegram, Meet) still flows through udpgw normally.
+    let dst_port = match dst {
+        DstAddr::V4(_, p) | DstAddr::V6(_, p) | DstAddr::Domain(_, p) => *p,
+    };
+    if dst_port == 443 || dst_port == 53 {
+        let _ = tx.send(serialise_err(frame.conn_id)).await;
+        return;
+    }
+
     let dst_addr = match dst.to_socket_addr() {
         Ok(a) => a,
         Err(e) => {
