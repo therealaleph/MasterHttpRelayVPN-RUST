@@ -94,7 +94,7 @@ libc = "0.2"
 # traffic black-holes (symptom: Chrome shows DNS_PROBE_STARTED).
 [target.'cfg(target_os = "android")'.dependencies]
 jni = { version = "0.21", default-features = false }
-tun2proxy = { version = "0.7", default-features = false }
+tun2proxy = { path = "vendor/tun2proxy", default-features = false, features = ["udpgw"] }
 
 [dev-dependencies]
 # Used in mitm tests to sanity-check the cert extensions we emit.

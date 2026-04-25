@@ -1,0 +1,3 @@
+[submodule "vendor/tun2proxy"]
+	path = vendor/tun2proxy
+	url = https://github.com/tun2proxy/tun2proxy.git
