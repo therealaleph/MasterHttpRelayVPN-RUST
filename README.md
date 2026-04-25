@@ -1,4 +1,4 @@
-# MasterHttpRelayVPN-RUST
+ # MasterHttpRelayVPN-RUST
 
 [![Latest release](https://img.shields.io/github/v/release/therealaleph/MasterHttpRelayVPN-RUST?sort=semver&display_name=tag&logo=github&label=release)](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/therealaleph/MasterHttpRelayVPN-RUST/total?label=downloads&logo=github)](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases)
