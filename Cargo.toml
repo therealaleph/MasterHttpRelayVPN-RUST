@@ -94,11 +94,17 @@ libc = "0.2"
 # traffic black-holes (symptom: Chrome shows DNS_PROBE_STARTED).
 [target.'cfg(target_os = "android")'.dependencies]
 jni = { version = "0.21", default-features = false }
-tun2proxy = { path = "vendor/tun2proxy", default-features = false, features = ["udpgw"] }
+tun2proxy = { version = "0.7", default-features = false, features = ["udpgw"] }
 
 [dev-dependencies]
 # Used in mitm tests to sanity-check the cert extensions we emit.
 x509-parser = "0.16"
+
+# Temporary patch: adds udpgw_server parameter to the Android JNI run()
+# function. Upstream PR: https://github.com/tun2proxy/tun2proxy/pull/247
+# Remove this section once tun2proxy >= 0.8 ships with the change.
+[patch.crates-io]
+tun2proxy = { git = "https://github.com/yyoyoian-pixel/tun2proxy", branch = "feat/udpgw-jni-param" }
 
 [profile.release]
 panic = "abort"
