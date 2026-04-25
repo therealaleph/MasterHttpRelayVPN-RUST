@@ -249,6 +249,10 @@ class MhrvVpnService : VpnService() {
         //    the sole owner once it's running.
         val detachedFd = parcelFd.detachFd()
         tun2proxyRunning.set(true)
+        // In full mode, enable udpgw so UDP traffic (DNS, QUIC, …) is
+        // forwarded through the tunnel-node's native udpgw handler.
+        // 198.18.0.1:7300 is a magic address the tunnel-node intercepts.
+        val udpgwAddr = if (cfg.mode == Mode.FULL) "198.18.0.1:7300" else ""
         val worker = Thread({
             try {
                 val rc = Tun2proxy.run(
@@ -258,6 +262,7 @@ class MhrvVpnService : VpnService() {
                     MTU.toChar(),
                     /* verbosity = info */ 3,
                     /* dnsStrategy = virtual */ 0,
+                    udpgwAddr,
                 )
                 Log.i(TAG, "tun2proxy exited rc=$rc")
             } catch (t: Throwable) {
