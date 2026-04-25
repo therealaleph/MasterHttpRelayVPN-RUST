@@ -22,6 +22,13 @@ on:
 
 permissions:
   contents: write
+  # `tunnel-docker` job pushes to ghcr.io/therealaleph/mhrv-tunnel-node.
+  # `packages: write` is required by docker/login-action when authenticating
+  # to GHCR with the workflow's auto-provisioned GITHUB_TOKEN. Granted at
+  # the workflow level so the matrix-build job (which doesn't need it) and
+  # the release job (which doesn't need it) both still have a single
+  # well-scoped permissions block.
+  packages: write
 
 # Runner strategy:
 #   - Linux + Android + mipsel:       self-hosted (mhrv-hetzner-*, Hetzner
@@ -487,6 +494,75 @@ jobs:
           path: dist/*.apk
           if-no-files-found: error
 
+  # Build + publish the tunnel-node Docker image to GHCR. Issue: every
+  # full-mode user has to set up tunnel-node on a VPS, and "rustup +
+  # cargo build --release" on a 1GB VPS is non-trivial — fails on memory,
+  # takes 8+ minutes if it works, blocks anyone without Rust experience.
+  # A prebuilt multi-arch image makes deployment a one-liner:
+  #   docker run -d -p 8080:8080 -e TUNNEL_AUTH_KEY=... \
+  #     ghcr.io/therealaleph/mhrv-tunnel-node:latest
+  #
+  # Tags published per release:
+  #   v1.5.0       — exact version pin
+  #   1.5          — auto-following minor
+  #   latest       — most recent release (skipped on workflow_dispatch
+  #                  re-publishes; see `latest` condition below)
+  #
+  # Build platforms: linux/amd64 and linux/arm64. Most VPS providers
+  # (DigitalOcean, Hetzner, Oracle Free Tier) offer arm64 instances at
+  # half price, and the binary works on both.
+  tunnel-docker:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Compute the version string the same way the rest of the workflow
+      # does: tag pushes get it from github.ref_name (e.g. "v1.5.0"),
+      # workflow_dispatch from the explicit `inputs.version` (e.g.
+      # "1.5.0"). Strip a possible leading "v" so the docker tag namespace
+      # is consistent: `:1.5.0`, not `:v1.5.0`.
+      - name: Compute version
+        id: ver
+        run: |
+          VER="${{ inputs.version || github.ref_name }}"
+          VER="${VER#v}"
+          MINOR="${VER%.*}"
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          echo "minor=${MINOR}" >> "$GITHUB_OUTPUT"
+          echo "Building docker for v${VER} (minor: ${MINOR})"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build for both amd64 and arm64. `:latest` is only updated on
+      # actual tag pushes — workflow_dispatch re-runs on an existing
+      # version (e.g. for the v1.4.0 mipsel republish) shouldn't move
+      # the latest pointer.
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./tunnel-node
+          file: ./tunnel-node/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/mhrv-tunnel-node:${{ steps.ver.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/mhrv-tunnel-node:${{ steps.ver.outputs.minor }}
+            ${{ github.event_name == 'push' && format('ghcr.io/{0}/mhrv-tunnel-node:latest', github.repository_owner) || '' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
   # release + telegram: lightweight aggregation jobs kept on GH-hosted
   # ubuntu-latest. They only download artifacts and call APIs — no build
   # tooling needed, no benefit from moving to self-hosted, and keeping them
@@ -507,6 +583,38 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # Compose the GitHub release body from `docs/changelog/v<ver>.md`
+      # so the Releases page tells humans what actually changed —
+      # `generate_release_notes: true` alone produces "Full Changelog:
+      # …compare/v1.x.0...v1.x.1" which is empty when no PRs landed
+      # between tags (e.g. for fix-forward releases like v1.4.1). The
+      # changelog file already exists for every release in our format
+      # (Persian section, then `---`, then English section); we wrap it
+      # with a header and append the auto-generated commit list at the
+      # bottom by NOT setting body_path and instead setting body
+      # directly to changelog_content + (the existing
+      # generate_release_notes flag handles the trailing comparison
+      # link automatically).
+      - name: Compose release body
+        id: relbody
+        run: |
+          VER="${{ inputs.version || github.ref_name }}"
+          VER="${VER#v}"
+          CHANGELOG="docs/changelog/v${VER}.md"
+          if [ ! -f "$CHANGELOG" ]; then
+            echo "::warning::no changelog at $CHANGELOG; release body will fall back to generate_release_notes only"
+            echo "has_changelog=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          {
+            echo 'body<<__RELEASE_BODY_EOF__'
+            # Strip leading HTML comment that documents the file format.
+            sed -e '1{/^<!--/d;}' "$CHANGELOG"
+            echo
+            echo '__RELEASE_BODY_EOF__'
+          } >> "$GITHUB_OUTPUT"
+          echo "has_changelog=true" >> "$GITHUB_OUTPUT"
+
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
@@ -519,6 +627,13 @@ jobs:
           # tags are `v1.4.0`, not `1.4.0`).
           tag_name: ${{ inputs.version && format('v{0}', inputs.version) || github.ref_name }}
           files: dist/*
+          # Append auto-generated comparison link AFTER our changelog
+          # body — `append_body: true` puts our body first, then the
+          # auto notes. If no changelog file existed, body is empty and
+          # the auto notes carry the whole release-page content (same
+          # behavior as before this change).
+          body: ${{ steps.relbody.outputs.body }}
+          append_body: true
           generate_release_notes: true
 
   # Notify the Persian-speaking Telegram channel with the CI-built

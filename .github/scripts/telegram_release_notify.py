@@ -64,6 +64,110 @@ def parse_changelog(path: str) -> tuple[str, str]:
     return fa.strip(), en.strip()
 
 
+# Telegram caption hard-cap is 1024 chars. The fixed parts of our caption
+# (title + SHA hash + two-link footer with their preambles) sum to roughly
+# 470 chars on a typical version string. That leaves ~550 chars for the
+# release-note section before we'd start losing the trailing release URL.
+# Keep the budget conservative so a long version string or a slightly
+# longer hash representation doesn't push us over.
+CAPTION_FA_NOTE_BUDGET = 500
+
+
+def _md_links_to_html(text: str) -> str:
+    """Convert `[label](url)` markdown links to `<a href="url">label</a>`.
+
+    Telegram's HTML parse mode renders `<a>` as clickable but treats
+    markdown verbatim, so an unconverted `[#160](https://…)` appears as
+    that literal string in the channel post — both ugly and wasteful of
+    caption budget. The HTML form is shorter visually (`#160` vs the
+    full URL), still clickable, and counts the same toward Telegram's
+    1024-char limit. Inline `code` (`backtick-quoted`) is also
+    translated to `<code>…</code>` since markdown backticks render
+    literally too.
+    """
+    text = re.sub(
+        r"\[([^\]]+)\]\(([^)]+)\)",
+        lambda m: f'<a href="{m.group(2)}">{m.group(1)}</a>',
+        text,
+    )
+    text = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", text)
+    # Bold (**…**) is rare in our changelog but happens — convert to <b>.
+    text = re.sub(r"\*\*([^*\n]+)\*\*", r"<b>\1</b>", text)
+    return text
+
+
+def _extract_headlines(fa_section: str) -> str:
+    """For each `• …: …` bullet, keep the headline part and drop the
+    elaboration.
+
+    Our changelog convention writes each bullet as one of:
+      • headline: full explanation
+      • headline ([#NN](url)): full explanation
+      • headline (issue ref): full explanation
+
+    The headline is everything up to the `: ` (colon + space) that ends
+    the leading clause. Naively searching for the first `:` lands inside
+    `https:` URLs of the markdown link form — instead we search from the
+    end of the parenthesized-issue-ref (if any) for the first `: `, or
+    fall back to the first `: ` in the line.
+
+    Headlines stay on the FA caption; the explanation is preserved in
+    the docs/changelog/ file and (optionally) the reply-threaded message
+    posted via --with-changelog.
+
+    Returns a newline-joined string of `• <headline>` lines.
+    """
+    headlines: list[str] = []
+    for line in fa_section.splitlines():
+        if not line.startswith("• "):
+            continue
+        body = line[2:]  # drop "• "
+        # Prefer cutting at "): " — the close of the parenthesized ref
+        # followed by the convention colon + space. That's our actual
+        # bullet structure and avoids the false-positive `https:` cut.
+        cut_idx = body.find("): ")
+        if cut_idx > 0:
+            headline = body[: cut_idx + 1]  # keep the close paren
+        else:
+            # Fall back to ": " (colon + space) anywhere in the body.
+            # Adding the space requirement skips `https:` which is
+            # always followed by `/`.
+            cut_idx = body.find(": ")
+            headline = body[:cut_idx] if cut_idx > 0 else body
+        headlines.append(f"• {headline.rstrip()}")
+    return "\n".join(headlines)
+
+
+def build_caption_release_note(changelog_path: str) -> str:
+    """Build the Persian "what's new" block for the Telegram caption.
+
+    Pulls the FA section of `docs/changelog/v<ver>.md`, extracts just
+    the bullet headlines (before the first `:` of each bullet) so the
+    note is compact, converts markdown links/code to Telegram HTML for
+    clickability, and wraps in a `<blockquote>`. Falls back to the full
+    FA section if the headlines extraction yields nothing (e.g. a
+    changelog that doesn't follow our `• headline: details` convention).
+
+    If the result still exceeds CAPTION_FA_NOTE_BUDGET, truncate at a
+    bullet boundary with a trailing `…`. In practice the headlines-only
+    form fits comfortably for any reasonable release note.
+    """
+    fa, _en = parse_changelog(changelog_path)
+    if not fa:
+        return ""
+    headlines = _extract_headlines(fa)
+    note = headlines if headlines else fa.strip()
+    note = _md_links_to_html(note)
+    if len(note) > CAPTION_FA_NOTE_BUDGET:
+        truncated = note[:CAPTION_FA_NOTE_BUDGET]
+        last_bullet = truncated.rfind("\n•")
+        if last_bullet > 0:
+            note = truncated[:last_bullet].rstrip() + "\n…"
+        else:
+            note = truncated.rstrip() + "…"
+    return f"<blockquote>{note}</blockquote>"
+
+
 def sha256_of(path: str) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -169,33 +273,70 @@ def main() -> int:
     # the tag (the workflow converts that into --with-changelog).
     ap.add_argument("--with-changelog", action="store_true",
                     help="Include the Persian+English changelog as a reply-threaded message.")
+    # Dry-run lets you verify the rendered caption locally without hitting
+    # Telegram. Useful when changing the brief-release-note budget /
+    # truncation logic — print, eyeball, push.
+    ap.add_argument("--dry-run", action="store_true",
+                    help="Render the caption and print it instead of posting. "
+                         "Skips token/chat_id checks.")
     args = ap.parse_args()
 
-    token = os.environ.get("BOT_TOKEN", "")
-    chat_id = os.environ.get("CHAT_ID", "")
-    if not token or not chat_id:
-        print("TELEGRAM secrets not present, skipping post.")
-        return 0
+    if not args.dry_run:
+        token = os.environ.get("BOT_TOKEN", "")
+        chat_id = os.environ.get("CHAT_ID", "")
+        if not token or not chat_id:
+            print("TELEGRAM secrets not present, skipping post.")
+            return 0
+    else:
+        token = ""
+        chat_id = ""
 
     ver = args.version
     sha = sha256_of(args.apk)
+    # Brief Persian release-note above the links. Pulled from the FA
+    # half of `docs/changelog/v<ver>.md` so each release auto-includes
+    # what's new without manual edits to this script. Truncated to fit
+    # Telegram's 1024-char caption budget alongside title + SHA + the
+    # two-link footer.
+    fa_note = build_caption_release_note(args.changelog)
+
     # Caption structure requested by the repo owner:
     #   1. Title + SHA-256 (as before)
-    #   2. Persian preamble labelling the repo link as
+    #   2. Brief Persian "what's new" note (extracted from changelog)
+    #   3. Persian preamble labelling the repo link as
     #      "GitHub repo + full Persian guide"
-    #   3. Repo URL
-    #   4. Persian preamble labelling the release link as
+    #   4. Repo URL
+    #   5. Persian preamble labelling the release link as
     #      "this version's release — desktop/router builds live here"
-    #   5. Release URL
+    #   6. Release URL
     # Keeps total well under Telegram's 1024-char caption limit.
-    caption = (
-        f"<b>mhrv-rs Android v{ver}</b>\n\n"
-        f"SHA-256: <code>{sha}</code>\n\n"
-        f"مخزن گیتهاب  + مطالعه راهنمای کامل فارسی:\n"
-        f"https://github.com/{args.repo}\n\n"
-        f"لینک به این نسخه جهت دریافت نسخه های مربوط به مودم و کامپیوتر:\n"
-        f"https://github.com/{args.repo}/releases/tag/v{ver}"
-    )
+    caption_parts = [
+        f"<b>mhrv-rs Android v{ver}</b>",
+        "",
+        f"SHA-256: <code>{sha}</code>",
+    ]
+    if fa_note:
+        caption_parts.extend(["", fa_note])
+    caption_parts.extend([
+        "",
+        "مخزن گیتهاب  + مطالعه راهنمای کامل فارسی:",
+        f"https://github.com/{args.repo}",
+        "",
+        "لینک به این نسخه جهت دریافت نسخه های مربوط به مودم و کامپیوتر:",
+        f"https://github.com/{args.repo}/releases/tag/v{ver}",
+    ])
+    caption = "\n".join(caption_parts)
+
+    if args.dry_run:
+        print(f"--- DRY RUN: caption ({len(caption)} chars) ---")
+        print(caption)
+        print(f"--- END DRY RUN ---")
+        if args.with_changelog:
+            fa, en = parse_changelog(args.changelog)
+            print(f"\nWould reply with changelog "
+                  f"(fa: {len(fa) if fa else 0} chars, "
+                  f"en: {len(en) if en else 0} chars)")
+        return 0
 
     doc_mid = send_document(token, chat_id, args.apk, caption)
     print(f"sendDocument OK, message_id={doc_mid}")

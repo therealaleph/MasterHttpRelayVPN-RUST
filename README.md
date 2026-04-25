@@ -297,7 +297,13 @@ More deployments = more total concurrency = lower per-session latency. Each batc
    - **Solo use** → 1–2 accounts is plenty
    - **Shared with ~3 people** → 3 accounts
    - **Shared with a group** → one account per heavy user
-2. Deploy the [tunnel-node](tunnel-node/) on a VPS
+2. Deploy the [tunnel-node](tunnel-node/) on a VPS. The fastest path is the prebuilt Docker image:
+   ```bash
+   docker run -d --name mhrv-tunnel --restart unless-stopped \
+     -p 8080:8080 -e TUNNEL_AUTH_KEY=your-strong-secret \
+     ghcr.io/therealaleph/mhrv-tunnel-node:latest
+   ```
+   Multi-arch (linux/amd64 + linux/arm64), runs as a non-root user, ~32 MB compressed. Pin a version tag (`:1.5.0`) for production. See [tunnel-node/README.md](tunnel-node/README.md) for Cloud Run, docker-compose, and source-build alternatives.
 3. Set `"mode": "full"` in your config with all deployment IDs:
 
 ```json
@@ -627,6 +633,16 @@ Donations cover hosting, self-hosted CI runner costs, and continued maintenance.
 ### حالت تونل کامل (Full tunnel mode)
 
 حالت `"mode": "full"` **تمام** ترافیک را سرتاسر از طریق `Apps Script` و یک [tunnel-node](tunnel-node/) روی سرور شما عبور می‌دهد — **بدون نیاز به نصب گواهی `MITM`**. تنها هزینه‌اش تأخیر بیشتر است (هر بایت از مسیر `Apps Script → tunnel-node → مقصد` می‌رود)، اما برای هر پروتکل و هر برنامه بدون نصب `CA` کار می‌کند.
+
+**سریع‌ترین راه راه‌اندازی `tunnel-node` روی `VPS`:** ایمیج آمادهٔ `Docker`:
+
+```bash
+docker run -d --name mhrv-tunnel --restart unless-stopped \
+  -p 8080:8080 -e TUNNEL_AUTH_KEY=رمز_قوی_شما \
+  ghcr.io/therealaleph/mhrv-tunnel-node:latest
+```
+
+`multi-arch` (هم `linux/amd64` و هم `linux/arm64`)، اجرا با کاربر غیر `root`، حدود ۳۲ مگابایت فشرده. برای محیط production نسخهٔ مشخص (`:1.5.0`) را pin کنید. راهنمای کامل (شامل `Cloud Run`، `docker-compose`، و بیلد از سورس) در [`tunnel-node/README.md`](tunnel-node/README.md) هست.
 
 #### چرا تعداد `Deployment ID` مهم است؟
 

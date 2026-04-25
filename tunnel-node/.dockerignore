@@ -1,0 +1,15 @@
+# Keep the build context small. The builder stage only needs Cargo.toml,
+# Cargo.lock, and src/ — everything else (cached cargo target/, IDE
+# state, README, etc.) just slows down `docker build` and bloats the
+# context sent to the daemon.
+target/
+**/*.rs.bk
+.git/
+.gitignore
+.idea/
+.vscode/
+*.iml
+README.md
+LICENSE
+Dockerfile
+.dockerignore
