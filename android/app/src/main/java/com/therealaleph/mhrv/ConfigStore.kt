@@ -230,59 +230,7 @@ object ConfigStore {
         val f = File(ctx.filesDir, FILE)
         if (!f.exists()) return MhrvConfig()
         return try {
-            val obj = JSONObject(f.readText())
-
-            val ids = obj.optJSONArray("script_ids")?.let { arr ->
-                buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }
-            }?.filter { it.isNotBlank() }.orEmpty()
-            // For display we turn each ID back into the full URL form —
-            // easier to paste-verify, and the Kotlin side doesn't depend
-            // on it (extractId re-parses on save).
-            val urls = ids.map { "https://script.google.com/macros/s/$it/exec" }
-
-            val sni = obj.optJSONArray("sni_hosts")?.let { arr ->
-                buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }
-            }?.filter { it.isNotBlank() }.orEmpty()
-
-            MhrvConfig(
-                mode = when (obj.optString("mode", "apps_script")) {
-                    "google_only" -> Mode.GOOGLE_ONLY
-                    "full" -> Mode.FULL
-                    else -> Mode.APPS_SCRIPT
-                },
-                listenHost = obj.optString("listen_host", "127.0.0.1"),
-                listenPort = obj.optInt("listen_port", 8080),
-                socks5Port = obj.optInt("socks5_port", 1081).takeIf { it > 0 },
-                appsScriptUrls = urls,
-                authKey = obj.optString("auth_key", ""),
-                frontDomain = obj.optString("front_domain", "www.google.com"),
-                sniHosts = sni,
-                googleIp = obj.optString("google_ip", "142.251.36.68"),
-                verifySsl = obj.optBoolean("verify_ssl", true),
-                logLevel = obj.optString("log_level", "info"),
-                parallelRelay = obj.optInt("parallel_relay", 1),
-                upstreamSocks5 = obj.optString("upstream_socks5", ""),
-                passthroughHosts = obj.optJSONArray("passthrough_hosts")?.let { arr ->
-                    buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }
-                }?.filter { it.isNotBlank() }.orEmpty(),
-                connectionMode = when (obj.optString("connection_mode", "vpn_tun")) {
-                    "proxy_only" -> ConnectionMode.PROXY_ONLY
-                    else -> ConnectionMode.VPN_TUN  // default for unknown/missing
-                },
-                splitMode = when (obj.optString("split_mode", "all")) {
-                    "only" -> SplitMode.ONLY
-                    "except" -> SplitMode.EXCEPT
-                    else -> SplitMode.ALL
-                },
-                splitApps = obj.optJSONArray("split_apps")?.let { arr ->
-                    buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }
-                }?.filter { it.isNotBlank() }.orEmpty(),
-                uiLang = when (obj.optString("ui_lang", "auto")) {
-                    "fa" -> UiLang.FA
-                    "en" -> UiLang.EN
-                    else -> UiLang.AUTO
-                },
-            )
+            loadFromJson(JSONObject(f.readText()))
         } catch (_: Throwable) {
             MhrvConfig()
         }
@@ -291,6 +239,152 @@ object ConfigStore {
     fun save(ctx: Context, cfg: MhrvConfig) {
         val f = File(ctx.filesDir, FILE)
         f.writeText(cfg.toJson())
+    }
+
+    /** Prefix for encoded config strings so we can detect them in clipboard. */
+    private const val HASH_PREFIX = "mhrv://"
+
+    /** Encode config as a shareable base64 string with prefix.
+     *  Only includes non-default fields to keep the hash short. */
+    fun encode(cfg: MhrvConfig): String {
+        val defaults = MhrvConfig()
+        val obj = JSONObject()
+
+        // Always include essential fields.
+        obj.put("mode", when (cfg.mode) {
+            Mode.APPS_SCRIPT -> "apps_script"
+            Mode.GOOGLE_ONLY -> "google_only"
+            Mode.FULL -> "full"
+        })
+        val ids = cfg.appsScriptUrls.mapNotNull { url ->
+            val marker = "/macros/s/"
+            val i = url.indexOf(marker)
+            if (i >= 0) {
+                var s = url.substring(i + marker.length)
+                val slash = s.indexOf('/'); if (slash >= 0) s = s.substring(0, slash)
+                s.trim().ifEmpty { null }
+            } else url.trim().ifEmpty { null }
+        }
+        if (ids.isNotEmpty()) obj.put("script_ids", JSONArray().apply { ids.forEach { put(it) } })
+        if (cfg.authKey.isNotBlank()) obj.put("auth_key", cfg.authKey)
+
+        // Only include non-default values.
+        if (cfg.googleIp != defaults.googleIp) obj.put("google_ip", cfg.googleIp)
+        if (cfg.frontDomain != defaults.frontDomain) obj.put("front_domain", cfg.frontDomain)
+        if (cfg.sniHosts.isNotEmpty()) obj.put("sni_hosts", JSONArray().apply { cfg.sniHosts.forEach { put(it) } })
+        if (cfg.verifySsl != defaults.verifySsl) obj.put("verify_ssl", cfg.verifySsl)
+        if (cfg.logLevel != defaults.logLevel) obj.put("log_level", cfg.logLevel)
+        if (cfg.parallelRelay != defaults.parallelRelay) obj.put("parallel_relay", cfg.parallelRelay)
+        if (cfg.upstreamSocks5.isNotBlank()) obj.put("upstream_socks5", cfg.upstreamSocks5)
+        if (cfg.passthroughHosts.isNotEmpty()) obj.put("passthrough_hosts", JSONArray().apply { cfg.passthroughHosts.forEach { put(it) } })
+
+        // Compress with DEFLATE then base64.
+        val jsonBytes = obj.toString().toByteArray(Charsets.UTF_8)
+        val compressed = java.io.ByteArrayOutputStream().also { bos ->
+            java.util.zip.DeflaterOutputStream(bos).use { it.write(jsonBytes) }
+        }.toByteArray()
+
+        val b64 = android.util.Base64.encodeToString(
+            compressed,
+            android.util.Base64.NO_WRAP or android.util.Base64.URL_SAFE,
+        )
+        return "$HASH_PREFIX$b64"
+    }
+
+    /** Try DEFLATE inflate; fall back to treating bytes as raw UTF-8
+     *  (for backward compat with uncompressed exports). */
+    private fun inflateOrRaw(raw: ByteArray): String {
+        return try {
+            java.util.zip.InflaterInputStream(raw.inputStream()).bufferedReader().readText()
+        } catch (_: Throwable) {
+            String(raw, Charsets.UTF_8)
+        }
+    }
+
+    /** Try to decode an encoded config string or raw JSON. Returns null on failure. */
+    fun decode(encoded: String): MhrvConfig? {
+        val trimmed = encoded.trim()
+        // Try raw JSON first.
+        if (trimmed.startsWith("{")) {
+            return try {
+                val obj = JSONObject(trimmed)
+                if (!obj.has("mode") && !obj.has("script_ids") && !obj.has("auth_key")) null
+                else loadFromJson(obj)
+            } catch (_: Throwable) { null }
+        }
+        // Try mhrv:// base64 encoded (possibly DEFLATE-compressed).
+        val payload = if (trimmed.startsWith(HASH_PREFIX)) trimmed.removePrefix(HASH_PREFIX) else trimmed
+        return try {
+            val raw = android.util.Base64.decode(payload, android.util.Base64.NO_WRAP or android.util.Base64.URL_SAFE)
+            val text = inflateOrRaw(raw)
+            val obj = JSONObject(text)
+            if (!obj.has("mode") && !obj.has("script_ids") && !obj.has("auth_key")) return null
+            loadFromJson(obj)
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /** Check if a string looks like an encoded mhrv config. */
+    fun looksLikeConfig(text: String): Boolean {
+        val t = text.trim()
+        if (t.startsWith(HASH_PREFIX)) return true
+        // Also accept raw JSON with a "mode" field.
+        if (t.startsWith("{")) {
+            return try { JSONObject(t).has("mode") } catch (_: Throwable) { false }
+        }
+        return false
+    }
+
+    /** Parse config from a JSON object — shared by load() and decode(). */
+    private fun loadFromJson(obj: JSONObject): MhrvConfig {
+        val ids = obj.optJSONArray("script_ids")?.let { arr ->
+            buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }
+        }?.filter { it.isNotBlank() }.orEmpty()
+        val urls = ids.map { "https://script.google.com/macros/s/$it/exec" }
+        val sni = obj.optJSONArray("sni_hosts")?.let { arr ->
+            buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }
+        }?.filter { it.isNotBlank() }.orEmpty()
+
+        return MhrvConfig(
+            mode = when (obj.optString("mode", "apps_script")) {
+                "google_only" -> Mode.GOOGLE_ONLY
+                "full" -> Mode.FULL
+                else -> Mode.APPS_SCRIPT
+            },
+            listenHost = obj.optString("listen_host", "127.0.0.1"),
+            listenPort = obj.optInt("listen_port", 8080),
+            socks5Port = obj.optInt("socks5_port", 1081).takeIf { it > 0 },
+            appsScriptUrls = urls,
+            authKey = obj.optString("auth_key", ""),
+            frontDomain = obj.optString("front_domain", "www.google.com"),
+            sniHosts = sni,
+            googleIp = obj.optString("google_ip", "142.251.36.68"),
+            verifySsl = obj.optBoolean("verify_ssl", true),
+            logLevel = obj.optString("log_level", "info"),
+            parallelRelay = obj.optInt("parallel_relay", 1),
+            upstreamSocks5 = obj.optString("upstream_socks5", ""),
+            passthroughHosts = obj.optJSONArray("passthrough_hosts")?.let { arr ->
+                buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }
+            }?.filter { it.isNotBlank() }.orEmpty(),
+            connectionMode = when (obj.optString("connection_mode", "vpn_tun")) {
+                "proxy_only" -> ConnectionMode.PROXY_ONLY
+                else -> ConnectionMode.VPN_TUN
+            },
+            splitMode = when (obj.optString("split_mode", "all")) {
+                "only" -> SplitMode.ONLY
+                "except" -> SplitMode.EXCEPT
+                else -> SplitMode.ALL
+            },
+            splitApps = obj.optJSONArray("split_apps")?.let { arr ->
+                buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }
+            }?.filter { it.isNotBlank() }.orEmpty(),
+            uiLang = when (obj.optString("ui_lang", "auto")) {
+                "fa" -> UiLang.FA
+                "en" -> UiLang.EN
+                else -> UiLang.AUTO
+            },
+        )
     }
 }
 

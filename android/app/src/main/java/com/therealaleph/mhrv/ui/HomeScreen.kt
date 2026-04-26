@@ -250,6 +250,13 @@ fun HomeScreen(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
+            // Config import/export bar — paste from clipboard + export + QR.
+            ConfigSharingBar(
+                cfg = cfg,
+                onImport = { persist(it) },
+                onSnackbar = { snackbar.showSnackbar(it) },
+            )
+
             SectionHeader("Mode")
             ModeDropdown(
                 mode = cfg.mode,

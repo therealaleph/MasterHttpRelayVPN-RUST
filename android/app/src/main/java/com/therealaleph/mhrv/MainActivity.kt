@@ -81,11 +81,28 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // Handle mhrv:// deep link — auto-import config.
+        handleDeepLink(intent)
+
         setContent {
             MhrvTheme {
                 AppRoot()
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleDeepLink(intent)
+    }
+
+    private fun handleDeepLink(intent: Intent?) {
+        val data = intent?.data ?: return
+        if (data.scheme != "mhrv") return
+        val encoded = data.toString()
+        val cfg = ConfigStore.decode(encoded) ?: return
+        ConfigStore.save(this, cfg)
+        android.widget.Toast.makeText(this, "Config imported", android.widget.Toast.LENGTH_SHORT).show()
     }
 
     @Composable

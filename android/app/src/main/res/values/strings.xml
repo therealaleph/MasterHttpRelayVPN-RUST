@@ -76,6 +76,21 @@
     <!-- Live logs -->
     <string name="logs_lines_count">%1$d lines</string>
 
+    <!-- Config import/export -->
+    <string name="btn_import_clipboard">Paste config from clipboard</string>
+    <string name="btn_export_config">Export config</string>
+    <string name="btn_export_qr">Show QR code</string>
+    <string name="btn_scan_qr">Scan QR code</string>
+    <string name="btn_copy_hash">Copy to clipboard</string>
+    <string name="snack_config_imported">Config imported</string>
+    <string name="snack_config_copied">Config copied to clipboard</string>
+    <string name="snack_invalid_config">Invalid config in clipboard</string>
+    <string name="dialog_export_title">Export config</string>
+    <string name="dialog_export_warning">This includes your auth_key. Only share with people you trust.</string>
+    <string name="dialog_import_title">Import config?</string>
+    <string name="dialog_import_body">This will replace your current settings.</string>
+    <string name="label_camera_permission">Camera permission needed to scan QR codes</string>
+
     <!-- Snackbar -->
     <string name="snack_google_ip_updated">google_ip updated to %1$s</string>
     <string name="snack_google_ip_current">google_ip already current (%1$s)</string>
