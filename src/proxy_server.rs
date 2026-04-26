@@ -461,25 +461,21 @@ async fn handle_http_client(
         sock.flush().await?;
         dispatch_tunnel(sock, host, port, fronter, mitm, rewrite_ctx, tunnel_mux).await
     } else {
-        // Plain HTTP proxy request (e.g. `GET http://…`). The Apps Script
-        // relay is the only code path that can fulfil this, so in google_only
-        // bootstrap mode we return a clear 502 instead.
+        // Plain HTTP proxy request (e.g. `GET http://…`).
+        //
+        // apps_script mode: relay through the Apps Script fronter (which
+        // is the whole point of the relay).
+        //
+        // google_only bootstrap mode: no fronter exists, so passthrough as
+        // direct TCP. Same contract as `dispatch_tunnel` honors for CONNECT
+        // in google_only — anything not on the Google edge is forwarded
+        // direct (or via `upstream_socks5`) so the user's browser still
+        // works while they finish setting up Apps Script. Issue: typing a
+        // bare `http://example.com` URL used to return a 502 here even
+        // though `https://example.com` (CONNECT) worked fine.
         match fronter {
             Some(f) => do_plain_http(sock, &head, &leftover, f).await,
-            None => {
-                let _ = sock
-                    .write_all(
-                        b"HTTP/1.1 502 Bad Gateway\r\n\
-                          Content-Type: text/plain; charset=utf-8\r\n\
-                          Content-Length: 120\r\n\
-                          Connection: close\r\n\r\n\
-                          google_only mode: plain HTTP proxy requests are not supported. \
-                          Browse https over CONNECT, or switch to apps_script mode.",
-                    )
-                    .await;
-                let _ = sock.flush().await;
-                Ok(())
-            }
+            None => do_plain_http_passthrough(sock, &head, &leftover, &rewrite_ctx).await,
         }
     }
 }
@@ -2203,6 +2199,174 @@ async fn do_plain_http(
     Ok(())
 }
 
+/// google_only mode plain-HTTP passthrough. The CONNECT path already
+/// falls through to direct TCP for non-Google-edge hosts in google_only;
+/// this is the same idea for the `GET http://…` proxy form so a bare
+/// `http://example.com` typed in the address bar doesn't 502.
+///
+/// We rewrite the absolute-form request URI (`GET http://host/path`) to
+/// origin form (`GET /path`), strip hop-by-hop headers, force
+/// `Connection: close` so a keep-alive client can't pipeline a request
+/// to a different host onto our spliced socket, then dial the origin
+/// (honoring `upstream_socks5` if set) and splice both directions.
+async fn do_plain_http_passthrough(
+    mut sock: TcpStream,
+    head: &[u8],
+    leftover: &[u8],
+    rewrite_ctx: &RewriteCtx,
+) -> std::io::Result<()> {
+    let (method, target, version, headers) = match parse_request_head(head) {
+        Some(v) => v,
+        None => return Ok(()),
+    };
+
+    let (host, port, path) = match resolve_plain_http_target(&target, &headers) {
+        Some(v) => v,
+        None => {
+            tracing::debug!("plain-http passthrough: cannot parse target {}", target);
+            return Ok(());
+        }
+    };
+
+    tracing::info!(
+        "dispatch http {}:{} -> raw-tcp ({}) (google_only: no relay)",
+        host,
+        port,
+        rewrite_ctx.upstream_socks5.as_deref().unwrap_or("direct"),
+    );
+
+    // Rewrite request line to origin form and drop hop-by-hop headers.
+    let mut rewritten = Vec::with_capacity(head.len());
+    rewritten.extend_from_slice(method.as_bytes());
+    rewritten.push(b' ');
+    rewritten.extend_from_slice(path.as_bytes());
+    rewritten.push(b' ');
+    rewritten.extend_from_slice(version.as_bytes());
+    rewritten.extend_from_slice(b"\r\n");
+    for (k, v) in &headers {
+        let kl = k.to_ascii_lowercase();
+        if kl == "proxy-connection" || kl == "connection" || kl == "keep-alive" {
+            continue;
+        }
+        rewritten.extend_from_slice(k.as_bytes());
+        rewritten.extend_from_slice(b": ");
+        rewritten.extend_from_slice(v.as_bytes());
+        rewritten.extend_from_slice(b"\r\n");
+    }
+    rewritten.extend_from_slice(b"Connection: close\r\n\r\n");
+
+    let target_host = host.trim_start_matches('[').trim_end_matches(']');
+    let connect_timeout = if looks_like_ip(target_host) {
+        std::time::Duration::from_secs(4)
+    } else {
+        std::time::Duration::from_secs(10)
+    };
+    let upstream = if let Some(proxy) = rewrite_ctx.upstream_socks5.as_deref() {
+        match socks5_connect_via(proxy, target_host, port).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    "upstream-socks5 {} -> {}:{} failed: {} (falling back to direct)",
+                    proxy,
+                    host,
+                    port,
+                    e
+                );
+                match tokio::time::timeout(
+                    connect_timeout,
+                    TcpStream::connect((target_host, port)),
+                )
+                .await
+                {
+                    Ok(Ok(s)) => s,
+                    _ => return Ok(()),
+                }
+            }
+        }
+    } else {
+        match tokio::time::timeout(connect_timeout, TcpStream::connect((target_host, port))).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                tracing::debug!("plain-http connect {}:{} failed: {}", host, port, e);
+                return Ok(());
+            }
+            Err(_) => {
+                tracing::debug!("plain-http connect {}:{} timeout", host, port);
+                return Ok(());
+            }
+        }
+    };
+    let _ = upstream.set_nodelay(true);
+
+    let (mut ar, mut aw) = sock.split();
+    let (mut br, mut bw) = upstream.into_split();
+    bw.write_all(&rewritten).await?;
+    if !leftover.is_empty() {
+        bw.write_all(leftover).await?;
+    }
+    let t1 = tokio::io::copy(&mut ar, &mut bw);
+    let t2 = tokio::io::copy(&mut br, &mut aw);
+    tokio::select! {
+        _ = t1 => {}
+        _ = t2 => {}
+    }
+    Ok(())
+}
+
+/// Parse the target of a plain-HTTP proxy request line into
+/// `(host, port, origin-form-path)`. Browsers send absolute form
+/// (`http://host[:port]/path`); we also accept the origin-form
+/// fallback (`/path` with a `Host:` header) for transparent-proxy
+/// clients. `https://` is accepted defensively, though browsers route
+/// HTTPS through CONNECT and shouldn't hit this path.
+fn resolve_plain_http_target(
+    target: &str,
+    headers: &[(String, String)],
+) -> Option<(String, u16, String)> {
+    let (rest, default_port) = if let Some(r) = target.strip_prefix("http://") {
+        (r, 80u16)
+    } else if let Some(r) = target.strip_prefix("https://") {
+        (r, 443u16)
+    } else if target.starts_with('/') {
+        let host_header = headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+            .map(|(_, v)| v.as_str())?;
+        let (host, port) = split_authority(host_header, 80);
+        return Some((host, port, target.to_string()));
+    } else {
+        return None;
+    };
+
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    if authority.is_empty() {
+        return None;
+    }
+    let (host, port) = split_authority(authority, default_port);
+    Some((host, port, path.to_string()))
+}
+
+/// Split an `authority` (`host[:port]`, with optional IPv6 brackets)
+/// into a `(host, port)` pair, defaulting the port when absent.
+fn split_authority(authority: &str, default_port: u16) -> (String, u16) {
+    // Bare IPv6 (multiple colons, no brackets) — `rsplit_once(':')`
+    // would otherwise mangle `::1` into `(":", 1)`. Take the whole
+    // string as the host and use the default port.
+    let colons = authority.bytes().filter(|&b| b == b':').count();
+    if colons > 1 && !authority.starts_with('[') {
+        return (authority.to_string(), default_port);
+    }
+    if let Some((h, p)) = authority.rsplit_once(':') {
+        if let Ok(port) = p.parse::<u16>() {
+            return (h.to_string(), port);
+        }
+    }
+    (authority.to_string(), default_port)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2213,6 +2377,63 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    #[test]
+    fn resolve_plain_http_target_parses_absolute_form() {
+        let h = headers(&[]);
+        let (host, port, path) =
+            resolve_plain_http_target("http://example.com/", &h).unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 80);
+        assert_eq!(path, "/");
+
+        let (host, port, path) =
+            resolve_plain_http_target("http://example.com:8080/foo?x=1", &h).unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 8080);
+        assert_eq!(path, "/foo?x=1");
+
+        let (host, port, path) =
+            resolve_plain_http_target("http://example.com", &h).unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 80);
+        assert_eq!(path, "/");
+    }
+
+    #[test]
+    fn resolve_plain_http_target_falls_back_to_host_header() {
+        let h = headers(&[("Host", "example.com:8080")]);
+        let (host, port, path) = resolve_plain_http_target("/foo", &h).unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 8080);
+        assert_eq!(path, "/foo");
+    }
+
+    #[test]
+    fn resolve_plain_http_target_rejects_bare_authority() {
+        // No scheme, doesn't start with `/` — not something we can route.
+        assert!(resolve_plain_http_target("example.com", &headers(&[])).is_none());
+        assert!(resolve_plain_http_target("http://", &headers(&[])).is_none());
+    }
+
+    #[test]
+    fn split_authority_handles_ports_and_ipv6() {
+        assert_eq!(
+            split_authority("example.com", 80),
+            ("example.com".to_string(), 80)
+        );
+        assert_eq!(
+            split_authority("example.com:8080", 80),
+            ("example.com".to_string(), 8080)
+        );
+        assert_eq!(
+            split_authority("[::1]:8080", 80),
+            ("[::1]".to_string(), 8080)
+        );
+        // Bare IPv6 without brackets — keep the whole string as the host
+        // and use the default port instead of mis-splitting on a colon.
+        assert_eq!(split_authority("::1", 80), ("::1".to_string(), 80));
     }
 
     #[test]
