@@ -239,6 +239,10 @@ struct FormState {
     normalize_x_graphql: bool,
     youtube_via_relay: bool,
     passthrough_hosts: Vec<String>,
+    /// Round-tripped from config.json so the UI's save path doesn't
+    /// drop the user's setting. Not currently exposed as a UI control;
+    /// users edit `block_quic` directly in `config.json` (Issue #213).
+    block_quic: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -321,6 +325,7 @@ fn load_form() -> (FormState, Option<String>) {
             normalize_x_graphql: c.normalize_x_graphql,
             youtube_via_relay: c.youtube_via_relay,
             passthrough_hosts: c.passthrough_hosts.clone(),
+            block_quic: c.block_quic,
         }
     } else {
         FormState {
@@ -348,6 +353,7 @@ fn load_form() -> (FormState, Option<String>) {
             normalize_x_graphql: false,
             youtube_via_relay: false,
             passthrough_hosts: Vec::new(),
+            block_quic: false,
         }
     };
     (form, load_err)
@@ -490,6 +496,10 @@ impl FormState {
             // Similarly config-only for now; round-trips through the
             // file so the UI doesn't drop the user's entries on save.
             passthrough_hosts: self.passthrough_hosts.clone(),
+            // Issue #213: block_quic is config-only for now (no UI
+            // control yet). Round-trip through the file so save
+            // doesn't drop a user-set true.
+            block_quic: self.block_quic,
         })
     }
 }
