@@ -61,11 +61,19 @@ fun AppPickerDialog(
     }
 
     val filtered: List<AppEntry> = remember(apps, query) {
-        if (query.isBlank()) apps
+        val base = if (query.isBlank()) apps
         else apps.filter {
             it.label.contains(query, ignoreCase = true) ||
                 it.packageName.contains(query, ignoreCase = true)
         }
+        // Pre-selected packages float to the top so the user can find what
+        // they already chose without scrolling the whole list. The sort
+        // key uses `initial` (the set passed when the dialog opened), not
+        // the live `selected` state — re-checking inside the dialog must
+        // not reorder rows under the user's finger. The new ordering takes
+        // effect the next time the dialog opens. Stable sort preserves
+        // the alphabetical-by-label order within each group.
+        base.sortedByDescending { it.packageName in initial }
     }
 
     AlertDialog(

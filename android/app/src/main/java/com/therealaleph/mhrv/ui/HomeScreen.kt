@@ -75,9 +75,11 @@ sealed class CaInstallOutcome {
 /**
  * Top-level screen. Intentionally one scrollable page rather than tabs —
  * first-run users need to see everything (deployment IDs, cert button,
- * Start) on one surface. Anything that isn't first-run critical lives in
- * collapsible sections (SNI pool, Advanced, Logs) so the default view
- * stays short.
+ * Connect) on one surface. The Connect/Disconnect button sits right under
+ * the Mode dropdown so a long deployment-ID list can't push it off-screen
+ * for daily-use taps. Anything that isn't first-run critical (Apps Script
+ * setup once filled, SNI pool, Advanced, Logs) lives in collapsible
+ * sections so the default view stays short.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -254,28 +256,111 @@ fun HomeScreen(
                 onChange = { persist(cfg.copy(mode = it)) },
             )
 
+            // Connect/Disconnect lives right under Mode so users with a long
+            // deployment-ID list don't have to scroll past it on every
+            // session. Disabled state still acts as the "you're not set up
+            // yet" signal — they'll expand the Apps Script section below to
+            // resolve it.
+            val isVpnRunning by VpnState.isRunning.collectAsState()
+            Button(
+                onClick = {
+                    if (isVpnRunning) {
+                        awaitingRunning = false
+                        onStop()
+                    } else {
+                        awaitingRunning = true
+                        // Connect flow: auto-resolve google_ip so we don't
+                        // hand the proxy a stale anycast target; repair
+                        // front_domain if it got corrupted into an IP
+                        // (SNI has to be a hostname); then fire onStart.
+                        // All three steps go through the Compose persist()
+                        // so a subsequent field edit can't overwrite the
+                        // fresh values with pre-resolve ones.
+                        scope.launch {
+                            // Only auto-fill google_ip if it's empty.
+                            // Issue #71: some Iranian ISPs return
+                            // poisoned A records for www.google.com that
+                            // resolve but then refuse TLS (or route to a
+                            // Google IP that's not on the GFE and can't
+                            // handle our SNI-rewrite). If the user has
+                            // manually set a working IP
+                            // (e.g. 216.239.38.120), we must NOT
+                            // overwrite it with a poisoned fresh lookup
+                            // just because the two values differ. They
+                            // can still force a re-resolve via the
+                            // explicit "Auto-detect" button above.
+                            var updated = cfg
+                            if (updated.googleIp.isBlank()) {
+                                val fresh = withContext(Dispatchers.IO) {
+                                    NetworkDetect.resolveGoogleIp()
+                                }
+                                if (!fresh.isNullOrBlank()) {
+                                    updated = updated.copy(googleIp = fresh)
+                                }
+                            }
+                            if (updated.frontDomain.isBlank() ||
+                                updated.frontDomain.parseAsIpOrNull() != null
+                            ) {
+                                updated = updated.copy(frontDomain = "www.google.com")
+                            }
+                            if (updated !== cfg) persist(updated)
+                            onStart()
+                        }
+                    }
+                },
+                enabled = (isVpnRunning ||
+                    cfg.mode == Mode.GOOGLE_ONLY ||
+                    (cfg.hasDeploymentId && cfg.authKey.isNotBlank())) && !transitioning,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (isVpnRunning) ErrRed else OkGreen,
+                    contentColor = androidx.compose.ui.graphics.Color.White,
+                    disabledContainerColor = MaterialTheme.colorScheme.surfaceVariant,
+                ),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 52.dp),
+            ) {
+                Text(
+                    when {
+                        transitioning -> "…"
+                        isVpnRunning -> stringResource(R.string.btn_disconnect)
+                        else -> stringResource(R.string.btn_connect)
+                    },
+                    style = MaterialTheme.typography.titleMedium,
+                )
+            }
+
             Spacer(Modifier.height(4.dp))
-            SectionHeader(stringResource(R.string.sec_apps_script_relay))
 
             val appsScriptEnabled = cfg.mode == Mode.APPS_SCRIPT || cfg.mode == Mode.FULL
-            DeploymentIdsField(
-                urls = cfg.appsScriptUrls,
-                onChange = { persist(cfg.copy(appsScriptUrls = it)) },
-                enabled = appsScriptEnabled,
-            )
+            // Wrapped in a collapsible so a long ID list (10+ deployments
+            // is normal in full-tunnel rotations) doesn't dominate the
+            // screen once it's set up. Starts expanded for first-run users
+            // (no IDs/key yet) so the form is immediately discoverable.
+            CollapsibleSection(
+                title = stringResource(R.string.sec_apps_script_relay),
+                initiallyExpanded = appsScriptEnabled &&
+                    (cfg.appsScriptUrls.isEmpty() || cfg.authKey.isBlank()),
+            ) {
+                DeploymentIdsField(
+                    urls = cfg.appsScriptUrls,
+                    onChange = { persist(cfg.copy(appsScriptUrls = it)) },
+                    enabled = appsScriptEnabled,
+                )
 
-            OutlinedTextField(
-                value = cfg.authKey,
-                onValueChange = { persist(cfg.copy(authKey = it)) },
-                label = { Text(stringResource(R.string.field_auth_key)) },
-                singleLine = true,
-                enabled = appsScriptEnabled,
-                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
-                modifier = Modifier.fillMaxWidth(),
-                supportingText = {
-                    Text(stringResource(R.string.help_auth_key))
-                },
-            )
+                OutlinedTextField(
+                    value = cfg.authKey,
+                    onValueChange = { persist(cfg.copy(authKey = it)) },
+                    label = { Text(stringResource(R.string.field_auth_key)) },
+                    singleLine = true,
+                    enabled = appsScriptEnabled,
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
+                    modifier = Modifier.fillMaxWidth(),
+                    supportingText = {
+                        Text(stringResource(R.string.help_auth_key))
+                    },
+                )
+            }
 
             Spacer(Modifier.height(4.dp))
             SectionHeader(stringResource(R.string.sec_network))
@@ -379,90 +464,10 @@ fun HomeScreen(
             }
 
             Spacer(Modifier.height(8.dp))
-
-            // Unified Connect/Disconnect button. Color + label track the
-            // service's real "is it running right now" state (via
-            // `VpnState.isRunning`), so the UI never shows "Connect" while
-            // the tunnel is still up or "Disconnect" after the service
-            // finished tearing down. Two tap paths, one button:
-            //   - running=false → green "Connect" → runs the auto-resolve
-            //     + persist + onStart() sequence we used to hang off the
-            //     old Start button.
-            //   - running=true  → red "Disconnect" → fires onStop().
-            val isVpnRunning by VpnState.isRunning.collectAsState()
-            Button(
-                onClick = {
-                    if (isVpnRunning) {
-                        awaitingRunning = false
-                        onStop()
-                    } else {
-                        awaitingRunning = true
-                        // Connect flow: auto-resolve google_ip so we don't
-                        // hand the proxy a stale anycast target; repair
-                        // front_domain if it got corrupted into an IP
-                        // (SNI has to be a hostname); then fire onStart.
-                        // All three steps go through the Compose persist()
-                        // so a subsequent field edit can't overwrite the
-                        // fresh values with pre-resolve ones.
-                        scope.launch {
-                            // Only auto-fill google_ip if it's empty.
-                            // Issue #71: some Iranian ISPs return
-                            // poisoned A records for www.google.com that
-                            // resolve but then refuse TLS (or route to a
-                            // Google IP that's not on the GFE and can't
-                            // handle our SNI-rewrite). If the user has
-                            // manually set a working IP
-                            // (e.g. 216.239.38.120), we must NOT
-                            // overwrite it with a poisoned fresh lookup
-                            // just because the two values differ. They
-                            // can still force a re-resolve via the
-                            // explicit "Auto-detect" button above.
-                            var updated = cfg
-                            if (updated.googleIp.isBlank()) {
-                                val fresh = withContext(Dispatchers.IO) {
-                                    NetworkDetect.resolveGoogleIp()
-                                }
-                                if (!fresh.isNullOrBlank()) {
-                                    updated = updated.copy(googleIp = fresh)
-                                }
-                            }
-                            if (updated.frontDomain.isBlank() ||
-                                updated.frontDomain.parseAsIpOrNull() != null
-                            ) {
-                                updated = updated.copy(frontDomain = "www.google.com")
-                            }
-                            if (updated !== cfg) persist(updated)
-                            onStart()
-                        }
-                    }
-                },
-                enabled = (isVpnRunning ||
-                    cfg.mode == Mode.GOOGLE_ONLY ||
-                    (cfg.hasDeploymentId && cfg.authKey.isNotBlank())) && !transitioning,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (isVpnRunning) ErrRed else OkGreen,
-                    contentColor = androidx.compose.ui.graphics.Color.White,
-                    disabledContainerColor = MaterialTheme.colorScheme.surfaceVariant,
-                ),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = 52.dp),
-            ) {
-                Text(
-                    when {
-                        transitioning -> "…"
-                        isVpnRunning -> stringResource(R.string.btn_disconnect)
-                        else -> stringResource(R.string.btn_connect)
-                    },
-                    style = MaterialTheme.typography.titleMedium,
-                )
-            }
-
-            Spacer(Modifier.height(4.dp))
-            // Secondary accent button — FilledTonalButton reads as a lower-
-            // priority action next to Start/Stop, matching the desktop UI's
-            // visual hierarchy where Install CA is offered as a helper
-            // button rather than the headline action.
+            // Secondary action — FilledTonalButton signals "helper" against
+            // the primary Connect/Disconnect button at the top. Kept down
+            // here because cert install is a one-time setup step; daily
+            // users never tap it again.
             FilledTonalButton(
                 onClick = { showInstallDialog = true },
                 modifier = Modifier.fillMaxWidth(),
