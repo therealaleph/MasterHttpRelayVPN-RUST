@@ -99,6 +99,10 @@ tun2proxy = { version = "0.7", default-features = false, features = ["udpgw"] }
 [dev-dependencies]
 # Used in mitm tests to sanity-check the cert extensions we emit.
 x509-parser = "0.16"
+# `test-util` enables `tokio::test(start_paused = true)` so timing-
+# sensitive tests in `tunnel_client` (the empty-poll cadence) can
+# auto-advance virtual time instead of burning real wall-clock seconds.
+tokio = { version = "1", features = ["test-util"] }
 
 [profile.release]
 panic = "abort"
