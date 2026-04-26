@@ -78,6 +78,12 @@ pub struct Config {
     pub hosts: HashMap<String, String>,
     #[serde(default)]
     pub enable_batching: bool,
+    #[serde(default = "default_batch_timeout_ms")]
+    pub batch_timeout_ms: u64,
+    #[serde(default = "default_batch_coalesce_window_ms")]
+    pub batch_coalesce_window_ms: u64,
+    #[serde(default = "default_max_batch_ops")]
+    pub max_batch_ops: usize,
     /// Optional upstream SOCKS5 proxy for non-HTTP / raw-TCP traffic
     /// (e.g. `"127.0.0.1:50529"` pointing at a local xray / v2ray instance).
     /// When set, the SOCKS5 listener forwards raw-TCP flows through it
@@ -164,7 +170,9 @@ pub struct Config {
     #[serde(default)]
     pub passthrough_hosts: Vec<String>,
 }
-
+fn default_batch_timeout_ms() -> u64 { 10000 }
+fn default_batch_coalesce_window_ms() -> u64 { 8 }
+fn default_max_batch_ops() -> usize { 50 }
 fn default_fetch_ips_from_api() -> bool { false }
 fn default_max_ips_to_scan() -> usize { 100 }
 fn default_scan_batch_size() -> usize {500}
@@ -219,6 +227,12 @@ impl Config {
                     ));
                 }
             }
+        }
+        if self.batch_timeout_ms == 0 {
+            return Err(ConfigError::Invalid("batch_timeout_ms must be greater than 0".into()));
+        }
+        if self.max_batch_ops == 0 {
+            return Err(ConfigError::Invalid("max_batch_ops must be greater than 0".into()));
         }
         if self.scan_batch_size == 0 {
             return Err(ConfigError::Invalid(
