@@ -29,6 +29,7 @@
 
     <!-- Field labels -->
     <string name="field_deployment_urls">Deployment URL(s) or script ID(s)</string>
+    <string name="placeholder_paste_ids">Paste one URL/ID, or many separated by newline / space / comma / semicolon</string>
     <string name="field_auth_key">auth_key</string>
     <string name="field_google_ip">google_ip</string>
     <string name="field_front_domain">front_domain</string>
@@ -52,7 +53,7 @@
     <string name="lang_toggle_cd">Switch language</string>
 
     <!-- Supporting / helper text -->
-    <string name="help_deployment_urls">Full URLs (https://script.google.com/macros/s/.../exec) or bare IDs. Multiple IDs are rotated round-robin — more IDs = more pipeline throughput in full mode.</string>
+    <string name="help_deployment_urls">Full URLs (https://script.google.com/macros/s/.../exec) or bare IDs. Paste many at once into the Add field — they\'ll be split on newline / space / comma / semicolon. Multiple IDs are rotated round-robin — more IDs = more pipeline throughput in full mode.</string>
     <string name="help_auth_key">The shared secret you set in the Apps Script.</string>
     <string name="help_mode_vpn_tun">Requests the OS VPN grant on Connect. All device traffic is routed automatically.</string>
     <string name="help_mode_proxy_only">No OS VPN. Set your Wi-Fi proxy to 127.0.0.1:%1$d (HTTP) or %2$d (SOCKS5) after Connect. Only apps that honour the proxy settings will tunnel.</string>

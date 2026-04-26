@@ -29,6 +29,7 @@
 
     <!-- Field labels -->
     <string name="field_deployment_urls">آدرس‌(های) Deployment یا Script ID</string>
+    <string name="placeholder_paste_ids">یک URL/ID، یا چند مورد با خط جدید/فاصله/ویرگول/نقطه‌ویرگول جدا کنید</string>
     <string name="field_auth_key">کلید احراز (auth_key)</string>
     <string name="field_google_ip">google_ip</string>
     <string name="field_front_domain">دامنهٔ فرانت</string>
@@ -52,7 +53,7 @@
     <string name="lang_toggle_cd">تغییر زبان</string>
 
     <!-- Supporting / helper text -->
-    <string name="help_deployment_urls">URL کامل (https://script.google.com/macros/s/.../exec) یا فقط ID خام. چند ID به‌صورت چرخشی استفاده می‌شوند — بیشتر ID = سرعت بیشتر در حالت تونل کامل.</string>
+    <string name="help_deployment_urls">URL کامل (https://script.google.com/macros/s/.../exec) یا فقط ID خام. می‌توانید چند مورد را یک‌جا در فیلد افزودن جای‌گذاری کنید — با خط جدید/فاصله/ویرگول/نقطه‌ویرگول جدا می‌شوند. چند ID به‌صورت چرخشی استفاده می‌شوند — بیشتر ID = سرعت بیشتر در حالت تونل کامل.</string>
     <string name="help_auth_key">همان رمز مشترکی که داخل Apps Script گذاشتید.</string>
     <string name="help_mode_vpn_tun">هنگام اتصال، مجوز VPN سیستم درخواست می‌شود. تمام ترافیک دستگاه به‌صورت خودکار رد می‌شود.</string>
     <string name="help_mode_proxy_only">بدون VPN سیستم. بعد از اتصال، پروکسی Wi-Fi را روی 127.0.0.1:%1$d (HTTP) یا %2$d (SOCKS5) تنظیم کنید. فقط برنامه‌هایی که تنظیمات پروکسی را رعایت می‌کنند رد می‌شوند.</string>

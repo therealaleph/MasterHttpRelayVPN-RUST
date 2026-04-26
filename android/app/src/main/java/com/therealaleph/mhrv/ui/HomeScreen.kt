@@ -714,8 +714,14 @@ private fun ConnectionModeDropdown(
 }
 
 // =========================================================================
-// Deployment IDs editor — one row per ID, with add/remove buttons.
+// Deployment IDs editor — one row per ID, with add/remove buttons. The
+// "+ Add" field accepts a single ID OR a bulk paste of many separated by
+// whitespace / newline / comma / semicolon — useful when migrating from
+// the desktop config or pasting a freshly-deployed batch (issue: bulk add).
 // =========================================================================
+
+/** Split a bulk-pasted blob into individual entries. */
+private val ID_SEPARATORS = Regex("[\\s,;]+")
 
 @Composable
 private fun DeploymentIdsField(
@@ -732,6 +738,8 @@ private fun DeploymentIdsField(
         )
 
         // Existing entries — each with its own row and a remove button.
+        // A bulk paste into an existing row also expands into multiple
+        // entries, so users don't have to find the "+ Add" field to do it.
         urls.forEachIndexed { index, url ->
             Row(
                 verticalAlignment = Alignment.CenterVertically,
@@ -740,8 +748,18 @@ private fun DeploymentIdsField(
                 OutlinedTextField(
                     value = url,
                     onValueChange = { edited ->
+                        val parts = edited.split(ID_SEPARATORS).filter { it.isNotBlank() }
                         val updated = urls.toMutableList()
-                        updated[index] = edited
+                        if (parts.size > 1) {
+                            // Bulk paste into this row: expand in place.
+                            updated.removeAt(index)
+                            updated.addAll(index, parts)
+                        } else {
+                            // Normal typing — preserve raw input so the
+                            // caret/whitespace doesn't get reformatted on
+                            // every keystroke.
+                            updated[index] = edited
+                        }
                         onChange(updated)
                     },
                     enabled = enabled,
@@ -761,9 +779,11 @@ private fun DeploymentIdsField(
             }
         }
 
-        // "Add" row: text field + button.
+        // "Add" row: multi-line text field + button. Multi-line so a user
+        // can paste a long list at once (newline-separated is the natural
+        // form when copying out of the desktop UI's textarea).
         Row(
-            verticalAlignment = Alignment.CenterVertically,
+            verticalAlignment = Alignment.Top,
             modifier = Modifier.fillMaxWidth(),
         ) {
             OutlinedTextField(
@@ -771,15 +791,17 @@ private fun DeploymentIdsField(
                 onValueChange = { newEntry = it },
                 enabled = enabled,
                 modifier = Modifier.weight(1f),
-                singleLine = true,
-                placeholder = { Text("Paste URL or ID") },
+                singleLine = false,
+                minLines = 1,
+                maxLines = 6,
+                placeholder = { Text(stringResource(R.string.placeholder_paste_ids)) },
             )
             Spacer(Modifier.width(8.dp))
             Button(
                 onClick = {
-                    val trimmed = newEntry.trim()
-                    if (trimmed.isNotBlank()) {
-                        onChange(urls + trimmed)
+                    val parts = newEntry.split(ID_SEPARATORS).filter { it.isNotBlank() }
+                    if (parts.isNotEmpty()) {
+                        onChange(urls + parts)
                         newEntry = ""
                     }
                 },
