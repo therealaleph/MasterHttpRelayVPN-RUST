@@ -308,9 +308,17 @@ impl ProxyServer {
         // doesn't pay a fresh TLS handshake to Google edge. Best-effort;
         // failures are logged and ignored. Skipped in `google_only` — there
         // is no fronter to warm.
+        //
+        // Sized to roughly match a browser's parallel-connection burst at
+        // startup. The previous fixed `3` was fine for a single deployment
+        // but left requests 4-10 of the opening burst paying a cold TLS
+        // handshake each (~300ms). Scaling with deployment count gives
+        // multi-account configs a proportionally warmer pool, capped so
+        // single-deployment users don't hammer Google edge unnecessarily.
         if let Some(warm_fronter) = self.fronter.clone() {
+            let n = warm_fronter.num_scripts().clamp(6, 16);
             tokio::spawn(async move {
-                warm_fronter.warm(3).await;
+                warm_fronter.warm(n).await;
             });
         }
 
@@ -503,6 +511,20 @@ async fn handle_http_client(
 
     if method.eq_ignore_ascii_case("CONNECT") {
         let (host, port) = parse_host_port(&target);
+        // Mirror the SOCKS5 short-circuit: if the tunnel-node just failed
+        // this (host, port) with unreachable, return 502 immediately rather
+        // than acknowledging the CONNECT and blowing tunnel quota on a
+        // guaranteed retry. See `TunnelMux::is_unreachable` for context.
+        if let Some(ref mux) = tunnel_mux {
+            if mux.is_unreachable(&host, port) {
+                tracing::info!("CONNECT {}:{} (negative-cached, refusing)", host, port);
+                let _ = sock
+                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+                let _ = sock.flush().await;
+                return Ok(());
+            }
+        }
         sock.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
         sock.flush().await?;
@@ -598,6 +620,21 @@ async fn handle_socks5_client(
     if cmd == 0x03 {
         tracing::info!("SOCKS5 UDP ASSOCIATE requested for {}:{}", host, port);
         return handle_socks5_udp_associate(sock, rewrite_ctx, tunnel_mux).await;
+    }
+
+    // Negative-cache short-circuit: if the tunnel-node just failed to reach
+    // this exact (host, port) with `Network is unreachable` / `No route to
+    // host`, reply 0x04 (Host unreachable) immediately. Saves a 1.5–2s tunnel
+    // round-trip on guaranteed-failing targets — the IPv6 probe retry loop
+    // is the main offender on devices without IPv6.
+    if let Some(ref mux) = tunnel_mux {
+        if mux.is_unreachable(&host, port) {
+            tracing::info!("SOCKS5 CONNECT -> {}:{} (negative-cached, refusing)", host, port);
+            sock.write_all(&[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await?;
+            sock.flush().await?;
+            return Ok(());
+        }
     }
 
     tracing::info!("SOCKS5 CONNECT -> {}:{}", host, port);
