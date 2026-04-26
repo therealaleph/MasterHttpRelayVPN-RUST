@@ -77,6 +77,9 @@ jobs:
           - target: x86_64-pc-windows-gnu
             os: windows-latest
             name: mhrv-rs-windows-amd64
+          - target: i686-pc-windows-msvc
+            os: windows-latest
+            name: mhrv-rs-windows-i686  
           - target: x86_64-unknown-linux-musl
             os: [self-hosted, linux, x64, mhrv-build]
             name: mhrv-rs-linux-musl-amd64
