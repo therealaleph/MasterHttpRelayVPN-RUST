@@ -59,7 +59,6 @@ object Tun2proxy {
         tunMtu: Char,
         verbosity: Int,
         dnsStrategy: Int,
-        udpgwServer: String,
     ): Int
 
     /** Signals the running `run()` to shut down. Idempotent. */

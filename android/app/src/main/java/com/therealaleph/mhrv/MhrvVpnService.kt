@@ -259,21 +259,20 @@ class MhrvVpnService : VpnService() {
         //    the sole owner once it's running.
         val detachedFd = parcelFd.detachFd()
         tun2proxyRunning.set(true)
-        // In full mode, enable udpgw so UDP traffic (DNS, QUIC, …) is
-        // forwarded through the tunnel-node's native udpgw handler.
-        // 198.18.0.1:7300 is a magic address the tunnel-node intercepts.
-        val udpgwAddr = if (cfg.mode == Mode.FULL) "198.18.0.1:7300" else ""
+        // Use tun2proxy_run_with_cli_args C API via dlsym — gives full
+        // CLI flexibility including --udpgw-server, no fork needed.
+        val cliArgs = buildString {
+            append("tun2proxy")
+            append(" --proxy socks5://127.0.0.1:$socks5Port")
+            append(" --tun-fd $detachedFd")
+            append(" --dns virtual")
+            append(" --verbosity info")
+            append(" --close-fd-on-drop true")
+            if (cfg.mode == Mode.FULL) append(" --udpgw-server 198.18.0.1:7300")
+        }
         val worker = Thread({
             try {
-                val rc = Tun2proxy.run(
-                    "socks5://127.0.0.1:$socks5Port",
-                    detachedFd,
-                    /* closeFdOnDrop = */ true,
-                    MTU.toChar(),
-                    /* verbosity = info */ 3,
-                    /* dnsStrategy = virtual */ 0,
-                    udpgwAddr,
-                )
+                val rc = Native.runTun2proxy(cliArgs, MTU)
                 Log.i(TAG, "tun2proxy exited rc=$rc")
             } catch (t: Throwable) {
                 Log.e(TAG, "tun2proxy crashed: ${t.message}", t)

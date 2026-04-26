@@ -482,3 +482,53 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_statsJson<'a>(
     }));
     env.new_string(out).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
+
+// ---------------------------------------------------------------------------
+// tun2proxy CLI API wrapper (dlsym — no fork or patch needed)
+// ---------------------------------------------------------------------------
+
+/// `Native.runTun2proxy(cliArgs, tunMtu)` -> int
+///
+/// Calls `tun2proxy_run_with_cli_args` from libtun2proxy.so via dlsym.
+/// This is the C API the tun2proxy maintainer recommends for callers that
+/// need full CLI flexibility (e.g. --udpgw-server). BLOCKS until shutdown.
+#[no_mangle]
+pub extern "system" fn Java_com_therealaleph_mhrv_Native_runTun2proxy<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass,
+    cli_args: JString,
+    tun_mtu: jni::sys::jint,
+) -> jni::sys::jint {
+    safe(-1, AssertUnwindSafe(|| {
+        let args_str = jstring_to_string(&mut env, &cli_args);
+        tracing::info!("runTun2proxy: cli={}", args_str);
+
+        unsafe {
+            use std::ffi::{CStr, CString};
+
+            let lib = CString::new("libtun2proxy.so").unwrap();
+            let handle = libc::dlopen(lib.as_ptr(), libc::RTLD_NOW);
+            if handle.is_null() {
+                let err = CStr::from_ptr(libc::dlerror());
+                tracing::error!("dlopen libtun2proxy.so failed: {:?}", err);
+                return -10;
+            }
+
+            let sym = CString::new("tun2proxy_run_with_cli_args").unwrap();
+            let func = libc::dlsym(handle, sym.as_ptr());
+            if func.is_null() {
+                let err = CStr::from_ptr(libc::dlerror());
+                tracing::error!("dlsym tun2proxy_run_with_cli_args: {:?}", err);
+                libc::dlclose(handle);
+                return -11;
+            }
+
+            type RunFn = unsafe extern "C" fn(*const std::ffi::c_char, u16, bool) -> i32;
+            let run: RunFn = std::mem::transmute(func);
+            let c_args = CString::new(args_str).unwrap();
+            let rc = run(c_args.as_ptr(), tun_mtu as u16, false);
+            libc::dlclose(handle);
+            rc
+        }
+    }))
+}
