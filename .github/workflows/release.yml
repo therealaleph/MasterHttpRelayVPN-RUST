@@ -676,10 +676,38 @@ jobs:
           ref: main
           fetch-depth: 0
 
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          merge-multiple: true
+      # Pull artifacts from the GitHub Release page (which the `release`
+      # job populated a few seconds earlier) rather than the workflow
+      # artifacts API. The artifacts API path —
+      # `actions/download-artifact@v4` with `merge-multiple: true` —
+      # has been failing with "artifact download failed after 5
+      # retries" on one of the ~13 artifacts on multiple consecutive
+      # runs (v1.7.5 retrigger, v1.7.6). The 10 fast downloads that
+      # complete first all succeed; the 11th-13th hit the error.
+      # `gh release download` reads from GitHub's Release-page CDN,
+      # which is independent of the artifacts blob store and has a
+      # different retry / rate-limit profile. Same files, more
+      # reliable surface.
+      - name: Download artifacts from the GitHub Release page
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VER="${{ inputs.version || github.ref_name }}"
+          # Strip leading `v` to normalize, then re-add — the Release
+          # tag is `vX.Y.Z`, but for the rest of the workflow we use
+          # bare `X.Y.Z`. Mirror the same pattern here so a downstream
+          # readme update can use the bare version.
+          VER="${VER#v}"
+          mkdir -p artifacts
+          gh release download "v${VER}" \
+            --repo "${{ github.repository }}" \
+            --dir artifacts \
+            --pattern '*.tar.gz' \
+            --pattern '*.zip' \
+            --pattern '*.apk'
+          echo "--- artifacts/ contents ---"
+          ls -la artifacts/
 
       - name: Refresh releases/ folder
         run: |
