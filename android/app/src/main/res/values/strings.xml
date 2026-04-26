@@ -24,6 +24,7 @@
     <string name="btn_test">Test</string>
     <string name="btn_add">Add</string>
     <string name="btn_clear">Clear</string>
+    <string name="btn_copy">Copy</string>
     <string name="btn_install">Install</string>
     <string name="btn_cancel">Cancel</string>
 
@@ -78,6 +79,7 @@
     <string name="snack_google_ip_updated">google_ip updated to %1$s</string>
     <string name="snack_google_ip_current">google_ip already current (%1$s)</string>
     <string name="snack_dns_lookup_failed">DNS lookup failed — check network</string>
+    <string name="snack_logs_copied">Logs copied to clipboard</string>
 
     <!-- Usage today card -->
     <string name="sec_usage_today">Usage today (estimated)</string>

@@ -1,5 +1,6 @@
 package com.therealaleph.mhrv.ui
 
+import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -9,6 +10,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
@@ -23,7 +25,9 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
@@ -1231,6 +1235,8 @@ private fun LiveLogPane() {
     val lines = remember { mutableStateListOf<String>() }
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
+    val clipboard = LocalClipboardManager.current
+    val ctx = LocalContext.current
 
     // Pull from the ring buffer periodically. We pull even while the
     // section is collapsed (cheap), so re-expanding shows fresh tail.
@@ -1260,24 +1266,41 @@ private fun LiveLogPane() {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.weight(1f),
             )
-            TextButton(onClick = { lines.clear() }) { Text("Clear") }
+            TextButton(
+                enabled = lines.isNotEmpty(),
+                onClick = {
+                    clipboard.setText(AnnotatedString(lines.joinToString("\n")))
+                    Toast.makeText(
+                        ctx,
+                        ctx.getString(R.string.snack_logs_copied),
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                },
+            ) { Text(stringResource(R.string.btn_copy)) }
+            TextButton(onClick = { lines.clear() }) { Text(stringResource(R.string.btn_clear)) }
         }
         Surface(
             color = MaterialTheme.colorScheme.surfaceVariant,
             shape = RoundedCornerShape(8.dp),
             modifier = Modifier.fillMaxWidth().heightIn(min = 160.dp, max = 320.dp),
         ) {
-            LazyColumn(
-                state = listState,
-                modifier = Modifier.padding(8.dp),
-            ) {
-                items(lines) { line ->
-                    Text(
-                        line,
-                        style = MaterialTheme.typography.bodySmall,
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 11.sp,
-                    )
+            // SelectionContainer makes log lines selectable for manual
+            // copy of partial ranges. Cross-line selection works within the
+            // currently rendered window; for "copy everything" the Copy
+            // button above is the reliable path.
+            SelectionContainer {
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier.padding(8.dp),
+                ) {
+                    items(lines) { line ->
+                        Text(
+                            line,
+                            style = MaterialTheme.typography.bodySmall,
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 11.sp,
+                        )
+                    }
                 }
             }
         }

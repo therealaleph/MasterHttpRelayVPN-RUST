@@ -24,6 +24,7 @@
     <string name="btn_test">تست</string>
     <string name="btn_add">افزودن</string>
     <string name="btn_clear">پاک</string>
+    <string name="btn_copy">کپی</string>
     <string name="btn_install">نصب</string>
     <string name="btn_cancel">انصراف</string>
 
@@ -78,6 +79,7 @@
     <string name="snack_google_ip_updated">google_ip به %1$s به‌روزرسانی شد</string>
     <string name="snack_google_ip_current">google_ip قبلاً به‌روز است (%1$s)</string>
     <string name="snack_dns_lookup_failed">خطای DNS — اتصال شبکه را بررسی کنید</string>
+    <string name="snack_logs_copied">لاگ‌ها در کلیپ‌بورد کپی شدند</string>
 
     <!-- Usage today card -->
     <string name="sec_usage_today">مصرف امروز (تخمینی)</string>
