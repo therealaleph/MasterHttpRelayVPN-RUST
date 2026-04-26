@@ -203,7 +203,7 @@ pub fn is_udpgw_dest(host: &str, port: u16) -> bool {
 /// continuously receives datagrams and queues response frames.
 struct ConnSocket {
     sock: Arc<UdpSocket>,
-    _reader: tokio::task::JoinHandle<()>,
+    _reader: tokio::task::AbortHandle,
 }
 
 /// Run the udpgw server over a duplex stream. Reads udpgw frames from the
@@ -262,10 +262,8 @@ pub async fn udpgw_server_task(stream: DuplexStream) {
         }
     }
 
-    // Abort all reader tasks on shutdown.
-    for (_, cs) in sockets {
-        cs._reader.abort();
-    }
+    // AbortHandle::drop aborts each reader task automatically.
+    drop(sockets);
     tracing::debug!("udpgw session ended");
 }
 
@@ -325,7 +323,7 @@ async fn get_or_create_socket(
         }
     });
 
-    sockets.insert(key, ConnSocket { sock: sock.clone(), _reader: reader });
+    sockets.insert(key, ConnSocket { sock: sock.clone(), _reader: reader.abort_handle() });
     Some(sock)
 }
 
