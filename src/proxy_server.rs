@@ -1862,7 +1862,7 @@ where
     // pourya-p's log in #64 showed the real Host header. Match every
     // subdomain of x.com here.
     let host_lower = host.to_ascii_lowercase();
-    let is_x_com = host_lower == "x.com" || host_lower.ends_with(".x.com");
+    let is_x_com = host_lower == "x.com" || host_lower.ends_with(".x.com") || host_lower == "twitter.com" || host_lower.ends_with(".twitter.com");
     let path = if is_x_com && path.starts_with("/i/api/graphql/") && path.contains("?variables=") {
         match path.split_once('&') {
             Some((short, _)) => {
