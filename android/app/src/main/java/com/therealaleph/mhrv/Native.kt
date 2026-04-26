@@ -95,4 +95,14 @@ object Native {
      * Cheap — just reads atomics. Safe to poll on a second-scale timer.
      */
     external fun statsJson(handle: Long): String
+
+    /**
+     * Start tun2proxy via its CLI args C API (`tun2proxy_run_with_cli_args`).
+     * Resolved at runtime via dlsym from libtun2proxy.so — no fork needed.
+     *
+     * @param cliArgs full CLI string, e.g. "tun2proxy --proxy socks5://... --tun-fd 42 --udpgw-server 198.18.0.1:7300"
+     * @param tunMtu TUN MTU (typically 1500)
+     * @return 0 on normal shutdown, negative on error. BLOCKS.
+     */
+    external fun runTun2proxy(cliArgs: String, tunMtu: Int): Int
 }

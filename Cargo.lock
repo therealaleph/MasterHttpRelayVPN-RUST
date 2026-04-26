@@ -3961,7 +3961,8 @@ dependencies = [
 [[package]]
 name = "tun2proxy"
 version = "0.7.21"
-source = "git+https://github.com/yyoyoian-pixel/tun2proxy?branch=feat%2Fudpgw-jni-param#dfc24ed12cdee69987bdd321ea55c6b940f2d0f0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d336ad07beb04a9e219972fcdc54a71d2586cdfd35ac03551a629e4ca328db3c"
 dependencies = [
  "android_logger",
  "async-trait",
