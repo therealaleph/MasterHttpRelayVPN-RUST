@@ -1,0 +1,65 @@
+# Updates the draft GitHub release on every push to main, and applies
+# Conventional-Commit-derived labels to incoming PRs. Config lives in
+# `.github/release-drafter.yml`. The drafter writes one line per merged
+# PR into a draft release tagged `next`; `prepare-release.yml` reads
+# that body when bumping versions so the English half of
+# `docs/changelog/v<ver>.md` is prefilled.
+#
+# Cost: one ubuntu-latest job per relevant PR/push event, single API
+# call, no compile, no tests. Zero contention with the self-hosted
+# Hetzner runners that release.yml uses.
+
+name: release-drafter
+
+on:
+  push:
+    branches: [main]
+  # `pull_request_target` runs in the context of the base branch (main),
+  # which is what the autolabeler needs to write labels back to PRs —
+  # including PRs from forks, which the regular `pull_request` event
+  # doesn't grant write permissions for. We never check out PR code
+  # in this workflow (only call the action), so the elevated context
+  # is safe.
+  pull_request_target:
+    types: [opened, reopened, synchronize, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  update-draft:
+    permissions:
+      contents: write       # write the draft release object
+      pull-requests: write  # apply autolabeler labels to incoming PRs
+    runs-on: ubuntu-latest
+    steps:
+      # Ensure the labels referenced by .github/release-drafter.yml's
+      # autolabeler block all exist. release-drafter logs a warning and
+      # skips when it tries to apply a label that's missing — labelling
+      # itself doesn't fail, but exclude-labels and downstream filtering
+      # become silent no-ops. `gh label create … || true` is idempotent:
+      # creates on first run, exits with "already exists" on every run
+      # after that. Cheap (5 API calls per workflow run, no compile).
+      - name: Ensure autolabeler labels exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Format: name|color|description (color without leading #).
+          while IFS='|' read -r name color desc; do
+            gh label create "$name" --color "$color" --description "$desc" \
+              --repo "${{ github.repository }}" 2>/dev/null || true
+          done <<'LABELS'
+          release-prep|ededed|Automated version-bump PR; excluded from release-drafter changelog
+          type: feature|a2eeef|feat: PR — auto-applied by release-drafter
+          type: fix|d73a4a|fix: PR — auto-applied by release-drafter
+          type: chore|cfd3d7|chore: PR — auto-applied by release-drafter
+          type: docs|0075ca|docs: PR — auto-applied by release-drafter
+          type: refactor|fbca04|refactor: PR — auto-applied by release-drafter
+          LABELS
+
+      - uses: release-drafter/release-drafter@v6
+        with:
+          config-name: release-drafter.yml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

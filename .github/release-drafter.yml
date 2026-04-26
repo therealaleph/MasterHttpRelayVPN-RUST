@@ -1,0 +1,79 @@
+# release-drafter config — accumulates merged-PR titles into a draft GitHub
+# Release as PRs land on main, so the English half of docs/changelog/v<ver>.md
+# is prefilled by the time we cut the next release.
+#
+# How it fits with the existing release flow:
+#   - PRs merge → release-drafter updates the draft release tagged `next`
+#   - When ready to ship, run `prepare-release.yml` which reads the draft
+#     body and writes it into `docs/changelog/v<ver>.md` as a stub
+#   - You translate the bullets into Persian above the `---` separator,
+#     merge the prep PR, push the `v<ver>` tag, and release.yml takes over
+#
+# The draft is tagged `next` (not `vX.Y.Z`) so it never collides with the
+# real release-tag namespace. softprops/action-gh-release in release.yml
+# will create a fresh release for the actual `vX.Y.Z` tag — the `next`
+# draft just gets reset by release-drafter on the following PR merge.
+
+name-template: 'Next release (draft)'
+tag-template: 'next'
+
+# Flat bullet template — one line per merged PR, matching the existing
+# docs/changelog/v<ver>.md style:
+#
+#   • <verb-first headline> ([#NN](url)): <full explanation>. Thanks @user
+#
+# We bake the `: <expand>. Thanks @AUTHOR` suffix directly into the
+# template so the maintainer's job is just (a) strip the leading
+# `feat:`/`fix:` Conventional-Commit prefix that PR titles in this repo
+# carry (prepare-release.yml does this automatically with a sed pass),
+# (b) fix the verb tense if needed (`added` → `Add`), and (c) replace
+# `<expand>` with the explanatory clause.
+#
+# Why the placeholder is part of the template and not added later:
+# putting it here means the no-changes-template fallback (below) does
+# *not* get a `<expand>` suffix — only real PR-derived bullets do.
+change-template: '• $TITLE ([#$NUMBER]($URL)): <expand>. Thanks @$AUTHOR'
+change-title-escapes: '\<*_&'
+
+# Fallback if no PRs have merged since the last draft reset. Rare in
+# practice; here as a safety net so the draft body is never empty.
+# Deliberately doesn't follow the `<expand>`-bullet shape so it's
+# obviously a placeholder line, not a real release entry.
+no-changes-template: '_(no PR-tracked changes since the last release)_'
+
+# Skip PRs labelled `release-prep` from the changelog — those are the
+# automated version-bump PRs opened by prepare-release.yml; including
+# them would echo "release: prepare v1.6.6" into the next release notes.
+exclude-labels:
+  - 'release-prep'
+  - 'skip-changelog'
+
+# Auto-apply labels based on Conventional Commit title prefixes. The repo
+# already enforces feat:/fix:/etc. on PR titles, so this is "free" — no
+# contributor action needed. Labels feed the exclude-labels above and
+# also unlock PR filtering on the GitHub issues page if we want it later.
+autolabeler:
+  - label: 'release-prep'
+    title:
+      - '/^release:/i'
+  - label: 'type: feature'
+    title:
+      - '/^feat(\(.+\))?:/i'
+  - label: 'type: fix'
+    title:
+      - '/^fix(\(.+\))?:/i'
+  - label: 'type: chore'
+    title:
+      - '/^chore(\(.+\))?:/i'
+  - label: 'type: docs'
+    title:
+      - '/^docs?(\(.+\))?:/i'
+  - label: 'type: refactor'
+    title:
+      - '/^refactor(\(.+\))?:/i'
+
+# Body of the draft release: just the flat bullet list. No "What's
+# Changed" header, no contributors block — keep it copy-paste-ready
+# into docs/changelog/v<ver>.md.
+template: |
+  $CHANGES

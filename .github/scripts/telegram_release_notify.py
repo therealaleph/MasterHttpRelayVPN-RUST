@@ -46,16 +46,42 @@ import uuid
 from pathlib import Path
 
 
+def _strip_leading_comments(body: str) -> str:
+    """Strip leading HTML comment blocks (single- or multi-line) from `body`.
+
+    The changelog template uses `<!-- ... -->` to document the format for
+    editors; we don't want those echoed to Telegram or the GitHub Release
+    page. The `(?:...)+` quantifier eats N consecutive comments separated
+    only by whitespace, so a stub with both a format-docs comment and a
+    TODO comment is cleaned in one pass. `re.S` makes `.` cross newlines
+    for multi-line `<!--\\n...\\n-->` blocks.
+
+    The matching regex is also used inline by .github/workflows/release.yml
+    to compose the GitHub Release body — keep them in sync if you change
+    one. Run `python -m doctest telegram_release_notify.py -v` to check.
+
+    >>> _strip_leading_comments("<!-- header -->\\nbody")
+    'body'
+    >>> _strip_leading_comments("<!-- a -->\\n<!-- b -->\\nbody")
+    'body'
+    >>> _strip_leading_comments("<!--\\nmulti\\nline\\n-->\\nbody")
+    'body'
+    >>> _strip_leading_comments("<!-- a -->\\n\\n<!-- b -->\\n\\nbody")
+    'body'
+    >>> _strip_leading_comments("body without comments")
+    'body without comments'
+    >>> _strip_leading_comments("body\\n<!-- mid-file comment -->\\nmore")
+    'body\\n<!-- mid-file comment -->\\nmore'
+    """
+    return re.sub(r"^\s*(?:<!--.*?-->\s*)+", "", body, count=1, flags=re.S)
+
+
 def parse_changelog(path: str) -> tuple[str, str]:
     """Return (persian_body, english_body). Blank strings if file missing."""
     p = Path(path)
     if not p.is_file():
         return "", ""
-    body = p.read_text(encoding="utf-8")
-    # Strip a leading HTML comment block if present — the changelog
-    # template uses <!-- ... --> to document the format for editors;
-    # we don't want that echoed to Telegram.
-    body = re.sub(r"^\s*<!--.*?-->\s*", "", body, count=1, flags=re.S)
+    body = _strip_leading_comments(p.read_text(encoding="utf-8"))
     fa, sep, en = body.partition("\n---\n")
     if not sep:
         # No separator — treat everything as Persian (content-language

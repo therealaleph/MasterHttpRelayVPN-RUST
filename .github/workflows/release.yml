@@ -608,8 +608,22 @@ jobs:
           fi
           {
             echo 'body<<__RELEASE_BODY_EOF__'
-            # Strip leading HTML comment that documents the file format.
-            sed -e '1{/^<!--/d;}' "$CHANGELOG"
+            # Strip leading HTML comment blocks (single-line OR multi-line)
+            # using the SAME regex as
+            # .github/scripts/telegram_release_notify.py:parse_changelog,
+            # so the GitHub Release page and the Telegram post agree on
+            # exactly what counts as "the leading comment block." Both
+            # also strip any leading whitespace/blank lines that follow.
+            #
+            # Quoted heredoc (`<<'PY'`) so backticks/$ in the python
+            # snippet aren't shell-interpolated; CHANGELOG is passed in
+            # as an env var on the python invocation rather than via
+            # `$CHANGELOG` interpolation inside the heredoc.
+            CHANGELOG_PATH="$CHANGELOG" python3 - <<'PY'
+          import os, re, pathlib
+          body = pathlib.Path(os.environ["CHANGELOG_PATH"]).read_text(encoding="utf-8")
+          print(re.sub(r"^\s*(?:<!--.*?-->\s*)+", "", body, count=1, flags=re.S), end="")
+          PY
             echo
             echo '__RELEASE_BODY_EOF__'
           } >> "$GITHUB_OUTPUT"

