@@ -59,7 +59,7 @@
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="mhrv" />
+                <data android:scheme="mhrv-rs" />
             </intent-filter>
         </activity>
 

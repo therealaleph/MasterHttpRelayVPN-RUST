@@ -45,6 +45,20 @@ fun ConfigSharingBar(
     onImport: (MhrvConfig) -> Unit,
     onSnackbar: suspend (String) -> Unit,
 ) {
+    // Deep link import — requires confirmation before applying.
+    val deepLinkCfg by com.therealaleph.mhrv.MainActivity.pendingDeepLinkConfig
+    if (deepLinkCfg != null) {
+        ImportConfirmDialog(
+            cfg = deepLinkCfg!!,
+            onConfirm = {
+                onImport(deepLinkCfg!!)
+                com.therealaleph.mhrv.MainActivity.pendingDeepLinkConfig.value = null
+            },
+            onDismiss = {
+                com.therealaleph.mhrv.MainActivity.pendingDeepLinkConfig.value = null
+            },
+        )
+    }
     val ctx = LocalContext.current
     val clipboard = LocalClipboardManager.current
     val scope = rememberCoroutineScope()
@@ -241,32 +255,76 @@ fun ConfigSharingBar(
         }
     }
 
-    // --- Import confirmation dialog ---
+    // --- Import confirmation dialog (clipboard + QR scan) ---
     if (showImportConfirm && pendingImport != null) {
-        AlertDialog(
-            onDismissRequest = {
+        ImportConfirmDialog(
+            cfg = pendingImport!!,
+            onConfirm = {
+                onImport(pendingImport!!)
+                clipboard.setText(AnnotatedString(""))
+                showImportConfirm = false
+                pendingImport = null
+                scope.launch { onSnackbar(ctx.getString(R.string.snack_config_imported)) }
+            },
+            onDismiss = {
                 showImportConfirm = false
                 pendingImport = null
             },
-            title = { Text(stringResource(R.string.dialog_import_title)) },
-            text = { Text(stringResource(R.string.dialog_import_body)) },
-            confirmButton = {
-                TextButton(onClick = {
-                    pendingImport?.let { onImport(it) }
-                    clipboard.setText(AnnotatedString(""))
-                    showImportConfirm = false
-                    pendingImport = null
-                    scope.launch { onSnackbar(ctx.getString(R.string.snack_config_imported)) }
-                }) { Text("Import") }
-            },
-            dismissButton = {
-                TextButton(onClick = {
-                    showImportConfirm = false
-                    pendingImport = null
-                }) { Text(stringResource(R.string.btn_cancel)) }
-            },
         )
     }
+}
+
+// =========================================================================
+// Import confirmation dialog — shared by clipboard, QR scan, and deep link.
+// Shows deployment IDs, mode, and a trust warning before overwriting config.
+// =========================================================================
+
+@Composable
+private fun ImportConfirmDialog(
+    cfg: MhrvConfig,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val ids = cfg.appsScriptUrls.mapNotNull { url ->
+        val marker = "/macros/s/"
+        val i = url.indexOf(marker)
+        val raw = if (i >= 0) url.substring(i + marker.length).substringBefore("/") else url
+        raw.trim().takeIf { it.isNotEmpty() }
+    }
+    val preview = ids.take(3).joinToString("\n") { "  ${it.take(20)}…" }
+    val modeLabel = when (cfg.mode) {
+        com.therealaleph.mhrv.Mode.APPS_SCRIPT -> "apps_script"
+        com.therealaleph.mhrv.Mode.GOOGLE_ONLY -> "google_only"
+        com.therealaleph.mhrv.Mode.FULL -> "full"
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.dialog_import_title)) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    "Importing routes your traffic through the deployment IDs in this config. Only import from trusted sources.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+                Text(
+                    "Mode: $modeLabel\nDeployments: ${ids.size}\n$preview",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                Text(
+                    stringResource(R.string.dialog_import_body),
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm) { Text("Import") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.btn_cancel)) }
+        },
+    )
 }
 
 // =========================================================================

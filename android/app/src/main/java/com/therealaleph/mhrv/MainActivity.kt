@@ -81,7 +81,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Handle mhrv:// deep link — auto-import config.
         handleDeepLink(intent)
 
         setContent {
@@ -96,14 +95,16 @@ class MainActivity : AppCompatActivity() {
         handleDeepLink(intent)
     }
 
+    /** Stash decoded config from deep link for the UI to confirm — never
+     *  auto-import. The composable reads this and shows a confirmation
+     *  dialog with the deployment IDs and a trust warning. */
     private fun handleDeepLink(intent: Intent?) {
         val data = intent?.data ?: return
-        if (data.scheme != "mhrv") return
-        val encoded = data.toString()
-        val cfg = ConfigStore.decode(encoded) ?: return
-        ConfigStore.save(this, cfg)
-        android.widget.Toast.makeText(this, "Config imported", android.widget.Toast.LENGTH_SHORT).show()
+        if (data.scheme != "mhrv-rs") return
+        val cfg = ConfigStore.decode(data.toString()) ?: return
+        pendingDeepLinkConfig.value = cfg
     }
+
 
     @Composable
     private fun AppRoot() {
@@ -254,5 +255,7 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val REQ_NOTIF = 42
+        /** Deep link config waiting for user confirmation. Read by ConfigSharingBar. */
+        val pendingDeepLinkConfig = mutableStateOf<MhrvConfig?>(null)
     }
 }

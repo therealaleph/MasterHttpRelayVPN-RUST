@@ -242,7 +242,7 @@ object ConfigStore {
     }
 
     /** Prefix for encoded config strings so we can detect them in clipboard. */
-    private const val HASH_PREFIX = "mhrv://"
+    private const val HASH_PREFIX = "mhrv-rs://"
 
     /** Encode config as a shareable base64 string with prefix.
      *  Only includes non-default fields to keep the hash short. */
