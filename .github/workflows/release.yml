@@ -79,7 +79,16 @@ jobs:
             name: mhrv-rs-windows-amd64
           - target: i686-pc-windows-msvc
             os: windows-latest
-            name: mhrv-rs-windows-i686  
+            name: mhrv-rs-windows-i686
+            # Pin Rust 1.77.2 specifically for this target. Rust 1.78
+            # (May 2024) raised the Windows MSRV from Win7 to Win10 by
+            # switching std::time to GetSystemTimePreciseAsFileTime, a
+            # kernel32 export that doesn't exist on Win7. The whole
+            # reason this target ships is to support legacy Win7 32-bit
+            # boxes (#272), so a stock-stable build defeats the purpose.
+            # 1.77.2 is the last stable that produces a Win7-loadable
+            # binary; other targets stay on @stable. (Fixes #318.)
+            rust_toolchain: "1.77.2"
           - target: x86_64-unknown-linux-musl
             os: [self-hosted, linux, x64, mhrv-build]
             name: mhrv-rs-linux-musl-amd64
@@ -141,9 +150,14 @@ jobs:
       # installed and the standard target triples are pre-added. It
       # still verifies the target is present and is cheap enough to keep
       # as a safety net.
-      - uses: dtolnay/rust-toolchain@stable
+      # Per-matrix-entry toolchain selection. Default is `stable` (latest)
+      # for every target except where `rust_toolchain` is explicitly pinned
+      # — currently just i686-pc-windows-msvc, which needs 1.77.2 to keep
+      # the Win7 binary loadable (Rust 1.78+ raised Windows MSRV to Win10).
+      - uses: dtolnay/rust-toolchain@master
         if: matrix.mipsel_softfloat != true
         with:
+          toolchain: ${{ matrix.rust_toolchain || 'stable' }}
           targets: ${{ matrix.target }}
 
       # Cache target/ + cargo registry across runs — this is the big
@@ -162,7 +176,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: matrix.mipsel_softfloat != true
         with:
-          key: ${{ matrix.target }}
+          # Include toolchain in the cache key so a pinned-Rust target
+          # (i686-pc-windows-msvc on 1.77.2) doesn't collide with
+          # stable-Rust caches for other targets, and a future toolchain
+          # bump invalidates only the affected slot.
+          key: ${{ matrix.target }}-${{ matrix.rust_toolchain || 'stable' }}
           cache-bin: "false"
 
       # eframe needs a few system libs on Linux for window management, keyboard,
