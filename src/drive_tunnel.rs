@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use futures_util::stream::{self, StreamExt};
 use rand::RngCore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -16,6 +17,12 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::config::Config;
 use crate::google_drive::{DriveError, GoogleDriveBackend};
+
+/// Maximum number of concurrent uploads/downloads in flight against
+/// Drive. Matches FlowDriver's `e.sem = make(chan struct{}, 8)`. Uses
+/// HTTP/2 multiplexing on a single TLS connection, so the cost of bumping
+/// this is just a few more in-flight streams — no extra handshakes.
+const STORAGE_CONCURRENCY: usize = 8;
 
 const MAGIC_BYTE: u8 = 0x1f;
 /// Bumped whenever the wire format changes. v1 added a flags byte
@@ -381,13 +388,36 @@ impl DriveEngine {
             muxes.entry(cid).or_default().push(env);
         }
 
+        // Encode all mux files up front (CPU only, fast), then ship them
+        // in parallel. With one client this is one upload — no win — but
+        // the server side typically has several active clients and the
+        // parallelism plus HTTP/2 multiplexing folds them into a single
+        // round-trip's worth of latency.
+        let mut uploads: Vec<(String, Vec<u8>)> = Vec::with_capacity(muxes.len());
         for (cid, envelopes) in muxes {
             let filename = format!("{}-{}-mux-{}.bin", self.my_dir.as_str(), cid, now_nanos());
             let mut body = Vec::new();
             for env in &envelopes {
                 env.encode(&mut body)?;
             }
-            self.backend.upload(&filename, body).await?;
+            uploads.push((filename, body));
+        }
+        if !uploads.is_empty() {
+            let backend = self.backend.clone();
+            let results: Vec<Result<(), DriveError>> = stream::iter(uploads.into_iter().map(
+                |(name, body)| {
+                    let backend = backend.clone();
+                    async move { backend.upload(&name, body).await }
+                },
+            ))
+            .buffer_unordered(STORAGE_CONCURRENCY)
+            .collect()
+            .await;
+            for r in results {
+                if let Err(e) = r {
+                    tracing::debug!("Drive upload error: {}", e);
+                }
+            }
         }
 
         if !closed_ids.is_empty() {
@@ -438,47 +468,87 @@ impl DriveEngine {
 
         let stale_cutoff = SystemTime::now().checked_sub(STARTUP_STALE_TTL);
 
-        for file in files {
-            if let (Some(cutoff), Some(created)) = (stale_cutoff, file.created_time) {
-                if created < cutoff {
-                    let _ = self.backend.delete(&file.name).await;
-                    continue;
+        // Pre-filter: drop stale files (created > 5 min ago is most
+        // likely a leftover from a previous run on the peer; nuking it
+        // is safer than re-processing) and skip files we already
+        // downloaded but haven't garbage-collected from `processed`
+        // yet. Mark the survivors as processed up front so a slow
+        // download doesn't get re-fetched on the next poll cycle.
+        let mut to_download: Vec<String> = Vec::with_capacity(files.len());
+        let mut to_delete_stale: Vec<String> = Vec::new();
+        {
+            let mut processed = self.processed.lock().await;
+            for file in files {
+                if let (Some(cutoff), Some(created)) = (stale_cutoff, file.created_time) {
+                    if created < cutoff {
+                        to_delete_stale.push(file.name);
+                        continue;
+                    }
                 }
-            }
-            let already_processed = {
-                let mut processed = self.processed.lock().await;
                 if processed.contains_key(&file.name) {
-                    true
-                } else {
-                    processed.insert(file.name.clone(), Instant::now());
-                    false
-                }
-            };
-            if already_processed {
-                continue;
-            }
-
-            let data = match self.backend.download(&file.name).await {
-                Ok(data) => data,
-                Err(e) => {
-                    self.processed.lock().await.remove(&file.name);
-                    tracing::debug!("Drive download {} failed: {}", file.name, e);
                     continue;
                 }
-            };
-            let file_client_id = client_id_from_filename(&file.name).unwrap_or_default();
-            if let Err(e) = self.process_mux_file(&data, &file_client_id).await {
-                // A bad envelope inside a mux file aborts the rest of
-                // that file's envelopes — nothing we can do, the format
-                // isn't self-synchronising. Bumping past `debug` so the
-                // data loss is visible in default logs.
-                tracing::warn!(
-                    "Drive mux decode {} failed: {} (remaining envelopes in this file are lost)",
-                    file.name,
-                    e
-                );
+                processed.insert(file.name.clone(), Instant::now());
+                to_download.push(file.name);
             }
-            let _ = self.backend.delete(&file.name).await;
+        }
+
+        // Fire stale deletes in the background — don't block this poll
+        // cycle on cleanup.
+        for name in to_delete_stale {
+            let backend = self.backend.clone();
+            tokio::spawn(async move {
+                let _ = backend.delete(&name).await;
+            });
+        }
+
+        if to_download.is_empty() {
+            return Ok(true);
+        }
+
+        // Concurrent downloads, bounded by STORAGE_CONCURRENCY. With
+        // HTTP/2 these all multiplex onto the same TLS connection — no
+        // extra handshakes, just more in-flight streams. This is the
+        // single biggest win over the v1 sequential implementation.
+        let backend = self.backend.clone();
+        let downloads = stream::iter(to_download.into_iter().map(|name| {
+            let backend = backend.clone();
+            async move {
+                let res = backend.download(&name).await;
+                (name, res)
+            }
+        }))
+        .buffer_unordered(STORAGE_CONCURRENCY);
+        tokio::pin!(downloads);
+
+        while let Some((name, result)) = downloads.next().await {
+            match result {
+                Ok(data) => {
+                    let file_client_id = client_id_from_filename(&name).unwrap_or_default();
+                    if let Err(e) = self.process_mux_file(&data, &file_client_id).await {
+                        // A bad envelope inside a mux file aborts the
+                        // rest of that file's envelopes. Bumping past
+                        // `debug` so the data loss is visible.
+                        tracing::warn!(
+                            "Drive mux decode {} failed: {} (remaining envelopes in this file are lost)",
+                            name,
+                            e
+                        );
+                    }
+                    // Fire-and-forget delete — the next poll won't see
+                    // it because we marked it processed; if delete
+                    // races we get a 404 which the backend ignores.
+                    let backend = self.backend.clone();
+                    let name_for_delete = name;
+                    tokio::spawn(async move {
+                        let _ = backend.delete(&name_for_delete).await;
+                    });
+                }
+                Err(e) => {
+                    self.processed.lock().await.remove(&name);
+                    tracing::debug!("Drive download {} failed: {}", name, e);
+                }
+            }
         }
 
         Ok(true)

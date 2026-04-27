@@ -7,22 +7,25 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::client::conn::http2::SendRequest;
+use hyper::Request;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use rand::RngCore;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
-use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
 
 use crate::config::Config;
@@ -49,12 +52,27 @@ pub enum DriveError {
     OAuth(String),
 }
 
-#[derive(Clone)]
+/// Domain-fronted HTTP/2 client over a single multiplexed TLS connection.
+///
+/// The earlier hand-rolled HTTP/1.1 client opened a fresh TLS handshake per
+/// Drive API call (`Connection: close`); on a busy SOCKS5 page-load it spent
+/// 1-2 seconds per poll cycle in pure handshake overhead. Hyper's HTTP/2
+/// client multiplexes every request as a stream on one long-lived
+/// connection, which is what FlowDriver does and what closes the perf gap.
+///
+/// The actual transport is still SNI-spoofing rustls — we connect a TCP
+/// socket to `connect_host`, do a TLS handshake with `sni`, advertise `h2`
+/// in ALPN, then hand the resulting stream to hyper's HTTP/2 builder. Every
+/// request rewrites `Host:` to `host_header` so Google's edge routes to the
+/// real `www.googleapis.com` backend regardless of the SNI we sent.
 struct GoogleApiClient {
     connect_host: String,
     sni: String,
     host_header: String,
     tls_connector: TlsConnector,
+    /// The live HTTP/2 sender. `None` until first use, replaced if a
+    /// request fails because the connection went away.
+    sender: Mutex<Option<SendRequest<Full<Bytes>>>>,
 }
 
 struct HttpResponse {
@@ -64,7 +82,7 @@ struct HttpResponse {
 
 impl GoogleApiClient {
     fn new(connect_host: String, sni: String, host_header: String, verify_ssl: bool) -> Self {
-        let tls_config = if verify_ssl {
+        let mut tls_config = if verify_ssl {
             let mut roots = rustls::RootCertStore::empty();
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
             ClientConfig::builder()
@@ -76,20 +94,59 @@ impl GoogleApiClient {
                 .with_custom_certificate_verifier(Arc::new(NoVerify))
                 .with_no_client_auth()
         };
+        // Advertise HTTP/2 in ALPN so Google's edge negotiates h2 instead
+        // of h1.1. Without this hyper's handshake will still complete but
+        // we'd lose multiplexing — back to one-stream-per-connection.
+        tls_config.alpn_protocols = vec![b"h2".to_vec()];
 
         Self {
             connect_host,
             sni,
             host_header,
             tls_connector: TlsConnector::from(Arc::new(tls_config)),
+            sender: Mutex::new(None),
         }
     }
 
-    async fn open(&self) -> Result<TlsStream<TcpStream>, DriveError> {
-        let tcp = TcpStream::connect(connect_addr(&self.connect_host)).await?;
+    /// Returns a clone of the live `SendRequest`, opening / reopening the
+    /// HTTP/2 connection if needed. The clone is cheap (it's an `mpsc`-like
+    /// handle into the connection driver), and concurrent callers don't
+    /// block each other once the connection is established.
+    async fn sender(&self) -> Result<SendRequest<Full<Bytes>>, DriveError> {
+        let mut guard = self.sender.lock().await;
+        if let Some(s) = guard.as_ref() {
+            if !s.is_closed() {
+                return Ok(s.clone());
+            }
+        }
+
+        let tcp = timeout(HTTP_TIMEOUT, TcpStream::connect(connect_addr(&self.connect_host)))
+            .await
+            .map_err(|_| DriveError::BadResponse("connect timeout".into()))??;
         let _ = tcp.set_nodelay(true);
         let server_name = ServerName::try_from(self.sni.clone())?;
-        Ok(self.tls_connector.connect(server_name, tcp).await?)
+        let tls = timeout(HTTP_TIMEOUT, self.tls_connector.connect(server_name, tcp))
+            .await
+            .map_err(|_| DriveError::BadResponse("tls handshake timeout".into()))??;
+        let io = TokioIo::new(tls);
+
+        let (sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+            .handshake(io)
+            .await
+            .map_err(|e| DriveError::BadResponse(format!("h2 handshake: {}", e)))?;
+
+        // The connection driver runs on its own task. When the peer closes
+        // (GOAWAY, network drop), it returns; the next sender() call sees
+        // `is_closed()` and reopens. Errors are debug-only; they're
+        // expected on idle teardown.
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                tracing::debug!("Drive HTTP/2 connection closed: {}", e);
+            }
+        });
+
+        *guard = Some(sender.clone());
+        Ok(sender)
     }
 
     async fn request(
@@ -99,45 +156,43 @@ impl GoogleApiClient {
         headers: Vec<(String, String)>,
         body: &[u8],
     ) -> Result<HttpResponse, DriveError> {
-        let mut stream = timeout(HTTP_TIMEOUT, self.open())
-            .await
-            .map_err(|_| DriveError::BadResponse("connect timeout".into()))??;
-
-        let mut req = format!(
-            "{method} {path} HTTP/1.1\r\n\
-             Host: {host}\r\n\
-             User-Agent: mhrv-rs-drive/{version}\r\n\
-             Accept-Encoding: identity\r\n\
-             Connection: close\r\n",
-            method = method,
-            path = path,
-            host = self.host_header,
-            version = env!("CARGO_PKG_VERSION"),
-        );
-        let mut has_content_length = false;
+        // Build the request once. The :authority pseudo-header is what
+        // routes the request inside Google's HTTP/2 frontend; it must be
+        // the API host even though we're connected via SNI=front_domain.
+        let uri = format!("https://{}{}", self.host_header, path);
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(&uri)
+            .header(
+                "user-agent",
+                format!("mhrv-rs-drive/{}", env!("CARGO_PKG_VERSION")),
+            )
+            .header("accept-encoding", "identity");
         for (k, v) in headers {
-            if k.eq_ignore_ascii_case("content-length") {
-                has_content_length = true;
-            }
-            req.push_str(&k);
-            req.push_str(": ");
-            req.push_str(&v);
-            req.push_str("\r\n");
+            builder = builder.header(k, v);
         }
-        if !has_content_length && (method == "POST" || method == "PATCH" || method == "PUT") {
-            req.push_str(&format!("Content-Length: {}\r\n", body.len()));
-        }
-        req.push_str("\r\n");
+        let req = builder
+            .body(Full::new(Bytes::from(body.to_vec())))
+            .map_err(|e| DriveError::BadResponse(format!("build request: {}", e)))?;
 
-        stream.write_all(req.as_bytes()).await?;
-        if !body.is_empty() {
-            stream.write_all(body).await?;
-        }
-        stream.flush().await?;
-
-        timeout(HTTP_TIMEOUT, read_http_response(&mut stream))
+        let mut sender = self.sender().await?;
+        let resp = timeout(HTTP_TIMEOUT, sender.send_request(req))
             .await
-            .map_err(|_| DriveError::BadResponse("response timeout".into()))?
+            .map_err(|_| DriveError::BadResponse("request timeout".into()))?
+            .map_err(|e| DriveError::BadResponse(format!("h2 send: {}", e)))?;
+
+        let status = resp.status().as_u16();
+        let body_bytes = timeout(HTTP_TIMEOUT, resp.into_body().collect())
+            .await
+            .map_err(|_| DriveError::BadResponse("body timeout".into()))?
+            .map_err(|e| DriveError::BadResponse(format!("body read: {}", e)))?
+            .to_bytes()
+            .to_vec();
+
+        Ok(HttpResponse {
+            status,
+            body: body_bytes,
+        })
     }
 }
 
@@ -842,169 +897,6 @@ fn write_secret_file(path: &PathBuf, data: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-async fn read_http_response<S>(stream: &mut S) -> Result<HttpResponse, DriveError>
-where
-    S: AsyncRead + Unpin,
-{
-    let mut buf = Vec::with_capacity(8192);
-    let mut tmp = [0u8; 8192];
-    let header_end = loop {
-        let n = stream.read(&mut tmp).await?;
-        if n == 0 {
-            return Err(DriveError::BadResponse(
-                "connection closed before headers".into(),
-            ));
-        }
-        buf.extend_from_slice(&tmp[..n]);
-        if let Some(pos) = find_double_crlf(&buf) {
-            break pos;
-        }
-        if buf.len() > 1024 * 1024 {
-            return Err(DriveError::BadResponse("headers too large".into()));
-        }
-    };
-
-    let header_text = std::str::from_utf8(&buf[..header_end])
-        .map_err(|_| DriveError::BadResponse("non-utf8 headers".into()))?;
-    let mut lines = header_text.split("\r\n");
-    let status = parse_status_line(lines.next().unwrap_or(""))?;
-    let mut headers = Vec::new();
-    for line in lines {
-        if let Some((k, v)) = line.split_once(':') {
-            headers.push((k.trim().to_string(), v.trim().to_string()));
-        }
-    }
-
-    let mut body = buf[header_end + 4..].to_vec();
-    let content_length = header_get(&headers, "content-length").and_then(|v| v.parse().ok());
-    let is_chunked = header_get(&headers, "transfer-encoding")
-        .map(|v| v.to_ascii_lowercase().contains("chunked"))
-        .unwrap_or(false);
-
-    if is_chunked {
-        body = read_chunked(stream, body).await?;
-    } else if let Some(len) = content_length {
-        while body.len() < len {
-            let n = stream.read(&mut tmp).await?;
-            if n == 0 {
-                return Err(DriveError::BadResponse(
-                    "connection closed before full body".into(),
-                ));
-            }
-            body.extend_from_slice(&tmp[..n]);
-        }
-        body.truncate(len);
-    } else {
-        loop {
-            let n = stream.read(&mut tmp).await?;
-            if n == 0 {
-                break;
-            }
-            body.extend_from_slice(&tmp[..n]);
-        }
-    }
-
-    if header_get(&headers, "content-encoding")
-        .map(|v| v.eq_ignore_ascii_case("gzip"))
-        .unwrap_or(false)
-    {
-        body = decode_gzip(&body)?;
-    }
-
-    Ok(HttpResponse { status, body })
-}
-
-async fn read_chunked<S>(stream: &mut S, mut buf: Vec<u8>) -> Result<Vec<u8>, DriveError>
-where
-    S: AsyncRead + Unpin,
-{
-    let mut out = Vec::new();
-    let mut tmp = [0u8; 8192];
-    loop {
-        let line = read_crlf_line(stream, &mut buf, &mut tmp).await?;
-        let line = std::str::from_utf8(&line)
-            .map_err(|_| DriveError::BadResponse("bad chunk header".into()))?
-            .trim();
-        if line.is_empty() {
-            continue;
-        }
-        let size = usize::from_str_radix(line.split(';').next().unwrap_or(""), 16)
-            .map_err(|_| DriveError::BadResponse(format!("bad chunk size '{}'", line)))?;
-        if size == 0 {
-            loop {
-                if read_crlf_line(stream, &mut buf, &mut tmp).await?.is_empty() {
-                    return Ok(out);
-                }
-            }
-        }
-        while buf.len() < size + 2 {
-            let n = stream.read(&mut tmp).await?;
-            if n == 0 {
-                return Err(DriveError::BadResponse(
-                    "connection closed mid-chunk".into(),
-                ));
-            }
-            buf.extend_from_slice(&tmp[..n]);
-        }
-        if &buf[size..size + 2] != b"\r\n" {
-            return Err(DriveError::BadResponse(
-                "chunk missing trailing CRLF".into(),
-            ));
-        }
-        out.extend_from_slice(&buf[..size]);
-        buf.drain(..size + 2);
-    }
-}
-
-async fn read_crlf_line<S>(
-    stream: &mut S,
-    buf: &mut Vec<u8>,
-    tmp: &mut [u8],
-) -> Result<Vec<u8>, DriveError>
-where
-    S: AsyncRead + Unpin,
-{
-    loop {
-        if let Some(pos) = buf.windows(2).position(|w| w == b"\r\n") {
-            let line = buf[..pos].to_vec();
-            buf.drain(..pos + 2);
-            return Ok(line);
-        }
-        let n = stream.read(tmp).await?;
-        if n == 0 {
-            return Err(DriveError::BadResponse("connection closed mid-line".into()));
-        }
-        buf.extend_from_slice(&tmp[..n]);
-    }
-}
-
-fn header_get(headers: &[(String, String)], name: &str) -> Option<String> {
-    headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(name))
-        .map(|(_, v)| v.clone())
-}
-
-fn find_double_crlf(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n")
-}
-
-fn parse_status_line(line: &str) -> Result<u16, DriveError> {
-    let mut parts = line.split_whitespace();
-    let _version = parts.next();
-    let code = parts
-        .next()
-        .ok_or_else(|| DriveError::BadResponse(format!("bad status line: {}", line)))?;
-    code.parse::<u16>()
-        .map_err(|_| DriveError::BadResponse(format!("bad status code: {}", code)))
-}
-
-fn decode_gzip(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
-    let mut out = Vec::with_capacity(data.len() * 2);
-    flate2::read::GzDecoder::new(data).read_to_end(&mut out)?;
-    Ok(out)
-}
-
 #[derive(Debug)]
 struct NoVerify;
 
@@ -1056,7 +948,6 @@ impl ServerCertVerifier for NoVerify {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncWriteExt;
 
     #[test]
     fn url_path_escape_keeps_unreserved_and_encodes_specials() {
@@ -1081,27 +972,5 @@ mod tests {
         // tz math wrong for a stale-file decision).
         assert!(parse_rfc3339("not a date").is_none());
         assert!(parse_rfc3339("2024-05-13T07:21:34+02:00").is_none());
-    }
-
-    #[tokio::test]
-    async fn read_http_response_decodes_chunked_body() {
-        let (mut w, mut r) = tokio::io::duplex(4096);
-        let body = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
-        w.write_all(body).await.unwrap();
-        drop(w);
-        let resp = read_http_response(&mut r).await.unwrap();
-        assert_eq!(resp.status, 200);
-        assert_eq!(&resp.body, b"hello world");
-    }
-
-    #[tokio::test]
-    async fn read_http_response_decodes_content_length_body() {
-        let (mut w, mut r) = tokio::io::duplex(4096);
-        let body = b"HTTP/1.1 201 Created\r\nContent-Length: 4\r\n\r\nbody";
-        w.write_all(body).await.unwrap();
-        drop(w);
-        let resp = read_http_response(&mut r).await.unwrap();
-        assert_eq!(resp.status, 201);
-        assert_eq!(&resp.body, b"body");
     }
 }

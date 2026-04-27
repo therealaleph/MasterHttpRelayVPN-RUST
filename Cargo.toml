@@ -50,6 +50,13 @@ httparse = "1"
 rand = "0.8"
 h2 = "0.4"
 http = "1"
+# hyper drives the Drive REST client over a single multiplexed HTTP/2
+# connection. Without this, every Drive API call paid a 300-500 ms TLS
+# handshake; HTTP/2 multiplexing folds them all onto one keep-alive
+# stream and gets us roughly an order of magnitude on perceived latency.
+hyper = { version = "1", features = ["client", "http2"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "tokio", "http2"] }
+http-body-util = "0.1"
 flate2 = "1"
 directories = "5"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
