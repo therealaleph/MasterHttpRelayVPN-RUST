@@ -43,9 +43,13 @@ import kotlinx.coroutines.launch
 fun ConfigSharingBar(
     cfg: MhrvConfig,
     onImport: (MhrvConfig) -> Unit,
+    onImportDriveSetup: (ConfigStore.DriveSetup) -> Unit,
     onSnackbar: suspend (String) -> Unit,
 ) {
-    // Deep link import — requires confirmation before applying.
+    // Deep link imports — both regular config and Drive-setup deep
+    // links land here and get a confirmation dialog before any
+    // mutation, identical to clipboard / QR-scan paths. Trust prompt
+    // is the same for all three input vectors.
     val deepLinkCfg by com.therealaleph.mhrv.MainActivity.pendingDeepLinkConfig
     if (deepLinkCfg != null) {
         ImportConfirmDialog(
@@ -59,32 +63,96 @@ fun ConfigSharingBar(
             },
         )
     }
+    val deepLinkSetup by com.therealaleph.mhrv.MainActivity.pendingDeepLinkSetup
+    if (deepLinkSetup != null) {
+        DriveSetupConfirmDialog(
+            setup = deepLinkSetup!!,
+            onConfirm = {
+                onImportDriveSetup(deepLinkSetup!!)
+                com.therealaleph.mhrv.MainActivity.pendingDeepLinkSetup.value = null
+            },
+            onDismiss = {
+                com.therealaleph.mhrv.MainActivity.pendingDeepLinkSetup.value = null
+            },
+        )
+    }
     val ctx = LocalContext.current
     val clipboard = LocalClipboardManager.current
     val scope = rememberCoroutineScope()
 
     val clipText = clipboard.getText()?.text.orEmpty()
     val hasConfigInClipboard = clipText.isNotEmpty() && ConfigStore.looksLikeConfig(clipText)
+    val hasDriveSetupInClipboard = clipText.isNotEmpty() && ConfigStore.looksLikeDriveSetup(clipText)
 
     var showExportDialog by remember { mutableStateOf(false) }
     var showImportConfirm by remember { mutableStateOf(false) }
     var pendingImport by remember { mutableStateOf<MhrvConfig?>(null) }
+    var pendingDriveSetup by remember { mutableStateOf<ConfigStore.DriveSetup?>(null) }
     var showQrDialog by remember { mutableStateOf(false) }
 
     // QR scanner launcher — fires the ZXing embedded scanner activity.
+    // Dispatches based on payload prefix: regular config vs Drive setup.
     val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
         val scanned = result.contents ?: return@rememberLauncherForActivityResult
-        val decoded = ConfigStore.decode(scanned)
-        if (decoded != null) {
-            pendingImport = decoded
-            showImportConfirm = true
+        if (ConfigStore.looksLikeDriveSetup(scanned)) {
+            val setup = ConfigStore.decodeDriveSetup(scanned)
+            if (setup != null) {
+                pendingDriveSetup = setup
+            } else {
+                scope.launch { onSnackbar(ctx.getString(R.string.snack_drive_setup_invalid)) }
+            }
         } else {
-            scope.launch { onSnackbar(ctx.getString(R.string.snack_invalid_config)) }
+            val decoded = ConfigStore.decode(scanned)
+            if (decoded != null) {
+                pendingImport = decoded
+                showImportConfirm = true
+            } else {
+                scope.launch { onSnackbar(ctx.getString(R.string.snack_invalid_config)) }
+            }
         }
     }
 
-    // --- Paste from clipboard banner ---
-    if (hasConfigInClipboard) {
+    // --- Paste from clipboard banner (regular config OR Drive setup) ---
+    // Drive-setup blob takes precedence — it's a more specific format
+    // and we want to surface it immediately when a fresh recipient
+    // pastes a `mhrv-rs-setup://...` link from WhatsApp.
+    if (hasDriveSetupInClipboard) {
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.primaryContainer,
+            ),
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text(
+                    stringResource(R.string.banner_drive_setup_clipboard),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                    modifier = Modifier.weight(1f),
+                )
+                FilledTonalButton(
+                    onClick = {
+                        val setup = ConfigStore.decodeDriveSetup(clipText)
+                        if (setup != null) {
+                            pendingDriveSetup = setup
+                        } else {
+                            scope.launch { onSnackbar(ctx.getString(R.string.snack_drive_setup_invalid)) }
+                        }
+                    },
+                ) {
+                    Icon(Icons.Default.ContentPaste, null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text(stringResource(R.string.btn_import_clipboard))
+                }
+            }
+        }
+    } else if (hasConfigInClipboard) {
         Card(
             modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.cardColors(
@@ -272,6 +340,63 @@ fun ConfigSharingBar(
             },
         )
     }
+
+    // --- Drive setup confirmation dialog (clipboard / QR / deep link) ---
+    pendingDriveSetup?.let { setup ->
+        DriveSetupConfirmDialog(
+            setup = setup,
+            onConfirm = {
+                onImportDriveSetup(setup)
+                clipboard.setText(AnnotatedString(""))
+                pendingDriveSetup = null
+                scope.launch { onSnackbar(ctx.getString(R.string.snack_drive_setup_imported)) }
+            },
+            onDismiss = { pendingDriveSetup = null },
+        )
+    }
+}
+
+/**
+ * Trust prompt before applying an `mhrv-rs-setup://...` payload. Same
+ * shape as the regular import confirm dialog, with copy that calls out
+ * the credential-bearing nature of the bundle so the user understands
+ * what they're accepting.
+ */
+@Composable
+internal fun DriveSetupConfirmDialog(
+    setup: ConfigStore.DriveSetup,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.dialog_drive_setup_import_title)) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    stringResource(R.string.dialog_drive_setup_import_warning),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+                Text(
+                    stringResource(
+                        R.string.dialog_drive_setup_import_summary,
+                        setup.folderId.ifEmpty { "(auto)" },
+                        setup.folderName,
+                    ),
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm) {
+                Text(stringResource(R.string.btn_drive_setup_import))
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.btn_cancel)) }
+        },
+    )
 }
 
 // =========================================================================

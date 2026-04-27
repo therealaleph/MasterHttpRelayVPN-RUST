@@ -261,6 +261,13 @@ fun HomeScreen(
             ConfigSharingBar(
                 cfg = cfg,
                 onImport = { persist(it) },
+                onImportDriveSetup = { setup ->
+                    val applied = ConfigStore.applyDriveSetup(ctx, cfg, setup)
+                    if (applied != null) persist(applied)
+                    else scope.launch {
+                        snackbar.showSnackbar(ctx.getString(R.string.snack_drive_setup_failed))
+                    }
+                },
                 onSnackbar = { snackbar.showSnackbar(it) },
             )
 
@@ -1256,6 +1263,30 @@ private fun DriveSection(
             scope.launch { onSnack(ctx.getString(R.string.snack_drive_setup_invalid)) }
         }
     }
+    // Gallery image picker → decode any QR payload found in the
+    // chosen image. Cheap fallback for the WhatsApp-receives-image
+    // case: long-press the QR in chat → save to gallery → tap this
+    // button → pick the saved image. No need to point one phone at
+    // another's screen.
+    val setupImagePicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.GetContent(),
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        val decoded = decodeQrFromImage(ctx, uri)
+        when {
+            decoded == null -> scope.launch {
+                onSnack(ctx.getString(R.string.snack_drive_setup_no_qr_in_image))
+            }
+            else -> {
+                val setup = ConfigStore.decodeDriveSetup(decoded)
+                if (setup != null) {
+                    setupScanResult = setup
+                } else {
+                    scope.launch { onSnack(ctx.getString(R.string.snack_drive_setup_invalid)) }
+                }
+            }
+        }
+    }
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text(
@@ -1295,6 +1326,15 @@ private fun DriveSection(
                 )
                 Spacer(Modifier.width(8.dp))
                 Text(stringResource(R.string.btn_drive_scan_setup))
+            }
+            // Gallery picker — for the case where someone messaged a
+            // QR image instead of letting it be scanned camera-to-camera.
+            // Long-press in WhatsApp → Save → tap this → pick the file.
+            OutlinedButton(
+                onClick = { setupImagePicker.launch("image/*") },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(stringResource(R.string.btn_drive_setup_from_image))
             }
             Text(
                 stringResource(R.string.help_drive_scan_setup),
@@ -1633,6 +1673,45 @@ private fun DriveSetupImportConfirmDialog(
             TextButton(onClick = onDismiss) { Text(stringResource(R.string.btn_cancel)) }
         },
     )
+}
+
+/**
+ * Decode a QR code embedded in a static image (gallery-picked content
+ * URI). Returns the decoded text payload or null if no QR was found,
+ * the image couldn't be loaded, or zxing failed to parse.
+ *
+ * Uses `BinaryBitmap(HybridBinarizer)` over the bitmap pixels because
+ * that's what zxing's reference Android samples do — handles screenshots
+ * with anti-aliasing, JPEG artefacts, etc. better than the global
+ * binarizer. Tries inverted colours as a fallback so dark-mode QRs
+ * (white on black) still decode.
+ */
+private fun decodeQrFromImage(
+    ctx: android.content.Context,
+    uri: android.net.Uri,
+): String? {
+    val bitmap = runCatching {
+        ctx.contentResolver.openInputStream(uri)?.use {
+            android.graphics.BitmapFactory.decodeStream(it)
+        }
+    }.getOrNull() ?: return null
+
+    val width = bitmap.width
+    val height = bitmap.height
+    val pixels = IntArray(width * height)
+    bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
+
+    val source = com.google.zxing.RGBLuminanceSource(width, height, pixels)
+    val reader = com.google.zxing.qrcode.QRCodeReader()
+
+    fun tryDecode(src: com.google.zxing.LuminanceSource): String? = runCatching {
+        val binary = com.google.zxing.BinaryBitmap(
+            com.google.zxing.common.HybridBinarizer(src),
+        )
+        reader.decode(binary).text
+    }.getOrNull()
+
+    return tryDecode(source) ?: tryDecode(source.invert())
 }
 
 /** Same QR generator the regular config-share dialog uses, copied here

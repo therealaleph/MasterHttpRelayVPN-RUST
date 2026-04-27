@@ -95,14 +95,22 @@ class MainActivity : AppCompatActivity() {
         handleDeepLink(intent)
     }
 
-    /** Stash decoded config from deep link for the UI to confirm — never
-     *  auto-import. The composable reads this and shows a confirmation
-     *  dialog with the deployment IDs and a trust warning. */
+    /** Stash decoded config / setup from deep link for the UI to
+     *  confirm — never auto-import. The composable reads these state
+     *  holders and shows a confirmation dialog before any disk write. */
     private fun handleDeepLink(intent: Intent?) {
         val data = intent?.data ?: return
-        if (data.scheme != "mhrv-rs") return
-        val cfg = ConfigStore.decode(data.toString()) ?: return
-        pendingDeepLinkConfig.value = cfg
+        when (data.scheme) {
+            "mhrv-rs" -> {
+                val cfg = ConfigStore.decode(data.toString()) ?: return
+                pendingDeepLinkConfig.value = cfg
+            }
+            "mhrv-rs-setup" -> {
+                val setup = ConfigStore.decodeDriveSetup(data.toString()) ?: return
+                pendingDeepLinkSetup.value = setup
+            }
+            else -> {}
+        }
     }
 
 
@@ -257,5 +265,9 @@ class MainActivity : AppCompatActivity() {
         private const val REQ_NOTIF = 42
         /** Deep link config waiting for user confirmation. Read by ConfigSharingBar. */
         val pendingDeepLinkConfig = mutableStateOf<MhrvConfig?>(null)
+        /** Deep link Drive-setup payload waiting for user confirmation.
+         *  Read by ConfigSharingBar; consumed in HomeScreen which knows
+         *  how to wire it through ConfigStore.applyDriveSetup. */
+        val pendingDeepLinkSetup = mutableStateOf<ConfigStore.DriveSetup?>(null)
     }
 }

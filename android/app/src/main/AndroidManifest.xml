@@ -53,13 +53,25 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-            <!-- Deep link: tapping mhrv://... in any app opens MainActivity
-                 and auto-imports the encoded config. -->
+            <!-- Deep link: tapping mhrv-rs://... in any app opens
+                 MainActivity and auto-imports the encoded config. -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="mhrv-rs" />
+            </intent-filter>
+            <!-- Drive setup deep link: tapping mhrv-rs-setup://... in
+                 WhatsApp / Telegram / SMS opens the app and offers to
+                 import the bundled credentials + refresh token. Distinct
+                 scheme so the recipient is asked to confirm a different
+                 (credential-bearing) payload than the regular config
+                 share. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="mhrv-rs-setup" />
             </intent-filter>
         </activity>
 
