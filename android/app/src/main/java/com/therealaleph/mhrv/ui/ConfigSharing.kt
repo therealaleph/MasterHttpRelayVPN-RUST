@@ -63,13 +63,9 @@ fun ConfigSharingBar(
     val clipboard = LocalClipboardManager.current
     val scope = rememberCoroutineScope()
 
-    val clipText = clipboard.getText()?.text.orEmpty()
-    val hasConfigInClipboard = clipText.isNotEmpty() && ConfigStore.looksLikeConfig(clipText)
-
     var showExportDialog by remember { mutableStateOf(false) }
     var showImportConfirm by remember { mutableStateOf(false) }
     var pendingImport by remember { mutableStateOf<MhrvConfig?>(null) }
-    var showQrDialog by remember { mutableStateOf(false) }
 
     // QR scanner launcher — fires the ZXing embedded scanner activity.
     val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
@@ -83,58 +79,32 @@ fun ConfigSharingBar(
         }
     }
 
-    // --- Paste from clipboard banner ---
-    if (hasConfigInClipboard) {
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(
-                containerColor = MaterialTheme.colorScheme.primaryContainer,
-            ),
-        ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                Text(
-                    "Config detected in clipboard",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onPrimaryContainer,
-                    modifier = Modifier.weight(1f),
-                )
-                FilledTonalButton(
-                    onClick = {
-                        val decoded = ConfigStore.decode(clipText)
-                        if (decoded != null) {
-                            pendingImport = decoded
-                            showImportConfirm = true
-                        } else {
-                            scope.launch { onSnackbar(ctx.getString(R.string.snack_invalid_config)) }
-                        }
-                    },
-                ) {
-                    Icon(Icons.Default.ContentPaste, null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(4.dp))
-                    Text(stringResource(R.string.btn_import_clipboard))
-                }
-            }
-        }
-    }
-
-    // --- Export + Scan row ---
+    // --- Export + Paste + Scan row ---
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
+        IconButton(onClick = { showExportDialog = true }) {
+            Icon(Icons.Default.Share, contentDescription = stringResource(R.string.btn_export_config))
+        }
+        // Manual paste — reads clipboard on tap. Android 13+ restricts
+        // background clipboard access, so auto-detect doesn't work.
+        // User interaction (tap) grants clipboard permission.
         OutlinedButton(
-            onClick = { showExportDialog = true },
-            modifier = Modifier.weight(1f),
+            onClick = {
+                val text = clipboard.getText()?.text.orEmpty()
+                val decoded = ConfigStore.decode(text)
+                if (decoded != null) {
+                    pendingImport = decoded
+                    showImportConfirm = true
+                } else {
+                    scope.launch { onSnackbar(ctx.getString(R.string.snack_invalid_config)) }
+                }
+            },
         ) {
-            Icon(Icons.Default.Share, null, modifier = Modifier.size(18.dp))
+            Icon(Icons.Default.ContentPaste, null, modifier = Modifier.size(18.dp))
             Spacer(Modifier.width(4.dp))
-            Text(stringResource(R.string.btn_export_config))
+            Text("Paste")
         }
         OutlinedButton(
             onClick = {
