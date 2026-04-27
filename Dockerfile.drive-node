@@ -1,0 +1,48 @@
+# Dockerfile for `mhrv-drive-node` — the server side of google_drive mode.
+#
+# Build:
+#   docker build -t mhrv-drive-node -f Dockerfile.drive-node .
+#
+# First run (interactive — completes Google OAuth):
+#   docker run -it --rm \
+#       -v /opt/mhrv-drive:/data \
+#       mhrv-drive-node
+#
+# Subsequent runs (detached, restart on host reboot):
+#   docker run -d --name mhrv-drive-node --restart unless-stopped \
+#       -v /opt/mhrv-drive:/data \
+#       mhrv-drive-node
+#
+# /data is expected to contain `credentials.json` and `config.drive.json`
+# before first run. The binary writes `credentials.json.token` (the cached
+# refresh token, chmod 0600) into the same dir on successful OAuth.
+
+# ---- builder ------------------------------------------------------------
+FROM rust:1.82-slim-bookworm AS builder
+WORKDIR /src
+
+# `ring` (TLS backend) needs a C compiler + assembler. Everything else is
+# pure Rust thanks to rustls.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+
+# Skip the desktop / Android binaries — we only need the drive node.
+RUN cargo build --release --bin mhrv-drive-node
+
+# ---- runtime ------------------------------------------------------------
+FROM debian:bookworm-slim
+
+# CA bundle for HTTPS to www.googleapis.com.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /src/target/release/mhrv-drive-node /usr/local/bin/
+
+WORKDIR /data
+ENTRYPOINT ["/usr/local/bin/mhrv-drive-node"]
+CMD ["-c", "/data/config.drive.json"]
