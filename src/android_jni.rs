@@ -42,8 +42,13 @@ struct Running {
     rt: Option<Runtime>,
     /// Keep an Arc to the DomainFronter so `statsJson(handle)` can read the
     /// live stats without going through the async server. `None` for
-    /// google-only / full-only configs where the fronter isn't used.
+    /// google-only / full-only configs (and google_drive) where the fronter
+    /// isn't used.
     fronter: Option<Arc<crate::domain_fronter::DomainFronter>>,
+    /// True when this slot is running a `drive_tunnel::run_client` instead
+    /// of the regular `ProxyServer`. Used by `stopProxy` purely for
+    /// logging — both paths share the same shutdown channel + runtime.
+    is_drive: bool,
 }
 
 static HANDLE_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -248,10 +253,221 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_startProxy(
                 shutdown: Some(tx),
                 rt: Some(rt),
                 fronter,
+                is_drive: false,
             },
         );
         handle as jlong
     }))
+}
+
+/// `Native.startDriveProxy(String configJson)` -> `long` handle (0 on failure).
+///
+/// Same shape as `startProxy` but takes the google_drive code path: we
+/// validate that mode == google_drive (otherwise the file would have
+/// gone through the regular ProxyServer constructor, which `unreachable!()`s
+/// for Drive), then spawn `drive_tunnel::run_client_with_shutdown` on
+/// our own runtime. The returned handle plugs into the existing
+/// `stopProxy` slot map — Stop works the same for both modes.
+///
+/// Auth is expected to be done up front (call `driveCompleteAuth` first).
+/// If the cached refresh token is missing, `init_backend` returns an
+/// OAuth error — we surface it via tracing/logcat and return 0.
+#[no_mangle]
+pub extern "system" fn Java_com_therealaleph_mhrv_Native_startDriveProxy(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_json: JString,
+) -> jlong {
+    safe(0i64, AssertUnwindSafe(|| {
+        install_logging_once();
+
+        let json = jstring_to_string(&mut env, &config_json);
+        let config: Config = match serde_json::from_str(&json) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("android: invalid drive config json: {}", e);
+                return 0i64;
+            }
+        };
+        if !matches!(
+            config.mode_kind(),
+            Ok(crate::config::Mode::GoogleDrive)
+        ) {
+            tracing::error!(
+                "android: startDriveProxy called with mode={} — must be google_drive",
+                config.mode
+            );
+            return 0i64;
+        }
+
+        let rt = match tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("mhrv-drive-worker")
+            .build()
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("android: drive runtime build failed: {}", e);
+                return 0i64;
+            }
+        };
+
+        let (tx, rx) = oneshot::channel::<()>();
+        let cfg_for_task = config;
+        rt.spawn(async move {
+            if let Err(e) =
+                crate::drive_tunnel::run_client_with_shutdown(&cfg_for_task, rx).await
+            {
+                tracing::error!("android: drive client exited: {}", e);
+            }
+        });
+
+        let handle = HANDLE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        slot_map().lock().unwrap().insert(
+            handle,
+            Running {
+                shutdown: Some(tx),
+                rt: Some(rt),
+                fronter: None,
+                is_drive: true,
+            },
+        );
+        handle as jlong
+    }))
+}
+
+/// `Native.driveAuthUrl(String configJson)` -> String. Returns the
+/// Google OAuth consent URL the UI should send the user to. Empty on
+/// failure (logged to logcat). Idempotent — does not start a server.
+#[no_mangle]
+pub extern "system" fn Java_com_therealaleph_mhrv_Native_driveAuthUrl<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass,
+    config_json: JString,
+) -> jstring {
+    let url = safe(String::new(), AssertUnwindSafe(|| {
+        install_logging_once();
+        let json = jstring_to_string(&mut env, &config_json);
+        let config: Config = match serde_json::from_str(&json) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("android: driveAuthUrl bad json: {}", e);
+                return String::new();
+            }
+        };
+        match crate::google_drive::GoogleDriveBackend::from_config(&config) {
+            Ok(b) => b.auth_url(),
+            Err(e) => {
+                tracing::error!("android: driveAuthUrl backend init: {}", e);
+                String::new()
+            }
+        }
+    }));
+    env.new_string(url)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// `Native.driveCompleteAuth(String configJson, String code)` -> String.
+///
+/// Hands the pasted authorization code (or full redirect URL) to the
+/// backend, which exchanges it for tokens and persists the refresh
+/// token to `<credentials>.token`. Returns a small JSON blob:
+///   `{"ok":true,"tokenPath":"/data/.../credentials.json.token"}` on
+///   success, `{"ok":false,"error":"..."}` otherwise.
+///
+/// BLOCKS on a one-shot tokio runtime — call from a background
+/// dispatcher.
+#[no_mangle]
+pub extern "system" fn Java_com_therealaleph_mhrv_Native_driveCompleteAuth<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass,
+    config_json: JString,
+    code: JString,
+) -> jstring {
+    let result_json = safe(
+        r#"{"ok":false,"error":"panic"}"#.to_string(),
+        AssertUnwindSafe(|| {
+            install_logging_once();
+            let json = jstring_to_string(&mut env, &config_json);
+            let raw = jstring_to_string(&mut env, &code);
+            if raw.trim().is_empty() {
+                return r#"{"ok":false,"error":"empty code"}"#.to_string();
+            }
+            let config: Config = match serde_json::from_str(&json) {
+                Ok(c) => c,
+                Err(e) => {
+                    return format!(
+                        r#"{{"ok":false,"error":"bad config json: {}"}}"#,
+                        json_escape(&e.to_string())
+                    );
+                }
+            };
+            let backend =
+                match crate::google_drive::GoogleDriveBackend::from_config(&config) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return format!(
+                            r#"{{"ok":false,"error":"{}"}}"#,
+                            json_escape(&e.to_string())
+                        );
+                    }
+                };
+            let Some(rt) = one_shot_runtime() else {
+                return r#"{"ok":false,"error":"tokio init failed"}"#.to_string();
+            };
+            match rt.block_on(backend.apply_auth_code(&raw)) {
+                Ok(()) => {
+                    let path = backend.token_path().display().to_string();
+                    format!(
+                        r#"{{"ok":true,"tokenPath":"{}"}}"#,
+                        json_escape(&path)
+                    )
+                }
+                Err(e) => format!(
+                    r#"{{"ok":false,"error":"{}"}}"#,
+                    json_escape(&e.to_string())
+                ),
+            }
+        }),
+    );
+    env.new_string(result_json)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// `Native.driveTokenPresent(String configJson)` -> boolean. True iff a
+/// non-empty refresh token has been persisted for these credentials.
+/// Cheap (just a file read) — UI calls this on every recompose to gate
+/// the "Authorize" vs "Re-authorize" button label.
+#[no_mangle]
+pub extern "system" fn Java_com_therealaleph_mhrv_Native_driveTokenPresent(
+    mut env: JNIEnv,
+    _class: JClass,
+    config_json: JString,
+) -> jboolean {
+    safe(JNI_FALSE, AssertUnwindSafe(|| {
+        install_logging_once();
+        let json = jstring_to_string(&mut env, &config_json);
+        let config: Config = match serde_json::from_str(&json) {
+            Ok(c) => c,
+            Err(_) => return JNI_FALSE,
+        };
+        let backend = match crate::google_drive::GoogleDriveBackend::from_config(&config) {
+            Ok(b) => b,
+            Err(_) => return JNI_FALSE,
+        };
+        if backend.has_cached_token() {
+            JNI_TRUE
+        } else {
+            JNI_FALSE
+        }
+    }))
+}
+
+fn json_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// `Native.stopProxy(long handle)` -> boolean. Idempotent: calling on an

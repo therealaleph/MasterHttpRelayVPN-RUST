@@ -91,6 +91,10 @@ fn main() -> eframe::Result<()> {
                 form,
                 last_poll: Instant::now(),
                 toast: initial_toast,
+                drive_oauth_open: false,
+                drive_oauth_code: String::new(),
+                drive_oauth_busy: false,
+                drive_oauth_status: None,
             }))
         }),
     )
@@ -143,6 +147,17 @@ struct UiState {
     /// One-line status of the most recent download (Ok(path) or Err(msg)).
     last_download: Option<Result<std::path::PathBuf, String>>,
     last_download_at: Option<Instant>,
+    /// Drive OAuth: the consent URL produced by the most recent
+    /// `DriveBeginAuth`. UI shows it as a clickable link.
+    drive_auth_url: Option<String>,
+    /// Result of the most recent `DriveCompleteAuth`. `Ok(token_path)` on
+    /// success, `Err(message)` otherwise.
+    drive_auth_result: Option<Result<String, String>>,
+    /// Whether the Drive client is the one currently held in `active`
+    /// on the background thread. Independent from `running` because the
+    /// drive client doesn't go through ProxyServer / DomainFronter, so
+    /// the stats panel stays empty while it runs.
+    drive_running: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -194,6 +209,13 @@ enum Cmd {
         url: String,
         name: String,
     },
+    /// google_drive: prompt the OAuth consent URL and surface it in the
+    /// Drive auth dialog. Output goes into the auth status fields.
+    DriveBeginAuth(Config),
+    /// google_drive: exchange the authorization code (or pasted redirect
+    /// URL) and persist the refresh token. Surfaces success / failure on
+    /// the dialog status line.
+    DriveCompleteAuth { config: Config, code: String },
 }
 
 struct App {
@@ -202,6 +224,16 @@ struct App {
     form: FormState,
     last_poll: Instant,
     toast: Option<(String, Instant)>,
+    /// Drive OAuth modal state. The dialog lives outside the form
+    /// because it owns its own background work (open URL, paste-back
+    /// code, exchange) and we don't want a re-render of the form to
+    /// reset its half-completed state.
+    drive_oauth_open: bool,
+    drive_oauth_code: String,
+    drive_oauth_busy: bool,
+    /// `Ok(message)` after a successful exchange, `Err(message)` after a
+    /// failure. Cleared when the dialog reopens.
+    drive_oauth_status: Option<Result<String, String>>,
 }
 
 #[derive(Clone)]
@@ -243,6 +275,25 @@ struct FormState {
     /// drop the user's setting. Not currently exposed as a UI control;
     /// users edit `block_quic` directly in `config.json` (Issue #213).
     block_quic: bool,
+
+    // ── google_drive mode fields ─────────────────────────────────────
+    /// Path to the Google Cloud OAuth desktop credentials JSON. The
+    /// refresh token is cached next to it as `<credentials>.token`.
+    drive_credentials_path: String,
+    /// Override for the cached-token path. Empty = derive from
+    /// drive_credentials_path.
+    drive_token_path: String,
+    /// Pinned Drive folder ID. When empty, we look up / create
+    /// `drive_folder_name` on the authorised account.
+    drive_folder_id: String,
+    drive_folder_name: String,
+    /// Stable per-process client_id used in Drive filenames. Empty =
+    /// generate a random short id at startup. Validated server-side
+    /// (length <=32, [A-Za-z0-9_-]).
+    drive_client_id: String,
+    drive_poll_ms: u64,
+    drive_flush_ms: u64,
+    drive_idle_timeout_secs: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -326,6 +377,14 @@ fn load_form() -> (FormState, Option<String>) {
             youtube_via_relay: c.youtube_via_relay,
             passthrough_hosts: c.passthrough_hosts.clone(),
             block_quic: c.block_quic,
+            drive_credentials_path: c.drive_credentials_path.clone(),
+            drive_token_path: c.drive_token_path.clone().unwrap_or_default(),
+            drive_folder_id: c.drive_folder_id.clone(),
+            drive_folder_name: c.drive_folder_name.clone(),
+            drive_client_id: c.drive_client_id.clone(),
+            drive_poll_ms: c.drive_poll_ms,
+            drive_flush_ms: c.drive_flush_ms,
+            drive_idle_timeout_secs: c.drive_idle_timeout_secs,
         }
     } else {
         FormState {
@@ -354,6 +413,14 @@ fn load_form() -> (FormState, Option<String>) {
             youtube_via_relay: false,
             passthrough_hosts: Vec::new(),
             block_quic: false,
+            drive_credentials_path: "credentials.json".into(),
+            drive_token_path: String::new(),
+            drive_folder_id: String::new(),
+            drive_folder_name: "MHRV-Drive".into(),
+            drive_client_id: String::new(),
+            drive_poll_ms: 500,
+            drive_flush_ms: 300,
+            drive_idle_timeout_secs: 300,
         }
     };
     (form, load_err)
@@ -406,12 +473,31 @@ fn sni_pool_for_form(user: Option<&[String]>, front_domain: &str) -> Vec<SniRow>
 impl FormState {
     fn to_config(&self) -> Result<Config, String> {
         let is_google_only = self.mode == "google_only";
-        if !is_google_only {
+        let is_google_drive = self.mode == "google_drive";
+        // Apps Script credentials are only required for the Apps Script
+        // relay paths. google_only and google_drive both bypass Apps
+        // Script entirely (one uses raw SNI rewrite, the other uses
+        // Drive as a queue), so the script_id / auth_key fields can stay
+        // empty without invalidating the form.
+        if !is_google_only && !is_google_drive {
             if self.script_id.trim().is_empty() {
                 return Err("Apps Script ID is required".into());
             }
             if self.auth_key.trim().is_empty() {
                 return Err("Auth key is required".into());
+            }
+        }
+        if is_google_drive {
+            if self.drive_credentials_path.trim().is_empty() {
+                return Err(
+                    "Google Drive mode requires drive_credentials_path".into(),
+                );
+            }
+            if self.drive_poll_ms == 0 || self.drive_flush_ms == 0 {
+                return Err("Drive poll/flush intervals must be > 0".into());
+            }
+            if self.drive_idle_timeout_secs == 0 {
+                return Err("Drive idle timeout must be > 0".into());
             }
         }
         let listen_port: u16 = self
@@ -500,16 +586,21 @@ impl FormState {
             // control yet). Round-trip through the file so save
             // doesn't drop a user-set true.
             block_quic: self.block_quic,
-            // Google Drive mode is CLI-only for now; keep defaults here so
-            // the desktop UI's Config initializer stays in sync.
-            drive_credentials_path: "credentials.json".into(),
-            drive_token_path: None,
-            drive_folder_id: String::new(),
-            drive_folder_name: "MHRV-Drive".into(),
-            drive_client_id: String::new(),
-            drive_poll_ms: 500,
-            drive_flush_ms: 300,
-            drive_idle_timeout_secs: 300,
+            drive_credentials_path: self.drive_credentials_path.trim().to_string(),
+            drive_token_path: {
+                let v = self.drive_token_path.trim();
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v.to_string())
+                }
+            },
+            drive_folder_id: self.drive_folder_id.trim().to_string(),
+            drive_folder_name: self.drive_folder_name.trim().to_string(),
+            drive_client_id: self.drive_client_id.trim().to_string(),
+            drive_poll_ms: self.drive_poll_ms,
+            drive_flush_ms: self.drive_flush_ms,
+            drive_idle_timeout_secs: self.drive_idle_timeout_secs,
         })
     }
 }
@@ -561,6 +652,29 @@ struct ConfigWire<'a> {
     max_ips_to_scan: usize,
     scan_batch_size: usize,
     google_ip_validation: bool,
+
+    // google_drive mode. Skipped when empty/default so files written by
+    // Apps Script users stay diff-clean against the previous schema.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    drive_credentials_path: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    drive_token_path: Option<&'a str>,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    drive_folder_id: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    drive_folder_name: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    drive_client_id: &'a str,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    drive_poll_ms: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    drive_flush_ms: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    drive_idle_timeout_secs: u64,
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
 }
 
 fn is_false(b: &bool) -> bool {
@@ -609,6 +723,42 @@ impl<'a> From<&'a Config> for ConfigWire<'a> {
             max_ips_to_scan: c.max_ips_to_scan,
             scan_batch_size: c.scan_batch_size,
             google_ip_validation: c.google_ip_validation,
+            // Only emit drive_* keys when the user has actually opted
+            // into google_drive mode. Otherwise the file would gain a
+            // pile of "credentials.json" / "MHRV-Drive" stubs that the
+            // user never asked for.
+            drive_credentials_path: if c.mode == "google_drive" {
+                c.drive_credentials_path.as_str()
+            } else {
+                ""
+            },
+            drive_token_path: if c.mode == "google_drive" {
+                c.drive_token_path.as_deref()
+            } else {
+                None
+            },
+            drive_folder_id: if c.mode == "google_drive" {
+                c.drive_folder_id.as_str()
+            } else {
+                ""
+            },
+            drive_folder_name: if c.mode == "google_drive" {
+                c.drive_folder_name.as_str()
+            } else {
+                ""
+            },
+            drive_client_id: if c.mode == "google_drive" {
+                c.drive_client_id.as_str()
+            } else {
+                ""
+            },
+            drive_poll_ms: if c.mode == "google_drive" { c.drive_poll_ms } else { 0 },
+            drive_flush_ms: if c.mode == "google_drive" { c.drive_flush_ms } else { 0 },
+            drive_idle_timeout_secs: if c.mode == "google_drive" {
+                c.drive_idle_timeout_secs
+            } else {
+                0
+            },
         }
     }
 }
@@ -754,12 +904,14 @@ impl eframe::App for App {
                 form_row(ui, "Mode", Some(
                     "apps_script: DPI bypass via Apps Script relay (needs cert).\n\
                      full: tunnel ALL traffic through Apps Script + tunnel node (no cert needed).\n\
-                     google_only: bootstrap — direct SNI-rewrite tunnel to *.google.com only."
+                     google_only: bootstrap — direct SNI-rewrite tunnel to *.google.com only.\n\
+                     google_drive: SOCKS5 multiplexed through a shared Google Drive folder (needs `mhrv-drive-node`)."
                 ), |ui| {
                     egui::ComboBox::from_id_source("mode")
                         .selected_text(match self.form.mode.as_str() {
                             "google_only" => "Google-only (bootstrap)",
                             "full" => "Full tunnel (no cert)",
+                            "google_drive" => "Google Drive queue",
                             _ => "Apps Script (MITM)",
                         })
                         .show_ui(ui, |ui| {
@@ -777,6 +929,11 @@ impl eframe::App for App {
                                 &mut self.form.mode,
                                 "google_only".into(),
                                 "Google-only (bootstrap)",
+                            );
+                            ui.selectable_value(
+                                &mut self.form.mode,
+                                "google_drive".into(),
+                                "Google Drive queue",
                             );
                         });
                 });
@@ -798,13 +955,23 @@ impl eframe::App for App {
                         .color(OK_GREEN));
                     });
                 }
+                if self.form.mode == "google_drive" {
+                    ui.horizontal(|ui| {
+                        ui.add_space(120.0 + 8.0);
+                        ui.small(egui::RichText::new(
+                            "Drive queue — SOCKS5 only. Run `mhrv-drive-node` on a remote host pointed at the same Drive folder.",
+                        )
+                        .color(OK_GREEN));
+                    });
+                }
             });
 
             let google_only = self.form.mode == "google_only";
+            let google_drive = self.form.mode == "google_drive";
 
             // ── Section: Apps Script relay ────────────────────────────────
             section(ui, "Apps Script relay", |ui| {
-                ui.add_enabled_ui(!google_only, |ui| {
+                ui.add_enabled_ui(!google_only && !google_drive, |ui| {
                     form_row(ui, "Deployment IDs", Some(
                         "One deployment ID per line. Proxy round-robins between them and sidelines \
                          any ID that hits its daily quota for 10 minutes before retrying."
@@ -908,6 +1075,112 @@ impl eframe::App for App {
                 });
             });
 
+            // ── Section: Google Drive queue ─────────────────────────────
+            // Only visible while the user has google_drive selected so it
+            // doesn't clutter the form for Apps Script users.
+            if google_drive {
+                section(ui, "Google Drive queue", |ui| {
+                    form_row(ui, "Credentials JSON", Some(
+                        "Path to your Google Cloud OAuth desktop credentials file. \
+                         The refresh token is cached next to it as `<path>.token` \
+                         (chmod 0600 on Unix)."
+                    ), |ui| {
+                        ui.add(egui::TextEdit::singleline(&mut self.form.drive_credentials_path)
+                            .hint_text("credentials.json")
+                            .desired_width(f32::INFINITY));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_space(120.0 + 8.0);
+                        if ui.small_button("Browse…")
+                            .on_hover_text("Pick the Google Cloud desktop credentials JSON.")
+                            .clicked()
+                        {
+                            if let Some(p) = pick_credentials_file() {
+                                self.form.drive_credentials_path = p;
+                            }
+                        }
+                        let oauth_btn = egui::Button::new(
+                            egui::RichText::new("Authorize Google Drive…")
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(ACCENT)
+                        .rounding(4.0);
+                        if ui.add(oauth_btn)
+                            .on_hover_text(
+                                "Open Google's OAuth consent page for the credentials file \
+                                 above. Paste back the redirected URL or just the code."
+                            )
+                            .clicked()
+                        {
+                            match self.form.to_config() {
+                                Ok(cfg) => {
+                                    self.drive_oauth_open = true;
+                                    self.drive_oauth_code.clear();
+                                    self.drive_oauth_busy = false;
+                                    self.drive_oauth_status = None;
+                                    let _ = self.cmd_tx.send(Cmd::DriveBeginAuth(cfg));
+                                }
+                                Err(e) => {
+                                    self.toast = Some((format!("Cannot authorize: {}", e), Instant::now()));
+                                }
+                            }
+                        }
+                    });
+
+                    form_row(ui, "Folder name", Some(
+                        "Friendly name of the shared Drive folder. Used to look up / create \
+                         the folder when `Folder ID` is empty. Both peers must agree."
+                    ), |ui| {
+                        ui.add(egui::TextEdit::singleline(&mut self.form.drive_folder_name)
+                            .hint_text("MHRV-Drive")
+                            .desired_width(f32::INFINITY));
+                    });
+                    form_row(ui, "Folder ID", Some(
+                        "Optional fixed Drive folder ID. When set, takes precedence over \
+                         the folder-name lookup. Useful when both ends use different OAuth \
+                         accounts (the folder name is scoped to whoever created it)."
+                    ), |ui| {
+                        ui.add(egui::TextEdit::singleline(&mut self.form.drive_folder_id)
+                            .hint_text("(empty = look up by name)")
+                            .desired_width(f32::INFINITY));
+                    });
+                    form_row(ui, "Client ID", Some(
+                        "Stable identifier for this client embedded in Drive filenames. \
+                         Empty = a random short id is generated each run. Validated as \
+                         <=32 ASCII alphanumeric / dash / underscore."
+                    ), |ui| {
+                        ui.add(egui::TextEdit::singleline(&mut self.form.drive_client_id)
+                            .hint_text("(empty = random)")
+                            .desired_width(f32::INFINITY));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [120.0, 20.0],
+                            egui::Label::new(egui::RichText::new("Timing")
+                                .color(egui::Color32::from_gray(200))),
+                        );
+                        ui.label(egui::RichText::new("poll ms").small());
+                        ui.add(egui::DragValue::new(&mut self.form.drive_poll_ms)
+                            .speed(50)
+                            .range(50..=10_000));
+                        ui.add_space(10.0);
+                        ui.label(egui::RichText::new("flush ms").small());
+                        ui.add(egui::DragValue::new(&mut self.form.drive_flush_ms)
+                            .speed(50)
+                            .range(50..=10_000));
+                        ui.add_space(10.0);
+                        ui.label(egui::RichText::new("idle s").small())
+                            .on_hover_text(
+                                "Per-session inactivity cutoff. Bump up if you tunnel \
+                                 long-poll HTTP / idle WebSockets that go quiet for minutes."
+                            );
+                        ui.add(egui::DragValue::new(&mut self.form.drive_idle_timeout_secs)
+                            .speed(10)
+                            .range(15..=3600));
+                    });
+                });
+            }
+
             // ── Section: Advanced (collapsed by default) ──────────────────
             ui.add_space(6.0);
             egui::CollapsingHeader::new(
@@ -1005,6 +1278,11 @@ impl eframe::App for App {
             // Floating SNI editor window. Rendered here so it's inside the
             // same egui context but visually pops out with its own title bar.
             self.show_sni_editor(ctx);
+
+            // Floating Drive OAuth dialog. Same lifetime/visibility model
+            // as the SNI editor — opened from the Authorize button and
+            // closed via its own X.
+            self.show_drive_oauth(ctx);
 
             ui.add_space(8.0);
 
@@ -1779,6 +2057,201 @@ impl App {
             });
         self.form.sni_editor_open = keep_open;
     }
+
+    /// Drive OAuth dialog. Two-step flow:
+    ///   1. Background thread loads credentials.json, derives the consent
+    ///      URL, and sets `shared.drive_auth_url`. UI shows it as a
+    ///      hyperlink + a Copy button.
+    ///   2. User signs in, copies either the redirect URL or just the
+    ///      `code=…` value, pastes it back, hits Submit. We hand the
+    ///      blob to `apply_auth_code`, which exchanges it for tokens
+    ///      and persists the refresh token to `<credentials>.token`
+    ///      (chmod 0600 on Unix).
+    fn show_drive_oauth(&mut self, ctx: &egui::Context) {
+        if !self.drive_oauth_open {
+            return;
+        }
+        let mut keep_open = true;
+        let mut closed_via_button = false;
+        let auth_url = self.shared.state.lock().unwrap().drive_auth_url.clone();
+        let auth_result = self.shared.state.lock().unwrap().drive_auth_result.clone();
+        // Sync the latest result into our local status field so a
+        // dialog reopen doesn't show a stale message.
+        if let Some(r) = auth_result {
+            match r {
+                Ok(p) => {
+                    self.drive_oauth_status = Some(Ok(format!("Saved refresh token to {}", p)));
+                    self.drive_oauth_busy = false;
+                }
+                Err(e) => {
+                    self.drive_oauth_status = Some(Err(e));
+                    self.drive_oauth_busy = false;
+                }
+            }
+            self.shared.state.lock().unwrap().drive_auth_result = None;
+        }
+
+        egui::Window::new("Authorize Google Drive")
+            .open(&mut keep_open)
+            .resizable(false)
+            .default_size(egui::vec2(560.0, 280.0))
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new(
+                    "1. Open this URL in your browser and approve access:",
+                ).strong());
+                ui.add_space(4.0);
+                if let Some(url) = &auth_url {
+                    ui.horizontal(|ui| {
+                        ui.hyperlink_to(
+                            egui::RichText::new("→ open consent page").color(ACCENT),
+                            url,
+                        );
+                        if ui.small_button("copy URL").clicked() {
+                            ui.output_mut(|o| o.copied_text = url.clone());
+                        }
+                    });
+                    egui::ScrollArea::horizontal()
+                        .max_width(f32::INFINITY)
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(url)
+                                    .monospace()
+                                    .size(11.0)
+                                    .color(egui::Color32::from_gray(170)),
+                            );
+                        });
+                } else if self.drive_oauth_busy {
+                    ui.label(
+                        egui::RichText::new("Loading credentials…")
+                            .italics()
+                            .color(egui::Color32::from_gray(150)),
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new(
+                            "Click Authorize on the form to load the credentials JSON.",
+                        )
+                        .color(ERR_RED),
+                    );
+                }
+
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new(
+                    "2. Paste the redirected URL — or just the `code=…` value:",
+                ).strong());
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.drive_oauth_code)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(2)
+                        .hint_text("https://localhost/?code=4/0AdQt8q…  (or just the code)"),
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let submit_enabled = !self.drive_oauth_busy
+                        && !self.drive_oauth_code.trim().is_empty()
+                        && auth_url.is_some();
+                    let btn = egui::Button::new(
+                        egui::RichText::new(if self.drive_oauth_busy {
+                            "Exchanging…"
+                        } else {
+                            "Submit"
+                        })
+                        .color(egui::Color32::WHITE),
+                    )
+                    .fill(ACCENT)
+                    .rounding(4.0);
+                    ui.add_enabled_ui(submit_enabled, |ui| {
+                        if ui.add(btn).clicked() {
+                            match self.form.to_config() {
+                                Ok(cfg) => {
+                                    self.drive_oauth_busy = true;
+                                    self.drive_oauth_status = None;
+                                    let _ = self.cmd_tx.send(Cmd::DriveCompleteAuth {
+                                        config: cfg,
+                                        code: self.drive_oauth_code.trim().to_string(),
+                                    });
+                                }
+                                Err(e) => {
+                                    self.drive_oauth_status = Some(Err(format!(
+                                        "Cannot exchange code: {}",
+                                        e
+                                    )));
+                                }
+                            }
+                        }
+                    });
+                    if ui.small_button("Close").clicked() {
+                        closed_via_button = true;
+                    }
+                });
+
+                if let Some(status) = &self.drive_oauth_status {
+                    ui.add_space(6.0);
+                    match status {
+                        Ok(msg) => {
+                            ui.colored_label(OK_GREEN, msg);
+                        }
+                        Err(e) => {
+                            ui.colored_label(ERR_RED, e);
+                        }
+                    }
+                }
+            });
+        self.drive_oauth_open = keep_open && !closed_via_button;
+        if !self.drive_oauth_open {
+            // Reset the URL/result so the next reopen doesn't flash
+            // stale state at the user.
+            let mut s = self.shared.state.lock().unwrap();
+            s.drive_auth_url = None;
+            s.drive_auth_result = None;
+        }
+    }
+}
+
+/// Native file dialog for picking the Google Cloud OAuth desktop
+/// credentials JSON. Best-effort per platform; falls back to `None` so
+/// the user can still type the path manually.
+fn pick_credentials_file() -> Option<String> {
+    // We deliberately don't pull in `rfd` (would mean another large
+    // GUI dep). PowerShell on Windows / osascript on macOS / zenity on
+    // Linux all handle the "pick a file" prompt without a new crate.
+    #[cfg(target_os = "windows")]
+    {
+        let script = "Add-Type -AssemblyName System.Windows.Forms; \
+            $f = New-Object System.Windows.Forms.OpenFileDialog; \
+            $f.Filter = 'JSON files (*.json)|*.json|All files (*.*)|*.*'; \
+            if ($f.ShowDialog() -eq 'OK') { Write-Output $f.FileName }";
+        let out = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", script])
+            .output()
+            .ok()?;
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if s.is_empty() { None } else { Some(s) }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let script = "POSIX path of (choose file with prompt \"Pick credentials.json\" of type {\"json\"})";
+        let out = std::process::Command::new("osascript")
+            .args(["-e", script])
+            .output()
+            .ok()?;
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if s.is_empty() { None } else { Some(s) }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let out = std::process::Command::new("zenity")
+            .args([
+                "--file-selection",
+                "--title=Pick credentials.json",
+                "--file-filter=JSON | *.json",
+            ])
+            .output()
+            .ok()?;
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if s.is_empty() { None } else { Some(s) }
+    }
 }
 
 fn fmt_duration(d: Duration) -> String {
@@ -1833,6 +2306,45 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
             Ok(Cmd::Start(cfg)) => {
                 if active.is_some() {
                     push_log(&shared, "[ui] already running");
+                    continue;
+                }
+                // google_drive mode bypasses the MITM/ProxyServer flow
+                // entirely — it owns its own SOCKS5 listener and never
+                // needs a CA. Spawn drive_tunnel::run_client_with_shutdown
+                // and reuse the same `active` handle slot so Stop works
+                // unchanged.
+                if matches!(cfg.mode_kind(), Ok(mhrv_rs::config::Mode::GoogleDrive)) {
+                    push_log(&shared, "[ui] starting google_drive client...");
+                    shared.state.lock().unwrap().proxy_active = true;
+                    let shared2 = shared.clone();
+                    let fronter_slot: Arc<AsyncMutex<Option<Arc<DomainFronter>>>> =
+                        Arc::new(AsyncMutex::new(None));
+                    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+                    let handle = rt.spawn(async move {
+                        {
+                            let mut s = shared2.state.lock().unwrap();
+                            s.running = true;
+                            s.started_at = Some(Instant::now());
+                            s.drive_running = true;
+                        }
+                        let port = cfg.socks5_port.unwrap_or(cfg.listen_port + 1);
+                        push_log(
+                            &shared2,
+                            &format!("[ui] drive client SOCKS5 {}:{}", cfg.listen_host, port),
+                        );
+                        if let Err(e) =
+                            mhrv_rs::drive_tunnel::run_client_with_shutdown(&cfg, shutdown_rx).await
+                        {
+                            push_log(&shared2, &format!("[ui] drive client error: {}", e));
+                        }
+                        let mut st = shared2.state.lock().unwrap();
+                        st.running = false;
+                        st.started_at = None;
+                        st.proxy_active = false;
+                        st.drive_running = false;
+                        push_log(&shared2, "[ui] drive client stopped");
+                    });
+                    active = Some((handle, fronter_slot, shutdown_tx));
                     continue;
                 }
                 push_log(&shared, "[ui] starting proxy...");
@@ -2173,6 +2685,52 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                         Err(e) => {
                             push_log(&shared2, &format!("[ui] download failed: {}", e));
                             st.last_download = Some(Err(e));
+                        }
+                    }
+                });
+            }
+            Ok(Cmd::DriveBeginAuth(cfg)) => {
+                let shared2 = shared.clone();
+                rt.spawn(async move {
+                    match mhrv_rs::google_drive::GoogleDriveBackend::from_config(&cfg) {
+                        Ok(backend) => {
+                            let url = backend.auth_url();
+                            push_log(&shared2, "[ui] drive: opened consent URL");
+                            shared2.state.lock().unwrap().drive_auth_url = Some(url);
+                        }
+                        Err(e) => {
+                            let msg = format!("Failed to load credentials: {}", e);
+                            push_log(&shared2, &format!("[ui] drive: {}", msg));
+                            shared2.state.lock().unwrap().drive_auth_result = Some(Err(msg));
+                        }
+                    }
+                });
+            }
+            Ok(Cmd::DriveCompleteAuth { config: cfg, code }) => {
+                let shared2 = shared.clone();
+                rt.spawn(async move {
+                    let backend = match mhrv_rs::google_drive::GoogleDriveBackend::from_config(&cfg) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            let msg = format!("Failed to load credentials: {}", e);
+                            push_log(&shared2, &format!("[ui] drive: {}", msg));
+                            shared2.state.lock().unwrap().drive_auth_result = Some(Err(msg));
+                            return;
+                        }
+                    };
+                    match backend.apply_auth_code(&code).await {
+                        Ok(()) => {
+                            let path = backend.token_path().display().to_string();
+                            push_log(
+                                &shared2,
+                                &format!("[ui] drive: refresh token saved to {}", path),
+                            );
+                            shared2.state.lock().unwrap().drive_auth_result = Some(Ok(path));
+                        }
+                        Err(e) => {
+                            let msg = format!("Code exchange failed: {}", e);
+                            push_log(&shared2, &format!("[ui] drive: {}", msg));
+                            shared2.state.lock().unwrap().drive_auth_result = Some(Err(msg));
                         }
                     }
                 });

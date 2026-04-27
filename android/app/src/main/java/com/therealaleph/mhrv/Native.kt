@@ -105,4 +105,39 @@ object Native {
      * @return 0 on normal shutdown, negative on error. BLOCKS.
      */
     external fun runTun2proxy(cliArgs: String, tunMtu: Int): Int
+
+    // ── google_drive mode ────────────────────────────────────────────
+
+    /**
+     * Same shape as [startProxy] but takes the google_drive code path.
+     * Caller is expected to have completed OAuth via
+     * [driveCompleteAuth] before calling this — otherwise the backend
+     * returns "no refresh token cached" and we return 0.
+     */
+    external fun startDriveProxy(configJson: String): Long
+
+    /**
+     * Build the OAuth consent URL the UI sends the user to. Empty
+     * string on credentials-load failure (logcat has details).
+     * Cheap (no network).
+     */
+    external fun driveAuthUrl(configJson: String): String
+
+    /**
+     * Exchange an authorization code (or full redirect URL) for tokens
+     * and persist the refresh token to disk. Returns a small JSON blob:
+     *   `{"ok":true,"tokenPath":"/data/.../credentials.json.token"}`
+     *   `{"ok":false,"error":"..."}`
+     * BLOCKS on a one-shot tokio runtime — call from a background
+     * dispatcher.
+     */
+    external fun driveCompleteAuth(configJson: String, code: String): String
+
+    /**
+     * Whether a non-empty refresh token has been persisted for the
+     * credentials referenced by `configJson`. Cheap (just a file
+     * read) — UIs poll this every recompose to gate "Authorize" vs
+     * "Re-authorize".
+     */
+    external fun driveTokenPresent(configJson: String): Boolean
 }

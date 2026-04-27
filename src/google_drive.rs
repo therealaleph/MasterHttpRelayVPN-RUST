@@ -266,48 +266,67 @@ impl GoogleDriveBackend {
         })
     }
 
+    /// Best-effort login: try cached refresh token, otherwise fall through
+    /// to the (CLI-only) interactive prompt. UIs should call
+    /// [`try_login_with_cached_token`] first and, if it errors with
+    /// [`DriveError::NeedsOAuth`], drive the [`auth_url`] / [`apply_auth_code`]
+    /// pair from their own widget instead.
     pub async fn login(&self) -> Result<(), DriveError> {
-        if let Ok(data) = fs::read_to_string(&self.token_path) {
-            if let Ok(cache) = serde_json::from_str::<TokenCache>(&data) {
-                if !cache.refresh_token.is_empty() {
-                    *self.token.lock().await = Some(TokenState {
-                        access_token: String::new(),
-                        refresh_token: cache.refresh_token,
-                        expires_at: Instant::now(),
-                    });
-                    return self.refresh_access_token().await;
-                }
-            }
+        if self.try_login_with_cached_token().await? {
+            return Ok(());
         }
-
         self.interactive_login().await
     }
 
-    async fn interactive_login(&self) -> Result<(), DriveError> {
-        let auth_url = {
-            let mut ser = url::form_urlencoded::Serializer::new(String::new());
-            ser.append_pair("client_id", &self.client_id);
-            ser.append_pair("redirect_uri", &self.redirect_uri);
-            ser.append_pair("response_type", "code");
-            ser.append_pair("scope", DRIVE_SCOPE);
-            ser.append_pair("access_type", "offline");
-            ser.append_pair("prompt", "consent");
-            format!("{}?{}", self.auth_uri, ser.finish())
+    /// Returns `Ok(true)` if a cached refresh token was found and an access
+    /// token was successfully minted from it; `Ok(false)` if no cached token
+    /// exists at all. Errors propagate transport / OAuth failures.
+    pub async fn try_login_with_cached_token(&self) -> Result<bool, DriveError> {
+        let Ok(data) = fs::read_to_string(&self.token_path) else {
+            return Ok(false);
         };
+        let Ok(cache) = serde_json::from_str::<TokenCache>(&data) else {
+            return Ok(false);
+        };
+        if cache.refresh_token.is_empty() {
+            return Ok(false);
+        }
+        *self.token.lock().await = Some(TokenState {
+            access_token: String::new(),
+            refresh_token: cache.refresh_token,
+            expires_at: Instant::now(),
+        });
+        self.refresh_access_token().await?;
+        Ok(true)
+    }
 
-        println!();
-        println!("==================== GOOGLE DRIVE OAUTH REQUIRED ====================");
-        println!("1. Open this URL in your browser:\n");
-        println!("{}", auth_url);
-        println!("\n2. Approve access, then paste the full redirected URL or just the code.");
-        print!("\nEnter URL or code: ");
-        std::io::stdout().flush()?;
+    /// Build the authorization URL. UIs show this to the user (clickable
+    /// link or QR code) and then ask them to paste the redirect URL or
+    /// raw code into a text field — which they hand back to
+    /// [`apply_auth_code`].
+    pub fn auth_url(&self) -> String {
+        let mut ser = url::form_urlencoded::Serializer::new(String::new());
+        ser.append_pair("client_id", &self.client_id);
+        ser.append_pair("redirect_uri", &self.redirect_uri);
+        ser.append_pair("response_type", "code");
+        ser.append_pair("scope", DRIVE_SCOPE);
+        ser.append_pair("access_type", "offline");
+        ser.append_pair("prompt", "consent");
+        format!("{}?{}", self.auth_uri, ser.finish())
+    }
 
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        let input = input.trim();
-        let code = if input.starts_with("http://") || input.starts_with("https://") {
-            let parsed = url::Url::parse(input)
+    /// Accept either a raw authorization code or the full redirect URL
+    /// (`http(s)://.../?code=…`). Exchanges it for tokens, persists the
+    /// refresh token to disk (chmod 0600 on Unix), and leaves the in-memory
+    /// state ready for API calls. Idempotent — safe to call multiple times
+    /// with fresh codes.
+    pub async fn apply_auth_code(&self, raw: &str) -> Result<(), DriveError> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(DriveError::OAuth("empty authorization code".into()));
+        }
+        let code = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            let parsed = url::Url::parse(trimmed)
                 .map_err(|e| DriveError::OAuth(format!("bad redirect URL: {}", e)))?;
             parsed
                 .query_pairs()
@@ -315,9 +334,8 @@ impl GoogleDriveBackend {
                 .map(|(_, v)| v.into_owned())
                 .ok_or_else(|| DriveError::OAuth("redirect URL did not contain a code".into()))?
         } else {
-            input.to_string()
+            trimmed.to_string()
         };
-
         if code.is_empty() {
             return Err(DriveError::OAuth("empty authorization code".into()));
         }
@@ -333,6 +351,41 @@ impl GoogleDriveBackend {
             .ok_or_else(|| DriveError::OAuth("Google did not return a refresh token".into()))?;
         let cache = serde_json::to_vec_pretty(&TokenCache { refresh_token })?;
         write_secret_file(&self.token_path, &cache)?;
+        Ok(())
+    }
+
+    /// Whether a refresh token is already cached on disk for this
+    /// credentials JSON. Cheap — does no network I/O. UIs use this to
+    /// decide whether to show the "Authorize" dialog at all.
+    pub fn has_cached_token(&self) -> bool {
+        let Ok(data) = fs::read_to_string(&self.token_path) else {
+            return false;
+        };
+        serde_json::from_str::<TokenCache>(&data)
+            .map(|c| !c.refresh_token.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Path to where the cached refresh token will be written by
+    /// [`apply_auth_code`]. Surfaced for UIs that want to display it.
+    pub fn token_path(&self) -> &PathBuf {
+        &self.token_path
+    }
+
+    async fn interactive_login(&self) -> Result<(), DriveError> {
+        let auth_url = self.auth_url();
+
+        println!();
+        println!("==================== GOOGLE DRIVE OAUTH REQUIRED ====================");
+        println!("1. Open this URL in your browser:\n");
+        println!("{}", auth_url);
+        println!("\n2. Approve access, then paste the full redirected URL or just the code.");
+        print!("\nEnter URL or code: ");
+        std::io::stdout().flush()?;
+
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        self.apply_auth_code(&input).await?;
         println!("Saved Drive OAuth token to {}", self.token_path.display());
         println!("=====================================================================");
         println!();

@@ -1,6 +1,9 @@
 package com.therealaleph.mhrv.ui
 
+import android.content.Intent
 import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -317,6 +320,7 @@ fun HomeScreen(
                 },
                 enabled = (isVpnRunning ||
                     cfg.mode == Mode.GOOGLE_ONLY ||
+                    (cfg.mode == Mode.GOOGLE_DRIVE && cfg.driveConfigured) ||
                     (cfg.hasDeploymentId && cfg.authKey.isNotBlank())) && !transitioning,
                 colors = ButtonDefaults.buttonColors(
                     containerColor = if (isVpnRunning) ErrRed else OkGreen,
@@ -367,6 +371,23 @@ fun HomeScreen(
                         Text(stringResource(R.string.help_auth_key))
                     },
                 )
+            }
+
+            // ── Google Drive section ──────────────────────────────────────
+            // Only shown when the user has selected GOOGLE_DRIVE mode.
+            // Starts expanded if the drive isn't yet configured (no
+            // credentials path, or no cached refresh token).
+            if (cfg.mode == Mode.GOOGLE_DRIVE) {
+                CollapsibleSection(
+                    title = stringResource(R.string.sec_google_drive),
+                    initiallyExpanded = !cfg.driveConfigured,
+                ) {
+                    DriveSection(
+                        cfg = cfg,
+                        onChange = ::persist,
+                        onSnack = { snackbar.showSnackbar(it) },
+                    )
+                }
             }
 
             Spacer(Modifier.height(4.dp))
@@ -849,10 +870,12 @@ private fun ModeDropdown(
     val labelApps = "Apps Script (MITM)"
     val labelGoogle = "Google-only (bootstrap)"
     val labelFull = "Full tunnel (no cert)"
+    val labelDrive = "Google Drive queue"
     val currentLabel = when (mode) {
         Mode.APPS_SCRIPT -> labelApps
         Mode.GOOGLE_ONLY -> labelGoogle
         Mode.FULL -> labelFull
+        Mode.GOOGLE_DRIVE -> labelDrive
     }
     var expanded by remember { mutableStateOf(false) }
 
@@ -885,6 +908,10 @@ private fun ModeDropdown(
                     text = { Text(labelFull) },
                     onClick = { onChange(Mode.FULL); expanded = false },
                 )
+                DropdownMenuItem(
+                    text = { Text(labelDrive) },
+                    onClick = { onChange(Mode.GOOGLE_DRIVE); expanded = false },
+                )
             }
         }
 
@@ -895,6 +922,8 @@ private fun ModeDropdown(
                 "Bootstrap: reach *.google.com directly so you can open script.google.com and deploy Code.gs. Non-Google traffic goes direct."
             Mode.FULL ->
                 "All traffic tunneled end-to-end through Apps Script + remote tunnel node. No certificate needed."
+            Mode.GOOGLE_DRIVE ->
+                "SOCKS5 multiplexed through a shared Google Drive folder. Needs `mhrv-drive-node` running on a remote host pointed at the same folder."
         }
         Text(
             help,
@@ -1163,6 +1192,336 @@ private fun parseProbeResult(json: String?): ProbeState {
         }
     } catch (_: Throwable) {
         ProbeState.Err("bad json")
+    }
+}
+
+// =========================================================================
+// Google Drive section. Importer for credentials.json + OAuth dialog +
+// poll/flush/idle knobs. Visible only while mode == GOOGLE_DRIVE.
+// =========================================================================
+
+@Composable
+private fun DriveSection(
+    cfg: MhrvConfig,
+    onChange: (MhrvConfig) -> Unit,
+    onSnack: suspend (String) -> Unit,
+) {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var oauthOpen by rememberSaveable { mutableStateOf(false) }
+    // Re-checked every time the credentials path changes — flips the
+    // button label between Authorize / Re-authorize so the user knows
+    // whether OAuth is already done.
+    var hasToken by remember(cfg.driveCredentialsPath) {
+        mutableStateOf(
+            cfg.driveCredentialsPath.isNotBlank() &&
+                runCatching { Native.driveTokenPresent(cfg.toJson()) }
+                    .getOrDefault(false)
+        )
+    }
+
+    // SAF-based importer. ACTION_OPEN_DOCUMENT returns a content URI we
+    // can read once; we copy the bytes into filesDir/drive-credentials.json
+    // so the Rust side has a stable absolute path.
+    val importLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        val dest = java.io.File(ctx.filesDir, "drive-credentials.json")
+        try {
+            ctx.contentResolver.openInputStream(uri)?.use { input ->
+                dest.outputStream().use { output -> input.copyTo(output) }
+            }
+            onChange(cfg.copy(driveCredentialsPath = dest.absolutePath))
+            scope.launch { onSnack("Credentials imported to ${dest.name}") }
+        } catch (t: Throwable) {
+            scope.launch { onSnack("Import failed: ${t.message ?: "unknown"}") }
+        }
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            stringResource(R.string.help_google_drive),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        // Credentials importer / status row.
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    stringResource(R.string.field_drive_credentials),
+                    style = MaterialTheme.typography.labelLarge,
+                )
+                Text(
+                    text = if (cfg.driveCredentialsPath.isBlank())
+                        stringResource(R.string.drive_creds_none)
+                    else
+                        cfg.driveCredentialsPath,
+                    style = MaterialTheme.typography.labelSmall,
+                    fontFamily = FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            FilledTonalButton(
+                onClick = { importLauncher.launch(arrayOf("application/json", "*/*")) },
+            ) {
+                Text(stringResource(R.string.btn_drive_import_creds))
+            }
+        }
+
+        // Authorize / re-authorize.
+        Button(
+            onClick = {
+                if (cfg.driveCredentialsPath.isBlank()) {
+                    scope.launch { onSnack("Import credentials.json first") }
+                } else {
+                    oauthOpen = true
+                }
+            },
+            modifier = Modifier.fillMaxWidth(),
+            enabled = cfg.driveCredentialsPath.isNotBlank(),
+        ) {
+            Text(
+                if (hasToken)
+                    stringResource(R.string.btn_drive_reauthorize)
+                else
+                    stringResource(R.string.btn_drive_authorize)
+            )
+        }
+
+        // Folder name + (optional) folder id.
+        OutlinedTextField(
+            value = cfg.driveFolderName,
+            onValueChange = { onChange(cfg.copy(driveFolderName = it)) },
+            label = { Text(stringResource(R.string.field_drive_folder_name)) },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = cfg.driveFolderId,
+            onValueChange = { onChange(cfg.copy(driveFolderId = it)) },
+            label = { Text(stringResource(R.string.field_drive_folder_id)) },
+            placeholder = { Text(stringResource(R.string.placeholder_drive_folder_id)) },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = cfg.driveClientId,
+            onValueChange = { onChange(cfg.copy(driveClientId = it)) },
+            label = { Text(stringResource(R.string.field_drive_client_id)) },
+            placeholder = { Text(stringResource(R.string.placeholder_drive_client_id)) },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+        )
+
+        // poll / flush / idle.
+        Column {
+            Text(
+                stringResource(R.string.adv_drive_poll, cfg.drivePollMs),
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Slider(
+                value = cfg.drivePollMs.toFloat(),
+                onValueChange = { onChange(cfg.copy(drivePollMs = it.toInt().coerceIn(100, 5000))) },
+                valueRange = 100f..5000f,
+            )
+        }
+        Column {
+            Text(
+                stringResource(R.string.adv_drive_flush, cfg.driveFlushMs),
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Slider(
+                value = cfg.driveFlushMs.toFloat(),
+                onValueChange = { onChange(cfg.copy(driveFlushMs = it.toInt().coerceIn(100, 5000))) },
+                valueRange = 100f..5000f,
+            )
+        }
+        Column {
+            Text(
+                stringResource(R.string.adv_drive_idle, cfg.driveIdleTimeoutSecs),
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Slider(
+                value = cfg.driveIdleTimeoutSecs.toFloat(),
+                onValueChange = { onChange(cfg.copy(driveIdleTimeoutSecs = it.toInt().coerceIn(15, 3600))) },
+                valueRange = 15f..3600f,
+            )
+            Text(
+                stringResource(R.string.adv_drive_idle_help),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+
+    if (oauthOpen) {
+        DriveOAuthDialog(
+            cfg = cfg,
+            onDismiss = {
+                oauthOpen = false
+                // Re-check after the dialog closes — covers the success
+                // case where the user just completed auth.
+                hasToken = cfg.driveCredentialsPath.isNotBlank() &&
+                    runCatching { Native.driveTokenPresent(cfg.toJson()) }
+                        .getOrDefault(false)
+            },
+            onSuccess = {
+                hasToken = true
+                scope.launch { onSnack("Google Drive authorized ✓") }
+            },
+        )
+    }
+}
+
+@Composable
+private fun DriveOAuthDialog(
+    cfg: MhrvConfig,
+    onDismiss: () -> Unit,
+    onSuccess: () -> Unit,
+) {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val clipboard = LocalClipboardManager.current
+
+    var url by remember { mutableStateOf<String?>(null) }
+    var loadingUrl by remember { mutableStateOf(true) }
+    var code by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    var status by remember { mutableStateOf<Result<String>?>(null) }
+
+    LaunchedEffect(cfg.driveCredentialsPath) {
+        loadingUrl = true
+        url = withContext(Dispatchers.IO) {
+            runCatching { Native.driveAuthUrl(cfg.toJson()) }
+                .getOrNull()
+                ?.takeIf { it.isNotBlank() }
+        }
+        loadingUrl = false
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.dialog_drive_auth_title)) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(stringResource(R.string.dialog_drive_auth_step1))
+                when {
+                    loadingUrl -> {
+                        Text(
+                            stringResource(R.string.dialog_drive_auth_loading),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    url == null -> {
+                        Text(
+                            stringResource(R.string.dialog_drive_auth_load_failed),
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                    else -> {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            TextButton(onClick = {
+                                runCatching {
+                                    val intent = Intent(
+                                        Intent.ACTION_VIEW,
+                                        android.net.Uri.parse(url),
+                                    )
+                                    ctx.startActivity(intent)
+                                }
+                            }) { Text(stringResource(R.string.btn_drive_open_consent)) }
+                            TextButton(onClick = {
+                                clipboard.setText(AnnotatedString(url ?: ""))
+                                Toast.makeText(
+                                    ctx,
+                                    ctx.getString(R.string.snack_drive_url_copied),
+                                    Toast.LENGTH_SHORT,
+                                ).show()
+                            }) { Text(stringResource(R.string.btn_copy)) }
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(4.dp))
+                Text(stringResource(R.string.dialog_drive_auth_step2))
+                OutlinedTextField(
+                    value = code,
+                    onValueChange = { code = it },
+                    placeholder = { Text(stringResource(R.string.placeholder_drive_code)) },
+                    minLines = 2,
+                    maxLines = 4,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                status?.let { r ->
+                    if (r.isSuccess) {
+                        Text(
+                            r.getOrNull() ?: "",
+                            color = OkGreen,
+                            style = MaterialTheme.typography.labelMedium,
+                        )
+                    } else {
+                        Text(
+                            r.exceptionOrNull()?.message
+                                ?: stringResource(R.string.dialog_drive_auth_failed_generic),
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.labelMedium,
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = !busy && url != null && code.isNotBlank(),
+                onClick = {
+                    busy = true
+                    status = null
+                    scope.launch {
+                        val json = withContext(Dispatchers.IO) {
+                            runCatching {
+                                Native.driveCompleteAuth(cfg.toJson(), code.trim())
+                            }.getOrNull()
+                        }
+                        busy = false
+                        val parsed = parseDriveAuthResult(json)
+                        status = parsed
+                        if (parsed.isSuccess) {
+                            onSuccess()
+                            onDismiss()
+                        }
+                    }
+                },
+            ) {
+                Text(
+                    if (busy) stringResource(R.string.dialog_drive_auth_exchanging)
+                    else stringResource(R.string.btn_drive_submit_code)
+                )
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.btn_cancel)) }
+        },
+    )
+}
+
+private fun parseDriveAuthResult(json: String?): Result<String> {
+    if (json.isNullOrBlank()) return Result.failure(RuntimeException("no response"))
+    return try {
+        val obj = JSONObject(json)
+        if (obj.optBoolean("ok", false)) {
+            val path = obj.optString("tokenPath", "")
+            Result.success("Saved refresh token to $path")
+        } else {
+            Result.failure(RuntimeException(obj.optString("error", "failed")))
+        }
+    } catch (_: Throwable) {
+        Result.failure(RuntimeException("bad json"))
     }
 }
 

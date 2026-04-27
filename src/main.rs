@@ -329,7 +329,8 @@ async fn main() -> ExitCode {
     }
 
     if mode == mhrv_rs::config::Mode::GoogleDrive {
-        let run = mhrv_rs::drive_tunnel::run_client(&config);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let run = mhrv_rs::drive_tunnel::run_client_with_shutdown(&config, shutdown_rx);
         tokio::select! {
             r = run => {
                 if let Err(e) = r {
@@ -339,6 +340,7 @@ async fn main() -> ExitCode {
             }
             _ = tokio::signal::ctrl_c() => {
                 tracing::warn!("Ctrl+C — shutting down google_drive client.");
+                let _ = shutdown_tx.send(());
             }
         }
         return ExitCode::SUCCESS;

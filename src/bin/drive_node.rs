@@ -86,6 +86,8 @@ async fn main() -> ExitCode {
     }
 
     tracing::warn!("mhrv-drive-node {} starting", VERSION);
+    // run_server is unaffected by the run_client refactor — it owns
+    // its own poll loop and exits when its mpsc channel closes.
     let run = mhrv_rs::drive_tunnel::run_server(&config);
     tokio::select! {
         r = run => {

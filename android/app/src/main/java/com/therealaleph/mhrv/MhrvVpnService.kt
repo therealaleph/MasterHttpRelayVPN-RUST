@@ -105,11 +105,19 @@ class MhrvVpnService : VpnService() {
 
         // Deployment ID + auth key are required for apps_script and full
         // modes — both talk to Apps Script. Only google_only (bootstrap)
-        // runs without them. Closes #73 regression where google_only
-        // users hit this branch and crashed on startForeground timeout.
-        val needsCreds = cfg.mode != Mode.GOOGLE_ONLY
-        if (needsCreds && (!cfg.hasDeploymentId || cfg.authKey.isBlank())) {
+        // and google_drive (Drive queue) run without them. Closes #73
+        // regression where google_only users hit this branch and crashed
+        // on startForeground timeout.
+        val needsAppsScriptCreds =
+            cfg.mode != Mode.GOOGLE_ONLY && cfg.mode != Mode.GOOGLE_DRIVE
+        if (needsAppsScriptCreds && (!cfg.hasDeploymentId || cfg.authKey.isBlank())) {
             Log.e(TAG, "Config is incomplete — deployment ID + auth key required for ${cfg.mode}")
+            try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Throwable) {}
+            stopSelf()
+            return
+        }
+        if (cfg.mode == Mode.GOOGLE_DRIVE && cfg.driveCredentialsPath.isBlank()) {
+            Log.e(TAG, "Drive mode needs drive_credentials_path; aborting")
             try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Throwable) {}
             stopSelf()
             return
@@ -127,9 +135,21 @@ class MhrvVpnService : VpnService() {
             proxyHandle = 0L
         }
 
-        proxyHandle = Native.startProxy(cfg.toJson())
+        // google_drive uses a separate JNI entry point because the
+        // ProxyServer constructor unreachable!()s for Drive mode (the
+        // drive client owns its own SOCKS5 listener; there's no MITM
+        // pipeline to wire up). Both paths share the same handle slot
+        // map, so stopProxy works unchanged for either.
+        proxyHandle = if (cfg.mode == Mode.GOOGLE_DRIVE) {
+            Native.startDriveProxy(cfg.toJson())
+        } else {
+            Native.startProxy(cfg.toJson())
+        }
         if (proxyHandle == 0L) {
-            Log.e(TAG, "Native.startProxy returned 0 — see logcat tag mhrv_rs")
+            Log.e(
+                TAG,
+                "Native.startProxy returned 0 (mode=${cfg.mode}) — see logcat tag mhrv_rs",
+            )
             try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Throwable) {}
             stopSelf()
             return

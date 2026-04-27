@@ -108,6 +108,35 @@
     <string name="btn_view_quota_on_google">View quota on Google →</string>
     <string name="usage_today_note">Estimate — this is what this device relayed. Google\'s dashboard has the authoritative number.</string>
 
+    <!-- Google Drive section -->
+    <string name="sec_google_drive">Google Drive queue</string>
+    <string name="help_google_drive">Multiplex SOCKS5 traffic through a shared Google Drive folder. Both this device and the remote `mhrv-drive-node` process need OAuth credentials for the same Google account (or a folder the second account has access to). No Apps Script involved.</string>
+    <string name="field_drive_credentials">credentials.json</string>
+    <string name="drive_creds_none">Not yet imported. Tap Import to pick the file.</string>
+    <string name="btn_drive_import_creds">Import…</string>
+    <string name="btn_drive_authorize">Authorize Google Drive</string>
+    <string name="btn_drive_reauthorize">Re-authorize Google Drive</string>
+    <string name="btn_drive_open_consent">Open consent page</string>
+    <string name="btn_drive_submit_code">Submit</string>
+    <string name="field_drive_folder_name">Drive folder name</string>
+    <string name="field_drive_folder_id">Drive folder ID (optional)</string>
+    <string name="placeholder_drive_folder_id">empty = look up by name</string>
+    <string name="field_drive_client_id">Client ID (optional)</string>
+    <string name="placeholder_drive_client_id">empty = random short id each run</string>
+    <string name="adv_drive_poll">poll interval: %1$d ms</string>
+    <string name="adv_drive_flush">flush interval: %1$d ms</string>
+    <string name="adv_drive_idle">idle timeout: %1$d s</string>
+    <string name="adv_drive_idle_help">Per-session inactivity cutoff. Bump up if you tunnel long-poll HTTP / idle WebSockets.</string>
+    <string name="dialog_drive_auth_title">Authorize Google Drive</string>
+    <string name="dialog_drive_auth_step1">1. Open Google\'s consent page and approve access:</string>
+    <string name="dialog_drive_auth_step2">2. Paste the redirected URL — or just the `code=…` value:</string>
+    <string name="dialog_drive_auth_loading">Loading credentials…</string>
+    <string name="dialog_drive_auth_load_failed">Could not load credentials. Re-import the file.</string>
+    <string name="dialog_drive_auth_failed_generic">Authorization failed</string>
+    <string name="dialog_drive_auth_exchanging">Exchanging…</string>
+    <string name="placeholder_drive_code">https://localhost/?code=4/0AdQt8q…  (or just the code)</string>
+    <string name="snack_drive_url_copied">Consent URL copied</string>
+
     <!-- "How to use" guide body. Localized — FA copy lives in values-fa. -->
     <string name="help_how_to_use">1. Paste one or more Apps Script deployment URLs (or bare IDs) and your auth_key.\n2. Tap Install MITM certificate. Confirm the dialog — the cert is saved to Downloads/mhrv-ca.crt and the Settings app opens. Use Settings\' search bar to find \"CA certificate\", tap that result (NOT \"VPN &amp; app user certificate\" or \"Wi-Fi\"), and pick mhrv-ca.crt from Downloads. You\'ll be asked to set a screen lock if you don\'t have one (Android requirement).\n3. Before tapping Start, expand \"SNI pool + tester\" and hit \"Test all\". If every entry times out, your google_ip is unreachable — replace it with one that resolves locally (e.g. `nslookup www.google.com` on any working device).\n4. Tap Start. Accept the VPN prompt. The full TUN bridge routes every app on the device through the proxy — no per-app setup needed.\n5. If Chrome shows \"504 Relay timeout\": your Apps Script deployment isn\'t responding. Redeploy the script, grab the new /exec URL, and paste it above. Watch Live logs for \"Relay timeout\" vs \"connect:\" errors to tell which layer is failing.\n\nKnown limitation — Cloudflare Turnstile (\"Verify you are human\") will loop endlessly on most CF-protected sites. Every Apps Script request uses a rotating Google-datacenter egress IP + a fixed \"Google-Apps-Script\" User-Agent + a Google TLS fingerprint. The cf_clearance cookie is bound to the (IP, UA, JA3) tuple the challenge was solved against, so the NEXT request — from a different egress IP — gets re-challenged. Nothing in this app can fix that; it\'s inherent to Apps Script as a relay. Sites that only gate the initial page load (not every request) will work after one solve.</string>
 </resources>

@@ -296,6 +296,7 @@ private fun ImportConfirmDialog(
         com.therealaleph.mhrv.Mode.APPS_SCRIPT -> "apps_script"
         com.therealaleph.mhrv.Mode.GOOGLE_ONLY -> "google_only"
         com.therealaleph.mhrv.Mode.FULL -> "full"
+        com.therealaleph.mhrv.Mode.GOOGLE_DRIVE -> "google_drive"
     }
 
     AlertDialog(

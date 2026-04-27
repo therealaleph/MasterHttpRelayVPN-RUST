@@ -628,6 +628,22 @@ fn apply_rx_env(session: &mut DriveSession, env: Envelope, out: &mut Vec<DriveRx
 }
 
 pub async fn run_client(config: &Config) -> Result<(), DriveError> {
+    // Backward compatibility shim — never returns. Newer entry points
+    // ([`run_client_with_shutdown`]) accept a oneshot so UIs can stop
+    // the SOCKS5 listener cleanly.
+    let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+    run_client_with_shutdown(config, rx).await
+}
+
+/// Same as [`run_client`] but returns when `shutdown` resolves. UIs and
+/// services use this so the listener can be released on stop without
+/// killing the whole tokio runtime. Backend OAuth + folder discovery
+/// happen up front (before the listen socket binds), so a Ctrl+C that
+/// arrives during login still bubbles back to the caller.
+pub async fn run_client_with_shutdown(
+    config: &Config,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+) -> Result<(), DriveError> {
     let backend = init_backend(config).await?;
     let client_id = if config.drive_client_id.trim().is_empty() {
         random_hex(4)
@@ -647,14 +663,24 @@ pub async fn run_client(config: &Config) -> Result<(), DriveError> {
     );
     tracing::warn!("HTTP proxy and UDP ASSOCIATE are not available in google_drive mode.");
 
+    let mut shutdown = shutdown;
     loop {
-        let (sock, peer) = listener.accept().await?;
-        let engine = engine.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_socks5_client(sock, engine).await {
-                tracing::debug!("Drive SOCKS5 client {} closed: {}", peer, e);
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => {
+                tracing::info!("google_drive client: shutdown signal received, releasing {}", addr);
+                return Ok(());
             }
-        });
+            accepted = listener.accept() => {
+                let (sock, peer) = accepted?;
+                let engine = engine.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_socks5_client(sock, engine).await {
+                        tracing::debug!("Drive SOCKS5 client {} closed: {}", peer, e);
+                    }
+                });
+            }
+        }
     }
 }
 

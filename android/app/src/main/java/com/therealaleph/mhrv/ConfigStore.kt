@@ -70,8 +70,11 @@ enum class UiLang { AUTO, FA, EN }
  *   Non-Google traffic goes direct (no relay).
  * - [FULL] — full tunnel mode. ALL traffic is tunneled end-to-end through
  *   Apps Script + a remote tunnel node. No certificate installation needed.
+ * - [GOOGLE_DRIVE] — FlowDriver-style queue. SOCKS5 multiplexed through
+ *   a shared Google Drive folder; needs `mhrv-drive-node` running on a
+ *   remote host pointed at the same folder. No Apps Script involved.
  */
-enum class Mode { APPS_SCRIPT, GOOGLE_ONLY, FULL }
+enum class Mode { APPS_SCRIPT, GOOGLE_ONLY, FULL, GOOGLE_DRIVE }
 
 data class MhrvConfig(
     val mode: Mode = Mode.APPS_SCRIPT,
@@ -114,6 +117,26 @@ data class MhrvConfig(
 
     /** UI language toggle. Non-Rust; honoured only by the Android wrapper. */
     val uiLang: UiLang = UiLang.AUTO,
+
+    // ── google_drive mode ──────────────────────────────────────────────
+    /**
+     * Path to the Google Cloud OAuth desktop credentials JSON. On Android
+     * this is the absolute path inside the app's filesDir where the user
+     * imported their downloaded `credentials.json`. Empty on a fresh install.
+     */
+    val driveCredentialsPath: String = "",
+    /** Pinned Drive folder ID, or empty to look up by [driveFolderName]. */
+    val driveFolderId: String = "",
+    val driveFolderName: String = "MHRV-Drive",
+    /**
+     * Stable per-device client_id embedded in Drive filenames. Empty =
+     * Rust generates a random short id at start. Validated server-side
+     * (<=32 chars, ASCII alphanumeric / dash / underscore).
+     */
+    val driveClientId: String = "",
+    val drivePollMs: Int = 500,
+    val driveFlushMs: Int = 300,
+    val driveIdleTimeoutSecs: Int = 300,
 ) {
     /**
      * Extract just the deployment ID from either a full
@@ -160,6 +183,7 @@ data class MhrvConfig(
                 Mode.APPS_SCRIPT -> "apps_script"
                 Mode.GOOGLE_ONLY -> "google_only"
                 Mode.FULL -> "full"
+                Mode.GOOGLE_DRIVE -> "google_drive"
             })
             put("listen_host", listenHost)
             put("listen_port", listenPort)
@@ -214,9 +238,35 @@ data class MhrvConfig(
                 UiLang.FA -> "fa"
                 UiLang.EN -> "en"
             })
+
+            // google_drive: only emit when the user has actually set a
+            // credentials path. Otherwise the file would gain stub keys
+            // (poll/flush/idle defaults) for users who don't run drive
+            // mode, which makes diffs noisier.
+            if (mode == Mode.GOOGLE_DRIVE || driveCredentialsPath.isNotBlank()) {
+                if (driveCredentialsPath.isNotBlank()) {
+                    put("drive_credentials_path", driveCredentialsPath)
+                }
+                if (driveFolderId.isNotBlank()) put("drive_folder_id", driveFolderId)
+                if (driveFolderName.isNotBlank()) put("drive_folder_name", driveFolderName)
+                if (driveClientId.isNotBlank()) put("drive_client_id", driveClientId)
+                put("drive_poll_ms", drivePollMs)
+                put("drive_flush_ms", driveFlushMs)
+                put("drive_idle_timeout_secs", driveIdleTimeoutSecs)
+            }
         }
         return obj.toString(2)
     }
+
+    /**
+     * Whether the Drive mode has enough configured to attempt a Start.
+     * Mirrors the Rust-side validate() rules: needs a credentials path
+     * and an OAuth refresh token cached for those credentials. The
+     * token check is best-effort — `Native.driveTokenPresent` reads the
+     * file on disk, so a true here doesn't guarantee Google will accept
+     * the refresh on next call.
+     */
+    val driveConfigured: Boolean get() = driveCredentialsPath.isNotBlank()
 
     /** Convenience: is there at least one usable deployment ID? */
     val hasDeploymentId: Boolean get() =
@@ -255,6 +305,7 @@ object ConfigStore {
             Mode.APPS_SCRIPT -> "apps_script"
             Mode.GOOGLE_ONLY -> "google_only"
             Mode.FULL -> "full"
+            Mode.GOOGLE_DRIVE -> "google_drive"
         })
         val ids = cfg.appsScriptUrls.mapNotNull { url ->
             val marker = "/macros/s/"
@@ -277,6 +328,15 @@ object ConfigStore {
         if (cfg.parallelRelay != defaults.parallelRelay) obj.put("parallel_relay", cfg.parallelRelay)
         if (cfg.upstreamSocks5.isNotBlank()) obj.put("upstream_socks5", cfg.upstreamSocks5)
         if (cfg.passthroughHosts.isNotEmpty()) obj.put("passthrough_hosts", JSONArray().apply { cfg.passthroughHosts.forEach { put(it) } })
+        // google_drive — share the knobs but never the credentials path
+        // or refresh token; those are device-local.
+        if (cfg.mode == Mode.GOOGLE_DRIVE) {
+            if (cfg.driveFolderId.isNotBlank()) obj.put("drive_folder_id", cfg.driveFolderId)
+            if (cfg.driveFolderName != defaults.driveFolderName) obj.put("drive_folder_name", cfg.driveFolderName)
+            if (cfg.drivePollMs != defaults.drivePollMs) obj.put("drive_poll_ms", cfg.drivePollMs)
+            if (cfg.driveFlushMs != defaults.driveFlushMs) obj.put("drive_flush_ms", cfg.driveFlushMs)
+            if (cfg.driveIdleTimeoutSecs != defaults.driveIdleTimeoutSecs) obj.put("drive_idle_timeout_secs", cfg.driveIdleTimeoutSecs)
+        }
 
         // Compress with DEFLATE then base64.
         val jsonBytes = obj.toString().toByteArray(Charsets.UTF_8)
@@ -350,6 +410,7 @@ object ConfigStore {
             mode = when (obj.optString("mode", "apps_script")) {
                 "google_only" -> Mode.GOOGLE_ONLY
                 "full" -> Mode.FULL
+                "google_drive" -> Mode.GOOGLE_DRIVE
                 else -> Mode.APPS_SCRIPT
             },
             listenHost = obj.optString("listen_host", "127.0.0.1"),
@@ -384,6 +445,13 @@ object ConfigStore {
                 "en" -> UiLang.EN
                 else -> UiLang.AUTO
             },
+            driveCredentialsPath = obj.optString("drive_credentials_path", ""),
+            driveFolderId = obj.optString("drive_folder_id", ""),
+            driveFolderName = obj.optString("drive_folder_name", "MHRV-Drive"),
+            driveClientId = obj.optString("drive_client_id", ""),
+            drivePollMs = obj.optInt("drive_poll_ms", 500),
+            driveFlushMs = obj.optInt("drive_flush_ms", 300),
+            driveIdleTimeoutSecs = obj.optInt("drive_idle_timeout_secs", 300),
         )
     }
 }

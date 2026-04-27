@@ -93,6 +93,35 @@
     <string name="btn_view_quota_on_google">مشاهدهٔ سهمیه در گوگل ←</string>
     <string name="usage_today_note">تخمینی — این همان چیزی است که از این دستگاه رد شده. عدد دقیق در داشبورد گوگل قابل مشاهده است.</string>
 
+    <!-- Google Drive section -->
+    <string name="sec_google_drive">صف Google Drive</string>
+    <string name="help_google_drive">ترافیک SOCKS5 را از طریق یک پوشهٔ مشترک گوگل درایو رد می‌کند. هم این دستگاه و هم پروسهٔ `mhrv-drive-node` روی سرور باید با یک حساب گوگل (یا پوشه‌ای که حساب دوم دسترسی دارد) OAuth شده باشند. Apps Script در این مدل دخیل نیست.</string>
+    <string name="field_drive_credentials">credentials.json</string>
+    <string name="drive_creds_none">هنوز وارد نشده. روی «وارد کردن» بزنید.</string>
+    <string name="btn_drive_import_creds">وارد کردن…</string>
+    <string name="btn_drive_authorize">احراز Google Drive</string>
+    <string name="btn_drive_reauthorize">احراز مجدد Google Drive</string>
+    <string name="btn_drive_open_consent">باز کردن صفحهٔ تأیید</string>
+    <string name="btn_drive_submit_code">ثبت</string>
+    <string name="field_drive_folder_name">نام پوشهٔ Drive</string>
+    <string name="field_drive_folder_id">شناسهٔ پوشهٔ Drive (اختیاری)</string>
+    <string name="placeholder_drive_folder_id">خالی = جست‌وجو با نام</string>
+    <string name="field_drive_client_id">شناسهٔ Client (اختیاری)</string>
+    <string name="placeholder_drive_client_id">خالی = هر بار یک شناسهٔ تصادفی</string>
+    <string name="adv_drive_poll">فاصلهٔ poll: %1$d ms</string>
+    <string name="adv_drive_flush">فاصلهٔ flush: %1$d ms</string>
+    <string name="adv_drive_idle">تایم‌اوت بی‌کاری: %1$d ثانیه</string>
+    <string name="adv_drive_idle_help">حد بی‌کاری هر نشست. اگر long-poll HTTP یا WebSocket بی‌کار رد می‌کنید، این را بالا ببرید.</string>
+    <string name="dialog_drive_auth_title">احراز Google Drive</string>
+    <string name="dialog_drive_auth_step1">۱. صفحهٔ تأیید گوگل را باز و دسترسی را تأیید کنید:</string>
+    <string name="dialog_drive_auth_step2">۲. URL ریدایرکت‌شده را — یا فقط مقدار `code=…` — جای‌گذاری کنید:</string>
+    <string name="dialog_drive_auth_loading">در حال خواندن credentials…</string>
+    <string name="dialog_drive_auth_load_failed">خواندن credentials ممکن نشد. فایل را دوباره وارد کنید.</string>
+    <string name="dialog_drive_auth_failed_generic">احراز انجام نشد</string>
+    <string name="dialog_drive_auth_exchanging">در حال تبادل…</string>
+    <string name="placeholder_drive_code">https://localhost/?code=4/0AdQt8q…  (یا فقط همان code)</string>
+    <string name="snack_drive_url_copied">URL تأیید کپی شد</string>
+
     <!-- "How to use" guide body. Localized — EN copy lives in values. -->
     <string name="help_how_to_use">۱. یک یا چند آدرس deployment از Apps Script (یا فقط ID خام) و همراه آن auth_key خود را جای‌گذاری کنید.\n۲. روی «نصب گواهی MITM» بزنید و پیام تأیید را قبول کنید — گواهی در Downloads/mhrv-ca.crt ذخیره می‌شود و برنامهٔ Settings باز می‌شود. داخل Settings از نوار جست‌وجو «CA certificate» را پیدا کنید و روی همان نتیجه بزنید (نه «VPN &amp; app user certificate» و نه «Wi-Fi»)، سپس mhrv-ca.crt را از Downloads انتخاب کنید. اگر قفل صفحه ندارید، اندروید می‌خواهد یکی تنظیم کنید (الزام سیستم).\n۳. قبل از Start، بخش «مجموعهٔ SNI + تستر» را باز کنید و «تست همه» را بزنید. اگر همه تایم‌اوت شدند یعنی google_ip در دسترس نیست — آن را با یک IP جایگزین کنید که روی شبکهٔ سالم resolve می‌شود (مثلاً `nslookup www.google.com` روی هر دستگاه سالم).\n۴. Start را بزنید و درخواست VPN را تأیید کنید. پل TUN کامل، تمام برنامه‌های دستگاه را خودکار از پروکسی رد می‌کند — نیاز به تنظیم per-app نیست.\n۵. اگر Chrome پیام «504 Relay timeout» نشان داد: deployment شما پاسخ نمی‌دهد. اسکریپت را دوباره deploy کنید، URL جدید /exec را بگیرید و بالا جای‌گذاری کنید. در «لاگ زنده» ببینید خطا از نوع «Relay timeout» است یا «connect:» — نوع خطا مشخص می‌کند کدام لایه مقصر است.\n\nمحدودیت شناخته‌شده — Cloudflare Turnstile («Verify you are human») روی اکثر سایت‌های پشت Cloudflare به‌طور بی‌پایان loop می‌زند. هر درخواست Apps Script از یک IP خروجی چرخشی دیتاسنتر گوگل + یک User-Agent ثابت «Google-Apps-Script» + اثرانگشت TLS گوگل عبور می‌کند. کوکی cf_clearance به tuple (IP, UA, JA3) مربوط به زمان حل چالش گره خورده است، پس درخواست بعدی — از یک IP خروجی متفاوت — دوباره چالش می‌خورد. این مسئله در این برنامه قابل‌حل نیست؛ ذات رلهٔ Apps Script است. سایت‌هایی که فقط بارگذاری اولیه را gate می‌کنند (نه هر درخواست) بعد از یک بار حل، کار خواهند کرد.</string>
 </resources>
