@@ -80,15 +80,10 @@ fun ConfigSharingBar(
     val clipboard = LocalClipboardManager.current
     val scope = rememberCoroutineScope()
 
-    val clipText = clipboard.getText()?.text.orEmpty()
-    val hasConfigInClipboard = clipText.isNotEmpty() && ConfigStore.looksLikeConfig(clipText)
-    val hasDriveSetupInClipboard = clipText.isNotEmpty() && ConfigStore.looksLikeDriveSetup(clipText)
-
     var showExportDialog by remember { mutableStateOf(false) }
     var showImportConfirm by remember { mutableStateOf(false) }
     var pendingImport by remember { mutableStateOf<MhrvConfig?>(null) }
     var pendingDriveSetup by remember { mutableStateOf<ConfigStore.DriveSetup?>(null) }
-    var showQrDialog by remember { mutableStateOf(false) }
 
     // QR scanner launcher — fires the ZXing embedded scanner activity.
     // Dispatches based on payload prefix: regular config vs Drive setup.
@@ -112,97 +107,44 @@ fun ConfigSharingBar(
         }
     }
 
-    // --- Paste from clipboard banner (regular config OR Drive setup) ---
-    // Drive-setup blob takes precedence — it's a more specific format
-    // and we want to surface it immediately when a fresh recipient
-    // pastes a `mhrv-rs-setup://...` link from WhatsApp.
-    if (hasDriveSetupInClipboard) {
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(
-                containerColor = MaterialTheme.colorScheme.primaryContainer,
-            ),
-        ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                Text(
-                    stringResource(R.string.banner_drive_setup_clipboard),
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onPrimaryContainer,
-                    modifier = Modifier.weight(1f),
-                )
-                FilledTonalButton(
-                    onClick = {
-                        val setup = ConfigStore.decodeDriveSetup(clipText)
-                        if (setup != null) {
-                            pendingDriveSetup = setup
-                        } else {
-                            scope.launch { onSnackbar(ctx.getString(R.string.snack_drive_setup_invalid)) }
-                        }
-                    },
-                ) {
-                    Icon(Icons.Default.ContentPaste, null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(4.dp))
-                    Text(stringResource(R.string.btn_import_clipboard))
-                }
-            }
-        }
-    } else if (hasConfigInClipboard) {
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(
-                containerColor = MaterialTheme.colorScheme.primaryContainer,
-            ),
-        ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                Text(
-                    "Config detected in clipboard",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onPrimaryContainer,
-                    modifier = Modifier.weight(1f),
-                )
-                FilledTonalButton(
-                    onClick = {
-                        val decoded = ConfigStore.decode(clipText)
-                        if (decoded != null) {
-                            pendingImport = decoded
-                            showImportConfirm = true
-                        } else {
-                            scope.launch { onSnackbar(ctx.getString(R.string.snack_invalid_config)) }
-                        }
-                    },
-                ) {
-                    Icon(Icons.Default.ContentPaste, null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(4.dp))
-                    Text(stringResource(R.string.btn_import_clipboard))
-                }
-            }
-        }
-    }
-
-    // --- Export + Scan row ---
+    // --- Export + Paste + Scan row ---
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
+        IconButton(onClick = { showExportDialog = true }) {
+            Icon(Icons.Default.Share, contentDescription = stringResource(R.string.btn_export_config))
+        }
+        // Manual paste — reads clipboard on tap. Android 13+ restricts
+        // background clipboard access, so auto-detect doesn't work
+        // (the OS only grants the read after a foreground tap). One
+        // button handles both regular config blobs and Drive-setup
+        // blobs; we disambiguate on the prefix and route to the right
+        // confirmation dialog.
         OutlinedButton(
-            onClick = { showExportDialog = true },
-            modifier = Modifier.weight(1f),
+            onClick = {
+                val text = clipboard.getText()?.text.orEmpty()
+                if (ConfigStore.looksLikeDriveSetup(text)) {
+                    val setup = ConfigStore.decodeDriveSetup(text)
+                    if (setup != null) {
+                        pendingDriveSetup = setup
+                    } else {
+                        scope.launch { onSnackbar(ctx.getString(R.string.snack_drive_setup_invalid)) }
+                    }
+                } else {
+                    val decoded = ConfigStore.decode(text)
+                    if (decoded != null) {
+                        pendingImport = decoded
+                        showImportConfirm = true
+                    } else {
+                        scope.launch { onSnackbar(ctx.getString(R.string.snack_invalid_config)) }
+                    }
+                }
+            },
         ) {
-            Icon(Icons.Default.Share, null, modifier = Modifier.size(18.dp))
+            Icon(Icons.Default.ContentPaste, null, modifier = Modifier.size(18.dp))
             Spacer(Modifier.width(4.dp))
-            Text(stringResource(R.string.btn_export_config))
+            Text("Paste")
         }
         OutlinedButton(
             onClick = {

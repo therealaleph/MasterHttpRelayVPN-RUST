@@ -141,7 +141,6 @@
     <string name="snack_drive_setup_failed">وارد کردن تنظیمات Drive ناموفق بود (نوشتن فایل‌ها ممکن نشد)</string>
     <string name="snack_drive_setup_invalid">QR معتبر تنظیمات Drive نیست</string>
     <string name="snack_drive_setup_copied">بستهٔ تنظیمات در کلیپ‌بورد کپی شد</string>
-    <string name="banner_drive_setup_clipboard">تنظیمات Drive در کلیپ‌بورد یافت شد</string>
     <string name="btn_drive_setup_from_image">انتخاب تصویر QR از گالری</string>
     <string name="snack_drive_setup_no_qr_in_image">هیچ QR در آن تصویر یافت نشد</string>
 

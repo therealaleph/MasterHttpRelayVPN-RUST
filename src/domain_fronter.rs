@@ -715,9 +715,9 @@ impl DomainFronter {
     ///      by relay() already (we skip cache for it).
     ///   2. Probe with `Range: bytes=0-<chunk-1>`.
     ///   3. 200 back (origin doesn't support ranges) → return as-is.
-    ///   4. 206 back → parse Content-Range total. If the body fits in
-    ///      the first probe (total <= chunk or body >= total), rewrite
-    ///      the 206 to a 200 so the client — which never asked for a
+    ///   4. 206 back → parse Content-Range total. If Content-Range says
+    ///      the entity fits in the first probe, rewrite the 206 to a 200
+    ///      so the client — which never asked for a
     ///      range — doesn't choke on a stray Partial Content. (x.com
     ///      and Cloudflare turnstile in particular reject unsolicited
     ///      206 on XHR/fetch.)
@@ -1481,10 +1481,26 @@ fn validate_probe_range(
         return None;
     }
     let range = parse_content_range(headers)?;
-    if range.start != 0 || range.end > requested_end || !content_range_matches_body(range, body.len()) {
+    if range.start != 0 || range.end > requested_end {
         return None;
     }
-    Some(range)
+    if content_range_matches_body(range, body.len())
+        || probe_range_covers_complete_entity(range, requested_end)
+    {
+        return Some(range);
+    }
+    None
+}
+
+fn probe_range_covers_complete_entity(range: ContentRange, requested_end: u64) -> bool {
+    // Apps Script may decode a gzip body while preserving the origin's
+    // compressed Content-Range. For the synthetic first probe only, a
+    // 0..total-1 range within the requested chunk is enough to prove we
+    // already have the complete entity; later chunks still require exact
+    // Content-Range/body length validation in extract_exact_range_body().
+    range.start == 0
+        && range.end.saturating_add(1) >= range.total
+        && range.total <= requested_end.saturating_add(1)
 }
 
 fn checked_stitched_range_capacity(total: u64) -> Option<usize> {
@@ -2180,6 +2196,11 @@ fn looks_like_quota_error(msg: &str) -> bool {
         || lower.contains("rate limit")
         || lower.contains("too many times")
         || lower.contains("service invoked")
+        || lower.contains("bandwidth")
+        || lower.contains("bandbreitenkontingent")
+        || lower.contains("datenübertragungsrate")
+        || lower.contains("transfer rate")
+        || lower.contains("limit exceeded")
 }
 
 fn mask_script_id(id: &str) -> String {
@@ -2517,6 +2538,59 @@ mod tests {
     }
 
     #[test]
+    fn validate_probe_range_accepts_decoded_full_entity_body_mismatch() {
+        let mut raw = b"HTTP/1.1 206 Partial Content\r\n\
+Content-Range: bytes 0-11247/11248\r\n\
+Content-Type: text/javascript\r\n\
+Vary: Accept-Encoding\r\n\
+Content-Length: 45812\r\n\r\n"
+            .to_vec();
+        raw.extend(std::iter::repeat(b'x').take(45_812));
+
+        let (status, headers, body) = split_response(&raw).unwrap();
+        assert_eq!(
+            validate_probe_range(status, &headers, body, RANGE_PARALLEL_CHUNK_BYTES - 1),
+            Some(ContentRange {
+                start: 0,
+                end: 11_247,
+                total: 11_248,
+            }),
+        );
+
+        let rewritten = rewrite_206_to_200(&raw);
+        let (status, headers, body) = split_response(&rewritten).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body.len(), 45_812);
+        assert!(!headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("content-range")));
+        assert_eq!(
+            headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                .map(|(_, v)| v.as_str()),
+            Some("45812"),
+        );
+    }
+
+    #[test]
+    fn validate_probe_range_rejects_missing_content_range() {
+        assert!(validate_probe_range(206, &[], b"hello", 4).is_none());
+    }
+
+    #[test]
+    fn validate_probe_range_rejects_nonzero_start() {
+        let headers = vec![("Content-Range".to_string(), "bytes 1-4/20".to_string())];
+        assert!(validate_probe_range(206, &headers, b"hell", 4).is_none());
+    }
+
+    #[test]
+    fn validate_probe_range_rejects_end_past_requested_end() {
+        let headers = vec![("Content-Range".to_string(), "bytes 0-5/20".to_string())];
+        assert!(validate_probe_range(206, &headers, b"hello!", 4).is_none());
+    }
+
+    #[test]
     fn validate_probe_range_rejects_body_length_mismatch() {
         let headers = vec![("Content-Range".to_string(), "bytes 0-4/20".to_string())];
         assert!(validate_probe_range(206, &headers, b"hey", 4).is_none());
@@ -2530,6 +2604,16 @@ mod tests {
         );
         assert_eq!(checked_stitched_range_capacity(MAX_STITCHED_RANGE_BYTES + 1), None);
         assert_eq!(checked_stitched_range_capacity(u64::MAX), None);
+    }
+
+    #[test]
+    fn extract_exact_range_body_rejects_body_length_mismatch() {
+        let raw = b"HTTP/1.1 206 Partial Content\r\n\
+Content-Range: bytes 5-9/20\r\n\
+Content-Length: 3\r\n\r\n\
+hey";
+        let err = extract_exact_range_body(raw, 5, 9, 20).unwrap_err();
+        assert_eq!(err, "Content-Range/body length mismatch");
     }
 
     #[test]
@@ -2564,6 +2648,9 @@ hello";
         assert!(!should_blacklist(200, ""));
         assert!(!should_blacklist(502, "bad gateway"));
         assert!(looks_like_quota_error("Exception: Service invoked too many times per day"));
+        assert!(looks_like_quota_error(
+            "Exception: Bandbreitenkontingent überschritten: https://example.com. Verringern Sie die Datenübertragungsrate."
+        ));
         assert!(!looks_like_quota_error("bad url"));
     }
 

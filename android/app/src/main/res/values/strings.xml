@@ -156,7 +156,6 @@
     <string name="snack_drive_setup_failed">Drive setup import failed (couldn\'t write files)</string>
     <string name="snack_drive_setup_invalid">Not a valid Drive setup QR</string>
     <string name="snack_drive_setup_copied">Setup payload copied to clipboard</string>
-    <string name="banner_drive_setup_clipboard">Drive setup detected in clipboard</string>
     <string name="btn_drive_setup_from_image">Pick QR image from gallery</string>
     <string name="snack_drive_setup_no_qr_in_image">No QR code found in that image</string>
 
