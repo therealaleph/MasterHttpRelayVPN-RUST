@@ -313,11 +313,38 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_startDriveProxy(
             }
         };
 
+        // Validate the Drive backend SYNCHRONOUSLY before we hand a
+        // handle back to Kotlin. Loads credentials.json, refreshes the
+        // OAuth access token, and ensures the target folder exists —
+        // any of which can fail (no token cached, expired refresh,
+        // network unreachable, folder ID typo, ...). Without this
+        // up-front validation, startDriveProxy would return a non-zero
+        // handle even on credential failure, leaving Kotlin with a
+        // dead service holding a zombie handle.
+        //
+        // The runtime is the same one the listener will run on, so
+        // the HTTP/2 connection task spawned during `build_backend`
+        // stays alive after we return.
+        let backend = match rt.block_on(crate::drive_tunnel::build_backend(&config)) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!("android: drive backend init failed: {}", e);
+                // Drop the runtime explicitly — `build_backend` may have
+                // spawned the HTTP/2 driver task that we no longer need.
+                rt.shutdown_timeout(std::time::Duration::from_secs(1));
+                return 0i64;
+            }
+        };
+
         let (tx, rx) = oneshot::channel::<()>();
         let cfg_for_task = config;
         rt.spawn(async move {
-            if let Err(e) =
-                crate::drive_tunnel::run_client_with_shutdown(&cfg_for_task, rx).await
+            if let Err(e) = crate::drive_tunnel::run_client_with_backend(
+                &cfg_for_task,
+                backend,
+                rx,
+            )
+            .await
             {
                 tracing::error!("android: drive client exited: {}", e);
             }
@@ -386,52 +413,32 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_driveCompleteAuth<'a>(
     config_json: JString,
     code: JString,
 ) -> jstring {
-    let result_json = safe(
-        r#"{"ok":false,"error":"panic"}"#.to_string(),
-        AssertUnwindSafe(|| {
-            install_logging_once();
-            let json = jstring_to_string(&mut env, &config_json);
-            let raw = jstring_to_string(&mut env, &code);
-            if raw.trim().is_empty() {
-                return r#"{"ok":false,"error":"empty code"}"#.to_string();
+    let result_json = safe(error_json("panic"), AssertUnwindSafe(|| {
+        install_logging_once();
+        let json = jstring_to_string(&mut env, &config_json);
+        let raw = jstring_to_string(&mut env, &code);
+        if raw.trim().is_empty() {
+            return error_json("empty code");
+        }
+        let config: Config = match serde_json::from_str(&json) {
+            Ok(c) => c,
+            Err(e) => return error_json(&format!("bad config json: {}", e)),
+        };
+        let backend = match crate::google_drive::GoogleDriveBackend::from_config(&config) {
+            Ok(b) => b,
+            Err(e) => return error_json(&e.to_string()),
+        };
+        let Some(rt) = one_shot_runtime() else {
+            return error_json("tokio init failed");
+        };
+        match rt.block_on(backend.apply_auth_code(&raw)) {
+            Ok(()) => {
+                let path = backend.token_path().display().to_string();
+                serde_json::json!({"ok": true, "tokenPath": path}).to_string()
             }
-            let config: Config = match serde_json::from_str(&json) {
-                Ok(c) => c,
-                Err(e) => {
-                    return format!(
-                        r#"{{"ok":false,"error":"bad config json: {}"}}"#,
-                        json_escape(&e.to_string())
-                    );
-                }
-            };
-            let backend =
-                match crate::google_drive::GoogleDriveBackend::from_config(&config) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        return format!(
-                            r#"{{"ok":false,"error":"{}"}}"#,
-                            json_escape(&e.to_string())
-                        );
-                    }
-                };
-            let Some(rt) = one_shot_runtime() else {
-                return r#"{"ok":false,"error":"tokio init failed"}"#.to_string();
-            };
-            match rt.block_on(backend.apply_auth_code(&raw)) {
-                Ok(()) => {
-                    let path = backend.token_path().display().to_string();
-                    format!(
-                        r#"{{"ok":true,"tokenPath":"{}"}}"#,
-                        json_escape(&path)
-                    )
-                }
-                Err(e) => format!(
-                    r#"{{"ok":false,"error":"{}"}}"#,
-                    json_escape(&e.to_string())
-                ),
-            }
-        }),
-    );
+            Err(e) => error_json(&e.to_string()),
+        }
+    }));
     env.new_string(result_json)
         .map(|s| s.into_raw())
         .unwrap_or(std::ptr::null_mut())
@@ -466,8 +473,12 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_driveTokenPresent(
     }))
 }
 
-fn json_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+/// Build a `{"ok": false, "error": "<msg>"}` blob with proper JSON
+/// escaping. Wraps `serde_json::json!` so callers don't need to spell
+/// out the shape on every error site, and so a stray `\n` / `"` in an
+/// error message can't poison the parser on the Kotlin side.
+fn error_json(msg: &str) -> String {
+    serde_json::json!({"ok": false, "error": msg}).to_string()
 }
 
 /// `Native.stopProxy(long handle)` -> boolean. Idempotent: calling on an
@@ -583,50 +594,58 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_checkUpdate<'a>(
     env: JNIEnv<'a>,
     _class: JClass,
 ) -> jstring {
-    let result_json = safe(
-        r#"{"kind":"error","reason":"panic"}"#.to_string(),
-        AssertUnwindSafe(|| {
-            install_logging_once();
-            let Some(rt) = one_shot_runtime() else {
-                return r#"{"kind":"error","reason":"tokio init failed"}"#.to_string();
-            };
-            let outcome = rt.block_on(crate::update_check::check(
-                crate::update_check::Route::Direct,
-            ));
-            update_check_to_json(&outcome)
-        }),
-    );
+    // Default-on-panic value uses the same `kind`/`reason` shape the
+    // happy path produces so the Kotlin parser doesn't need a special
+    // case for unwind crashes.
+    let panic_default = serde_json::json!({"kind": "error", "reason": "panic"}).to_string();
+    let result_json = safe(panic_default, AssertUnwindSafe(|| {
+        install_logging_once();
+        let Some(rt) = one_shot_runtime() else {
+            return serde_json::json!({"kind": "error", "reason": "tokio init failed"})
+                .to_string();
+        };
+        let outcome =
+            rt.block_on(crate::update_check::check(crate::update_check::Route::Direct));
+        update_check_to_json(&outcome)
+    }));
     env.new_string(result_json)
         .map(|s| s.into_raw())
         .unwrap_or(std::ptr::null_mut())
 }
 
 fn update_check_to_json(u: &crate::update_check::UpdateCheck) -> String {
-    // Hand-serialized to keep the JNI side free of serde derive noise on
-    // the inner enum (which would need `#[derive(Serialize)]`). Short
-    // enough that the hand-rolled version is simpler than pulling
-    // serde_json in here for one call.
-    fn esc(s: &str) -> String {
-        s.replace('\\', "\\\\").replace('"', "\\\"")
-    }
-    match u {
-        crate::update_check::UpdateCheck::UpToDate { current, latest } => format!(
-            r#"{{"kind":"upToDate","current":"{}","latest":"{}"}}"#,
-            esc(current), esc(latest),
-        ),
-        crate::update_check::UpdateCheck::UpdateAvailable { current, latest, release_url, .. } => format!(
-            r#"{{"kind":"updateAvailable","current":"{}","latest":"{}","url":"{}"}}"#,
-            esc(current), esc(latest), esc(release_url),
-        ),
-        crate::update_check::UpdateCheck::Offline(reason) => format!(
-            r#"{{"kind":"offline","reason":"{}"}}"#,
-            esc(reason),
-        ),
-        crate::update_check::UpdateCheck::Error(reason) => format!(
-            r#"{{"kind":"error","reason":"{}"}}"#,
-            esc(reason),
-        ),
-    }
+    // serde_json::json! handles all the JSON escaping (control chars,
+    // backslashes, embedded quotes, non-BMP code points) in one go;
+    // the hand-rolled escaper that lived here only handled `\\` and
+    // `"`, so a `\n` in an offline reason or release-note URL would
+    // produce malformed JSON the Kotlin side couldn't parse.
+    let value = match u {
+        crate::update_check::UpdateCheck::UpToDate { current, latest } => serde_json::json!({
+            "kind": "upToDate",
+            "current": current,
+            "latest": latest,
+        }),
+        crate::update_check::UpdateCheck::UpdateAvailable {
+            current,
+            latest,
+            release_url,
+            ..
+        } => serde_json::json!({
+            "kind": "updateAvailable",
+            "current": current,
+            "latest": latest,
+            "url": release_url,
+        }),
+        crate::update_check::UpdateCheck::Offline(reason) => serde_json::json!({
+            "kind": "offline",
+            "reason": reason,
+        }),
+        crate::update_check::UpdateCheck::Error(reason) => serde_json::json!({
+            "kind": "error",
+            "reason": reason,
+        }),
+    };
+    value.to_string()
 }
 
 /// `Native.testSni(googleIp, sni)` -> String. Returns a small JSON blob
@@ -639,21 +658,21 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_testSni<'a>(
     google_ip: JString,
     sni: JString,
 ) -> jstring {
-    let result_json = safe(r#"{"ok":false,"error":"panic"}"#.to_string(), AssertUnwindSafe(|| {
+    let result_json = safe(error_json("panic"), AssertUnwindSafe(|| {
         install_logging_once();
         let ip = jstring_to_string(&mut env, &google_ip);
         let s = jstring_to_string(&mut env, &sni);
         if ip.is_empty() || s.is_empty() {
-            return r#"{"ok":false,"error":"empty google_ip or sni"}"#.to_string();
+            return error_json("empty google_ip or sni");
         }
         let Some(rt) = one_shot_runtime() else {
-            return r#"{"ok":false,"error":"tokio init failed"}"#.to_string();
+            return error_json("tokio init failed");
         };
         let probe = rt.block_on(crate::scan_sni::probe_one(&ip, &s));
         match (probe.latency_ms, probe.error) {
             (Some(ms), _) => {
                 tracing::info!("sni_probe: {} via {} ok in {}ms", s, ip, ms);
-                format!(r#"{{"ok":true,"latencyMs":{}}}"#, ms)
+                serde_json::json!({"ok": true, "latencyMs": ms}).to_string()
             }
             (None, Some(e)) => {
                 // Surface the reason in logcat too — otherwise users see a
@@ -662,10 +681,9 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_testSni<'a>(
                 //   - "connect: ..." -> TCP to google_ip:443 blocked
                 //   - "handshake: ..." -> TLS fail (cert, ALPN, etc.)
                 tracing::warn!("sni_probe: {} via {} FAIL: {}", s, ip, e);
-                let cleaned = e.replace('\\', "\\\\").replace('"', "\\\"");
-                format!(r#"{{"ok":false,"error":"{}"}}"#, cleaned)
+                error_json(&e)
             }
-            _ => r#"{"ok":false,"error":"unknown"}"#.to_string(),
+            _ => error_json("unknown"),
         }
     }));
     env.new_string(result_json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())

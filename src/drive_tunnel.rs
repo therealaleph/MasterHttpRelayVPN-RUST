@@ -751,6 +751,20 @@ pub async fn run_client_with_shutdown(
     shutdown: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), DriveError> {
     let backend = init_backend(config).await?;
+    run_client_with_backend(config, backend, shutdown).await
+}
+
+/// Run the SOCKS5 client side with a pre-built (and pre-validated) Drive
+/// backend. JNI / UI entry points use this so OAuth refresh + folder
+/// discovery can happen synchronously up front and surface any failure
+/// before they commit to spawning the listener task. The runtime that
+/// drives this future must be the same one the `backend` was built
+/// against — its HTTP/2 connection task is already attached to it.
+pub async fn run_client_with_backend(
+    config: &Config,
+    backend: Arc<GoogleDriveBackend>,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+) -> Result<(), DriveError> {
     let client_id = if config.drive_client_id.trim().is_empty() {
         random_hex(4)
     } else {
@@ -788,6 +802,15 @@ pub async fn run_client_with_shutdown(
             }
         }
     }
+}
+
+/// Build and validate a Drive backend (loads credentials JSON, refreshes
+/// the OAuth access token, ensures the target folder exists). Surfaces
+/// any failure synchronously so JNI / UI callers can early-return
+/// before spawning long-lived state. Public so it can be shared by the
+/// CLI and the JNI entry points.
+pub async fn build_backend(config: &Config) -> Result<Arc<GoogleDriveBackend>, DriveError> {
+    init_backend(config).await
 }
 
 pub async fn run_server(config: &Config) -> Result<(), DriveError> {
