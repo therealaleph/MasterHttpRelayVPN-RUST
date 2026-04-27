@@ -137,6 +137,26 @@
     <string name="placeholder_drive_code">https://localhost/?code=4/0AdQt8q…  (or just the code)</string>
     <string name="snack_drive_url_copied">Consent URL copied</string>
 
+    <!-- Drive setup share / scan (one-tap onboarding) -->
+    <string name="btn_drive_share_setup">Share Drive setup</string>
+    <string name="btn_drive_scan_setup">Scan setup QR</string>
+    <string name="btn_drive_share_reveal">Show QR + payload</string>
+    <string name="btn_drive_share_send">Send</string>
+    <string name="btn_drive_setup_import">Import</string>
+    <string name="help_drive_scan_setup">If someone shared a Drive setup QR with you, scan it here. The app will write their credentials and OAuth token, set the folder ID, and you can tap Connect — no Google Cloud Console or browser steps needed.</string>
+    <string name="dialog_drive_share_title">Share Drive setup</string>
+    <string name="dialog_drive_share_warning">This QR contains your OAuth client secret AND your Drive refresh token. Anyone who scans it gets the same access to your Drive that this app has. Only share with people you trust.</string>
+    <string name="dialog_drive_share_unavailable">Nothing to share yet — finish OAuth on this device first (Authorize Google Drive button).</string>
+    <string name="dialog_drive_share_qr_too_large">Setup payload is too large for a QR code. Use the Copy / Send buttons to share the text instead.</string>
+    <string name="dialog_drive_setup_scan_prompt">Scan a Drive setup QR</string>
+    <string name="dialog_drive_setup_import_title">Import Drive setup?</string>
+    <string name="dialog_drive_setup_import_warning">This will overwrite any existing Drive credentials on this device. Only proceed if the QR came from someone you trust — it grants this app access to their Google Drive app data.</string>
+    <string name="dialog_drive_setup_import_summary">Folder ID: %1$s\nFolder name: %2$s</string>
+    <string name="snack_drive_setup_imported">Drive setup imported — tap Connect to start</string>
+    <string name="snack_drive_setup_failed">Drive setup import failed (couldn\'t write files)</string>
+    <string name="snack_drive_setup_invalid">Not a valid Drive setup QR</string>
+    <string name="snack_drive_setup_copied">Setup payload copied to clipboard</string>
+
     <!-- "How to use" guide body. Localized — FA copy lives in values-fa. -->
     <string name="help_how_to_use">1. Paste one or more Apps Script deployment URLs (or bare IDs) and your auth_key.\n2. Tap Install MITM certificate. Confirm the dialog — the cert is saved to Downloads/mhrv-ca.crt and the Settings app opens. Use Settings\' search bar to find \"CA certificate\", tap that result (NOT \"VPN &amp; app user certificate\" or \"Wi-Fi\"), and pick mhrv-ca.crt from Downloads. You\'ll be asked to set a screen lock if you don\'t have one (Android requirement).\n3. Before tapping Start, expand \"SNI pool + tester\" and hit \"Test all\". If every entry times out, your google_ip is unreachable — replace it with one that resolves locally (e.g. `nslookup www.google.com` on any working device).\n4. Tap Start. Accept the VPN prompt. The full TUN bridge routes every app on the device through the proxy — no per-app setup needed.\n5. If Chrome shows \"504 Relay timeout\": your Apps Script deployment isn\'t responding. Redeploy the script, grab the new /exec URL, and paste it above. Watch Live logs for \"Relay timeout\" vs \"connect:\" errors to tell which layer is failing.\n\nKnown limitation — Cloudflare Turnstile (\"Verify you are human\") will loop endlessly on most CF-protected sites. Every Apps Script request uses a rotating Google-datacenter egress IP + a fixed \"Google-Apps-Script\" User-Agent + a Google TLS fingerprint. The cf_clearance cookie is bound to the (IP, UA, JA3) tuple the challenge was solved against, so the NEXT request — from a different egress IP — gets re-challenged. Nothing in this app can fix that; it\'s inherent to Apps Script as a relay. Sites that only gate the initial page load (not every request) will work after one solve.</string>
 </resources>

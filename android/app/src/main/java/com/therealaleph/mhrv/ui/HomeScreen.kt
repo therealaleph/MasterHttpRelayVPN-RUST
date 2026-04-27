@@ -5,6 +5,7 @@ import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -22,6 +23,8 @@ import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.HourglassBottom
+import androidx.compose.material.icons.filled.QrCodeScanner
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -29,6 +32,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
@@ -1239,12 +1243,79 @@ private fun DriveSection(
         }
     }
 
+    var setupShareOpen by remember { mutableStateOf(false) }
+    var setupScanResult by remember { mutableStateOf<ConfigStore.DriveSetup?>(null) }
+    val setupScanLauncher = rememberLauncherForActivityResult(
+        com.journeyapps.barcodescanner.ScanContract(),
+    ) { result ->
+        val scanned = result.contents ?: return@rememberLauncherForActivityResult
+        val decoded = ConfigStore.decodeDriveSetup(scanned)
+        if (decoded != null) {
+            setupScanResult = decoded
+        } else {
+            scope.launch { onSnack(ctx.getString(R.string.snack_drive_setup_invalid)) }
+        }
+    }
+
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text(
             stringResource(R.string.help_google_drive),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+
+        // ---------------------------------------------------------------
+        // Share / Scan setup. The "Scan setup QR" path is the one-tap
+        // onboarding for non-technical recipients: the sharer's QR
+        // includes credentials + refresh token + folder ID, so the
+        // scanner skips file imports and the OAuth dance entirely.
+        //
+        // We render the Scan button big and primary when nothing is
+        // configured yet (fresh install — most likely a recipient).
+        // The Share button only enables once OAuth has produced a
+        // refresh token to share.
+        // ---------------------------------------------------------------
+        if (!cfg.driveConfigured || !hasToken) {
+            Button(
+                onClick = {
+                    val opts = com.journeyapps.barcodescanner.ScanOptions().apply {
+                        setDesiredBarcodeFormats(com.journeyapps.barcodescanner.ScanOptions.QR_CODE)
+                        setPrompt(ctx.getString(R.string.dialog_drive_setup_scan_prompt))
+                        setBeepEnabled(false)
+                        setOrientationLocked(true)
+                    }
+                    setupScanLauncher.launch(opts)
+                },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Icon(
+                    Icons.Default.QrCodeScanner,
+                    null,
+                    modifier = Modifier.size(18.dp),
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(stringResource(R.string.btn_drive_scan_setup))
+            }
+            Text(
+                stringResource(R.string.help_drive_scan_setup),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        if (hasToken) {
+            OutlinedButton(
+                onClick = { setupShareOpen = true },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Icon(
+                    Icons.Default.Share,
+                    null,
+                    modifier = Modifier.size(18.dp),
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(stringResource(R.string.btn_drive_share_setup))
+            }
+        }
 
         // Credentials importer / status row.
         Row(
@@ -1375,6 +1446,217 @@ private fun DriveSection(
                 scope.launch { onSnack("Google Drive authorized ✓") }
             },
         )
+    }
+
+    if (setupShareOpen) {
+        DriveSetupShareDialog(
+            cfg = cfg,
+            onDismiss = { setupShareOpen = false },
+            onSnack = { msg -> scope.launch { onSnack(msg) } },
+        )
+    }
+
+    setupScanResult?.let { setup ->
+        DriveSetupImportConfirmDialog(
+            setup = setup,
+            onConfirm = {
+                val applied = ConfigStore.applyDriveSetup(ctx, cfg, setup)
+                if (applied != null) {
+                    onChange(applied)
+                    hasToken = true
+                    scope.launch { onSnack(ctx.getString(R.string.snack_drive_setup_imported)) }
+                } else {
+                    scope.launch { onSnack(ctx.getString(R.string.snack_drive_setup_failed)) }
+                }
+                setupScanResult = null
+            },
+            onDismiss = { setupScanResult = null },
+        )
+    }
+}
+
+/**
+ * Share-setup dialog. Renders the encoded blob as a QR code plus a
+ * monospace text fallback the sharer can copy/paste into a chat. The
+ * payload contains a refresh token and the OAuth client secret, so we
+ * lead with a red warning and only put the QR behind a one-tap reveal
+ * step — sharers don't accidentally hold their phone screen up in a
+ * café and have someone else scan it from across the table.
+ */
+@Composable
+private fun DriveSetupShareDialog(
+    cfg: MhrvConfig,
+    onDismiss: () -> Unit,
+    onSnack: (String) -> Unit,
+) {
+    val ctx = LocalContext.current
+    val clipboard = LocalClipboardManager.current
+    val encoded = remember(cfg) { ConfigStore.encodeDriveSetup(ctx, cfg) }
+
+    if (encoded == null) {
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            title = { Text(stringResource(R.string.dialog_drive_share_title)) },
+            text = { Text(stringResource(R.string.dialog_drive_share_unavailable)) },
+            confirmButton = {
+                TextButton(onClick = onDismiss) { Text(stringResource(R.string.btn_cancel)) }
+            },
+        )
+        return
+    }
+
+    var revealed by remember { mutableStateOf(false) }
+    val qrBitmap = remember(encoded, revealed) {
+        if (revealed) generateSetupQr(encoded, 512) else null
+    }
+
+    androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
+        Card(modifier = Modifier.padding(16.dp)) {
+            Column(
+                modifier = Modifier
+                    .padding(20.dp)
+                    .verticalScroll(rememberScrollState()),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Text(
+                    stringResource(R.string.dialog_drive_share_title),
+                    style = MaterialTheme.typography.titleMedium,
+                )
+                Text(
+                    stringResource(R.string.dialog_drive_share_warning),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+
+                if (!revealed) {
+                    Button(
+                        onClick = { revealed = true },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(stringResource(R.string.btn_drive_share_reveal))
+                    }
+                } else {
+                    if (qrBitmap != null) {
+                        Image(
+                            bitmap = qrBitmap.asImageBitmap(),
+                            contentDescription = "Drive setup QR",
+                            modifier = Modifier.size(280.dp),
+                        )
+                    } else {
+                        Text(
+                            stringResource(R.string.dialog_drive_share_qr_too_large),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        FilledTonalButton(
+                            onClick = {
+                                clipboard.setText(AnnotatedString(encoded))
+                                onSnack(ctx.getString(R.string.snack_drive_setup_copied))
+                            },
+                            modifier = Modifier.weight(1f),
+                        ) {
+                            Text(stringResource(R.string.btn_copy_hash))
+                        }
+                        FilledTonalButton(
+                            onClick = {
+                                val intent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                                    type = "text/plain"
+                                    putExtra(android.content.Intent.EXTRA_TEXT, encoded)
+                                }
+                                ctx.startActivity(
+                                    android.content.Intent.createChooser(
+                                        intent,
+                                        ctx.getString(R.string.dialog_drive_share_title),
+                                    ),
+                                )
+                            },
+                            modifier = Modifier.weight(1f),
+                        ) {
+                            Text(stringResource(R.string.btn_drive_share_send))
+                        }
+                    }
+                }
+
+                TextButton(onClick = onDismiss, modifier = Modifier.align(Alignment.End)) {
+                    Text(stringResource(R.string.btn_cancel))
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Confirmation dialog shown after a setup QR scan but before we touch
+ * disk. Reuses the same trust-prompt language as the regular config
+ * import; the only twist is reminding the user that this includes
+ * credentials, so they should only proceed for QRs they trust.
+ */
+@Composable
+private fun DriveSetupImportConfirmDialog(
+    setup: ConfigStore.DriveSetup,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.dialog_drive_setup_import_title)) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    stringResource(R.string.dialog_drive_setup_import_warning),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+                Text(
+                    stringResource(
+                        R.string.dialog_drive_setup_import_summary,
+                        setup.folderId.ifEmpty { "(auto)" },
+                        setup.folderName,
+                    ),
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm) {
+                Text(stringResource(R.string.btn_drive_setup_import))
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.btn_cancel)) }
+        },
+    )
+}
+
+/** Same QR generator the regular config-share dialog uses, copied here
+ *  so DriveSection isn't transitively depending on ConfigSharing.kt's
+ *  private helper. Returns null when the payload is too large for a
+ *  single QR — caller falls back to the copy/share text path. */
+private fun generateSetupQr(content: String, size: Int): android.graphics.Bitmap? {
+    return try {
+        val writer = com.google.zxing.qrcode.QRCodeWriter()
+        val matrix = writer.encode(content, com.google.zxing.BarcodeFormat.QR_CODE, size, size)
+        val bitmap = android.graphics.Bitmap.createBitmap(
+            size, size, android.graphics.Bitmap.Config.RGB_565,
+        )
+        for (x in 0 until size) {
+            for (y in 0 until size) {
+                bitmap.setPixel(
+                    x, y,
+                    if (matrix[x, y]) android.graphics.Color.BLACK else android.graphics.Color.WHITE,
+                )
+            }
+        }
+        bitmap
+    } catch (_: Throwable) {
+        null
     }
 }
 

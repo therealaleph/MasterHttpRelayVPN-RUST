@@ -294,6 +294,23 @@ object ConfigStore {
     /** Prefix for encoded config strings so we can detect them in clipboard. */
     private const val HASH_PREFIX = "mhrv-rs://"
 
+    /** Distinct prefix for the "Drive setup" share — bundles credentials
+     *  + refresh token so a recipient can connect with no manual OAuth.
+     *  Different from [HASH_PREFIX] because the payload includes secrets,
+     *  the recipient flow needs to write extra files, and we don't want
+     *  to silently fall through to the regular config import path. */
+    private const val DRIVE_SETUP_PREFIX = "mhrv-rs-setup://"
+
+    /** Filename inside the app's filesDir where imported credentials are
+     *  written. Must match what the regular Drive import flow uses, so
+     *  a setup-import is indistinguishable from a manual import +
+     *  authorize after the fact. */
+    private const val DRIVE_CREDENTIALS_FILE = "drive-credentials.json"
+
+    /** Token cache filename — `<credentials>.token` — same shape the
+     *  Rust side writes when a fresh OAuth dance completes. */
+    private const val DRIVE_TOKEN_FILE = "drive-credentials.json.token"
+
     /** Encode config as a shareable base64 string with prefix.
      *  Only includes non-default fields to keep the hash short. */
     fun encode(cfg: MhrvConfig): String {
@@ -381,6 +398,175 @@ object ConfigStore {
             if (!obj.has("mode") && !obj.has("script_ids") && !obj.has("auth_key")) return null
             loadFromJson(obj)
         } catch (_: Throwable) {
+            null
+        }
+    }
+
+    // -----------------------------------------------------------------
+    //  Drive setup share — bundle credentials + refresh token + folder
+    //  ID so a fresh device can be onboarded with one QR scan and zero
+    //  technical steps. Distinct from [encode]/[decode] because that
+    //  flow deliberately omits secrets; this one deliberately includes
+    //  them and warns the sharer accordingly.
+    // -----------------------------------------------------------------
+
+    /**
+     * Drive-setup payload as it travels in the QR. Versioned in case we
+     * later rotate the bundle shape.
+     *
+     * - [credentials]: full content of credentials.json (the OAuth
+     *   desktop client config — client_id + client_secret).
+     * - [refreshToken]: the cached OAuth refresh token. The recipient
+     *   uses it directly without any browser dance.
+     * - [folderId] / [folderName] / [pollMs] / [flushMs] / [idleSecs] /
+     *   [googleIp] / [frontDomain]: the same Drive-mode knobs that
+     *   apply on the recipient.
+     */
+    data class DriveSetup(
+        val credentials: String,
+        val refreshToken: String,
+        val folderId: String,
+        val folderName: String,
+        val pollMs: Int,
+        val flushMs: Int,
+        val idleSecs: Int,
+        val googleIp: String,
+        val frontDomain: String,
+    )
+
+    /** Read the on-disk credentials + token files and bundle them with
+     *  the user's Drive config knobs into a shareable string. Returns
+     *  null when there's nothing to share (no credentials imported, or
+     *  no token cached yet — the sharer has to complete OAuth first). */
+    fun encodeDriveSetup(ctx: Context, cfg: MhrvConfig): String? {
+        if (cfg.driveCredentialsPath.isBlank()) return null
+        val credsFile = File(cfg.driveCredentialsPath)
+        if (!credsFile.exists()) return null
+        val tokenFile = File(credsFile.absolutePath + ".token")
+        if (!tokenFile.exists()) return null
+
+        val credentials = runCatching { credsFile.readText() }.getOrNull() ?: return null
+        val refreshToken = runCatching {
+            JSONObject(tokenFile.readText()).optString("refresh_token", "")
+        }.getOrNull().orEmpty()
+        if (refreshToken.isBlank()) return null
+
+        val defaults = MhrvConfig()
+        val obj = JSONObject().apply {
+            put("v", 1)
+            put("credentials", credentials)
+            put("refresh_token", refreshToken)
+            if (cfg.driveFolderId.isNotBlank()) put("folder_id", cfg.driveFolderId)
+            if (cfg.driveFolderName != defaults.driveFolderName) put("folder_name", cfg.driveFolderName)
+            if (cfg.drivePollMs != defaults.drivePollMs) put("poll_ms", cfg.drivePollMs)
+            if (cfg.driveFlushMs != defaults.driveFlushMs) put("flush_ms", cfg.driveFlushMs)
+            if (cfg.driveIdleTimeoutSecs != defaults.driveIdleTimeoutSecs) put("idle_secs", cfg.driveIdleTimeoutSecs)
+            if (cfg.googleIp != defaults.googleIp) put("google_ip", cfg.googleIp)
+            if (cfg.frontDomain != defaults.frontDomain) put("front_domain", cfg.frontDomain)
+        }
+
+        val raw = obj.toString().toByteArray(Charsets.UTF_8)
+        val compressed = java.io.ByteArrayOutputStream().also { bos ->
+            java.util.zip.DeflaterOutputStream(bos).use { it.write(raw) }
+        }.toByteArray()
+        val b64 = android.util.Base64.encodeToString(
+            compressed,
+            android.util.Base64.NO_WRAP or android.util.Base64.URL_SAFE,
+        )
+        return "$DRIVE_SETUP_PREFIX$b64"
+    }
+
+    /** Cheap check used to dispatch a scanned / pasted blob to the
+     *  Drive-setup import path instead of the regular config-import
+     *  path (the two formats look different but both base64; the prefix
+     *  is what disambiguates). */
+    fun looksLikeDriveSetup(text: String): Boolean =
+        text.trim().startsWith(DRIVE_SETUP_PREFIX)
+
+    /** Decode a [DRIVE_SETUP_PREFIX] payload. Returns null if the blob
+     *  doesn't parse, lacks required fields, or has an unsupported
+     *  version. Does NOT touch disk — call [applyDriveSetup] to actually
+     *  import. */
+    fun decodeDriveSetup(encoded: String): DriveSetup? {
+        val trimmed = encoded.trim()
+        val payload = trimmed.removePrefix(DRIVE_SETUP_PREFIX).trim()
+        if (payload.isEmpty()) return null
+        val raw = runCatching {
+            android.util.Base64.decode(
+                payload,
+                android.util.Base64.NO_WRAP or android.util.Base64.URL_SAFE,
+            )
+        }.getOrNull() ?: return null
+        val text = inflateOrRaw(raw)
+        return try {
+            val obj = JSONObject(text)
+            if (obj.optInt("v", 0) != 1) return null
+            val credentials = obj.optString("credentials", "")
+            val refreshToken = obj.optString("refresh_token", "")
+            if (credentials.isBlank() || refreshToken.isBlank()) return null
+            val defaults = MhrvConfig()
+            DriveSetup(
+                credentials = credentials,
+                refreshToken = refreshToken,
+                folderId = obj.optString("folder_id", ""),
+                folderName = obj.optString("folder_name", defaults.driveFolderName),
+                pollMs = obj.optInt("poll_ms", defaults.drivePollMs),
+                flushMs = obj.optInt("flush_ms", defaults.driveFlushMs),
+                idleSecs = obj.optInt("idle_secs", defaults.driveIdleTimeoutSecs),
+                googleIp = obj.optString("google_ip", defaults.googleIp),
+                frontDomain = obj.optString("front_domain", defaults.frontDomain),
+            )
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /**
+     * Write the credentials + token files into the app's filesDir and
+     * return an [MhrvConfig] reflecting the imported setup. The caller
+     * is responsible for [save]'ing it (we keep this side-effect-free
+     * apart from disk writes so callers can compose it into their own
+     * "import + persist + snackbar" flow).
+     *
+     * On success returns the new config. On any I/O failure returns
+     * null and tries to clean up partial writes — better to leave the
+     * recipient in the original (empty) state than half-imported.
+     */
+    fun applyDriveSetup(ctx: Context, base: MhrvConfig, setup: DriveSetup): MhrvConfig? {
+        val credsFile = File(ctx.filesDir, DRIVE_CREDENTIALS_FILE)
+        val tokenFile = File(ctx.filesDir, DRIVE_TOKEN_FILE)
+        return try {
+            credsFile.writeText(setup.credentials)
+            tokenFile.writeText(JSONObject().apply {
+                put("refresh_token", setup.refreshToken)
+            }.toString())
+            // Best-effort 0600. Android's FileProvider sandbox already
+            // walls /data/user/0/<pkg>/files/ off from other apps, so
+            // this is belt-and-braces.
+            runCatching {
+                credsFile.setReadable(false, false)
+                credsFile.setReadable(true, true)
+                credsFile.setWritable(false, false)
+                credsFile.setWritable(true, true)
+                tokenFile.setReadable(false, false)
+                tokenFile.setReadable(true, true)
+                tokenFile.setWritable(false, false)
+                tokenFile.setWritable(true, true)
+            }
+            base.copy(
+                mode = Mode.GOOGLE_DRIVE,
+                driveCredentialsPath = credsFile.absolutePath,
+                driveFolderId = setup.folderId,
+                driveFolderName = setup.folderName,
+                drivePollMs = setup.pollMs,
+                driveFlushMs = setup.flushMs,
+                driveIdleTimeoutSecs = setup.idleSecs,
+                googleIp = setup.googleIp,
+                frontDomain = setup.frontDomain,
+            )
+        } catch (_: Throwable) {
+            runCatching { credsFile.delete() }
+            runCatching { tokenFile.delete() }
             null
         }
     }

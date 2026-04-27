@@ -122,6 +122,26 @@
     <string name="placeholder_drive_code">https://localhost/?code=4/0AdQt8q…  (یا فقط همان code)</string>
     <string name="snack_drive_url_copied">URL تأیید کپی شد</string>
 
+    <!-- Drive setup share / scan -->
+    <string name="btn_drive_share_setup">اشتراک‌گذاری تنظیمات Drive</string>
+    <string name="btn_drive_scan_setup">اسکن QR تنظیمات</string>
+    <string name="btn_drive_share_reveal">نمایش QR + بسته</string>
+    <string name="btn_drive_share_send">ارسال</string>
+    <string name="btn_drive_setup_import">وارد کردن</string>
+    <string name="help_drive_scan_setup">اگر کسی QR تنظیمات Drive را با شما به اشتراک گذاشته، اینجا اسکن کنید. برنامه credentials و توکن OAuth را می‌نویسد، folder_id را تنظیم می‌کند و فقط کافی است Connect را بزنید — نیازی به Google Cloud Console یا مرورگر نیست.</string>
+    <string name="dialog_drive_share_title">اشتراک‌گذاری تنظیمات Drive</string>
+    <string name="dialog_drive_share_warning">این QR شامل client secret و refresh token شما است. هر کس آن را اسکن کند به همان مقدار دسترسی به Drive شما خواهد داشت که این برنامه دارد. فقط با افراد قابل اعتماد به اشتراک بگذارید.</string>
+    <string name="dialog_drive_share_unavailable">هنوز چیزی برای اشتراک‌گذاری وجود ندارد — ابتدا روی این دستگاه OAuth را تکمیل کنید (دکمهٔ احراز Google Drive).</string>
+    <string name="dialog_drive_share_qr_too_large">حجم بسته برای QR زیاد است. از دکمه‌های کپی / ارسال برای فرستادن متن استفاده کنید.</string>
+    <string name="dialog_drive_setup_scan_prompt">QR تنظیمات Drive را اسکن کنید</string>
+    <string name="dialog_drive_setup_import_title">وارد کردن تنظیمات Drive؟</string>
+    <string name="dialog_drive_setup_import_warning">این عمل credentials فعلی Drive روی این دستگاه را بازنویسی می‌کند. فقط در صورتی ادامه دهید که QR را از فردی قابل اعتماد دریافت کرده‌اید — این به برنامه اجازهٔ دسترسی به فضای Drive ایشان را می‌دهد.</string>
+    <string name="dialog_drive_setup_import_summary">شناسهٔ پوشه: %1$s\nنام پوشه: %2$s</string>
+    <string name="snack_drive_setup_imported">تنظیمات Drive وارد شد — برای شروع Connect را بزنید</string>
+    <string name="snack_drive_setup_failed">وارد کردن تنظیمات Drive ناموفق بود (نوشتن فایل‌ها ممکن نشد)</string>
+    <string name="snack_drive_setup_invalid">QR معتبر تنظیمات Drive نیست</string>
+    <string name="snack_drive_setup_copied">بستهٔ تنظیمات در کلیپ‌بورد کپی شد</string>
+
     <!-- "How to use" guide body. Localized — EN copy lives in values. -->
     <string name="help_how_to_use">۱. یک یا چند آدرس deployment از Apps Script (یا فقط ID خام) و همراه آن auth_key خود را جای‌گذاری کنید.\n۲. روی «نصب گواهی MITM» بزنید و پیام تأیید را قبول کنید — گواهی در Downloads/mhrv-ca.crt ذخیره می‌شود و برنامهٔ Settings باز می‌شود. داخل Settings از نوار جست‌وجو «CA certificate» را پیدا کنید و روی همان نتیجه بزنید (نه «VPN &amp; app user certificate» و نه «Wi-Fi»)، سپس mhrv-ca.crt را از Downloads انتخاب کنید. اگر قفل صفحه ندارید، اندروید می‌خواهد یکی تنظیم کنید (الزام سیستم).\n۳. قبل از Start، بخش «مجموعهٔ SNI + تستر» را باز کنید و «تست همه» را بزنید. اگر همه تایم‌اوت شدند یعنی google_ip در دسترس نیست — آن را با یک IP جایگزین کنید که روی شبکهٔ سالم resolve می‌شود (مثلاً `nslookup www.google.com` روی هر دستگاه سالم).\n۴. Start را بزنید و درخواست VPN را تأیید کنید. پل TUN کامل، تمام برنامه‌های دستگاه را خودکار از پروکسی رد می‌کند — نیاز به تنظیم per-app نیست.\n۵. اگر Chrome پیام «504 Relay timeout» نشان داد: deployment شما پاسخ نمی‌دهد. اسکریپت را دوباره deploy کنید، URL جدید /exec را بگیرید و بالا جای‌گذاری کنید. در «لاگ زنده» ببینید خطا از نوع «Relay timeout» است یا «connect:» — نوع خطا مشخص می‌کند کدام لایه مقصر است.\n\nمحدودیت شناخته‌شده — Cloudflare Turnstile («Verify you are human») روی اکثر سایت‌های پشت Cloudflare به‌طور بی‌پایان loop می‌زند. هر درخواست Apps Script از یک IP خروجی چرخشی دیتاسنتر گوگل + یک User-Agent ثابت «Google-Apps-Script» + اثرانگشت TLS گوگل عبور می‌کند. کوکی cf_clearance به tuple (IP, UA, JA3) مربوط به زمان حل چالش گره خورده است، پس درخواست بعدی — از یک IP خروجی متفاوت — دوباره چالش می‌خورد. این مسئله در این برنامه قابل‌حل نیست؛ ذات رلهٔ Apps Script است. سایت‌هایی که فقط بارگذاری اولیه را gate می‌کنند (نه هر درخواست) بعد از یک بار حل، کار خواهند کرد.</string>
 </resources>
