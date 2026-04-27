@@ -22,6 +22,10 @@ name = "mhrv-rs-ui"
 path = "src/bin/ui.rs"
 required-features = ["ui"]
 
+[[bin]]
+name = "mhrv-drive-node"
+path = "src/bin/drive_node.rs"
+
 [features]
 default = []
 ui = ["dep:eframe"]

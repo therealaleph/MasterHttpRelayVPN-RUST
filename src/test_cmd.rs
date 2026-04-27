@@ -20,10 +20,11 @@ use crate::domain_fronter::DomainFronter;
 const TEST_URL: &str = "https://api.ipify.org/?format=json";
 
 pub async fn run(config: &Config) -> bool {
-    if matches!(config.mode_kind(), Ok(Mode::GoogleOnly)) {
+    if matches!(config.mode_kind(), Ok(Mode::GoogleOnly | Mode::GoogleDrive)) {
         let msg = "`mhrv-rs test` probes the Apps Script relay, which isn't \
-                   wired up in google_only mode. Run `mhrv-rs test-sni` to \
-                   check the direct SNI-rewrite tunnel instead.";
+                   wired up in this mode. Run `mhrv-rs test-sni` to check \
+                   Google-edge reachability; google_drive mode is exercised \
+                   by starting both `mhrv-rs` and `mhrv-drive-node`.";
         println!("{}", msg);
         tracing::error!("{}", msg);
         return false;

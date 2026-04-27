@@ -500,6 +500,16 @@ impl FormState {
             // control yet). Round-trip through the file so save
             // doesn't drop a user-set true.
             block_quic: self.block_quic,
+            // Google Drive mode is CLI-only for now; keep defaults here so
+            // the desktop UI's Config initializer stays in sync.
+            drive_credentials_path: "credentials.json".into(),
+            drive_token_path: None,
+            drive_folder_id: String::new(),
+            drive_folder_name: "MHRV-Drive".into(),
+            drive_client_id: String::new(),
+            drive_poll_ms: 500,
+            drive_flush_ms: 300,
+            drive_idle_timeout_secs: 300,
         })
     }
 }

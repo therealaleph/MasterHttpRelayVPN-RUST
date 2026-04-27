@@ -33,7 +33,7 @@ enum Command {
 
 fn print_help() {
     println!(
-        "mhrv-rs {} — Rust port of MasterHttpRelayVPN (apps_script mode only)
+        "mhrv-rs {} — Rust port of MasterHttpRelayVPN
 
 USAGE:
     mhrv-rs [OPTIONS]                  Start the proxy server (default)
@@ -312,9 +312,36 @@ async fn main() -> ExitCode {
             }
             tracing::warn!(
                 "Full tunnel mode: NO certificate installation needed. \
-                 ALL traffic is tunneled end-to-end through Apps Script + tunnel node."
+                ALL traffic is tunneled end-to-end through Apps Script + tunnel node."
             );
         }
+        mhrv_rs::config::Mode::GoogleDrive => {
+            tracing::info!(
+                "Google Drive tunnel: SNI={} -> www.googleapis.com (via {})",
+                config.front_domain,
+                config.google_ip
+            );
+            tracing::warn!(
+                "Google Drive mode is SOCKS5-only and needs `mhrv-drive-node` \
+                 running with the same Drive folder."
+            );
+        }
+    }
+
+    if mode == mhrv_rs::config::Mode::GoogleDrive {
+        let run = mhrv_rs::drive_tunnel::run_client(&config);
+        tokio::select! {
+            r = run => {
+                if let Err(e) = r {
+                    eprintln!("google_drive client error: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                tracing::warn!("Ctrl+C — shutting down google_drive client.");
+            }
+        }
+        return ExitCode::SUCCESS;
     }
 
     // Initialize MITM manager (generates CA on first run).

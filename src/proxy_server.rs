@@ -235,6 +235,8 @@ impl ProxyServer {
         // `google_only` mode skips the Apps Script relay entirely, so we must
         // not try to construct the DomainFronter — it errors on a missing
         // `script_id`, which is exactly the state a bootstrapping user is in.
+        // `google_drive` never reaches this constructor (main.rs short-circuits
+        // before ProxyServer::new), but the arm has to typecheck.
         let fronter = match mode {
             Mode::AppsScript | Mode::Full => {
                 let f = DomainFronter::new(config)
@@ -242,6 +244,9 @@ impl ProxyServer {
                 Some(Arc::new(f))
             }
             Mode::GoogleOnly => None,
+            Mode::GoogleDrive => unreachable!(
+                "ProxyServer::new called in google_drive mode; main.rs is supposed to dispatch to drive_tunnel::run_client first"
+            ),
         };
 
         let tls_config = if config.verify_ssl {
@@ -1338,10 +1343,13 @@ async fn dispatch_tunnel(
     //    isn't SNI-rewrite-matched gets direct TCP passthrough so the user's
     //    browser still works while they're deploying Code.gs. They'd switch
     //    to apps_script mode for the real DPI bypass.
+    //    google_drive doesn't run through dispatch_tunnel at all (main.rs
+    //    routes those connections to drive_tunnel::run_client), so we don't
+    //    need an arm for it here.
     if rewrite_ctx.mode == Mode::GoogleOnly {
         let via = rewrite_ctx.upstream_socks5.as_deref();
         tracing::info!(
-            "dispatch {}:{} -> raw-tcp ({}) (google_only: no relay)",
+            "dispatch {}:{} -> raw-tcp ({}) (google_only: no Apps Script relay)",
             host,
             port,
             via.unwrap_or("direct")

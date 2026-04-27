@@ -23,6 +23,7 @@ pub enum Mode {
     AppsScript,
     GoogleOnly,
     Full,
+    GoogleDrive,
 }
 
 impl Mode {
@@ -31,6 +32,7 @@ impl Mode {
             Mode::AppsScript => "apps_script",
             Mode::GoogleOnly => "google_only",
             Mode::Full => "full",
+            Mode::GoogleDrive => "google_drive",
         }
     }
 }
@@ -111,7 +113,7 @@ pub struct Config {
     pub max_ips_to_scan: usize,
 
     #[serde(default = "default_scan_batch_size")]
-    pub scan_batch_size:usize,
+    pub scan_batch_size: usize,
 
     #[serde(default = "default_google_ip_validation")]
     pub google_ip_validation: bool,
@@ -190,12 +192,67 @@ pub struct Config {
     /// failure modes later. Issue #213.
     #[serde(default)]
     pub block_quic: bool,
+
+    /// Google Drive queue mode (`mode = "google_drive"`). This is the
+    /// FlowDriver-style transport: both client and `mhrv-drive-node` poll
+    /// a shared Drive folder and exchange multiplexed binary envelopes as
+    /// short-lived files. It does not use Apps Script, `script_id`, or
+    /// `auth_key`; OAuth credentials are loaded from this desktop-client
+    /// JSON instead.
+    #[serde(default = "default_drive_credentials_path")]
+    pub drive_credentials_path: String,
+    /// Optional override for the cached OAuth refresh token path. When
+    /// omitted, `<drive_credentials_path>.token` is used.
+    #[serde(default)]
+    pub drive_token_path: Option<String>,
+    /// Shared Google Drive folder ID. If empty, the client/node will find
+    /// or create `drive_folder_name` in the authorized account.
+    #[serde(default)]
+    pub drive_folder_id: String,
+    #[serde(default = "default_drive_folder_name")]
+    pub drive_folder_name: String,
+    /// Stable client ID used in Drive filenames. If empty, a short random
+    /// ID is generated for this process.
+    #[serde(default)]
+    pub drive_client_id: String,
+    #[serde(default = "default_drive_poll_ms")]
+    pub drive_poll_ms: u64,
+    #[serde(default = "default_drive_flush_ms")]
+    pub drive_flush_ms: u64,
+    /// Per-session inactivity cutoff. Long-poll HTTP, idle WebSockets and
+    /// the like need this above their own keepalive interval; the FlowDriver
+    /// default of 15 s was too aggressive for real protocols.
+    #[serde(default = "default_drive_idle_timeout_secs")]
+    pub drive_idle_timeout_secs: u64,
 }
 
-fn default_fetch_ips_from_api() -> bool { false }
-fn default_max_ips_to_scan() -> usize { 100 }
-fn default_scan_batch_size() -> usize {500}
-fn default_google_ip_validation() -> bool {true}
+fn default_fetch_ips_from_api() -> bool {
+    false
+}
+fn default_max_ips_to_scan() -> usize {
+    100
+}
+fn default_scan_batch_size() -> usize {
+    500
+}
+fn default_google_ip_validation() -> bool {
+    true
+}
+fn default_drive_credentials_path() -> String {
+    "credentials.json".into()
+}
+fn default_drive_folder_name() -> String {
+    "MHRV-Drive".into()
+}
+fn default_drive_poll_ms() -> u64 {
+    500
+}
+fn default_drive_flush_ms() -> u64 {
+    300
+}
+fn default_drive_idle_timeout_secs() -> u64 {
+    300
+}
 
 fn default_google_ip() -> String {
     "216.239.38.120".into()
@@ -247,6 +304,49 @@ impl Config {
                 }
             }
         }
+        if mode == Mode::GoogleDrive {
+            if self.drive_credentials_path.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "drive_credentials_path is required in google_drive mode".into(),
+                ));
+            }
+            if self.drive_poll_ms == 0 || self.drive_flush_ms == 0 {
+                return Err(ConfigError::Invalid(
+                    "drive_poll_ms and drive_flush_ms must be greater than 0".into(),
+                ));
+            }
+            if self.drive_idle_timeout_secs == 0 {
+                return Err(ConfigError::Invalid(
+                    "drive_idle_timeout_secs must be greater than 0".into(),
+                ));
+            }
+            // The id is concatenated unsanitised into Drive filenames and
+            // the `name contains '...'` query, so reject anything that
+            // could break the wire format or query string.
+            let cid = self.drive_client_id.trim();
+            if !cid.is_empty()
+                && (cid.len() > 32
+                    || !cid
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+            {
+                return Err(ConfigError::Invalid(
+                    "drive_client_id must be <=32 chars, ASCII alphanumeric / '-' / '_'".into(),
+                ));
+            }
+            // Folder name shows up inside a single-quoted Drive query; the
+            // helper escapes \\ and ', but a stray newline could still
+            // throw the query off. Disallow control chars defensively.
+            if self
+                .drive_folder_name
+                .chars()
+                .any(|c| c.is_control() || c == '\r' || c == '\n')
+            {
+                return Err(ConfigError::Invalid(
+                    "drive_folder_name must not contain control characters".into(),
+                ));
+            }
+        }
         if self.scan_batch_size == 0 {
             return Err(ConfigError::Invalid(
                 "scan_batch_size must be greater than 0".into(),
@@ -265,8 +365,9 @@ impl Config {
             "apps_script" => Ok(Mode::AppsScript),
             "google_only" => Ok(Mode::GoogleOnly),
             "full" => Ok(Mode::Full),
+            "google_drive" => Ok(Mode::GoogleDrive),
             other => Err(ConfigError::Invalid(format!(
-                "unknown mode '{}' (expected 'apps_script', 'google_only', or 'full')",
+                "unknown mode '{}' (expected 'apps_script', 'google_only', 'full', or 'google_drive')",
                 other
             ))),
         }
@@ -340,7 +441,8 @@ mod tests {
             "mode": "google_only"
         }"#;
         let cfg: Config = serde_json::from_str(s).unwrap();
-        cfg.validate().expect("google_only must validate without script_id / auth_key");
+        cfg.validate()
+            .expect("google_only must validate without script_id / auth_key");
         assert_eq!(cfg.mode_kind().unwrap(), Mode::GoogleOnly);
     }
 
@@ -375,6 +477,39 @@ mod tests {
             "mode": "full",
             "auth_key": "SECRET"
         }"#;
+        let cfg: Config = serde_json::from_str(s).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn parses_google_drive_without_apps_script_fields() {
+        let s = r#"{
+            "mode": "google_drive",
+            "drive_credentials_path": "credentials.json"
+        }"#;
+        let cfg: Config = serde_json::from_str(s).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.mode_kind().unwrap(), Mode::GoogleDrive);
+        assert_eq!(cfg.drive_folder_name, "MHRV-Drive");
+        assert_eq!(cfg.drive_poll_ms, 500);
+        assert_eq!(cfg.drive_flush_ms, 300);
+        assert_eq!(cfg.drive_idle_timeout_secs, 300);
+    }
+
+    #[test]
+    fn rejects_google_drive_client_id_with_special_chars() {
+        let s = r#"{
+            "mode": "google_drive",
+            "drive_credentials_path": "credentials.json",
+            "drive_client_id": "bad client id"
+        }"#;
+        let cfg: Config = serde_json::from_str(s).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_google_drive_folder_name_with_control_chars() {
+        let s = "{\"mode\":\"google_drive\",\"drive_credentials_path\":\"c.json\",\"drive_folder_name\":\"bad\\nname\"}";
         let cfg: Config = serde_json::from_str(s).unwrap();
         assert!(cfg.validate().is_err());
     }

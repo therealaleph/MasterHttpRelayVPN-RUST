@@ -319,6 +319,23 @@ More deployments = more total concurrency = lower per-session latency. Each batc
 }
 ```
 
+## Google Drive queue mode
+
+Experimental `google_drive` mode ports the FlowDriver idea: Google Drive is used as a shared file queue instead of Apps Script. The client listens as a SOCKS5 proxy, writes multiplexed request envelopes into a Drive folder, and `mhrv-drive-node` polls the same folder, opens the real TCP connections, and writes response envelopes back.
+
+Use [`config.drive.example.json`](config.drive.example.json) on both machines. Create a Google OAuth desktop credential JSON with the Drive API enabled, set `drive_credentials_path`, then start the node first:
+
+```bash
+mhrv-drive-node -c config.drive.json
+mhrv-rs -c config.drive.json
+```
+
+On first run each side prints a Google OAuth URL and saves `<credentials>.token` (the client tries to chmod 0600 on Unix — the file holds a long-lived OAuth refresh token, treat it like a credential). If `drive_folder_id` is empty, the program finds or creates `drive_folder_name`; for different machines/accounts, copy the resulting folder ID into both configs. This mode is SOCKS5-only and does not support UDP.
+
+Tune `drive_idle_timeout_secs` (default 300) upward if you tunnel long-poll HTTP, idle WebSockets, or anything else that can go quiet for minutes — sessions silent past this window are force-closed.
+
+> **Security note:** `mhrv-drive-node` is effectively an open TCP relay for whoever has read/write access to the shared Drive folder — anything that can drop a `req-…mux-…bin` file in there can open arbitrary `host:port` connections through the node. Keep the folder narrowly scoped (one OAuth account, no link sharing) and don't run the node on a machine you don't control.
+
 ## Running on OpenWRT (or any musl distro)
 
 The `*-linux-musl-*` archives ship a fully static CLI that runs on OpenWRT, Alpine, and any libc-less Linux userland. Put the binary on the router and start it as a service:

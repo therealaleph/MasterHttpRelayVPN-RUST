@@ -1,0 +1,17 @@
+{
+  "mode": "google_drive",
+  "google_ip": "216.239.38.120",
+  "front_domain": "www.google.com",
+  "listen_host": "127.0.0.1",
+  "listen_port": 8085,
+  "socks5_port": 8086,
+  "log_level": "info",
+  "verify_ssl": true,
+  "drive_credentials_path": "credentials.json",
+  "drive_folder_id": "",
+  "drive_folder_name": "MHRV-Drive",
+  "drive_client_id": "client1",
+  "drive_poll_ms": 500,
+  "drive_flush_ms": 300,
+  "drive_idle_timeout_secs": 300
+}
