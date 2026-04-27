@@ -646,6 +646,42 @@ impl DriveEngine {
                     }
                 }
             }
+
+            // Reap orphan peer files. Normal flow has each side
+            // deleting its own files via `cleanup_loop` above plus the
+            // `processed`-then-delete path in `poll_once`. The edge
+            // case is the peer dying mid-batch: a `res-*` file it
+            // wrote remains in the folder, the dead node can't run
+            // its own cleanup, and our own cleanup above only
+            // touches files matching our `my_dir` prefix. Without
+            // the block below, those orphans accumulate forever.
+            //
+            // Scoped to `<peer_dir>-<my_client_id>-mux-` so a single
+            // client sharing a folder with several others doesn't
+            // touch their in-flight files. Uses STARTUP_STALE_TTL
+            // (5 min) — much longer than the per-file lifetime in
+            // normal operation, so this only fires on the orphan
+            // case; a slow round-trip won't trip it.
+            let orphan_prefix = format!(
+                "{}-{}-mux-",
+                self.peer_dir.as_str(),
+                self.client_id,
+            );
+            if !self.client_id.is_empty() {
+                if let Ok(orphans) = self.backend.list_query(&orphan_prefix).await {
+                    if let Some(orphan_cutoff) =
+                        SystemTime::now().checked_sub(STARTUP_STALE_TTL)
+                    {
+                        for file in orphans {
+                            if let Some(created) = file.created_time {
+                                if created < orphan_cutoff {
+                                    let _ = self.backend.delete(&file.name).await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }

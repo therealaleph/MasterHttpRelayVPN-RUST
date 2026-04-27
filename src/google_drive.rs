@@ -9,8 +9,17 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Google Drive's free-tier quota is 1000 requests / 100 s / user. We
+/// surface a warning at 80% and an error past 100% so operators see
+/// quota pressure in logs before Drive starts handing back 403s. The
+/// per-project ceiling (10k / 100s / project) is shared across all
+/// users of an OAuth client and isn't observable from one client.
+const DRIVE_QUOTA_PER_USER_100S: u64 = 1000;
+const DRIVE_QUOTA_WARN_THRESHOLD: u64 = (DRIVE_QUOTA_PER_USER_100S * 80) / 100;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -33,6 +42,90 @@ use crate::config::Config;
 const GOOGLE_API_HOST: &str = "www.googleapis.com";
 const DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive.file";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Lock-free counter of Drive REST calls within a 100-second sliding
+/// bucket. The bucket boundary is best-effort — a request right at the
+/// 100s mark may land in the previous or next window, which is fine
+/// since Google's quota is also approximate. Used purely for logging
+/// and the [`QuotaSnapshot`] surface; doesn't gate or rate-limit.
+#[derive(Debug)]
+pub struct QuotaTracker {
+    start: Instant,
+    bucket_start_secs: AtomicU64,
+    bucket_count: AtomicU64,
+    total: AtomicU64,
+}
+
+impl QuotaTracker {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            bucket_start_secs: AtomicU64::new(0),
+            bucket_count: AtomicU64::new(0),
+            total: AtomicU64::new(0),
+        }
+    }
+
+    /// Bump on every Drive REST call. Returns the count for the
+    /// current 100-second window so callers can decide if the rate
+    /// looks scary. Logs a warning at 80% of the per-user quota and
+    /// an error past 100%, throttled to once per 50 calls past the
+    /// limit so we don't spam the log under sustained overrun.
+    fn record_call(&self) -> u64 {
+        let now_secs = self.start.elapsed().as_secs();
+        let bucket = self.bucket_start_secs.load(Ordering::Relaxed);
+        if now_secs.saturating_sub(bucket) >= 100 {
+            // Rolling window: stale bucket → reset. Race-prone in the
+            // strict sense (two threads can both reset) but the
+            // off-by-one calls don't matter for a logging counter.
+            self.bucket_start_secs.store(now_secs, Ordering::Relaxed);
+            self.bucket_count.store(0, Ordering::Relaxed);
+        }
+        let count = self.bucket_count.fetch_add(1, Ordering::Relaxed) + 1;
+        self.total.fetch_add(1, Ordering::Relaxed);
+        if count == DRIVE_QUOTA_WARN_THRESHOLD {
+            tracing::warn!(
+                "Drive API rate climbing: {}/100s — free-tier limit is {}/100s/user. \
+                 Consider increasing drive_poll_ms / drive_flush_ms to slow down.",
+                count,
+                DRIVE_QUOTA_PER_USER_100S,
+            );
+        } else if count >= DRIVE_QUOTA_PER_USER_100S && count.is_multiple_of(50) {
+            tracing::error!(
+                "Drive API rate {}/100s — exceeded free-tier per-user quota ({}/100s). \
+                 Expect 403/429 responses. Drive returns these with no Retry-After, so \
+                 the caller has to back off itself.",
+                count,
+                DRIVE_QUOTA_PER_USER_100S,
+            );
+        }
+        count
+    }
+
+    /// Snapshot of the live counters for UI display. Cheap (atomic
+    /// loads only, no allocation).
+    pub fn snapshot(&self) -> QuotaSnapshot {
+        QuotaSnapshot {
+            total: self.total.load(Ordering::Relaxed),
+            current_window: self.bucket_count.load(Ordering::Relaxed),
+            window_secs: 100,
+            quota_per_user: DRIVE_QUOTA_PER_USER_100S,
+        }
+    }
+}
+
+/// Read-only view of the quota counter for UI / status surfaces.
+/// `current_window` is the count of API calls in the most recent
+/// 100-second bucket; `quota_per_user` is the documented free-tier
+/// limit. Workspace / paid Cloud projects get higher ceilings, but
+/// without knowing the user's project tier we display the floor.
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+pub struct QuotaSnapshot {
+    pub total: u64,
+    pub current_window: u64,
+    pub window_secs: u64,
+    pub quota_per_user: u64,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum DriveError {
@@ -73,6 +166,10 @@ struct GoogleApiClient {
     /// The live HTTP/2 sender. `None` until first use, replaced if a
     /// request fails because the connection went away.
     sender: Mutex<Option<SendRequest<Full<Bytes>>>>,
+    /// Per-process Drive REST call counter. Wrapped in `Arc` so the
+    /// outer [`GoogleDriveBackend`] can hand snapshots to the UI
+    /// without holding a lock on this client.
+    quota: Arc<QuotaTracker>,
 }
 
 struct HttpResponse {
@@ -105,6 +202,7 @@ impl GoogleApiClient {
             host_header,
             tls_connector: TlsConnector::from(Arc::new(tls_config)),
             sender: Mutex::new(None),
+            quota: Arc::new(QuotaTracker::new()),
         }
     }
 
@@ -156,6 +254,12 @@ impl GoogleApiClient {
         headers: Vec<(String, String)>,
         body: &[u8],
     ) -> Result<HttpResponse, DriveError> {
+        // Tick the rate counter on every Drive REST call. This is what
+        // surfaces "you're about to hit the free-tier quota" warnings
+        // in the log without any UI work, and what feeds [`quota()`]
+        // for surfaces that want to display it.
+        self.quota.record_call();
+
         // Build the request once. The :authority pseudo-header is what
         // routes the request inside Google's HTTP/2 frontend; it must be
         // the API host even though we're connected via SNI=front_domain.
@@ -775,6 +879,14 @@ impl GoogleDriveBackend {
 
     pub fn credentials_path(&self) -> &PathBuf {
         &self.credentials_path
+    }
+
+    /// Snapshot of the Drive API rate counter — total calls since
+    /// process start plus the count in the most recent 100-second
+    /// window. Used by stats / status surfaces that want to render a
+    /// quota meter; cheap (atomic loads only).
+    pub fn quota_snapshot(&self) -> QuotaSnapshot {
+        self.api.quota.snapshot()
     }
 }
 

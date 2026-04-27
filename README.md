@@ -336,6 +336,33 @@ Tune `drive_idle_timeout_secs` (default 300) upward if you tunnel long-poll HTTP
 
 > **Security note:** `mhrv-drive-node` is effectively an open TCP relay for whoever has read/write access to the shared Drive folder — anything that can drop a `req-…mux-…bin` file in there can open arbitrary `host:port` connections through the node. Keep the folder narrowly scoped (one OAuth account, no link sharing) and don't run the node on a machine you don't control.
 
+### Onboarding a non-technical user (Android)
+
+Once one device has finished OAuth, you can hand the configured state to another via QR or text — no Cloud Console steps required on the receiving end. In the Drive section: **Share Drive setup** → **Show QR + payload** → copy / send the `mhrv-rs-setup://...` link via WhatsApp / Telegram / SMS. The recipient pastes the link, scans the QR, picks the QR image from their gallery, or just taps the link if their messenger linkifies it. The bundle includes the OAuth refresh token, so they don't run their own consent flow — they share the sharer's Google identity for `drive.file` scope.
+
+Caveat: the **sharer** still needs an unfiltered path to `accounts.google.com` for the initial OAuth dance, since the consent page opens in their system browser. If your network blocks Google Accounts, do the initial OAuth on a different network (mobile data, friend's Wi-Fi) and then share the resulting setup. Recipients aren't bound by this — they get the refresh token via the QR.
+
+When the consent page warns _"Google hasn't verified this app"_, that's expected for personal Cloud projects in **Testing** publication status. Click **Advanced → Go to mhrv-drive (unsafe)** → grant the `drive.file` scope. Same flow as deploying an Apps Script for the existing modes.
+
+### Quota and reachability
+
+Google Drive's free-tier per-user quota is **1,000 requests per 100 seconds**. Default `drive_poll_ms = 100` plus `drive_flush_ms = 100` is comfortably below that even under heavy traffic, but if you turn polling down further or run a single OAuth identity across many devices you can blow it. The Rust side logs a `WARN` at 80% and `ERROR`s past 100% — watch for `Drive API rate climbing` in the logs. Bump `drive_poll_ms` / `drive_flush_ms` if you see them.
+
+Before deploying, sanity-check that your network can actually reach Drive's edge IPs. The most informative test (from the host that will run `mhrv-drive-node` or the client):
+
+```bash
+curl --resolve www.googleapis.com:443:216.239.38.120 \
+     -I https://www.googleapis.com/drive/v3/files
+```
+
+A 401 response (no auth) is success — it means TCP reached Google and the TLS handshake completed. A connect timeout, RST, or TLS error means the same DPI / RST-injection path that affects the Apps Script outbound also hits Drive's API endpoint, and this mode won't work better than the existing Apps Script ones on that network.
+
+### Garbage collection
+
+Both sides reap their own files via `cleanup_loop` (every 5 s, deletes own files older than `OLD_FILE_TTL = 60 s` using Drive's `createdTime` so cross-machine clock skew can't false-positive). The poll path also auto-deletes peer files older than `STARTUP_STALE_TTL = 5 min` that look like leftovers from a previous run, plus reaps orphan response files for our own client ID at the same TTL — covers the edge case where `mhrv-drive-node` dies mid-batch and can't run its own cleanup.
+
+If you ever notice `MHRV-Drive` accumulating files past these windows, check the Live logs / Docker logs on both sides for poll errors that prevent the cleanup loop from firing.
+
 ## Running on OpenWRT (or any musl distro)
 
 The `*-linux-musl-*` archives ship a fully static CLI that runs on OpenWRT, Alpine, and any libc-less Linux userland. Put the binary on the router and start it as a service:
