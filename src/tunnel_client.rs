@@ -23,7 +23,7 @@ use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 
-use crate::domain_fronter::{BatchOp, DomainFronter, TunnelResponse};
+use crate::domain_fronter::{BatchOp, DomainFronter, FronterError, TunnelResponse};
 
 /// Apps Script allows 30 concurrent executions per account / deployment.
 const CONCURRENCY_PER_DEPLOYMENT: usize = 30;
@@ -827,6 +827,7 @@ async fn fire_batch(
 
         match result {
             Ok(Ok(batch_resp)) => {
+                f.record_batch_success(&script_id);
                 for (idx, reply) in data_replies {
                     if let Some(resp) = batch_resp.r.get(idx) {
                         let _ = reply.send(Ok((resp.clone(), script_id.clone())));
@@ -836,6 +837,15 @@ async fn fire_batch(
                 }
             }
             Ok(Err(e)) => {
+                // Read-side timeout from `domain_fronter`: Apps Script didn't
+                // start streaming response bytes within the per-read deadline.
+                // Common cause: deployment's `TUNNEL_SERVER_URL` points at a
+                // dead host, so UrlFetchApp inside Apps Script hangs until its
+                // own internal connect timeout. Strike-counter blacklists the
+                // deployment after a sustained pattern.
+                if matches!(e, FronterError::Timeout) {
+                    f.record_timeout_strike(&script_id);
+                }
                 let err_msg = format!("{}", e);
                 tracing::warn!("batch failed: {}", err_msg);
                 for (_, reply) in data_replies {
@@ -843,6 +853,10 @@ async fn fire_batch(
                 }
             }
             Err(_) => {
+                // Whole-batch budget (`BATCH_TIMEOUT`, 30 s) elapsed. Even
+                // stronger signal than a per-read timeout — count it the same
+                // way so a truly-stuck deployment exits round-robin fast.
+                f.record_timeout_strike(&script_id);
                 tracing::warn!("batch timed out after {:?} ({} ops)", BATCH_TIMEOUT, n_ops);
                 for (_, reply) in data_replies {
                     let _ = reply.send(Err("batch timed out".into()));

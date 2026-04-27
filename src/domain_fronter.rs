@@ -102,6 +102,13 @@ pub struct DomainFronter {
     inflight: Arc<Mutex<HashMap<String, broadcast::Sender<Vec<u8>>>>>,
     coalesced: AtomicU64,
     blacklist: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+    /// Per-deployment rolling timeout counter. Maps `script_id` →
+    /// `(window_start, strike_count)`. Reset when the window expires
+    /// or when a batch succeeds. Triggers a short-cooldown blacklist
+    /// at `TIMEOUT_STRIKE_LIMIT`. Distinct from `blacklist` because
+    /// strike state is per-deployment health bookkeeping, not the
+    /// permanent ban list.
+    script_timeouts: Arc<std::sync::Mutex<HashMap<String, (Instant, u32)>>>,
     relay_calls: AtomicU64,
     relay_failures: AtomicU64,
     bytes_relayed: AtomicU64,
@@ -145,6 +152,21 @@ impl HostStat {
 }
 
 const BLACKLIST_COOLDOWN_SECS: u64 = 600;
+
+/// Sliding window for the timeout-strike blacklist heuristic. Three
+/// timeouts within this window on a single deployment trip the
+/// blacklist. Tuned so a single cold-start stall plus one transient
+/// network blip won't false-trigger, but a deployment that's actually
+/// dead (stale `TUNNEL_SERVER_URL`, paused project, dropped script)
+/// fails fast instead of poisoning round-robin until the user notices.
+const TIMEOUT_STRIKE_WINDOW: Duration = Duration::from_secs(30);
+const TIMEOUT_STRIKE_LIMIT: u32 = 3;
+
+/// Cooldown for a deployment blacklisted via the timeout-strike path.
+/// Distinct from `BLACKLIST_COOLDOWN_SECS` (10 min) because timeouts
+/// are a much noisier signal than quota errors — if the deployment
+/// recovers, we want to rejoin in minutes, not after a 10-min penalty.
+const TIMEOUT_BLACKLIST_COOLDOWN_SECS: u64 = 120;
 
 /// Request payload sent to Apps Script (single, non-batch).
 #[derive(Serialize)]
@@ -258,6 +280,7 @@ impl DomainFronter {
             inflight: Arc::new(Mutex::new(HashMap::new())),
             coalesced: AtomicU64::new(0),
             blacklist: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            script_timeouts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             relay_calls: AtomicU64::new(0),
             relay_failures: AtomicU64::new(0),
             bytes_relayed: AtomicU64::new(0),
@@ -414,15 +437,65 @@ impl DomainFronter {
     }
 
     fn blacklist_script(&self, script_id: &str, reason: &str) {
-        let until = Instant::now() + Duration::from_secs(BLACKLIST_COOLDOWN_SECS);
+        self.blacklist_script_for(
+            script_id,
+            Duration::from_secs(BLACKLIST_COOLDOWN_SECS),
+            reason,
+        );
+    }
+
+    fn blacklist_script_for(&self, script_id: &str, cooldown: Duration, reason: &str) {
+        let until = Instant::now() + cooldown;
         let mut bl = self.blacklist.lock().unwrap();
         bl.insert(script_id.to_string(), until);
         tracing::warn!(
             "blacklisted script {} for {}s: {}",
             mask_script_id(script_id),
-            BLACKLIST_COOLDOWN_SECS,
+            cooldown.as_secs(),
             reason
         );
+    }
+
+    /// Record a batch timeout against `script_id`. After
+    /// `TIMEOUT_STRIKE_LIMIT` timeouts inside `TIMEOUT_STRIKE_WINDOW`
+    /// the deployment is blacklisted with a short cooldown so the
+    /// round-robin stops sending real traffic to a deployment that's
+    /// hung (most commonly: stale `TUNNEL_SERVER_URL` after the
+    /// tunnel-node moved hosts).
+    pub(crate) fn record_timeout_strike(&self, script_id: &str) {
+        let now = Instant::now();
+        let mut counts = self.script_timeouts.lock().unwrap();
+        let entry = counts
+            .entry(script_id.to_string())
+            .or_insert((now, 0));
+        if now.duration_since(entry.0) > TIMEOUT_STRIKE_WINDOW {
+            *entry = (now, 1);
+        } else {
+            entry.1 += 1;
+        }
+        let strikes = entry.1;
+        if strikes >= TIMEOUT_STRIKE_LIMIT {
+            counts.remove(script_id);
+            drop(counts);
+            self.blacklist_script_for(
+                script_id,
+                Duration::from_secs(TIMEOUT_BLACKLIST_COOLDOWN_SECS),
+                &format!(
+                    "{} timeouts in {}s",
+                    strikes,
+                    TIMEOUT_STRIKE_WINDOW.as_secs()
+                ),
+            );
+        }
+    }
+
+    /// Clear the timeout strike counter for `script_id`. Called after
+    /// a batch succeeds so a recovered deployment doesn't keep stale
+    /// strikes from hours ago — three strikes must occur within one
+    /// real failure burst, not accumulate across unrelated incidents.
+    pub(crate) fn record_batch_success(&self, script_id: &str) {
+        let mut counts = self.script_timeouts.lock().unwrap();
+        counts.remove(script_id);
     }
 
     /// Log a relay failure with extra guidance on cert-validation cases.
