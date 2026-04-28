@@ -55,15 +55,11 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(35);
 /// connect saves one Apps Script round-trip per new flow.
 const CLIENT_FIRST_DATA_WAIT: Duration = Duration::from_millis(50);
 
-/// How long the muxer holds open the batch buffer after the first op
-/// arrives, waiting for more ops to coalesce. Issue #231 — the previous
-/// implementation drained `try_recv()` *immediately* after the first
-/// message landed, so under any non-bursty workload every batch held
-/// exactly one op (defeating the entire batching premise). 8 ms is small
-/// vs the ~2-7 s Apps Script round-trip the batch is amortizing, but
-/// long enough that concurrent HTTP/2 stream openings, parallel fetches,
-/// or any other burst lands in the same batch.
-const BATCH_COALESCE_WINDOW: Duration = Duration::from_millis(8);
+/// Adaptive coalesce defaults: after each new op arrives, wait another
+/// step for more ops. Resets on every arrival, up to max from the first
+/// op. Overridable via config `coalesce_step_ms` / `coalesce_max_ms`.
+const DEFAULT_COALESCE_STEP_MS: u64 = 40;
+const DEFAULT_COALESCE_MAX_MS: u64 = 1000;
 
 /// Structured error code the tunnel-node returns when it doesn't know the
 /// op (version mismatch). Must match `tunnel-node/src/main.rs`.
@@ -255,7 +251,7 @@ pub struct TunnelMux {
 }
 
 impl TunnelMux {
-    pub fn start(fronter: Arc<DomainFronter>) -> Arc<Self> {
+    pub fn start(fronter: Arc<DomainFronter>, coalesce_step_ms: u64, coalesce_max_ms: u64) -> Arc<Self> {
         // Dedupe before snapshotting: the aggregate `all_legacy` gate
         // compares `legacy_deployments.len()` (a HashMap, so unique
         // keys) against this count, so using the raw `num_scripts()`
@@ -280,8 +276,11 @@ impl TunnelMux {
             unique_n,
             CONCURRENCY_PER_DEPLOYMENT
         );
+        let step = if coalesce_step_ms > 0 { coalesce_step_ms } else { DEFAULT_COALESCE_STEP_MS };
+        let max = if coalesce_max_ms > 0 { coalesce_max_ms } else { DEFAULT_COALESCE_MAX_MS };
+        tracing::info!("batch coalesce: step={}ms max={}ms", step, max);
         let (tx, rx) = mpsc::channel(512);
-        tokio::spawn(mux_loop(rx, fronter));
+        tokio::spawn(mux_loop(rx, fronter, step, max));
         Arc::new(Self {
             tx,
             connect_data_unsupported: Arc::new(AtomicBool::new(false)),
@@ -556,7 +555,9 @@ impl TunnelMux {
     }
 }
 
-async fn mux_loop(mut rx: mpsc::Receiver<MuxMsg>, fronter: Arc<DomainFronter>) {
+async fn mux_loop(mut rx: mpsc::Receiver<MuxMsg>, fronter: Arc<DomainFronter>, coalesce_step_ms: u64, coalesce_max_ms: u64) {
+    let coalesce_step = Duration::from_millis(coalesce_step_ms);
+    let coalesce_max = Duration::from_millis(coalesce_max_ms);
     // One semaphore per deployment ID, each allowing 30 concurrent requests.
     let sems: Arc<HashMap<String, Arc<Semaphore>>> = Arc::new(
         fronter
@@ -574,27 +575,35 @@ async fn mux_loop(mut rx: mpsc::Receiver<MuxMsg>, fronter: Arc<DomainFronter>) {
     loop {
         let mut msgs = Vec::new();
         // Block on the first message — no point waking up to find an empty
-        // queue. Once the first op lands, we hold open BATCH_COALESCE_WINDOW
-        // so concurrent ops (parallel fetches, HTTP/2 stream openings, etc.)
-        // land in the same batch instead of getting a fresh round-trip each.
+        // queue. Once the first op lands, the adaptive coalesce loop waits
+        // in `coalesce_step` increments (resetting on each new arrival, up
+        // to `coalesce_max`) so concurrent ops land in the same batch.
         match rx.recv().await {
             Some(msg) => msgs.push(msg),
             None => break,
         }
-        let deadline = tokio::time::Instant::now() + BATCH_COALESCE_WINDOW;
+        let hard_deadline = tokio::time::Instant::now() + coalesce_max;
+        let mut soft_deadline = tokio::time::Instant::now() + coalesce_step;
         loop {
             // Drain anything that's already queued without waiting.
             while let Ok(msg) = rx.try_recv() {
                 msgs.push(msg);
+                // Reset the soft deadline — more ops are arriving.
+                soft_deadline = tokio::time::Instant::now() + coalesce_step;
             }
             let now = tokio::time::Instant::now();
-            if now >= deadline {
+            let wait_until = soft_deadline.min(hard_deadline);
+            if now >= wait_until {
                 break;
             }
-            match tokio::time::timeout(deadline - now, rx.recv()).await {
-                Ok(Some(msg)) => msgs.push(msg),
+            match tokio::time::timeout(wait_until - now, rx.recv()).await {
+                Ok(Some(msg)) => {
+                    msgs.push(msg);
+                    // New op arrived — extend the soft deadline.
+                    soft_deadline = tokio::time::Instant::now() + coalesce_step;
+                }
                 Ok(None) => return,
-                Err(_) => break,
+                Err(_) => break, // soft or hard deadline hit, no more ops
             }
         }
 

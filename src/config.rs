@@ -96,6 +96,14 @@ pub struct Config {
     /// script IDs.
     #[serde(default)]
     pub parallel_relay: u8,
+    /// Adaptive batch coalesce: after each op arrives, wait this many ms
+    /// for more ops before firing the batch. Resets on every arrival.
+    /// 0 = use compiled default (40ms).
+    #[serde(default)]
+    pub coalesce_step_ms: u16,
+    /// Hard cap on total coalesce wait (ms). 0 = use compiled default (1000ms).
+    #[serde(default)]
+    pub coalesce_max_ms: u16,
     /// Optional explicit SNI rotation pool for outbound TLS to `google_ip`.
     /// Empty / missing = auto-expand from `front_domain` (current default of
     /// {www, mail, drive, docs, calendar}.google.com). Set to an explicit list

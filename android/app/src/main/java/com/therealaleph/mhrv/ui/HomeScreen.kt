@@ -1246,6 +1246,32 @@ private fun AdvancedSettings(
             )
         }
 
+        // Batch coalesce step slider
+        Column {
+            Text(
+                "Coalesce step: ${cfg.coalesceStepMs}ms",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Slider(
+                value = cfg.coalesceStepMs.toFloat(),
+                onValueChange = { onChange(cfg.copy(coalesceStepMs = it.toInt().coerceIn(10, 500))) },
+                valueRange = 10f..500f,
+            )
+        }
+
+        // Batch coalesce max slider
+        Column {
+            Text(
+                "Coalesce max: ${cfg.coalesceMaxMs}ms",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Slider(
+                value = cfg.coalesceMaxMs.toFloat(),
+                onValueChange = { onChange(cfg.copy(coalesceMaxMs = it.toInt().coerceIn(100, 2000))) },
+                valueRange = 100f..2000f,
+            )
+        }
+
         OutlinedTextField(
             value = cfg.upstreamSocks5,
             onValueChange = { onChange(cfg.copy(upstreamSocks5 = it)) },

@@ -216,6 +216,8 @@ pub struct ProxyServer {
     mitm: Arc<Mutex<MitmCertManager>>,
     rewrite_ctx: Arc<RewriteCtx>,
     tunnel_mux: Option<Arc<TunnelMux>>,
+    coalesce_step_ms: u64,
+    coalesce_max_ms: u64,
 }
 
 pub struct RewriteCtx {
@@ -375,6 +377,8 @@ impl ProxyServer {
             mitm,
             rewrite_ctx,
             tunnel_mux: None, // initialized in run() inside the tokio runtime
+            coalesce_step_ms: if config.coalesce_step_ms > 0 { config.coalesce_step_ms as u64 } else { 40 },
+            coalesce_max_ms: if config.coalesce_max_ms > 0 { config.coalesce_max_ms as u64 } else { 1000 },
         })
     }
 
@@ -388,7 +392,7 @@ impl ProxyServer {
         // Initialize TunnelMux inside the runtime (tokio::spawn requires it).
         if self.rewrite_ctx.mode == Mode::Full {
             if let Some(f) = self.fronter.as_ref() {
-                self.tunnel_mux = Some(TunnelMux::start(f.clone()));
+                self.tunnel_mux = Some(TunnelMux::start(f.clone(), self.coalesce_step_ms, self.coalesce_max_ms));
             }
         }
 

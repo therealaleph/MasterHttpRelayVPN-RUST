@@ -92,6 +92,8 @@ data class MhrvConfig(
     val verifySsl: Boolean = true,
     val logLevel: String = "info",
     val parallelRelay: Int = 1,
+    val coalesceStepMs: Int = 40,
+    val coalesceMaxMs: Int = 1000,
     val upstreamSocks5: String = "",
 
     /**
@@ -197,6 +199,8 @@ data class MhrvConfig(
             put("verify_ssl", verifySsl)
             put("log_level", logLevel)
             put("parallel_relay", parallelRelay)
+            if (coalesceStepMs != 40) put("coalesce_step_ms", coalesceStepMs)
+            if (coalesceMaxMs != 1000) put("coalesce_max_ms", coalesceMaxMs)
             if (upstreamSocks5.isNotBlank()) {
                 put("upstream_socks5", upstreamSocks5.trim())
             }
@@ -304,6 +308,8 @@ object ConfigStore {
         if (cfg.verifySsl != defaults.verifySsl) obj.put("verify_ssl", cfg.verifySsl)
         if (cfg.logLevel != defaults.logLevel) obj.put("log_level", cfg.logLevel)
         if (cfg.parallelRelay != defaults.parallelRelay) obj.put("parallel_relay", cfg.parallelRelay)
+        if (cfg.coalesceStepMs != defaults.coalesceStepMs) obj.put("coalesce_step_ms", cfg.coalesceStepMs)
+        if (cfg.coalesceMaxMs != defaults.coalesceMaxMs) obj.put("coalesce_max_ms", cfg.coalesceMaxMs)
         if (cfg.upstreamSocks5.isNotBlank()) obj.put("upstream_socks5", cfg.upstreamSocks5)
         if (cfg.passthroughHosts.isNotEmpty()) obj.put("passthrough_hosts", JSONArray().apply { cfg.passthroughHosts.forEach { put(it) } })
         if (cfg.tunnelDoh != defaults.tunnelDoh) obj.put("tunnel_doh", cfg.tunnelDoh)
@@ -400,6 +406,8 @@ object ConfigStore {
             verifySsl = obj.optBoolean("verify_ssl", true),
             logLevel = obj.optString("log_level", "info"),
             parallelRelay = obj.optInt("parallel_relay", 1),
+            coalesceStepMs = obj.optInt("coalesce_step_ms", 40),
+            coalesceMaxMs = obj.optInt("coalesce_max_ms", 1000),
             upstreamSocks5 = obj.optString("upstream_socks5", ""),
             passthroughHosts = obj.optJSONArray("passthrough_hosts")?.let { arr ->
                 buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }
