@@ -130,7 +130,7 @@
     <string name="btn_drive_setup_import">وارد کردن</string>
     <string name="help_drive_scan_setup">اگر کسی QR تنظیمات Drive را با شما به اشتراک گذاشته، اینجا اسکن کنید. برنامه credentials و توکن OAuth را می‌نویسد، folder_id را تنظیم می‌کند و فقط کافی است Connect را بزنید — نیازی به Google Cloud Console یا مرورگر نیست.</string>
     <string name="dialog_drive_share_title">اشتراک‌گذاری تنظیمات Drive</string>
-    <string name="dialog_drive_share_warning">این QR شامل client secret و refresh token شما است. هر کس آن را اسکن کند به همان مقدار دسترسی به Drive شما خواهد داشت که این برنامه دارد. فقط با افراد قابل اعتماد به اشتراک بگذارید.</string>
+    <string name="dialog_drive_share_warning">این QR شامل client secret و refresh token شما است. هر کس آن را اسکن کند — یا بعداً در پشتیبان چت، اسکرین‌شات یا دستگاه آلوده پیدا کند — همان دسترسی `drive.file` این برنامه را خواهد داشت و تا زمانی که OAuth client را در Google Cloud Console عوض نکنید نگه می‌دارد (که این دستگاه را هم خارج می‌کند). امکان لغو دسترسی فقط برای یک گیرنده وجود ندارد. آن را مثل یک رمز عبور بلندمدت در نظر بگیرید و فقط با افراد قابل اعتماد به اشتراک بگذارید.</string>
     <string name="dialog_drive_share_unavailable">هنوز چیزی برای اشتراک‌گذاری وجود ندارد — ابتدا روی این دستگاه OAuth را تکمیل کنید (دکمهٔ احراز Google Drive).</string>
     <string name="dialog_drive_share_qr_too_large">حجم بسته برای QR زیاد است. از دکمه‌های کپی / ارسال برای فرستادن متن استفاده کنید.</string>
     <string name="dialog_drive_setup_scan_prompt">QR تنظیمات Drive را اسکن کنید</string>

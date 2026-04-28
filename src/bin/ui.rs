@@ -153,11 +153,6 @@ struct UiState {
     /// Result of the most recent `DriveCompleteAuth`. `Ok(token_path)` on
     /// success, `Err(message)` otherwise.
     drive_auth_result: Option<Result<String, String>>,
-    /// Whether the Drive client is the one currently held in `active`
-    /// on the background thread. Independent from `running` because the
-    /// drive client doesn't go through ProxyServer / DomainFronter, so
-    /// the stats panel stays empty while it runs.
-    drive_running: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -294,6 +289,12 @@ struct FormState {
     drive_poll_ms: u64,
     drive_flush_ms: u64,
     drive_idle_timeout_secs: u64,
+    /// Round-tripped from config.json so a hand-edited override
+    /// survives a save. Not surfaced as a UI control; `0` means "use
+    /// built-in default" (currently 8). Hidden because the right value
+    /// is dictated by the user's network and Drive quota — operators
+    /// who care can edit config.json directly.
+    drive_storage_concurrency: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -385,6 +386,7 @@ fn load_form() -> (FormState, Option<String>) {
             drive_poll_ms: c.drive_poll_ms,
             drive_flush_ms: c.drive_flush_ms,
             drive_idle_timeout_secs: c.drive_idle_timeout_secs,
+            drive_storage_concurrency: c.drive_storage_concurrency,
         }
     } else {
         FormState {
@@ -421,6 +423,7 @@ fn load_form() -> (FormState, Option<String>) {
             drive_poll_ms: 500,
             drive_flush_ms: 300,
             drive_idle_timeout_secs: 300,
+            drive_storage_concurrency: 0,
         }
     };
     (form, load_err)
@@ -601,6 +604,7 @@ impl FormState {
             drive_poll_ms: self.drive_poll_ms,
             drive_flush_ms: self.drive_flush_ms,
             drive_idle_timeout_secs: self.drive_idle_timeout_secs,
+            drive_storage_concurrency: self.drive_storage_concurrency,
         })
     }
 }
@@ -671,9 +675,15 @@ struct ConfigWire<'a> {
     drive_flush_ms: u64,
     #[serde(skip_serializing_if = "is_zero_u64")]
     drive_idle_timeout_secs: u64,
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    drive_storage_concurrency: usize,
 }
 
 fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
+fn is_zero_usize(v: &usize) -> bool {
     *v == 0
 }
 
@@ -756,6 +766,11 @@ impl<'a> From<&'a Config> for ConfigWire<'a> {
             drive_flush_ms: if c.mode == "google_drive" { c.drive_flush_ms } else { 0 },
             drive_idle_timeout_secs: if c.mode == "google_drive" {
                 c.drive_idle_timeout_secs
+            } else {
+                0
+            },
+            drive_storage_concurrency: if c.mode == "google_drive" {
+                c.drive_storage_concurrency
             } else {
                 0
             },
@@ -2222,12 +2237,27 @@ fn pick_credentials_file() -> Option<String> {
             $f = New-Object System.Windows.Forms.OpenFileDialog; \
             $f.Filter = 'JSON files (*.json)|*.json|All files (*.*)|*.*'; \
             if ($f.ShowDialog() -eq 'OK') { Write-Output $f.FileName }";
-        let out = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command", script])
-            .output()
-            .ok()?;
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if s.is_empty() { None } else { Some(s) }
+        // Try PowerShell 7 (`pwsh`) first, then Windows PowerShell. Some
+        // hardened images ship only one or the other, so falling through
+        // both lets the dialog work regardless. The script is identical
+        // for both interpreters.
+        for exe in &["pwsh", "powershell"] {
+            let Ok(out) = std::process::Command::new(exe)
+                .args(["-NoProfile", "-Command", script])
+                .output()
+            else {
+                continue;
+            };
+            if !out.status.success() {
+                continue;
+            }
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if s.is_empty() {
+                return None;
+            }
+            return Some(s);
+        }
+        None
     }
     #[cfg(target_os = "macos")]
     {
@@ -2325,7 +2355,6 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                             let mut s = shared2.state.lock().unwrap();
                             s.running = true;
                             s.started_at = Some(Instant::now());
-                            s.drive_running = true;
                         }
                         let port = cfg.socks5_port.unwrap_or(cfg.listen_port + 1);
                         push_log(
@@ -2341,7 +2370,6 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                         st.running = false;
                         st.started_at = None;
                         st.proxy_active = false;
-                        st.drive_running = false;
                         push_log(&shared2, "[ui] drive client stopped");
                     });
                     active = Some((handle, fronter_slot, shutdown_tx));

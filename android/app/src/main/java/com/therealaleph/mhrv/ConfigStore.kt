@@ -298,8 +298,13 @@ object ConfigStore {
      *  + refresh token so a recipient can connect with no manual OAuth.
      *  Different from [HASH_PREFIX] because the payload includes secrets,
      *  the recipient flow needs to write extra files, and we don't want
-     *  to silently fall through to the regular config import path. */
-    private const val DRIVE_SETUP_PREFIX = "mhrv-rs-setup://"
+     *  to silently fall through to the regular config import path.
+     *
+     *  The fixed `import/` host narrows the deep-link surface: the
+     *  AndroidManifest filter requires `android:host="import"`, so a
+     *  foreign URL like `mhrv-rs-setup://attacker.example/...` won't
+     *  even reach the trust prompt. */
+    private const val DRIVE_SETUP_PREFIX = "mhrv-rs-setup://import/"
 
     /** Filename inside the app's filesDir where imported credentials are
      *  written. Must match what the regular Drive import flow uses, so
@@ -437,7 +442,14 @@ object ConfigStore {
     /** Read the on-disk credentials + token files and bundle them with
      *  the user's Drive config knobs into a shareable string. Returns
      *  null when there's nothing to share (no credentials imported, or
-     *  no token cached yet — the sharer has to complete OAuth first). */
+     *  no token cached yet — the sharer has to complete OAuth first).
+     *
+     *  Caller is responsible for showing a destructive-action warning
+     *  before producing the QR. The bundle contains the OAuth
+     *  `client_secret` and a long-lived refresh token; anyone with the
+     *  QR (or a backup of the chat that delivered it) keeps `drive.file`
+     *  access until the sharer rotates the OAuth client in Google
+     *  Cloud Console. There is no per-recipient revoke. */
     fun encodeDriveSetup(ctx: Context, cfg: MhrvConfig): String? {
         if (cfg.driveCredentialsPath.isBlank()) return null
         val credsFile = File(cfg.driveCredentialsPath)
@@ -540,19 +552,10 @@ object ConfigStore {
             tokenFile.writeText(JSONObject().apply {
                 put("refresh_token", setup.refreshToken)
             }.toString())
-            // Best-effort 0600. Android's FileProvider sandbox already
-            // walls /data/user/0/<pkg>/files/ off from other apps, so
-            // this is belt-and-braces.
-            runCatching {
-                credsFile.setReadable(false, false)
-                credsFile.setReadable(true, true)
-                credsFile.setWritable(false, false)
-                credsFile.setWritable(true, true)
-                tokenFile.setReadable(false, false)
-                tokenFile.setReadable(true, true)
-                tokenFile.setWritable(false, false)
-                tokenFile.setWritable(true, true)
-            }
+            // No setReadable/setWritable dance: Android's per-app
+            // sandbox under /data/user/0/<pkg>/files/ already walls
+            // these files off from other apps. The previous gymnastics
+            // were no-ops on every Android version we support.
             base.copy(
                 mode = Mode.GOOGLE_DRIVE,
                 driveCredentialsPath = credsFile.absolutePath,

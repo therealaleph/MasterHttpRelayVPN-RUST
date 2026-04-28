@@ -145,7 +145,7 @@
     <string name="btn_drive_setup_import">Import</string>
     <string name="help_drive_scan_setup">If someone shared a Drive setup QR with you, scan it here. The app will write their credentials and OAuth token, set the folder ID, and you can tap Connect — no Google Cloud Console or browser steps needed.</string>
     <string name="dialog_drive_share_title">Share Drive setup</string>
-    <string name="dialog_drive_share_warning">This QR contains your OAuth client secret AND your Drive refresh token. Anyone who scans it gets the same access to your Drive that this app has. Only share with people you trust.</string>
+    <string name="dialog_drive_share_warning">This QR contains your OAuth client secret AND your Drive refresh token. Anyone who scans it — or later finds it in a chat backup, screenshot, or compromised device — gets the same `drive.file` access this app has, and keeps it until you rotate the OAuth client in Google Cloud Console (which also kicks THIS device). There is no way to revoke a single recipient. Treat it like a long-lived password and only share with people you trust.</string>
     <string name="dialog_drive_share_unavailable">Nothing to share yet — finish OAuth on this device first (Authorize Google Drive button).</string>
     <string name="dialog_drive_share_qr_too_large">Setup payload is too large for a QR code. Use the Copy / Send buttons to share the text instead.</string>
     <string name="dialog_drive_setup_scan_prompt">Scan a Drive setup QR</string>

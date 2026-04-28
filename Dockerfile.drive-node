@@ -18,10 +18,11 @@
 # refresh token, chmod 0600) into the same dir on successful OAuth.
 
 # ---- builder ------------------------------------------------------------
-# Need >= 1.85 for the edition2024 stabilization that time-macros (and a
-# few other transitive deps in our lockfile) now require. `rust:1` always
-# points at the latest 1.x stable — fine for a build image we throw away.
-FROM rust:1-slim-bookworm AS builder
+# Pin the Rust toolchain so a future `rust:1` retag (or a transitive dep
+# bumping its MSRV) can't silently break this image. Need >= 1.85 for
+# the edition2024 stabilization that time-macros and a few other
+# transitive deps in our lockfile now require; bump deliberately.
+FROM rust:1.85-slim-bookworm AS builder
 WORKDIR /src
 
 # `ring` (TLS backend) needs a C compiler + assembler. Everything else is

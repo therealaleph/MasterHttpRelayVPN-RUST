@@ -224,6 +224,13 @@ pub struct Config {
     /// default of 15 s was too aggressive for real protocols.
     #[serde(default = "default_drive_idle_timeout_secs")]
     pub drive_idle_timeout_secs: u64,
+    /// Max concurrent in-flight Drive uploads/downloads. `0` (default)
+    /// uses the built-in [`drive_tunnel::STORAGE_CONCURRENCY`] of 8.
+    /// Bump up if you have a fat pipe and many sessions; HTTP/2
+    /// multiplexes everything onto one TLS connection so the cost of
+    /// raising this is just a few more in-flight streams.
+    #[serde(default)]
+    pub drive_storage_concurrency: usize,
 }
 
 fn default_fetch_ips_from_api() -> bool {
@@ -315,9 +322,14 @@ impl Config {
                     "drive_poll_ms and drive_flush_ms must be greater than 0".into(),
                 ));
             }
-            if self.drive_idle_timeout_secs == 0 {
+            // Floor at 15s to match the UI sliders. Lower values
+            // force-close real protocols (TLS, long-poll HTTP, idle
+            // WebSockets) on every flush and were previously only
+            // rejected at zero — a hand-edited `config.json` could
+            // still set 1 and silently break every connection.
+            if self.drive_idle_timeout_secs < 15 {
                 return Err(ConfigError::Invalid(
-                    "drive_idle_timeout_secs must be greater than 0".into(),
+                    "drive_idle_timeout_secs must be at least 15".into(),
                 ));
             }
             // The id is concatenated unsanitised into Drive filenames and
@@ -494,6 +506,30 @@ mod tests {
         assert_eq!(cfg.drive_poll_ms, 500);
         assert_eq!(cfg.drive_flush_ms, 300);
         assert_eq!(cfg.drive_idle_timeout_secs, 300);
+    }
+
+    #[test]
+    fn rejects_google_drive_idle_timeout_below_floor() {
+        // Validator floor is 15s — below it a hand-edited config could
+        // set 1 and force-close every session on each flush. Verify both
+        // 0 and a low-but-positive value are rejected, and exactly 15
+        // is accepted.
+        let mk = |idle: u64| {
+            format!(
+                "{{\"mode\":\"google_drive\",\"drive_credentials_path\":\"c.json\",\"drive_idle_timeout_secs\":{}}}",
+                idle
+            )
+        };
+        for bad in [0u64, 1, 14] {
+            let cfg: Config = serde_json::from_str(&mk(bad)).unwrap();
+            assert!(
+                cfg.validate().is_err(),
+                "drive_idle_timeout_secs = {} should reject",
+                bad
+            );
+        }
+        let cfg: Config = serde_json::from_str(&mk(15)).unwrap();
+        cfg.validate().expect("15s should be accepted");
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -54,6 +54,11 @@ pub struct QuotaTracker {
     bucket_start_secs: AtomicU64,
     bucket_count: AtomicU64,
     total: AtomicU64,
+    /// Set the first time the warn fires in the current bucket; cleared
+    /// at the next bucket reset. Without this, a thread that races past
+    /// the threshold by more than one increment skips the warn entirely
+    /// (the previous `count == THRESHOLD` was an exact-match trigger).
+    warned_this_bucket: AtomicBool,
 }
 
 impl QuotaTracker {
@@ -63,6 +68,7 @@ impl QuotaTracker {
             bucket_start_secs: AtomicU64::new(0),
             bucket_count: AtomicU64::new(0),
             total: AtomicU64::new(0),
+            warned_this_bucket: AtomicBool::new(false),
         }
     }
 
@@ -80,10 +86,14 @@ impl QuotaTracker {
             // off-by-one calls don't matter for a logging counter.
             self.bucket_start_secs.store(now_secs, Ordering::Relaxed);
             self.bucket_count.store(0, Ordering::Relaxed);
+            self.warned_this_bucket.store(false, Ordering::Relaxed);
         }
         let count = self.bucket_count.fetch_add(1, Ordering::Relaxed) + 1;
         self.total.fetch_add(1, Ordering::Relaxed);
-        if count == DRIVE_QUOTA_WARN_THRESHOLD {
+        if count >= DRIVE_QUOTA_WARN_THRESHOLD
+            && count < DRIVE_QUOTA_PER_USER_100S
+            && !self.warned_this_bucket.swap(true, Ordering::Relaxed)
+        {
             tracing::warn!(
                 "Drive API rate climbing: {}/100s — free-tier limit is {}/100s/user. \
                  Consider increasing drive_poll_ms / drive_flush_ms to slow down.",
@@ -900,7 +910,9 @@ fn http_error(resp: HttpResponse) -> DriveError {
     }
 }
 
-fn random_hex(bytes: usize) -> String {
+/// Lowercase hex string from `bytes` random bytes. Shared with
+/// `drive_tunnel` (one helper, one place) — keep the signature stable.
+pub(crate) fn random_hex(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
     rand::thread_rng().fill_bytes(&mut buf);
     let mut out = String::with_capacity(bytes * 2);
@@ -1066,6 +1078,49 @@ mod tests {
         assert_eq!(url_path_escape("AbC-_.~123"), "AbC-_.~123");
         assert_eq!(url_path_escape("hello world"), "hello%20world");
         assert_eq!(url_path_escape("a+b/c?d"), "a%2Bb%2Fc%3Fd");
+    }
+
+    #[test]
+    fn quota_tracker_counts_and_snapshots() {
+        // record_call() returns the in-bucket count and bumps the
+        // total. The exact warn / error threshold logging is exercised
+        // implicitly by hitting >= the warn threshold; we can't capture
+        // tracing output here without a subscriber, but we can at
+        // least verify the snapshot reflects what we did.
+        let q = QuotaTracker::new();
+        assert_eq!(q.snapshot().total, 0);
+        assert_eq!(q.snapshot().current_window, 0);
+        for _ in 0..5 {
+            q.record_call();
+        }
+        let s = q.snapshot();
+        assert_eq!(s.total, 5);
+        assert_eq!(s.current_window, 5);
+        assert_eq!(s.window_secs, 100);
+        assert_eq!(s.quota_per_user, DRIVE_QUOTA_PER_USER_100S);
+    }
+
+    #[test]
+    fn quota_tracker_warns_at_or_above_threshold() {
+        // Regression guard for the `count == THRESHOLD` exact-match
+        // bug: calling record_call() far past the warn threshold
+        // (simulating a thread that races past it without ever landing
+        // exactly on the boundary) should still flip warned_this_bucket
+        // exactly once. We assert the latch by observing the AtomicBool.
+        let q = QuotaTracker::new();
+        // Pre-load the bucket so the next call lands well above the
+        // threshold rather than incrementally crossing it.
+        q.bucket_count
+            .store(DRIVE_QUOTA_WARN_THRESHOLD + 10, Ordering::Relaxed);
+        assert!(!q.warned_this_bucket.load(Ordering::Relaxed));
+        q.record_call();
+        assert!(
+            q.warned_this_bucket.load(Ordering::Relaxed),
+            "warn latch should fire even when count overshoots the threshold"
+        );
+        // Subsequent calls in the same bucket don't re-arm.
+        q.record_call();
+        assert!(q.warned_this_bucket.load(Ordering::Relaxed));
     }
 
     #[test]

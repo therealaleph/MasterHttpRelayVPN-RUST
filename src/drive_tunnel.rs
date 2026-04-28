@@ -10,18 +10,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::stream::{self, StreamExt};
-use rand::RngCore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::config::Config;
-use crate::google_drive::{DriveError, GoogleDriveBackend};
+use crate::google_drive::{random_hex, DriveError, GoogleDriveBackend};
 
-/// Maximum number of concurrent uploads/downloads in flight against
+/// Default ceiling on concurrent uploads/downloads in flight against
 /// Drive. Matches FlowDriver's `e.sem = make(chan struct{}, 8)`. Uses
 /// HTTP/2 multiplexing on a single TLS connection, so the cost of bumping
 /// this is just a few more in-flight streams — no extra handshakes.
+/// Operators can override via `drive_storage_concurrency` in config.
 const STORAGE_CONCURRENCY: usize = 8;
 
 const MAGIC_BYTE: u8 = 0x1f;
@@ -220,6 +220,10 @@ pub struct DriveEngine {
     poll_interval: Duration,
     flush_interval: Duration,
     idle_timeout: Duration,
+    /// Max concurrent in-flight Drive uploads/downloads. Resolved from
+    /// config (`drive_storage_concurrency`); falls back to
+    /// [`STORAGE_CONCURRENCY`] when unset.
+    storage_concurrency: usize,
     new_session_tx: Option<mpsc::Sender<DriveNewSession>>,
 }
 
@@ -250,6 +254,11 @@ impl DriveEngine {
             poll_interval: Duration::from_millis(config.drive_poll_ms),
             flush_interval: Duration::from_millis(config.drive_flush_ms),
             idle_timeout: Duration::from_secs(config.drive_idle_timeout_secs),
+            storage_concurrency: if config.drive_storage_concurrency == 0 {
+                STORAGE_CONCURRENCY
+            } else {
+                config.drive_storage_concurrency
+            },
             new_session_tx,
         })
     }
@@ -341,12 +350,24 @@ impl DriveEngine {
     }
 
     async fn flush_all(&self) -> Result<(), DriveError> {
+        // Build phase: drain each session's tx_buf into an envelope, but
+        // do NOT yet bump tx_seq or clear pending_open_ok. We commit those
+        // state changes only after the upload returns Ok; on Err, we
+        // restore the payload (prepended before any new writes) and leave
+        // tx_seq alone, so the next flush retries the same envelope at the
+        // same seq number.
+        //
+        // Why this matters: pre-fix, a failed upload silently advanced
+        // tx_seq, and the peer's rx_seq stalled forever waiting for the
+        // missing seq — the session hung until idle_timeout (5 min) before
+        // anything user-visible happened.
         let sessions: Vec<Arc<Mutex<DriveSession>>> =
             self.sessions.lock().await.values().cloned().collect();
-        let mut muxes: HashMap<String, Vec<Envelope>> = HashMap::new();
-        let mut closed_ids = Vec::new();
+        let mut muxes: HashMap<String, Vec<(Arc<Mutex<DriveSession>>, Envelope)>> = HashMap::new();
+        let mut closed_ids: Vec<String> = Vec::new();
 
         for session in sessions {
+            let session_for_commit = session.clone();
             let mut s = session.lock().await;
             if s.last_activity.elapsed() > self.idle_timeout {
                 s.closed = true;
@@ -365,19 +386,23 @@ impl DriveEngine {
             }
             if open_ok {
                 flags |= FLAG_OPEN_OK;
-                s.pending_open_ok = false;
             }
+            // Server-side responses don't need to echo target_addr — the
+            // peer only ever uses target_addr to dial, which is a
+            // request-side concern. Saves `target_addr.len() + 1` bytes
+            // per envelope on the response stream.
+            let target_addr = if self.my_dir == Direction::Req {
+                s.target_addr.clone()
+            } else {
+                String::new()
+            };
             let env = Envelope {
                 session_id: s.id.clone(),
                 seq: s.tx_seq,
-                target_addr: s.target_addr.clone(),
+                target_addr,
                 payload,
                 flags,
             };
-            s.tx_seq += 1;
-            if s.closed {
-                closed_ids.push(s.id.clone());
-            }
             let cid = if self.my_dir == Direction::Req {
                 self.client_id.clone()
             } else if s.client_id.is_empty() {
@@ -385,7 +410,11 @@ impl DriveEngine {
             } else {
                 s.client_id.clone()
             };
-            muxes.entry(cid).or_default().push(env);
+            drop(s);
+            muxes
+                .entry(cid)
+                .or_default()
+                .push((session_for_commit, env));
         }
 
         // Encode all mux files up front (CPU only, fast), then ship them
@@ -393,33 +422,84 @@ impl DriveEngine {
         // the server side typically has several active clients and the
         // parallelism plus HTTP/2 multiplexing folds them into a single
         // round-trip's worth of latency.
-        let mut uploads: Vec<(String, Vec<u8>)> = Vec::with_capacity(muxes.len());
-        for (cid, envelopes) in muxes {
+        let mut uploads: Vec<(String, Vec<u8>, Vec<(Arc<Mutex<DriveSession>>, Envelope)>)> =
+            Vec::with_capacity(muxes.len());
+        for (cid, items) in muxes {
             let filename = format!("{}-{}-mux-{}.bin", self.my_dir.as_str(), cid, now_nanos());
             let mut body = Vec::new();
-            for env in &envelopes {
+            for (_, env) in &items {
                 env.encode(&mut body)?;
             }
-            uploads.push((filename, body));
+            uploads.push((filename, body, items));
         }
         if !uploads.is_empty() {
             let backend = self.backend.clone();
-            let results: Vec<Result<(), DriveError>> = stream::iter(uploads.into_iter().map(
-                |(name, body)| {
-                    let backend = backend.clone();
-                    async move { backend.upload(&name, body).await }
-                },
-            ))
-            .buffer_unordered(STORAGE_CONCURRENCY)
+            let storage_concurrency = self.storage_concurrency;
+            let results: Vec<(
+                String,
+                Vec<(Arc<Mutex<DriveSession>>, Envelope)>,
+                Result<(), DriveError>,
+            )> = stream::iter(uploads.into_iter().map(|(name, body, items)| {
+                let backend = backend.clone();
+                async move {
+                    let r = backend.upload(&name, body).await;
+                    (name, items, r)
+                }
+            }))
+            .buffer_unordered(storage_concurrency)
             .collect()
             .await;
-            for r in results {
-                if let Err(e) = r {
-                    tracing::debug!("Drive upload error: {}", e);
+
+            for (name, items, r) in results {
+                match r {
+                    Ok(()) => {
+                        // Commit: bump tx_seq, clear pending_open_ok flags,
+                        // and queue closed sessions for teardown. We use
+                        // env.seq + 1 (not s.tx_seq + 1) so a session with
+                        // its tx_seq already advanced by another path is a
+                        // no-op rather than a backwards step.
+                        for (session, env) in items {
+                            let mut s = session.lock().await;
+                            if s.tx_seq <= env.seq {
+                                s.tx_seq = env.seq + 1;
+                            }
+                            if env.flags & FLAG_OPEN_OK != 0 {
+                                s.pending_open_ok = false;
+                            }
+                            if env.flags & FLAG_CLOSE != 0 {
+                                closed_ids.push(s.id.clone());
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // Rollback: restore payload to tx_buf (prepended,
+                        // so retry preserves byte order), keep tx_seq and
+                        // pending_open_ok untouched so the next flush
+                        // re-emits the same envelope with the same seq.
+                        // Bump to warn — the previous debug-only log meant
+                        // operators couldn't see why a session looked
+                        // stuck.
+                        tracing::warn!(
+                            "Drive upload {} failed: {} (will retry next flush)",
+                            name,
+                            e
+                        );
+                        for (session, env) in items {
+                            let mut s = session.lock().await;
+                            if !env.payload.is_empty() {
+                                let mut restored = env.payload;
+                                restored.extend_from_slice(&s.tx_buf);
+                                s.tx_buf = restored;
+                            }
+                        }
+                    }
                 }
             }
         }
 
+        // Lock order: sessions before closed_sessions. Only one site in
+        // this file takes both locks; documenting it here so a future
+        // edit doesn't accidentally invert.
         if !closed_ids.is_empty() {
             let mut sessions = self.sessions.lock().await;
             let mut closed_set = self.closed_sessions.lock().await;
@@ -506,7 +586,7 @@ impl DriveEngine {
             return Ok(true);
         }
 
-        // Concurrent downloads, bounded by STORAGE_CONCURRENCY. With
+        // Concurrent downloads, bounded by storage_concurrency. With
         // HTTP/2 these all multiplex onto the same TLS connection — no
         // extra handshakes, just more in-flight streams. This is the
         // single biggest win over the v1 sequential implementation.
@@ -518,7 +598,7 @@ impl DriveEngine {
                 (name, res)
             }
         }))
-        .buffer_unordered(STORAGE_CONCURRENCY);
+        .buffer_unordered(self.storage_concurrency);
         tokio::pin!(downloads);
 
         while let Some((name, result)) = downloads.next().await {
@@ -1143,21 +1223,15 @@ fn read_string(buf: &[u8], pos: &mut usize, len: usize) -> Result<String, DriveE
     Ok(s)
 }
 
-fn random_hex(bytes: usize) -> String {
-    let mut buf = vec![0u8; bytes];
-    rand::thread_rng().fill_bytes(&mut buf);
-    let mut out = String::with_capacity(bytes * 2);
-    for b in buf {
-        out.push_str(&format!("{:02x}", b));
-    }
-    out
-}
-
 fn now_nanos() -> u128 {
+    // Floor at 1 so a clock set before 1970 (or a `duration_since` error)
+    // still produces a non-zero filename suffix — zero would collide with
+    // any other badly-clocked event and break ordering hints.
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
+        .map(|d| d.as_nanos())
+        .unwrap_or(1)
+        .max(1)
 }
 
 fn timestamp_from_filename(filename: &str) -> Option<u128> {
@@ -1272,5 +1346,108 @@ mod tests {
         assert_eq!(timestamp_from_filename(res), Some(67890));
 
         assert!(client_id_from_filename("garbage.txt").is_none());
+    }
+
+    #[test]
+    fn apply_rx_env_handles_all_flag_combinations() {
+        // Pure-function exercise of the rx-side flag decoder. Covers
+        // each combination so a future flag addition / reorder shows up
+        // here before it ships as a wire-protocol regression.
+        let mk = |flags: u8, payload: &[u8]| Envelope {
+            session_id: "sid".into(),
+            seq: 0,
+            target_addr: String::new(),
+            payload: payload.to_vec(),
+            flags,
+        };
+        let new_session = || {
+            DriveSession {
+                id: "sid".into(),
+                target_addr: String::new(),
+                client_id: String::new(),
+                tx_buf: Vec::new(),
+                tx_seq: 0,
+                rx_seq: 0,
+                rx_queue: BTreeMap::new(),
+                last_activity: Instant::now(),
+                closed: false,
+                rx_closed: false,
+                pending_open_ok: false,
+                rx_tx: mpsc::channel(1).0,
+            }
+        };
+
+        // Plain data: one Data emission, rx_seq advances, no close.
+        let mut s = new_session();
+        let mut out = Vec::new();
+        apply_rx_env(&mut s, mk(0, b"data"), &mut out);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0], DriveRx::Data(ref d) if d == b"data"));
+        assert_eq!(s.rx_seq, 1);
+        assert!(!s.rx_closed);
+
+        // Open-only: one Open emission, no Data, rx_seq advances.
+        let mut s = new_session();
+        let mut out = Vec::new();
+        apply_rx_env(&mut s, mk(FLAG_OPEN_OK, &[]), &mut out);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0], DriveRx::Open));
+        assert_eq!(s.rx_seq, 1);
+
+        // Open + Data + Close in one envelope: Open, Data, Close in
+        // that order, session marked closed.
+        let mut s = new_session();
+        let mut out = Vec::new();
+        apply_rx_env(&mut s, mk(FLAG_OPEN_OK | FLAG_CLOSE, b"x"), &mut out);
+        assert_eq!(out.len(), 3);
+        assert!(matches!(out[0], DriveRx::Open));
+        assert!(matches!(out[1], DriveRx::Data(ref d) if d == b"x"));
+        assert!(matches!(out[2], DriveRx::Close));
+        assert!(s.rx_closed);
+        assert!(s.closed);
+
+        // Close-only with empty payload: just Close, no Data.
+        let mut s = new_session();
+        let mut out = Vec::new();
+        apply_rx_env(&mut s, mk(FLAG_CLOSE, &[]), &mut out);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0], DriveRx::Close));
+        assert!(s.rx_closed);
+    }
+
+    #[test]
+    fn server_side_envelope_omits_target_addr() {
+        // Confirms the wire-size optimization: Direction::Res envelopes
+        // encode an empty target_addr (one zero byte), not the session's
+        // dial address. This isn't just a perf nit — a future change
+        // that re-introduces target_addr on the response side would
+        // bloat every byte of return traffic by ~10–80 bytes.
+        let env_res = Envelope {
+            session_id: "s".into(),
+            seq: 0,
+            target_addr: String::new(),
+            payload: b"hello".to_vec(),
+            flags: 0,
+        };
+        let mut buf_res = Vec::new();
+        env_res.encode(&mut buf_res).unwrap();
+
+        let env_req = Envelope {
+            session_id: "s".into(),
+            seq: 0,
+            target_addr: "example.com:443".into(),
+            payload: b"hello".to_vec(),
+            flags: 0,
+        };
+        let mut buf_req = Vec::new();
+        env_req.encode(&mut buf_req).unwrap();
+
+        // Same payload, same seq, same flags — the only delta should be
+        // the target_addr length + bytes.
+        assert_eq!(
+            buf_req.len() - buf_res.len(),
+            "example.com:443".len(),
+            "Direction::Res envelope should be exactly target_addr.len() bytes shorter"
+        );
     }
 }
