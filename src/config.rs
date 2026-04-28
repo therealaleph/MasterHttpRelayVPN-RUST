@@ -205,6 +205,45 @@ pub struct Config {
     /// flip on your specific ISP path.
     #[serde(default)]
     pub disable_padding: bool,
+
+    /// Opt-out for the DoH bypass. Default `false` (= bypass active):
+    /// CONNECTs to well-known DoH hostnames (Cloudflare, Google, Quad9,
+    /// AdGuard, NextDNS, OpenDNS, browser-pinned variants like
+    /// `chrome.cloudflare-dns.com` and `mozilla.cloudflare-dns.com`)
+    /// skip the Apps Script tunnel and exit via plain TCP (or
+    /// `upstream_socks5` if set). DoH already encrypts the queries
+    /// themselves, so the only privacy property the tunnel was adding
+    /// is hiding *the fact that you're doing DoH* from the local
+    /// network — a marginal gain not worth the ~2 s Apps Script
+    /// round-trip cost paid on every name lookup. In Full mode this
+    /// was the dominant DNS slowdown source.
+    ///
+    /// Set `tunnel_doh: true` to keep DoH inside the tunnel. With the
+    /// bypass off, browsers that find their pinned DoH host
+    /// unreachable already fall back to OS DNS on their own, so
+    /// failure modes are graceful in either direction.
+    ///
+    /// Port-gated to TCP/443 only. A private DoH on a non-standard port
+    /// (e.g. `doh.internal.example:8443`) won't take the bypass path —
+    /// list it in `passthrough_hosts` instead, which has no port gate.
+    #[serde(default)]
+    pub tunnel_doh: bool,
+
+    /// Extra hostnames to treat as DoH endpoints in addition to the
+    /// built-in default list. Case-insensitive; entries match exactly
+    /// OR as a dot-anchored suffix unconditionally — `doh.acme.test`
+    /// covers both `doh.acme.test` and `tenant.doh.acme.test`. (Unlike
+    /// `passthrough_hosts`, no leading dot is required for suffix
+    /// matching: every legitimate subdomain of a DoH host is itself
+    /// a DoH endpoint, so the leading-dot convention would be a
+    /// footgun.) Use this to cover private/enterprise DoH resolvers
+    /// without waiting for a release.
+    ///
+    /// Inert when `tunnel_doh = true` — the bypass itself is off, so
+    /// the extras have nothing to feed. The proxy logs a warning at
+    /// startup if both are set together.
+    #[serde(default)]
+    pub bypass_doh_hosts: Vec<String>,
 }
 
 fn default_fetch_ips_from_api() -> bool { false }

@@ -257,6 +257,14 @@ struct FormState {
     /// users edit `disable_padding` directly when needed (Issue #391).
     /// Default false (padding active).
     disable_padding: bool,
+    /// Round-tripped from config.json. Not exposed in the UI form yet —
+    /// the bypass-DoH default is the right answer for almost everyone
+    /// (DoH already encrypts, the tunnel was just adding latency), so
+    /// this is a config-only opt-out. See config.rs `tunnel_doh`.
+    tunnel_doh: bool,
+    /// User-supplied DoH hostnames added to the built-in default list,
+    /// round-tripped from config.json. See config.rs `bypass_doh_hosts`.
+    bypass_doh_hosts: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -341,6 +349,8 @@ fn load_form() -> (FormState, Option<String>) {
             passthrough_hosts: c.passthrough_hosts.clone(),
             block_quic: c.block_quic,
             disable_padding: c.disable_padding,
+            tunnel_doh: c.tunnel_doh,
+            bypass_doh_hosts: c.bypass_doh_hosts.clone(),
         }
     } else {
         FormState {
@@ -370,6 +380,8 @@ fn load_form() -> (FormState, Option<String>) {
             passthrough_hosts: Vec::new(),
             block_quic: false,
             disable_padding: false,
+            tunnel_doh: false,
+            bypass_doh_hosts: Vec::new(),
         }
     };
     (form, load_err)
@@ -519,6 +531,11 @@ impl FormState {
             // Issue #391: disable_padding is config-only for now.
             // Round-trip preserves the user's choice.
             disable_padding: self.disable_padding,
+            // DoH bypass is enabled-by-default with `tunnel_doh = false`.
+            // Round-trip the user's choice (and any extra hostnames they
+            // added) so save doesn't drop them.
+            tunnel_doh: self.tunnel_doh,
+            bypass_doh_hosts: self.bypass_doh_hosts.clone(),
         })
     }
 }
@@ -570,6 +587,12 @@ struct ConfigWire<'a> {
     max_ips_to_scan: usize,
     scan_batch_size: usize,
     google_ip_validation: bool,
+    /// Default false (= bypass DoH). Only emitted when explicitly true
+    /// so unchanged configs stay clean.
+    #[serde(skip_serializing_if = "is_false")]
+    tunnel_doh: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    bypass_doh_hosts: &'a Vec<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -618,6 +641,8 @@ impl<'a> From<&'a Config> for ConfigWire<'a> {
             max_ips_to_scan: c.max_ips_to_scan,
             scan_batch_size: c.scan_batch_size,
             google_ip_validation: c.google_ip_validation,
+            tunnel_doh: c.tunnel_doh,
+            bypass_doh_hosts: &c.bypass_doh_hosts,
         }
     }
 }

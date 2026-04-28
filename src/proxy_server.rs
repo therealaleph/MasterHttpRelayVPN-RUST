@@ -117,6 +117,44 @@ const YOUTUBE_RELAY_HOSTS: &[&str] = &[
     "youtubei.googleapis.com",
 ];
 
+/// Built-in list of DNS-over-HTTPS endpoints. CONNECTs to these (when
+/// `tunnel_doh` is left at the default of `false`, i.e. bypass enabled)
+/// skip the Apps Script tunnel and exit via plain TCP. Mix of the
+/// browser-pinned variants Chrome/Brave/Edge/Firefox/Safari use and the
+/// well-known public DoH providers users wire up by hand. Suffix
+/// matching means we don't need to enumerate every tenant subdomain
+/// (e.g. `*.cloudflare-dns.com` covers Workers-hosted DoH too).
+///
+/// Entries are matched case-insensitively. Both exact-match (`dns.google`)
+/// and dot-anchored suffix-match (a host whose suffix is `.cloudflare-dns.com`
+/// or which equals `cloudflare-dns.com`) are accepted — same shape as
+/// `passthrough_hosts`'s `.foo` rule.
+const DEFAULT_DOH_HOSTS: &[&str] = &[
+    // The base SLD covers every tenant subdomain via suffix matching;
+    // the browser-pinned variants below are listed for grep/discovery
+    // (so a user searching "chrome.cloudflare-dns.com" finds this list)
+    // and are technically redundant under cloudflare-dns.com.
+    "cloudflare-dns.com",
+    "chrome.cloudflare-dns.com",
+    "mozilla.cloudflare-dns.com",
+    "1dot1dot1dot1.cloudflare-dns.com",
+    "dns.google",
+    "dns.google.com",
+    "dns.quad9.net",
+    "dns11.quad9.net",
+    "dns.adguard-dns.com",
+    "unfiltered.adguard-dns.com",
+    "family.adguard-dns.com",
+    "dns.nextdns.io",
+    "doh.opendns.com",
+    "doh.cleanbrowsing.org",
+    "doh.dns.sb",
+    "dns0.eu",
+    "dns.alidns.com",
+    "doh.pub",
+    "dns.mullvad.net",
+];
+
 fn matches_sni_rewrite(host: &str, youtube_via_relay: bool) -> bool {
     let h = host.to_ascii_lowercase();
     let h = h.trim_end_matches('.');
@@ -199,6 +237,47 @@ pub struct RewriteCtx {
     /// callers fall back to TCP/HTTPS. See config.rs `block_quic` for
     /// the trade-off. Issue #213.
     pub block_quic: bool,
+    /// If true, route DoH CONNECTs around the Apps Script tunnel via
+    /// plain TCP. Default true via `Config::tunnel_doh = false`. See
+    /// `DEFAULT_DOH_HOSTS` and `matches_doh_host` for matching, and
+    /// config.rs `tunnel_doh` for the trade-off.
+    pub bypass_doh: bool,
+    /// User-supplied DoH hostnames added to the built-in default list.
+    /// Same matching semantics as `passthrough_hosts`.
+    pub bypass_doh_hosts: Vec<String>,
+}
+
+/// True if `host` matches a known DoH endpoint — either the built-in
+/// `DEFAULT_DOH_HOSTS` list or a user-supplied entry in `extra`. Match
+/// is case-insensitive, and entries match either exactly OR as a
+/// dot-anchored suffix unconditionally (no leading-dot requirement,
+/// unlike `passthrough_hosts`). The DoH list is *always* about a
+/// service — every legitimate tenant subdomain of `cloudflare-dns.com`
+/// or a user's private `doh.acme.test` is a DoH endpoint, so requiring
+/// users to remember to write `.doh.acme.test` would be a footgun
+/// without an obvious benefit.
+fn host_matches_doh_entry(h: &str, entry: &str) -> bool {
+    let e = entry.trim().trim_end_matches('.').to_ascii_lowercase();
+    let e = e.strip_prefix('.').unwrap_or(&e);
+    if e.is_empty() {
+        return false;
+    }
+    h == e || h.ends_with(&format!(".{}", e))
+}
+
+pub fn matches_doh_host(host: &str, extra: &[String]) -> bool {
+    let h = host.to_ascii_lowercase();
+    let h = h.trim_end_matches('.');
+    if h.is_empty() {
+        return false;
+    }
+    if DEFAULT_DOH_HOSTS
+        .iter()
+        .any(|s| host_matches_doh_entry(h, s))
+    {
+        return true;
+    }
+    extra.iter().any(|s| host_matches_doh_entry(h, s))
 }
 
 /// True if `host` matches any entry in the user's passthrough list.
@@ -258,6 +337,20 @@ impl ProxyServer {
         };
         let tls_connector = TlsConnector::from(Arc::new(tls_config));
 
+        // Surface a config combo that is otherwise silently inert: extras
+        // listed under `bypass_doh_hosts` only take effect when the bypass
+        // itself is on. A user who set `tunnel_doh: true` *and* populated
+        // the extras list almost certainly didn't mean to disable the
+        // feature their custom hosts feed into.
+        if config.tunnel_doh && !config.bypass_doh_hosts.is_empty() {
+            tracing::warn!(
+                "config: bypass_doh_hosts has {} entries but tunnel_doh=true — \
+                 the bypass is off, so the extras have no effect. Set \
+                 tunnel_doh=false (or omit it) to use them.",
+                config.bypass_doh_hosts.len()
+            );
+        }
+
         let rewrite_ctx = Arc::new(RewriteCtx {
             google_ip: config.google_ip.clone(),
             front_domain: config.front_domain.clone(),
@@ -268,6 +361,8 @@ impl ProxyServer {
             youtube_via_relay: config.youtube_via_relay,
             passthrough_hosts: config.passthrough_hosts.clone(),
             block_quic: config.block_quic,
+            bypass_doh: !config.tunnel_doh,
+            bypass_doh_hosts: config.bypass_doh_hosts.clone(),
         });
 
         let socks5_port = config.socks5_port.unwrap_or(config.listen_port + 1);
@@ -1332,6 +1427,28 @@ async fn dispatch_tunnel(
         let via = rewrite_ctx.upstream_socks5.as_deref();
         tracing::info!(
             "dispatch {}:{} -> raw-tcp ({}) (passthrough_hosts match)",
+            host,
+            port,
+            via.unwrap_or("direct")
+        );
+        plain_tcp_passthrough(sock, &host, port, via).await;
+        return Ok(());
+    }
+
+    // 0.5. DoH bypass. DNS-over-HTTPS is the dominant per-flow DNS cost
+    //      in Full mode (every browser name lookup costs a ~2 s Apps
+    //      Script round-trip), and the tunnel adds no privacy beyond
+    //      what DoH already provides. Route known DoH hosts directly.
+    //      Port-gated to 443 so a non-TLS CONNECT to e.g. `dns.google:80`
+    //      doesn't get diverted off-tunnel by accident.
+    //      See `DEFAULT_DOH_HOSTS` and config.rs `tunnel_doh`.
+    if rewrite_ctx.bypass_doh
+        && port == 443
+        && matches_doh_host(&host, &rewrite_ctx.bypass_doh_hosts)
+    {
+        let via = rewrite_ctx.upstream_socks5.as_deref();
+        tracing::info!(
+            "dispatch {}:{} -> raw-tcp ({}) (doh bypass)",
             host,
             port,
             via.unwrap_or("direct")
@@ -2912,5 +3029,65 @@ mod tests {
         let list = vec!["example.com.".to_string()];
         assert!(matches_passthrough("example.com", &list));
         assert!(matches_passthrough("example.com.", &list));
+    }
+
+    #[test]
+    fn doh_default_list_exact_matches() {
+        let extra: Vec<String> = vec![];
+        assert!(matches_doh_host("chrome.cloudflare-dns.com", &extra));
+        assert!(matches_doh_host("dns.google", &extra));
+        assert!(matches_doh_host("dns.quad9.net", &extra));
+        assert!(matches_doh_host("doh.opendns.com", &extra));
+    }
+
+    #[test]
+    fn doh_default_list_case_insensitive_and_trailing_dot() {
+        let extra: Vec<String> = vec![];
+        assert!(matches_doh_host("DNS.GOOGLE", &extra));
+        assert!(matches_doh_host("dns.google.", &extra));
+    }
+
+    #[test]
+    fn doh_default_list_suffix_match_for_tenant_subdomains() {
+        // `cloudflare-dns.com` is in the default list — Workers-hosted
+        // tenant DoH endpoints sit under it and should match too.
+        let extra: Vec<String> = vec![];
+        assert!(matches_doh_host("tenant.cloudflare-dns.com", &extra));
+        // But a substring match must NOT pass: `xcloudflare-dns.com` is
+        // a different domain.
+        assert!(!matches_doh_host("xcloudflare-dns.com", &extra));
+    }
+
+    #[test]
+    fn doh_default_list_unrelated_hosts_do_not_match() {
+        let extra: Vec<String> = vec![];
+        assert!(!matches_doh_host("example.com", &extra));
+        assert!(!matches_doh_host("googlevideo.com", &extra));
+        assert!(!matches_doh_host("", &extra));
+    }
+
+    #[test]
+    fn doh_extra_list_extends_default() {
+        let extra = vec![".internal-doh.example".to_string(), "doh.acme.test".to_string()];
+        // Defaults still match.
+        assert!(matches_doh_host("dns.google", &extra));
+        // User additions match.
+        assert!(matches_doh_host("doh.acme.test", &extra));
+        assert!(matches_doh_host("a.b.internal-doh.example", &extra));
+        // Unrelated still doesn't match.
+        assert!(!matches_doh_host("example.com", &extra));
+    }
+
+    #[test]
+    fn doh_extra_entries_match_subdomains_without_leading_dot() {
+        // Asymmetry footgun guard: user adds `doh.acme.test` and expects
+        // `tenant.doh.acme.test` to match too — same as `dns.google`
+        // matching `tenant.dns.google` from the default list. Unlike
+        // `passthrough_hosts`, DoH extras don't require a leading dot.
+        let extra = vec!["doh.acme.test".to_string()];
+        assert!(matches_doh_host("doh.acme.test", &extra));
+        assert!(matches_doh_host("tenant.doh.acme.test", &extra));
+        // But substring overlap must still be rejected.
+        assert!(!matches_doh_host("xdoh.acme.test", &extra));
     }
 }
