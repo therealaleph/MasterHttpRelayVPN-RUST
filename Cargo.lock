@@ -2283,7 +2283,7 @@ dependencies = [
 
 [[package]]
 name = "mhrv-rs"
-version = "1.7.10"
+version = "1.8.1"
 dependencies = [
  "base64 0.22.1",
  "bytes",

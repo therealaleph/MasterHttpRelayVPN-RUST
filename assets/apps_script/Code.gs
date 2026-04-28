@@ -18,6 +18,19 @@
 
 const AUTH_KEY = "CHANGE_ME_TO_A_STRONG_SECRET";
 
+// Active-probing defense. When false (production default), bad AUTH_KEY
+// requests get a decoy HTML page that looks like a placeholder Apps
+// Script web app instead of the JSON `{"e":"unauthorized"}` body. This
+// makes the deployment indistinguishable from a forgotten-but-public
+// Apps Script project to active scanners that POST malformed payloads
+// looking for proxy endpoints.
+//
+// Set to `true` during initial setup if a misconfigured client is
+// hitting "unauthorized" and you want the explicit JSON error to debug
+// — then flip back to false before the deployment is widely shared.
+// (Inspired by #365 Section 3, mhrv-rs v1.8.0+.)
+const DIAGNOSTIC_MODE = false;
+
 // Keep browser capability headers (sec-ch-ua*, sec-fetch-*) intact.
 // Some modern apps, notably Google Meet, use them for browser gating.
 const SKIP_HEADERS = {
@@ -26,10 +39,25 @@ const SKIP_HEADERS = {
   "priority": 1, te: 1,
 };
 
+// HTML body for the bad-auth decoy. Mimics a minimal Apps Script-style
+// placeholder page — no proxy-shaped JSON, nothing distinctive enough
+// for a probe to fingerprint as a tunnel endpoint.
+const DECOY_HTML =
+  '<!DOCTYPE html><html><head><title>Web App</title></head>' +
+  '<body><p>The script completed but did not return anything.</p>' +
+  '</body></html>';
+
+function _decoyOrError(jsonBody) {
+  if (DIAGNOSTIC_MODE) return _json(jsonBody);
+  return ContentService
+    .createTextOutput(DECOY_HTML)
+    .setMimeType(ContentService.MimeType.HTML);
+}
+
 function doPost(e) {
   try {
     var req = JSON.parse(e.postData.contents);
-    if (req.k !== AUTH_KEY) return _json({ e: "unauthorized" });
+    if (req.k !== AUTH_KEY) return _decoyOrError({ e: "unauthorized" });
 
     // Batch mode: { k, q: [...] }
     if (Array.isArray(req.q)) return _doBatch(req.q);
@@ -37,8 +65,21 @@ function doPost(e) {
     // Single mode
     return _doSingle(req);
   } catch (err) {
-    return _json({ e: String(err) });
+    // Parse failures of the request body are also probe-shaped — a real
+    // mhrv-rs client never sends invalid JSON. Decoy for the same reason.
+    return _decoyOrError({ e: String(err) });
   }
+}
+
+// `doGet` is what active scanners hit first (HTTP GET probes are cheaper
+// than POSTs). Apps Script defaults to a "Script function not found" page
+// here which is a fine-enough decoy on its own, but explicitly returning
+// the same harmless placeholder makes the response identical to the
+// bad-auth POST decoy — one less fingerprint vector.
+function doGet(e) {
+  return ContentService
+    .createTextOutput(DECOY_HTML)
+    .setMimeType(ContentService.MimeType.HTML);
 }
 
 function _doSingle(req) {

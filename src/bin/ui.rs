@@ -270,6 +270,10 @@ struct FormState {
     /// drop the user's setting. Not currently exposed as a UI control;
     /// users edit `block_quic` directly in `config.json` (Issue #213).
     block_quic: bool,
+    /// Round-tripped from config.json. Not exposed as a UI control —
+    /// users edit `disable_padding` directly when needed (Issue #391).
+    /// Default false (padding active).
+    disable_padding: bool,
 
     // ── google_drive mode fields ─────────────────────────────────────
     /// Path to the Google Cloud OAuth desktop credentials JSON. The
@@ -378,6 +382,7 @@ fn load_form() -> (FormState, Option<String>) {
             youtube_via_relay: c.youtube_via_relay,
             passthrough_hosts: c.passthrough_hosts.clone(),
             block_quic: c.block_quic,
+            disable_padding: c.disable_padding,
             drive_credentials_path: c.drive_credentials_path.clone(),
             drive_token_path: c.drive_token_path.clone().unwrap_or_default(),
             drive_folder_id: c.drive_folder_id.clone(),
@@ -415,6 +420,7 @@ fn load_form() -> (FormState, Option<String>) {
             youtube_via_relay: false,
             passthrough_hosts: Vec::new(),
             block_quic: false,
+            disable_padding: false,
             drive_credentials_path: "credentials.json".into(),
             drive_token_path: String::new(),
             drive_folder_id: String::new(),
@@ -589,6 +595,9 @@ impl FormState {
             // control yet). Round-trip through the file so save
             // doesn't drop a user-set true.
             block_quic: self.block_quic,
+            // Issue #391: disable_padding is config-only for now.
+            // Round-trip preserves the user's choice.
+            disable_padding: self.disable_padding,
             drive_credentials_path: self.drive_credentials_path.trim().to_string(),
             drive_token_path: {
                 let v = self.drive_token_path.trim();
@@ -1436,7 +1445,7 @@ impl eframe::App for App {
                             ),
                         ),
                         ("bytes today", fmt_bytes(s.today_bytes)),
-                        ("UTC day", s.today_key.clone()),
+                        ("PT day", s.today_key.clone()),
                         ("resets in", reset_str),
                     ];
                     egui::Grid::new("usage_today")

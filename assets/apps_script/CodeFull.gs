@@ -16,18 +16,46 @@ const AUTH_KEY = "CHANGE_ME_TO_A_STRONG_SECRET";
 const TUNNEL_SERVER_URL = "https://YOUR_TUNNEL_NODE_URL";
 const TUNNEL_AUTH_KEY = "YOUR_TUNNEL_AUTH_KEY";
 
+// Active-probing defense. When false (production default), bad AUTH_KEY
+// requests get a decoy HTML page that looks like a placeholder Apps
+// Script web app instead of the JSON `{"e":"unauthorized"}` body. This
+// makes the deployment indistinguishable from a forgotten-but-public
+// Apps Script project to active scanners that POST malformed payloads
+// looking for proxy endpoints.
+//
+// Set to `true` during initial setup if a misconfigured client is
+// hitting "unauthorized" and you want the explicit JSON error to debug
+// — then flip back to false before the deployment is widely shared.
+// (Inspired by #365 Section 3, mhrv-rs v1.8.0+.)
+const DIAGNOSTIC_MODE = false;
+
 const SKIP_HEADERS = {
   host: 1, connection: 1, "content-length": 1,
   "transfer-encoding": 1, "proxy-connection": 1, "proxy-authorization": 1,
   "priority": 1, te: 1,
 };
 
+// HTML body for the bad-auth decoy. Mimics a minimal Apps Script-style
+// placeholder page — no proxy-shaped JSON, nothing distinctive enough
+// for a probe to fingerprint as a tunnel endpoint.
+const DECOY_HTML =
+  '<!DOCTYPE html><html><head><title>Web App</title></head>' +
+  '<body><p>The script completed but did not return anything.</p>' +
+  '</body></html>';
+
+function _decoyOrError(jsonBody) {
+  if (DIAGNOSTIC_MODE) return _json(jsonBody);
+  return ContentService
+    .createTextOutput(DECOY_HTML)
+    .setMimeType(ContentService.MimeType.HTML);
+}
+
 // ========================== Entry point ==========================
 
 function doPost(e) {
   try {
     var req = JSON.parse(e.postData.contents);
-    if (req.k !== AUTH_KEY) return _json({ e: "unauthorized" });
+    if (req.k !== AUTH_KEY) return _decoyOrError({ e: "unauthorized" });
 
     // Tunnel mode
     if (req.t) return _doTunnel(req);
@@ -38,7 +66,9 @@ function doPost(e) {
     // Single relay mode
     return _doSingle(req);
   } catch (err) {
-    return _json({ e: String(err) });
+    // Parse failures of the request body are also probe-shaped — a real
+    // mhrv-rs client never sends invalid JSON. Decoy for the same reason.
+    return _decoyOrError({ e: String(err) });
   }
 }
 

@@ -535,6 +535,16 @@ struct AppState {
     sessions: Arc<Mutex<HashMap<String, ManagedSession>>>,
     udp_sessions: Arc<Mutex<HashMap<String, ManagedUdpSession>>>,
     auth_key: String,
+    /// Active probing defense: when false (default, production), bad
+    /// AUTH_KEY responses are a generic-looking 404 with no JSON-shaped
+    /// "unauthorized" body — same as a static nginx 404. Active scanners
+    /// that POST malformed payloads to `/tunnel` to discover proxy
+    /// endpoints categorize this as a non-tunnel host and move on.
+    /// Enable via `MHRV_DIAGNOSTIC=1` for setup/debugging — restores the
+    /// previous JSON `{"e":"unauthorized"}` body so it's clear *which*
+    /// of "wrong key", "wrong URL path", or "wrong tunnel-node" you've
+    /// hit. (Inspired by #365 Section 3.)
+    diagnostic_mode: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -608,19 +618,41 @@ struct BatchResponse {
 async fn handle_tunnel(
     State(state): State<AppState>,
     Json(req): Json<TunnelRequest>,
-) -> Json<TunnelResponse> {
+) -> axum::response::Response {
     if req.k != state.auth_key {
-        return Json(TunnelResponse::error("unauthorized"));
+        return decoy_or_unauthorized(state.diagnostic_mode);
     }
-    match req.op.as_str() {
-        "connect" => Json(handle_connect(&state, req.host, req.port).await),
+    let resp: TunnelResponse = match req.op.as_str() {
+        "connect" => handle_connect(&state, req.host, req.port).await,
         "connect_data" => {
-            Json(handle_connect_data_single(&state, req.host, req.port, req.data).await)
+            handle_connect_data_single(&state, req.host, req.port, req.data).await
         }
-        "data" => Json(handle_data_single(&state, req.sid, req.data).await),
-        "close" => Json(handle_close(&state, req.sid).await),
-        other => Json(TunnelResponse::unsupported_op(other)),
+        "data" => handle_data_single(&state, req.sid, req.data).await,
+        "close" => handle_close(&state, req.sid).await,
+        other => TunnelResponse::unsupported_op(other),
+    };
+    Json(resp).into_response()
+}
+
+/// Active-probing defense for the bad-auth path. Production default is
+/// a 404 with a generic "Not Found" HTML body that mimics a vanilla
+/// nginx/apache static error page — active scanners categorize this
+/// as a regular web server with nothing interesting and move on.
+/// `MHRV_DIAGNOSTIC=1` restores the previous JSON `{"e":"unauthorized"}`
+/// body so misconfigured clients get a clear error during setup.
+fn decoy_or_unauthorized(diagnostic_mode: bool) -> axum::response::Response {
+    if diagnostic_mode {
+        return Json(TunnelResponse::error("unauthorized")).into_response();
     }
+    let body = "<html>\r\n<head><title>404 Not Found</title></head>\r\n\
+                <body>\r\n<center><h1>404 Not Found</h1></center>\r\n\
+                <hr><center>nginx</center>\r\n</body>\r\n</html>\r\n";
+    (
+        StatusCode::NOT_FOUND,
+        [(header::CONTENT_TYPE, "text/html")],
+        body,
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -657,10 +689,20 @@ async fn handle_batch(
     };
 
     if req.k != state.auth_key {
-        let resp = serde_json::to_vec(&BatchResponse {
-            r: vec![TunnelResponse::error("unauthorized")],
-        }).unwrap_or_default();
-        return (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], resp);
+        if state.diagnostic_mode {
+            let resp = serde_json::to_vec(&BatchResponse {
+                r: vec![TunnelResponse::error("unauthorized")],
+            }).unwrap_or_default();
+            return (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], resp);
+        }
+        // Production: same nginx-404 decoy as the single-op path. See
+        // `decoy_or_unauthorized` for rationale.
+        let body = "<html>\r\n<head><title>404 Not Found</title></head>\r\n\
+                    <body>\r\n<center><h1>404 Not Found</h1></center>\r\n\
+                    <hr><center>nginx</center>\r\n</body>\r\n</html>\r\n"
+            .as_bytes()
+            .to_vec();
+        return (StatusCode::NOT_FOUND, [(header::CONTENT_TYPE, "text/html")], body);
     }
 
     // Process all ops in two phases.
@@ -1311,7 +1353,20 @@ async fn main() {
         Arc::new(Mutex::new(HashMap::new()));
     tokio::spawn(cleanup_task(sessions.clone(), udp_sessions.clone()));
 
-    let state = AppState { sessions, udp_sessions, auth_key };
+    // MHRV_DIAGNOSTIC=1 in env restores verbose JSON error responses on
+    // bad auth (instead of the nginx-404 decoy). Use during setup so
+    // misconfigured clients see "unauthorized"; flip back off in prod.
+    let diagnostic_mode = std::env::var("MHRV_DIAGNOSTIC")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if diagnostic_mode {
+        tracing::warn!(
+            "MHRV_DIAGNOSTIC=1 — bad-auth responses are verbose JSON \
+             errors instead of the production nginx-404 decoy. Disable \
+             before exposing this tunnel-node to the public internet."
+        );
+    }
+    let state = AppState { sessions, udp_sessions, auth_key, diagnostic_mode };
 
     let app = Router::new()
         .route("/tunnel", post(handle_tunnel))
@@ -1346,6 +1401,10 @@ mod tests {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             udp_sessions: Arc::new(Mutex::new(HashMap::new())),
             auth_key: "test-key".into(),
+            // Tests assert against the JSON `unauthorized` body shape
+            // (see e.g. `bad_auth_returns_unauthorized`), so they need
+            // diagnostic_mode enabled. Production default is false.
+            diagnostic_mode: true,
         }
     }
 

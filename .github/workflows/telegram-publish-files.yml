@@ -1,0 +1,137 @@
+name: Telegram publish release files
+
+# Posts every release artifact (Android APKs, Windows ZIP, macOS, Linux,
+# OpenWRT, Raspbian) to the Telegram channel as individual messages with
+# Persian captions and a #v<MAJOR><MINOR><PATCH> hashtag. Files larger
+# than the bot API's 50 MB ceiling are split into ~45 MB byte chunks
+# server-side and posted as `<name>.part_aa`, `.part_ab`, ... — recipients
+# reassemble with `cat <name>.part_* > <name>`.
+#
+# This workflow is decoupled from `release.yml` so it can be re-triggered
+# for any historical tag (e.g. to re-post v1.8.0 after a Telegram channel
+# wipe) without rebuilding artifacts. It downloads from the GitHub Release
+# page directly via `gh release download`, so the assets must already
+# exist there.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release tag to publish (with or without the v prefix, e.g. 1.8.0 or v1.8.0)'
+        required: true
+        type: string
+  # Auto-trigger after a successful `release` workflow run. Posts files
+  # to Telegram once the release page exists. The `head_branch` of the
+  # triggering run is the tag name (e.g. `v1.8.0`) on tag-pushed releases,
+  # which is what we feed `gh release download`.
+  workflow_run:
+    workflows: [release]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    # Skip when triggered by a `release` run that didn't succeed — no
+    # point posting half a release. Manual `workflow_dispatch` always
+    # runs (the user explicitly asked for it).
+    if: |
+      github.event_name == 'workflow_dispatch'
+      || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Sparse checkout would be nicer but stock checkout is fast
+          # enough for a 5 MB workflow file + ~200 KB script.
+          fetch-depth: 1
+
+      - name: Resolve version + hashtag
+        id: ver
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.version || '' }}" ]; then
+            VER="${{ inputs.version }}"
+          else
+            # workflow_run path. `head_branch` for a tag-pushed release
+            # workflow is the tag name (e.g. `v1.8.0`).
+            VER="${{ github.event.workflow_run.head_branch || '' }}"
+          fi
+          if [ -z "$VER" ]; then
+            echo "::error::could not determine version from inputs or workflow_run trigger"
+            exit 1
+          fi
+          # Strip the leading `v` if present.
+          VER="${VER#v}"
+          # Hashtag: `#v` + version with dots removed. So 1.8.0 → #v180,
+          # 1.8.10 → #v1810, 2.0.0 → #v200. Predictable across releases.
+          HASHTAG="#v$(echo "$VER" | tr -d '.')"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "hashtag=$HASHTAG" >> "$GITHUB_OUTPUT"
+          echo "Resolved: version=$VER  hashtag=$HASHTAG"
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p assets
+          # Mirror the retry pattern from `release.yml`'s download step —
+          # GitHub's release-asset CDN occasionally times out on cold
+          # tags. Three attempts with 30 s backoff covers most flakes.
+          for attempt in 1 2 3; do
+            if gh release download "v${{ steps.ver.outputs.version }}" \
+                 --dir assets \
+                 --repo "${GITHUB_REPOSITORY}"; then
+              echo "downloaded release assets on attempt $attempt"
+              ls -la assets/
+              exit 0
+            fi
+            echo "attempt $attempt failed; retrying in 30s..."
+            sleep 30
+          done
+          echo "::error::failed to download release assets after 3 attempts"
+          exit 1
+
+      - name: Publish files to Telegram channel
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          # The files channel — supergroup-style negative ID, hard-coded
+          # rather than templated as a repo variable because there's only
+          # ever one of these and putting it in source makes the workflow
+          # auditable. The bot token already has post permissions there.
+          CHAT_ID: '-1003966234444'
+          # The main announcement channel. Receives a single cross-link
+          # message per release pointing at the file-channel anchor post,
+          # instead of the previous behaviour of attaching the universal
+          # APK + full changelog. Sourced from the same secret the
+          # legacy `telegram` job in release.yml used.
+          MAIN_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Public-username form of the files channel link. Used for
+          # both (a) the post-link in the main-channel cross-post — so
+          # `t.me/<name>/<msg>` works for everyone, not just members
+          # via `t.me/c/<id>/<msg>` — and (b) one of the two
+          # channel-join links rendered at the bottom of the cross-post.
+          # Defaults to `mhrv_rs` (current public username); override via
+          # repo variable if the channel is renamed.
+          FILES_CHANNEL_USERNAME: ${{ vars.FILES_CHANNEL_USERNAME || 'mhrv_rs' }}
+          # `t.me/+<hash>` invite link for the files channel. Rendered
+          # as the second channel-join option in the main-channel
+          # cross-post — the only join path that works for users coming
+          # from outside Telegram search (private/restricted channels)
+          # or whose Telegram client doesn't resolve usernames cleanly.
+          # Override via repo variable if the channel's invite hash is
+          # rotated.
+          FILES_CHANNEL_INVITE: ${{ vars.FILES_CHANNEL_INVITE || 'https://t.me/+R1OyoHX2boA1ZDgx' }}
+        run: |
+          if [ -z "${BOT_TOKEN:-}" ]; then
+            echo "::error::TELEGRAM_BOT_TOKEN not set; can't publish"
+            exit 1
+          fi
+          python3 .github/scripts/telegram_publish_files.py \
+            --assets-dir assets \
+            --version "${{ steps.ver.outputs.version }}" \
+            --hashtag "${{ steps.ver.outputs.hashtag }}"

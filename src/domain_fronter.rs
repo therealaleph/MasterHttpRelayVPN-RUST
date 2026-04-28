@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
+use rand::{thread_rng, Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -130,6 +131,10 @@ pub struct DomainFronter {
     today_calls: AtomicU64,
     today_bytes: AtomicU64,
     today_key: std::sync::Mutex<String>,
+    /// Suppress the random `_pad` field that v1.8.0+ adds to outbound
+    /// payloads. Mirrors `Config::disable_padding` (#391). Default false
+    /// (padding active = stronger DPI defense at +25% bandwidth cost).
+    disable_padding: bool,
 }
 
 /// Aggregated stats for one remote host.
@@ -287,15 +292,20 @@ impl DomainFronter {
             per_site: Arc::new(std::sync::Mutex::new(HashMap::new())),
             today_calls: AtomicU64::new(0),
             today_bytes: AtomicU64::new(0),
-            today_key: std::sync::Mutex::new(current_utc_day_key()),
+            today_key: std::sync::Mutex::new(current_pt_day_key()),
+            disable_padding: config.disable_padding,
         })
     }
 
     /// Record one relay call toward the daily budget. Called once per
     /// outbound Apps Script fetch. Rolls over both daily counters at
-    /// 00:00 UTC.
-    fn record_today(&self, bytes: u64) {
-        let today = current_utc_day_key();
+    /// 00:00 Pacific Time, matching Apps Script's quota reset cadence
+    /// (#230, #362). Crate-public so the Full-mode batch path in
+    /// `tunnel_client::fire_batch` can wire into the same accounting
+    /// (Apps Script sees Full-mode batches as ordinary `UrlFetchApp`
+    /// calls and counts them against the same daily quota).
+    pub(crate) fn record_today(&self, bytes: u64) {
+        let today = current_pt_day_key();
         // Fast path: same day as what we last saw. No lock.
         let mut guard = self.today_key.lock().unwrap();
         if *guard != today {
@@ -340,8 +350,8 @@ impl DomainFronter {
         // Read today_key under lock and cheaply check rollover so the
         // UI never sees stale "today_calls=1847" on a day where no
         // traffic has flowed yet (e.g. user left the app open past
-        // midnight UTC).
-        let today_now = current_utc_day_key();
+        // midnight PT).
+        let today_now = current_pt_day_key();
         let today_key = {
             let mut guard = self.today_key.lock().unwrap();
             if *guard != today_now {
@@ -364,7 +374,7 @@ impl DomainFronter {
             today_calls: self.today_calls.load(Ordering::Relaxed),
             today_bytes: self.today_bytes.load(Ordering::Relaxed),
             today_key,
-            today_reset_secs: seconds_until_utc_midnight(),
+            today_reset_secs: seconds_until_pacific_midnight(),
         }
     }
 
@@ -1148,7 +1158,18 @@ impl DomainFronter {
             ct,
             r: true,
         };
-        Ok(serde_json::to_vec(&req)?)
+        // Serialize via Value so we can splice in the random `_pad` field
+        // without changing RelayRequest's wire schema. Apps Script ignores
+        // unknown JSON fields, so old Code.gs deployments stay compatible
+        // — the pad is just bytes-on-the-wire that the server sees and
+        // discards.
+        let mut v = serde_json::to_value(&req)?;
+        if let Value::Object(map) = &mut v {
+            if !self.disable_padding {
+                add_random_pad(map);
+            }
+        }
+        Ok(serde_json::to_vec(&v)?)
     }
 
     // ────── Full-mode tunnel protocol ──────────────────────────────────
@@ -1276,6 +1297,9 @@ impl DomainFronter {
         if let Some(d) = data {
             map.insert("d".into(), Value::String(d));
         }
+        if !self.disable_padding {
+            add_random_pad(&mut map);
+        }
         Ok(serde_json::to_vec(&Value::Object(map))?)
     }
 
@@ -1303,6 +1327,9 @@ impl DomainFronter {
         map.insert("k".into(), Value::String(self.auth_key.clone()));
         map.insert("t".into(), Value::String("batch".into()));
         map.insert("ops".into(), serde_json::to_value(ops)?);
+        if !self.disable_padding {
+            add_random_pad(&mut map);
+        }
         let payload = serde_json::to_vec(&Value::Object(map))?;
 
         let path = format!("/macros/s/{}/exec", script_id);
@@ -1613,35 +1640,138 @@ fn normalize_x_graphql_url(url: &str) -> String {
     format!("{}{}{}?{}", scheme, host, path, new_query)
 }
 
-/// "YYYY-MM-DD" of the current UTC date. Used as the daily-reset
-/// boundary for `today_calls` / `today_bytes`. We format manually so
-/// this stays std-only and doesn't pull `time` or `chrono` for a
-/// ~20-line helper.
-fn current_utc_day_key() -> String {
+/// Maximum bytes of random padding appended to outbound Apps Script
+/// JSON request bodies. Picked so the per-request padding distribution
+/// (uniformly 0..MAX) shifts the body length enough to defeat naive
+/// length-fingerprint DPI without bloating bandwidth — at the average
+/// 512-byte add, on a typical 2 KB tunnel batch this is +25%, which is
+/// negligible compared to Apps Script's per-call latency floor anyway.
+/// (Issue #313, #365 Section 1 — DPI evasion.)
+const MAX_RANDOM_PAD_BYTES: usize = 1024;
+
+/// Insert a `_pad` field of random length (0..MAX_RANDOM_PAD_BYTES)
+/// into a request payload before serialization. Server-side ignores
+/// unknown JSON fields, so this is fully backward-compatible with old
+/// `Code.gs` / `CodeFull.gs` deployments — the pad is just along for
+/// the ride.
+///
+/// Random bytes are base64-encoded (NO inner JSON-escape worries) and
+/// the pad LENGTH itself is uniformly distributed, so packet sizes
+/// land all over the place rather than clustering at a few discrete
+/// peaks. That's the property DPI's length-distribution clustering
+/// fingerprints can't match.
+fn add_random_pad(map: &mut serde_json::Map<String, Value>) {
+    let mut rng = thread_rng();
+    let len = rng.gen_range(0..=MAX_RANDOM_PAD_BYTES);
+    if len == 0 {
+        // Skip the field entirely sometimes — adds another bit of
+        // distribution variance (presence-vs-absence of `_pad` itself).
+        return;
+    }
+    let mut buf = vec![0u8; len];
+    rng.fill_bytes(&mut buf);
+    map.insert("_pad".into(), Value::String(B64.encode(&buf)));
+}
+
+/// "YYYY-MM-DD" of the current Pacific Time date. Used as the daily-reset
+/// boundary for `today_calls` / `today_bytes` because **Apps Script's
+/// quota counter resets at midnight Pacific Time, not UTC** — that's
+/// where Google's quota bookkeeping lives. We format manually so this
+/// stays std-only and doesn't pull `time-tz` or `chrono` plus a ~3 MB
+/// IANA tzdb just for one ~50-line helper. (Issue #230, #362.)
+///
+/// PT offset depends on DST: PST = UTC-8, PDT = UTC-7. We use the
+/// stable US DST rule (2nd Sunday of March 02:00 → 1st Sunday of
+/// November 02:00 = PDT, otherwise PST). The hour-of-day boundary on
+/// transition days is approximated; this drifts by up to 1h for at
+/// most 2h/year on the spring-forward / fall-back transitions, which
+/// is fine for a daily countdown.
+fn current_pt_day_key() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let (y, m, d) = unix_to_ymd_utc(secs);
+    let pt_secs = unix_to_pt_seconds(secs);
+    let (y, m, d) = unix_to_ymd_utc(pt_secs);
     format!("{:04}-{:02}-{:02}", y, m, d)
 }
 
-/// Seconds until the next 00:00 UTC. Used by the UI to render a
-/// "resets in Xh Ym" countdown without the UI having to import time
-/// libraries. Conservative: if the system clock is broken we return
-/// 0 instead of a huge negative-looking number.
-fn seconds_until_utc_midnight() -> u64 {
+/// Seconds until the next 00:00 Pacific Time. Used by the UI to render
+/// a "resets in Xh Ym" countdown matching Apps Script's actual quota
+/// reset cadence (#230, #362). Conservative: if the system clock is
+/// broken we return 0 instead of a huge negative-looking number.
+fn seconds_until_pacific_midnight() -> u64 {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let pt_secs = unix_to_pt_seconds(secs);
     let day = 86_400u64;
-    let rem = secs % day;
+    let rem = pt_secs % day;
     if rem == 0 {
         day
     } else {
         day - rem
     }
+}
+
+/// Convert Unix UTC seconds to "Pacific Time as if it were UTC" seconds,
+/// i.e. add the PT-from-UTC offset (negative for the western hemisphere
+/// becomes a subtraction). Result is suitable for feeding into
+/// `unix_to_ymd_utc` to extract the PT calendar date, or for `% 86_400`
+/// to find PT seconds-into-day.
+fn unix_to_pt_seconds(utc_secs: u64) -> u64 {
+    // First-pass guess at PT date using PST (-8) — used to determine
+    // whether DST is currently in effect, which then settles the actual
+    // offset. The two-pass approach avoids the chicken-and-egg of
+    // "I need the PT date to know if it's DST, but I need the offset
+    // to compute the PT date." A 1-hour fudge in the guess is harmless
+    // because DST never starts within the first hour after midnight
+    // PST or ends within the first hour after midnight PDT.
+    let pst_guess = utc_secs.saturating_sub(8 * 3600);
+    let (y, m, d) = unix_to_ymd_utc(pst_guess);
+    let offset_secs = if pacific_is_dst(y, m, d) {
+        7 * 3600
+    } else {
+        8 * 3600
+    };
+    utc_secs.saturating_sub(offset_secs)
+}
+
+/// Whether Pacific Time is observing daylight saving on the given
+/// calendar date (year, month=1..12, day=1..31). US DST window:
+/// 2nd Sunday of March through 1st Sunday of November. The transition
+/// hour itself (02:00 local) is approximated to whole-day boundaries —
+/// good enough for a daily-quota countdown.
+fn pacific_is_dst(year: i64, month: u32, day: u32) -> bool {
+    if month < 3 || month > 11 {
+        return false;
+    }
+    if month > 3 && month < 11 {
+        return true;
+    }
+    if month == 3 {
+        let dst_start = nth_sunday_of_month(year, 3, 2);
+        day >= dst_start
+    } else {
+        // month == 11
+        let dst_end = nth_sunday_of_month(year, 11, 1);
+        day < dst_end
+    }
+}
+
+/// Day-of-month for the Nth Sunday (1-indexed) of (year, month). Uses
+/// Sakamoto's method for the month's-1st day-of-week, then offsets to
+/// the desired Sunday. Pure arithmetic, no calendar tables.
+fn nth_sunday_of_month(year: i64, month: u32, nth: u32) -> u32 {
+    // Sakamoto's day-of-week. 0 = Sunday.
+    static T: [i64; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+    let y = if month < 3 { year - 1 } else { year };
+    let m = month as i64;
+    let dow_of_1st =
+        ((y + y / 4 - y / 100 + y / 400 + T[(m - 1) as usize] + 1).rem_euclid(7)) as u32;
+    let first_sunday = if dow_of_1st == 0 { 1 } else { 8 - dow_of_1st };
+    first_sunday + (nth - 1) * 7
 }
 
 /// Convert a Unix timestamp (seconds since 1970-01-01 UTC) to a
@@ -2116,15 +2246,18 @@ pub struct StatsSnapshot {
     pub cache_bytes: usize,
     pub blacklisted_scripts: usize,
     pub total_scripts: usize,
-    /// Relay calls attributed to the current UTC day. Resets at 00:00 UTC.
-    /// This is what-this-process-has-done today, not the Google-side bucket.
+    /// Relay calls attributed to the current Pacific Time day. Resets
+    /// at 00:00 PT (midnight Pacific) — matches Apps Script's actual
+    /// quota reset cadence (#230, #362). This is what-this-process-
+    /// has-done today, not the Google-side bucket.
     pub today_calls: u64,
-    /// Response bytes from relay calls attributed to the current UTC day.
+    /// Response bytes from relay calls attributed to the current PT day.
     pub today_bytes: u64,
-    /// "YYYY-MM-DD" of the day `today_calls` / `today_bytes` refer to.
-    /// Useful for cross-referencing against Google's dashboard.
+    /// "YYYY-MM-DD" of the PT day `today_calls` / `today_bytes` refer
+    /// to. Useful for cross-referencing against Google's dashboard,
+    /// which is also PT-aligned.
     pub today_key: String,
-    /// Seconds until the next 00:00 UTC rollover. Convenient for the UI
+    /// Seconds until the next 00:00 PT rollover. Convenient for the UI
     /// to render "Resets in Xh Ym" without importing time libraries.
     pub today_reset_secs: u64,
 }
@@ -2336,10 +2469,45 @@ mod tests {
     }
 
     #[test]
-    fn seconds_until_utc_midnight_is_bounded() {
-        let n = seconds_until_utc_midnight();
+    fn seconds_until_pacific_midnight_is_bounded() {
+        let n = seconds_until_pacific_midnight();
         // Must be in (0, 86400] for any valid system clock.
         assert!(n > 0 && n <= 86_400);
+    }
+
+    #[test]
+    fn nth_sunday_of_month_anchors() {
+        // Spot-check Sakamoto's day-of-week + offset arithmetic against
+        // a few known Sundays. Mistakes here would silently shift the
+        // DST transition by ±1 week.
+        // March 2026: 2nd Sunday is March 8 (Sun Mar 1, Sun Mar 8).
+        assert_eq!(nth_sunday_of_month(2026, 3, 2), 8);
+        // November 2026: 1st Sunday is November 1 (Sun Nov 1).
+        assert_eq!(nth_sunday_of_month(2026, 11, 1), 1);
+        // March 2024: 2nd Sunday is March 10 (Sun Mar 3, Sun Mar 10).
+        assert_eq!(nth_sunday_of_month(2024, 3, 2), 10);
+        // November 2024: 1st Sunday is November 3.
+        assert_eq!(nth_sunday_of_month(2024, 11, 1), 3);
+        // March 2027: 2nd Sunday is March 14.
+        assert_eq!(nth_sunday_of_month(2027, 3, 2), 14);
+    }
+
+    #[test]
+    fn pacific_dst_window_anchors() {
+        // Outside the DST window: PST.
+        assert!(!pacific_is_dst(2026, 1, 15));
+        assert!(!pacific_is_dst(2026, 12, 25));
+        assert!(!pacific_is_dst(2026, 2, 28));
+        assert!(!pacific_is_dst(2026, 11, 5)); // first Sun of Nov 2026 = Nov 1; Nov 5 is past
+        // Inside: PDT.
+        assert!(pacific_is_dst(2026, 6, 1));
+        assert!(pacific_is_dst(2026, 9, 30));
+        // Boundary: March 8, 2026 (DST start day) and after = PDT.
+        assert!(!pacific_is_dst(2026, 3, 7));
+        assert!(pacific_is_dst(2026, 3, 8));
+        // Boundary: Oct 31 = PDT, Nov 1 = first Sunday = PST flips on.
+        assert!(pacific_is_dst(2026, 10, 31));
+        assert!(!pacific_is_dst(2026, 11, 1));
     }
 
     #[test]

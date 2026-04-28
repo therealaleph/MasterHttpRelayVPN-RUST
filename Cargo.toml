@@ -1,6 +1,6 @@
 [package]
 name = "mhrv-rs"
-version = "1.7.10"
+version = "1.8.1"
 edition = "2021"
 description = "Rust port of MasterHttpRelayVPN -- DPI bypass via Google Apps Script relay with domain fronting"
 license = "MIT"
