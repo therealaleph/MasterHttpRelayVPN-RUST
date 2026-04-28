@@ -983,10 +983,15 @@ impl eframe::App for App {
 
             let google_only = self.form.mode == "google_only";
             let google_drive = self.form.mode == "google_drive";
+            // Apps Script relay only applies to apps_script + full. Hide
+            // the section entirely in google_only / google_drive — those
+            // modes have no Deployment ID or Auth key concept and the
+            // greyed-out fields were just confusing first-time users.
+            let needs_apps_script = !google_only && !google_drive;
 
             // ── Section: Apps Script relay ────────────────────────────────
-            section(ui, "Apps Script relay", |ui| {
-                ui.add_enabled_ui(!google_only && !google_drive, |ui| {
+            if needs_apps_script {
+                section(ui, "Apps Script relay", |ui| {
                     form_row(ui, "Deployment IDs", Some(
                         "One deployment ID per line. Proxy round-robins between them and sidelines \
                          any ID that hits its daily quota for 10 minutes before retrying."
@@ -1022,7 +1027,7 @@ impl eframe::App for App {
                             .desired_width(f32::INFINITY));
                     });
                 });
-            });
+            }
 
             // ── Section: Network ──────────────────────────────────────────
             section(ui, "Network", |ui| {
@@ -1082,9 +1087,16 @@ impl eframe::App for App {
                         egui::Label::new(egui::RichText::new("Ports")
                             .color(egui::Color32::from_gray(200))),
                     );
-                    ui.label(egui::RichText::new("HTTP").small());
-                    ui.add(egui::TextEdit::singleline(&mut self.form.listen_port).desired_width(70.0));
-                    ui.add_space(10.0);
+                    // google_drive doesn't bind the HTTP port at all
+                    // (the Drive client is SOCKS5-only). Hiding it
+                    // avoids implying it does something. The form still
+                    // tracks the value so a switch back to apps_script
+                    // recovers the user's previous setting.
+                    if !google_drive {
+                        ui.label(egui::RichText::new("HTTP").small());
+                        ui.add(egui::TextEdit::singleline(&mut self.form.listen_port).desired_width(70.0));
+                        ui.add_space(10.0);
+                    }
                     ui.label(egui::RichText::new("SOCKS5").small());
                     ui.add(egui::TextEdit::singleline(&mut self.form.socks5_port).desired_width(70.0));
                 });
@@ -1212,26 +1224,32 @@ impl eframe::App for App {
                     .rounding(6.0)
                     .inner_margin(egui::Margin::same(10.0));
                 frame.show(ui, |ui| {
-                    form_row(ui, "Upstream SOCKS5", Some(
-                        "Optional. host:port of a local xray / v2ray / sing-box SOCKS5 inbound. \
-                         When set, non-HTTP / raw-TCP traffic (Telegram MTProto, IMAP, SSH, …) \
-                         is chained through it instead of direct. HTTP/HTTPS still go through \
-                         the Apps Script relay."
-                    ), |ui| {
-                        ui.add(egui::TextEdit::singleline(&mut self.form.upstream_socks5)
-                            .hint_text("empty = direct; 127.0.0.1:50529 for local xray")
-                            .desired_width(f32::INFINITY));
-                    });
+                    // Apps-Script-specific tweaks. Drive mode bypasses
+                    // the relay entirely and google_only doesn't relay
+                    // either, so these knobs are no-ops there — hide
+                    // rather than just disable.
+                    if needs_apps_script {
+                        form_row(ui, "Upstream SOCKS5", Some(
+                            "Optional. host:port of a local xray / v2ray / sing-box SOCKS5 inbound. \
+                             When set, non-HTTP / raw-TCP traffic (Telegram MTProto, IMAP, SSH, …) \
+                             is chained through it instead of direct. HTTP/HTTPS still go through \
+                             the Apps Script relay."
+                        ), |ui| {
+                            ui.add(egui::TextEdit::singleline(&mut self.form.upstream_socks5)
+                                .hint_text("empty = direct; 127.0.0.1:50529 for local xray")
+                                .desired_width(f32::INFINITY));
+                        });
 
-                    form_row(ui, "Parallel dispatch", Some(
-                        "Fire N Apps Script IDs in parallel per request and take the first \
-                         response. 0/1 = off. 2-3 kills long-tail latency at N× quota cost. \
-                         Only effective with multiple IDs configured."
-                    ), |ui| {
-                        ui.add(egui::DragValue::new(&mut self.form.parallel_relay)
-                            .speed(1)
-                            .range(0..=8));
-                    });
+                        form_row(ui, "Parallel dispatch", Some(
+                            "Fire N Apps Script IDs in parallel per request and take the first \
+                             response. 0/1 = off. 2-3 kills long-tail latency at N× quota cost. \
+                             Only effective with multiple IDs configured."
+                        ), |ui| {
+                            ui.add(egui::DragValue::new(&mut self.form.parallel_relay)
+                                .speed(1)
+                                .range(0..=8));
+                        });
+                    }
 
                     form_row(ui, "Log level", None, |ui| {
                         egui::ComboBox::from_id_source("loglevel")
@@ -1247,33 +1265,35 @@ impl eframe::App for App {
                         ui.add_space(120.0 + 8.0);
                         ui.checkbox(&mut self.form.verify_ssl, "Verify TLS server certificate (recommended)");
                     });
-                    ui.horizontal(|ui| {
-                        ui.add_space(120.0 + 8.0);
-                        ui.checkbox(&mut self.form.show_auth_key, "Show auth key");
-                    });
-                    ui.horizontal(|ui| {
-                        ui.add_space(120.0 + 8.0);
-                        ui.checkbox(&mut self.form.normalize_x_graphql, "Normalize X/Twitter GraphQL URLs")
+                    if needs_apps_script {
+                        ui.horizontal(|ui| {
+                            ui.add_space(120.0 + 8.0);
+                            ui.checkbox(&mut self.form.show_auth_key, "Show auth key");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.add_space(120.0 + 8.0);
+                            ui.checkbox(&mut self.form.normalize_x_graphql, "Normalize X/Twitter GraphQL URLs")
+                                .on_hover_text(
+                                    "Trim the `features` / `fieldToggles` query params from x.com/i/api/graphql/… \
+                                     requests before relaying. Massively improves cache hit rate when browsing \
+                                     Twitter/X. Off by default — some endpoints may reject trimmed requests. \
+                                     Credit: seramo_ir + Persian Python community (issue #16).",
+                                );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.add_space(120.0 + 8.0);
+                            ui.checkbox(
+                                &mut self.form.youtube_via_relay,
+                                "Send YouTube through relay (no SNI rewrite)",
+                            )
                             .on_hover_text(
-                                "Trim the `features` / `fieldToggles` query params from x.com/i/api/graphql/… \
-                                 requests before relaying. Massively improves cache hit rate when browsing \
-                                 Twitter/X. Off by default — some endpoints may reject trimmed requests. \
-                                 Credit: seramo_ir + Persian Python community (issue #16).",
+                                "YouTube normally uses the same direct Google-edge tunnel as google.com (TLS SNI is \
+                                 the front domain, not youtube.com). That can trigger restricted mode or sign-out \
+                                 prompts. Enable this to route youtube.com / youtu.be / ytimg.com through the Apps \
+                                 Script relay instead — slower for video, but the visible SNI matches the site.",
                             );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.add_space(120.0 + 8.0);
-                        ui.checkbox(
-                            &mut self.form.youtube_via_relay,
-                            "Send YouTube through relay (no SNI rewrite)",
-                        )
-                        .on_hover_text(
-                            "YouTube normally uses the same direct Google-edge tunnel as google.com (TLS SNI is \
-                             the front domain, not youtube.com). That can trigger restricted mode or sign-out \
-                             prompts. Enable this to route youtube.com / youtu.be / ytimg.com through the Apps \
-                             Script relay instead — slower for video, but the visible SNI matches the site.",
-                        );
-                    });
+                        });
+                    }
                 });
             });
 

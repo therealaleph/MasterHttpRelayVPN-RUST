@@ -355,33 +355,37 @@ fun HomeScreen(
             Spacer(Modifier.height(4.dp))
 
             val appsScriptEnabled = cfg.mode == Mode.APPS_SCRIPT || cfg.mode == Mode.FULL
-            // Wrapped in a collapsible so a long ID list (10+ deployments
-            // is normal in full-tunnel rotations) doesn't dominate the
-            // screen once it's set up. Starts expanded for first-run users
-            // (no IDs/key yet) so the form is immediately discoverable.
-            CollapsibleSection(
-                title = stringResource(R.string.sec_apps_script_relay),
-                initiallyExpanded = appsScriptEnabled &&
-                    (cfg.appsScriptUrls.isEmpty() || cfg.authKey.isBlank()),
-            ) {
-                DeploymentIdsField(
-                    urls = cfg.appsScriptUrls,
-                    onChange = { persist(cfg.copy(appsScriptUrls = it)) },
-                    enabled = appsScriptEnabled,
-                )
+            // Apps Script section only renders for the modes that
+            // actually use Apps Script. google_only / google_drive have
+            // no Deployment ID or Auth key concept — showing them
+            // greyed-out (the previous behavior) just confused
+            // first-time users. Wrapped in a collapsible so a long ID
+            // list (10+ deployments is normal in full-tunnel rotations)
+            // doesn't dominate the screen once set up.
+            if (appsScriptEnabled) {
+                CollapsibleSection(
+                    title = stringResource(R.string.sec_apps_script_relay),
+                    initiallyExpanded = cfg.appsScriptUrls.isEmpty() || cfg.authKey.isBlank(),
+                ) {
+                    DeploymentIdsField(
+                        urls = cfg.appsScriptUrls,
+                        onChange = { persist(cfg.copy(appsScriptUrls = it)) },
+                        enabled = true,
+                    )
 
-                OutlinedTextField(
-                    value = cfg.authKey,
-                    onValueChange = { persist(cfg.copy(authKey = it)) },
-                    label = { Text(stringResource(R.string.field_auth_key)) },
-                    singleLine = true,
-                    enabled = appsScriptEnabled,
-                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
-                    modifier = Modifier.fillMaxWidth(),
-                    supportingText = {
-                        Text(stringResource(R.string.help_auth_key))
-                    },
-                )
+                    OutlinedTextField(
+                        value = cfg.authKey,
+                        onValueChange = { persist(cfg.copy(authKey = it)) },
+                        label = { Text(stringResource(R.string.field_auth_key)) },
+                        singleLine = true,
+                        enabled = true,
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
+                        modifier = Modifier.fillMaxWidth(),
+                        supportingText = {
+                            Text(stringResource(R.string.help_auth_key))
+                        },
+                    )
+                }
             }
 
             // ── Google Drive section ──────────────────────────────────────
@@ -494,7 +498,11 @@ fun HomeScreen(
                 )
             }
 
-            // Advanced settings: collapsed by default.
+            // Advanced settings: collapsed by default. The block
+            // contains a mix of always-applicable knobs (verify_ssl,
+            // log_level) and Apps-Script-only knobs (parallel_relay,
+            // upstream_socks5); the inner composable hides the latter
+            // when the current mode doesn't use Apps Script.
             CollapsibleSection(title = stringResource(R.string.sec_advanced)) {
                 AdvancedSettings(
                     cfg = cfg,
@@ -506,12 +514,17 @@ fun HomeScreen(
             // Secondary action — FilledTonalButton signals "helper" against
             // the primary Connect/Disconnect button at the top. Kept down
             // here because cert install is a one-time setup step; daily
-            // users never tap it again.
-            FilledTonalButton(
-                onClick = { showInstallDialog = true },
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text(stringResource(R.string.btn_install_mitm))
+            // users never tap it again. Only meaningful when MITM is
+            // active: apps_script does the TLS interception, full owns
+            // a tunnel-node + cert. google_only and google_drive do
+            // not MITM so hiding the button keeps the flow honest.
+            if (cfg.mode == Mode.APPS_SCRIPT || cfg.mode == Mode.FULL) {
+                FilledTonalButton(
+                    onClick = { showInstallDialog = true },
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(stringResource(R.string.btn_install_mitm))
+                }
             }
 
             // "Usage today (estimated)" — visible only while a proxy is
@@ -532,12 +545,18 @@ fun HomeScreen(
             // Wrapped in a collapsible so the big prose block doesn't
             // dominate the form after the user has learned the flow.
             // Starts expanded once for a fresh install so the first-run
-            // instructions are immediately visible.
-            CollapsibleSection(
-                title = stringResource(R.string.sec_how_to_use),
-                initiallyExpanded = cfg.appsScriptUrls.isEmpty() || cfg.authKey.isBlank(),
-            ) {
-                HowToUseBody(cfg.listenPort)
+            // instructions are immediately visible. The body is
+            // Apps-Script-flavoured (Deployment IDs, MITM cert, Code.gs)
+            // so it's only relevant in apps_script / full — Drive and
+            // google_only have their own onboarding inside their
+            // respective sections.
+            if (cfg.mode == Mode.APPS_SCRIPT || cfg.mode == Mode.FULL) {
+                CollapsibleSection(
+                    title = stringResource(R.string.sec_how_to_use),
+                    initiallyExpanded = cfg.appsScriptUrls.isEmpty() || cfg.authKey.isBlank(),
+                ) {
+                    HowToUseBody(cfg.listenPort)
+                }
             }
         }
     }
@@ -1896,6 +1915,11 @@ private fun AdvancedSettings(
     cfg: MhrvConfig,
     onChange: (MhrvConfig) -> Unit,
 ) {
+    // parallel_relay and upstream_socks5 only have an effect on the
+    // Apps Script relay path; they're no-ops in google_only and
+    // google_drive. Hide them in those modes so users don't think
+    // they're tunable knobs that just don't take effect.
+    val appsScriptRelevant = cfg.mode == Mode.APPS_SCRIPT || cfg.mode == Mode.FULL
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         // verify_ssl
         Row(
@@ -1947,36 +1971,38 @@ private fun AdvancedSettings(
             }
         }
 
-        // parallel_relay slider
-        Column {
-            Text(
-                stringResource(R.string.adv_parallel_relay, cfg.parallelRelay),
-                style = MaterialTheme.typography.bodyMedium,
-            )
-            Slider(
-                value = cfg.parallelRelay.toFloat(),
-                onValueChange = { onChange(cfg.copy(parallelRelay = it.toInt().coerceIn(1, 5))) },
-                valueRange = 1f..5f,
-                steps = 3,  // yields 1,2,3,4,5 positions
-            )
-            Text(
-                stringResource(R.string.adv_parallel_relay_help),
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+        if (appsScriptRelevant) {
+            // parallel_relay slider
+            Column {
+                Text(
+                    stringResource(R.string.adv_parallel_relay, cfg.parallelRelay),
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Slider(
+                    value = cfg.parallelRelay.toFloat(),
+                    onValueChange = { onChange(cfg.copy(parallelRelay = it.toInt().coerceIn(1, 5))) },
+                    valueRange = 1f..5f,
+                    steps = 3,  // yields 1,2,3,4,5 positions
+                )
+                Text(
+                    stringResource(R.string.adv_parallel_relay_help),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
+            OutlinedTextField(
+                value = cfg.upstreamSocks5,
+                onValueChange = { onChange(cfg.copy(upstreamSocks5 = it)) },
+                label = { Text(stringResource(R.string.adv_upstream_socks5)) },
+                placeholder = { Text("host:port") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+                supportingText = {
+                    Text(stringResource(R.string.adv_upstream_socks5_help))
+                },
             )
         }
-
-        OutlinedTextField(
-            value = cfg.upstreamSocks5,
-            onValueChange = { onChange(cfg.copy(upstreamSocks5 = it)) },
-            label = { Text(stringResource(R.string.adv_upstream_socks5)) },
-            placeholder = { Text("host:port") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
-            supportingText = {
-                Text(stringResource(R.string.adv_upstream_socks5_help))
-            },
-        )
     }
 }
 
