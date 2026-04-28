@@ -536,6 +536,13 @@ impl FormState {
             // added) so save doesn't drop them.
             tunnel_doh: self.tunnel_doh,
             bypass_doh_hosts: self.bypass_doh_hosts.clone(),
+            // PR #448 (Android): adaptive coalesce window. Desktop UI
+            // doesn't expose sliders for these yet (Android does), so
+            // we pass 0 to keep the compiled defaults (40ms step,
+            // 1000ms max). Round-trip planned for the v1.8.x desktop UI
+            // batch alongside the system-proxy toggle (#432).
+            coalesce_step_ms: 0,
+            coalesce_max_ms: 0,
         })
     }
 }
