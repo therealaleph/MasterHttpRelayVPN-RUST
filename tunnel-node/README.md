@@ -1,5 +1,7 @@
 # Tunnel Node
 
+> *Persian / فارسی: [README.fa.md](./README.fa.md)*
+
 HTTP tunnel bridge server for MasterHttpRelayVPN "full" mode. Bridges HTTP tunnel requests (from Apps Script) to real TCP connections.
 
 ## Architecture
