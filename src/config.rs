@@ -232,15 +232,25 @@ pub struct Config {
     /// round-trip cost paid on every name lookup. In Full mode this
     /// was the dominant DNS slowdown source.
     ///
-    /// Set `tunnel_doh: true` to keep DoH inside the tunnel. With the
+    /// Set `tunnel_doh: false` to enable the bypass and let DoH go
+    /// direct (saves the ~2 s Apps Script round-trip per name on
+    /// networks where the DoH endpoints are reachable). With the
     /// bypass off, browsers that find their pinned DoH host
     /// unreachable already fall back to OS DNS on their own, so
     /// failure modes are graceful in either direction.
     ///
+    /// **Default flipped to `true` in v1.9.0** (issue #468). The
+    /// previous default (`false` = bypass active) silently broke for
+    /// Iranian users because Iran ISPs filter direct connections to
+    /// `dns.google`, `chrome.cloudflare-dns.com`, etc. — exactly the
+    /// "pinned DoH" hosts that the bypass was sending through. The
+    /// safe default keeps DoH inside the tunnel; users on networks
+    /// where direct DoH works can opt back into the bypass.
+    ///
     /// Port-gated to TCP/443 only. A private DoH on a non-standard port
     /// (e.g. `doh.internal.example:8443`) won't take the bypass path —
     /// list it in `passthrough_hosts` instead, which has no port gate.
-    #[serde(default)]
+    #[serde(default = "default_tunnel_doh")]
     pub tunnel_doh: bool,
 
     /// Extra hostnames to treat as DoH endpoints in addition to the
@@ -323,6 +333,14 @@ fn default_fetch_ips_from_api() -> bool { false }
 fn default_max_ips_to_scan() -> usize { 100 }
 fn default_scan_batch_size() -> usize {500}
 fn default_google_ip_validation() -> bool {true}
+
+/// Default for `tunnel_doh`: `true` (DoH stays inside the tunnel).
+/// Flipped from `false` in v1.9.0 per #468 — Iran ISPs filter direct
+/// connections to pinned DoH hosts (`dns.google`, `chrome.cloudflare-dns.com`,
+/// …) and the prior bypass-on default silently broke DNS for the
+/// dominant userbase. Users on networks where direct DoH works can
+/// opt back in with `tunnel_doh: false`.
+fn default_tunnel_doh() -> bool { true }
 
 fn default_google_ip() -> String {
     "216.239.38.120".into()

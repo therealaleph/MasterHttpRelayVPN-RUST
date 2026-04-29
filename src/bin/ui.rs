@@ -398,7 +398,7 @@ fn load_form() -> (FormState, Option<String>) {
             passthrough_hosts: Vec::new(),
             block_quic: false,
             disable_padding: false,
-            tunnel_doh: false,
+            tunnel_doh: true,
             bypass_doh_hosts: Vec::new(),
             fronting_groups: Vec::new(),
         }

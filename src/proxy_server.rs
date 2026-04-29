@@ -241,9 +241,10 @@ pub struct RewriteCtx {
     /// the trade-off. Issue #213.
     pub block_quic: bool,
     /// If true, route DoH CONNECTs around the Apps Script tunnel via
-    /// plain TCP. Default true via `Config::tunnel_doh = false`. See
-    /// `DEFAULT_DOH_HOSTS` and `matches_doh_host` for matching, and
-    /// config.rs `tunnel_doh` for the trade-off.
+    /// plain TCP. Default false via `Config::tunnel_doh = true` (flipped
+    /// in v1.9.0, issue #468). See `DEFAULT_DOH_HOSTS` and
+    /// `matches_doh_host` for matching, and config.rs `tunnel_doh` for
+    /// the trade-off.
     pub bypass_doh: bool,
     /// User-supplied DoH hostnames added to the built-in default list.
     /// Same matching semantics as `passthrough_hosts`.
