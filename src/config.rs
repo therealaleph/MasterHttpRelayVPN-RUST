@@ -1,4 +1,5 @@
-use serde::Deserialize;
+use rustls::pki_types::ServerName;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -14,14 +15,19 @@ pub enum ConfigError {
 
 /// Operating mode. `AppsScript` is the full client — MITMs TLS locally and
 /// relays HTTP/HTTPS through a user-deployed Apps Script endpoint.
-/// `GoogleOnly` is a bootstrap: no relay, no Apps Script config needed,
-/// only the SNI-rewrite tunnel to the Google edge is active. Intended for
-/// users who need to reach `script.google.com` to deploy `Code.gs` in the
-/// first place.
+/// `Direct` runs without any Apps Script relay: only the SNI-rewrite tunnel
+/// is active, targeting the Google edge by default plus any user-configured
+/// `fronting_groups`. Originally introduced as a `script.google.com`
+/// bootstrap (when this mode could only reach Google's edge it was named
+/// `google_only`), now generalized to any user-configured CDN edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     AppsScript,
-    GoogleOnly,
+    /// Was named `GoogleOnly` before v1.9 and the introduction of
+    /// `fronting_groups`. The string `"google_only"` is still accepted
+    /// in `mode_kind()` as a deprecated alias so existing configs do
+    /// not break.
+    Direct,
     Full,
 }
 
@@ -29,7 +35,7 @@ impl Mode {
     pub fn as_str(self) -> &'static str {
         match self {
             Mode::AppsScript => "apps_script",
-            Mode::GoogleOnly => "google_only",
+            Mode::Direct => "direct",
             Mode::Full => "full",
         }
     }
@@ -252,6 +258,65 @@ pub struct Config {
     /// startup if both are set together.
     #[serde(default)]
     pub bypass_doh_hosts: Vec<String>,
+
+    /// Multi-edge domain-fronting groups. Each group is a triple of
+    /// (edge IP, front SNI, member domains): when a CONNECT to one of
+    /// the member domains arrives, the proxy MITMs at the local CA
+    /// then re-encrypts upstream against `ip` with `sni` as the TLS
+    /// SNI — same trick we already do for `google_ip` + `front_domain`,
+    /// but generalised so users can target Vercel's edge (sni=react.dev,
+    /// fronting vercel.com / vercel.app / nextjs.org / ...) or Fastly's
+    /// (sni=www.python.org, fronting reddit.com / githubassets.com / ...)
+    /// directly without burning Apps Script quota or relying on the
+    /// Google edge for non-Google traffic.
+    ///
+    /// The cert returned by the upstream is validated against `sni` by
+    /// rustls as normal — no custom SAN-allowlist needed, the front SNI
+    /// must itself be a real domain hosted by the same edge as the
+    /// targets. Picking the right (ip, sni) pair is on the user; see
+    /// `docs/fronting-groups.md` for the recipe.
+    ///
+    /// Group match wins over the built-in Google SNI-rewrite suffix list
+    /// but loses to `passthrough_hosts` (explicit user opt-out wins) and
+    /// to the DoH bypass. Empty / missing = feature off.
+    #[serde(default)]
+    pub fronting_groups: Vec<FrontingGroup>,
+}
+
+/// One multi-edge fronting group. Edge CDNs like Vercel and Fastly
+/// host hundreds of tenants behind a single set of edge IPs and use
+/// the inner HTTP `Host` header (after TLS handshake) to dispatch to
+/// the right backend. Pick one neutral domain hosted on the same edge
+/// as `sni`; the cert it serves will be valid for that name (rustls
+/// validates against `sni`, not against the inner `Host`), and the
+/// edge will route based on the `Host` header.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FrontingGroup {
+    /// Human-readable name used in log lines. Free-form; uniqueness not
+    /// enforced but recommended.
+    pub name: String,
+    /// Edge IP to dial. A single IP for now — most edges have many but
+    /// one is enough to validate the technique. IP rotation per-group
+    /// can come later.
+    pub ip: String,
+    /// SNI to send on the outbound TLS handshake. Must be a real domain
+    /// served by the same edge as `domains`, otherwise the edge will
+    /// either refuse the handshake or serve a default page that 404s
+    /// the inner Host. Examples: `react.dev` for Vercel, `www.python.org`
+    /// for Fastly.
+    pub sni: String,
+    /// Member domain list. Matching is case-insensitive: an entry
+    /// matches the host exactly OR as an unconditional dot-anchored
+    /// suffix (`vercel.com` matches `app.vercel.com` too). Same shape
+    /// as the DoH host list.
+    ///
+    /// Canonical form for matching is lowercase and trailing-dot
+    /// trimmed; entries are normalized to that form once at proxy
+    /// startup. The on-disk representation is preserved as written
+    /// (we don't mutate the user's config), so `Vercel.com.` and
+    /// `vercel.com` both work — the matcher is the source of truth
+    /// for equality.
+    pub domains: Vec<String>,
 }
 
 fn default_fetch_ips_from_api() -> bool { false }
@@ -321,16 +386,62 @@ impl Config {
                 self.listen_port, self.listen_host
             )));
         }
+        for (i, g) in self.fronting_groups.iter().enumerate() {
+            if g.name.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "fronting_groups[{}]: name is empty", i
+                )));
+            }
+            if g.ip.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "fronting_groups[{}] ('{}'): ip is empty", i, g.name
+                )));
+            }
+            if g.sni.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "fronting_groups[{}] ('{}'): sni is empty", i, g.name
+                )));
+            }
+            // Parse the SNI here so an invalid hostname fails the same
+            // load path the UI / `mhrv-rs` CLI both use, rather than
+            // surfacing later only when ProxyServer::new tries to build
+            // the TLS server name. Same fail-fast contract as the rest
+            // of validate(). The parse is cheap; runtime path repeats
+            // it once at proxy startup, idempotently.
+            if let Err(e) = ServerName::try_from(g.sni.clone()) {
+                return Err(ConfigError::Invalid(format!(
+                    "fronting_groups[{}] ('{}'): invalid sni '{}': {}",
+                    i, g.name, g.sni, e
+                )));
+            }
+            if g.domains.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "fronting_groups[{}] ('{}'): domains list is empty", i, g.name
+                )));
+            }
+            for d in &g.domains {
+                if d.trim().is_empty() {
+                    return Err(ConfigError::Invalid(format!(
+                        "fronting_groups[{}] ('{}'): empty domain entry", i, g.name
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 
     pub fn mode_kind(&self) -> Result<Mode, ConfigError> {
         match self.mode.as_str() {
             "apps_script" => Ok(Mode::AppsScript),
-            "google_only" => Ok(Mode::GoogleOnly),
+            "direct" => Ok(Mode::Direct),
+            // Deprecated alias. `google_only` was the name of `direct`
+            // before fronting_groups generalized the mode beyond
+            // Google's edge. Accepted forever so old configs keep
+            // working — the UI rewrites it on next save.
+            "google_only" => Ok(Mode::Direct),
             "full" => Ok(Mode::Full),
             other => Err(ConfigError::Invalid(format!(
-                "unknown mode '{}' (expected 'apps_script', 'google_only', or 'full')",
+                "unknown mode '{}' (expected 'apps_script', 'direct', or 'full')",
                 other
             ))),
         }
@@ -397,24 +508,36 @@ mod tests {
     }
 
     #[test]
-    fn parses_google_only_without_script_id() {
-        // Bootstrap mode: no script_id, no auth_key — both are only meaningful
+    fn parses_direct_without_script_id() {
+        // Direct mode: no script_id, no auth_key — both are only meaningful
         // once the Apps Script relay exists.
+        let s = r#"{
+            "mode": "direct"
+        }"#;
+        let cfg: Config = serde_json::from_str(s).unwrap();
+        cfg.validate().expect("direct must validate without script_id / auth_key");
+        assert_eq!(cfg.mode_kind().unwrap(), Mode::Direct);
+    }
+
+    #[test]
+    fn google_only_alias_parses_as_direct() {
+        // Backwards compat: `direct` was named `google_only` before
+        // fronting_groups. Existing configs must continue to load.
         let s = r#"{
             "mode": "google_only"
         }"#;
         let cfg: Config = serde_json::from_str(s).unwrap();
-        cfg.validate().expect("google_only must validate without script_id / auth_key");
-        assert_eq!(cfg.mode_kind().unwrap(), Mode::GoogleOnly);
+        cfg.validate().expect("google_only alias must still validate");
+        assert_eq!(cfg.mode_kind().unwrap(), Mode::Direct);
     }
 
     #[test]
-    fn google_only_ignores_placeholder_script_id() {
+    fn direct_ignores_placeholder_script_id() {
         // UI round-trip: user saved config in apps_script with the placeholder,
-        // then switched mode to google_only. The placeholder should not block
-        // validation in the bootstrap mode.
+        // then switched mode to direct. The placeholder should not block
+        // validation in the no-relay mode.
         let s = r#"{
-            "mode": "google_only",
+            "mode": "direct",
             "script_id": "YOUR_APPS_SCRIPT_DEPLOYMENT_ID"
         }"#;
         let cfg: Config = serde_json::from_str(s).unwrap();
@@ -464,6 +587,68 @@ mod tests {
         }"#;
         let cfg: Config = serde_json::from_str(s).unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn fronting_groups_parse_and_validate() {
+        let s = r#"{
+            "mode": "direct",
+            "fronting_groups": [
+                {
+                    "name": "vercel",
+                    "ip": "76.76.21.21",
+                    "sni": "react.dev",
+                    "domains": ["vercel.com", "nextjs.org"]
+                }
+            ]
+        }"#;
+        let cfg: Config = serde_json::from_str(s).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.fronting_groups.len(), 1);
+        assert_eq!(cfg.fronting_groups[0].name, "vercel");
+        assert_eq!(cfg.fronting_groups[0].domains.len(), 2);
+    }
+
+    #[test]
+    fn fronting_group_rejects_invalid_sni_at_validate() {
+        // SNI must parse as a DNS hostname at the same fail-fast point
+        // as the rest of validate(), not later at proxy-startup time.
+        // The CLI and UI both run validate() on Save / before serve.
+        let s = r#"{
+            "mode": "direct",
+            "fronting_groups": [{
+                "name": "bad",
+                "ip": "1.2.3.4",
+                "sni": "not a valid hostname",
+                "domains": ["x.com"]
+            }]
+        }"#;
+        let cfg: Config = serde_json::from_str(s).unwrap();
+        let err = cfg.validate().expect_err("invalid sni must fail validate()");
+        let msg = format!("{}", err);
+        assert!(msg.contains("invalid sni"), "error should mention invalid sni: {}", msg);
+    }
+
+    #[test]
+    fn fronting_group_rejects_empty_fields() {
+        for bad in [
+            r#"{ "name": "", "ip": "1.2.3.4", "sni": "a.b", "domains": ["x.com"] }"#,
+            r#"{ "name": "n", "ip": "",       "sni": "a.b", "domains": ["x.com"] }"#,
+            r#"{ "name": "n", "ip": "1.2.3.4","sni": "",    "domains": ["x.com"] }"#,
+            r#"{ "name": "n", "ip": "1.2.3.4","sni": "a.b", "domains": []        }"#,
+            r#"{ "name": "n", "ip": "1.2.3.4","sni": "a.b", "domains": ["  "]    }"#,
+        ] {
+            let s = format!(
+                r#"{{ "mode": "direct", "fronting_groups": [{}] }}"#,
+                bad
+            );
+            let cfg: Config = serde_json::from_str(&s).unwrap();
+            assert!(
+                cfg.validate().is_err(),
+                "expected validation error for: {}",
+                bad
+            );
+        }
     }
 
     #[test]

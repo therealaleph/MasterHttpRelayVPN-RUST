@@ -20,10 +20,10 @@ use crate::domain_fronter::DomainFronter;
 const TEST_URL: &str = "https://api.ipify.org/?format=json";
 
 pub async fn run(config: &Config) -> bool {
-    if matches!(config.mode_kind(), Ok(Mode::GoogleOnly)) {
+    if matches!(config.mode_kind(), Ok(Mode::Direct)) {
         let msg = "`mhrv-rs test` probes the Apps Script relay, which isn't \
-                   wired up in google_only mode. Run `mhrv-rs test-sni` to \
-                   check the direct SNI-rewrite tunnel instead.";
+                   wired up in direct mode. Run `mhrv-rs test-sni` to check \
+                   the SNI-rewrite tunnel instead.";
         println!("{}", msg);
         tracing::error!("{}", msg);
         return false;
@@ -35,7 +35,7 @@ pub async fn run(config: &Config) -> bool {
         // back as the Apps Script datacenter — confusing because it
         // disagreed with what whatismyipaddress.com showed in the
         // browser (which DOES go through the tunnel). Rather than fake
-        // a passing test, refuse the same way we do for google_only and
+        // a passing test, refuse the same way we do for direct mode and
         // tell the user how to actually verify Full mode.
         let msg = "`mhrv-rs test` is wired only for the apps_script relay \
                    path. In full mode the data plane is the pipelined \

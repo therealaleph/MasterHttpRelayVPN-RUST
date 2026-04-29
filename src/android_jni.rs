@@ -42,7 +42,7 @@ struct Running {
     rt: Option<Runtime>,
     /// Keep an Arc to the DomainFronter so `statsJson(handle)` can read the
     /// live stats without going through the async server. `None` for
-    /// google-only / full-only configs where the fronter isn't used.
+    /// direct / full-only configs where the fronter isn't used.
     fronter: Option<Arc<crate::domain_fronter::DomainFronter>>,
 }
 
@@ -457,7 +457,7 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_testSni<'a>(
 
 /// `Native.statsJson(long handle)` -> String. Returns a JSON blob with the
 /// live `StatsSnapshot` for a running proxy, or an empty string if the
-/// handle is unknown or the proxy has no fronter (google_only / full modes).
+/// handle is unknown or the proxy has no fronter (direct / full modes).
 ///
 /// Cheap — just reads a handful of atomics. The Kotlin UI polls this on a
 /// timer to render the "Usage today (estimated)" card.

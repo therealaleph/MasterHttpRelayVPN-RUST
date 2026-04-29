@@ -1,0 +1,51 @@
+{
+  "mode": "direct",
+  "google_ip": "216.239.38.120",
+  "front_domain": "www.google.com",
+  "listen_host": "127.0.0.1",
+  "listen_port": 8085,
+  "socks5_port": 8086,
+  "log_level": "info",
+  "verify_ssl": true,
+  "fronting_groups": [
+    {
+      "name": "vercel",
+      "ip": "76.76.21.21",
+      "sni": "react.dev",
+      "domains": [
+        "vercel.com",
+        "vercel.app",
+        "vercel.dev",
+        "vercel.live",
+        "vercel.sh",
+        "nextjs.org",
+        "now.sh",
+        "cursor.com",
+        "ai-sdk.dev"
+      ]
+    },
+    {
+      "name": "fastly",
+      "ip": "151.101.1.140",
+      "sni": "www.python.org",
+      "domains": [
+        "reddit.com",
+        "redditstatic.com",
+        "redditmedia.com",
+        "githubassets.com",
+        "githubusercontent.com",
+        "pypi.org",
+        "fastly.com"
+      ]
+    },
+    {
+      "name": "netlify",
+      "ip": "35.157.26.135",
+      "sni": "letsencrypt.org",
+      "domains": [
+        "netlify.app",
+        "netlify.com"
+      ]
+    }
+  ]
+}

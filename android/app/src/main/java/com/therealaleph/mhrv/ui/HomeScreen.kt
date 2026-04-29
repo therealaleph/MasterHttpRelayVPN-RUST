@@ -316,7 +316,7 @@ fun HomeScreen(
                     }
                 },
                 enabled = (isVpnRunning ||
-                    cfg.mode == Mode.GOOGLE_ONLY ||
+                    cfg.mode == Mode.DIRECT ||
                     (cfg.hasDeploymentId && cfg.authKey.isNotBlank())) && !transitioning,
                 colors = ButtonDefaults.buttonColors(
                     containerColor = if (isVpnRunning) ErrRed else OkGreen,
@@ -837,7 +837,7 @@ private fun DeploymentIdsField(
 }
 
 // =========================================================================
-// Mode dropdown: apps_script (default) vs google_only (bootstrap).
+// Mode dropdown: apps_script (default), direct (no relay), or full.
 // =========================================================================
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -847,11 +847,11 @@ private fun ModeDropdown(
     onChange: (Mode) -> Unit,
 ) {
     val labelApps = "Apps Script (MITM)"
-    val labelGoogle = "Google-only (bootstrap)"
+    val labelDirect = "Direct (no relay)"
     val labelFull = "Full tunnel (no cert)"
     val currentLabel = when (mode) {
         Mode.APPS_SCRIPT -> labelApps
-        Mode.GOOGLE_ONLY -> labelGoogle
+        Mode.DIRECT -> labelDirect
         Mode.FULL -> labelFull
     }
     var expanded by remember { mutableStateOf(false) }
@@ -878,8 +878,8 @@ private fun ModeDropdown(
                     onClick = { onChange(Mode.APPS_SCRIPT); expanded = false },
                 )
                 DropdownMenuItem(
-                    text = { Text(labelGoogle) },
-                    onClick = { onChange(Mode.GOOGLE_ONLY); expanded = false },
+                    text = { Text(labelDirect) },
+                    onClick = { onChange(Mode.DIRECT); expanded = false },
                 )
                 DropdownMenuItem(
                     text = { Text(labelFull) },
@@ -891,8 +891,8 @@ private fun ModeDropdown(
         val help = when (mode) {
             Mode.APPS_SCRIPT ->
                 "Full DPI bypass through your deployed Apps Script relay."
-            Mode.GOOGLE_ONLY ->
-                "Bootstrap: reach *.google.com directly so you can open script.google.com and deploy Code.gs. Non-Google traffic goes direct."
+            Mode.DIRECT ->
+                "SNI-rewrite tunnel only — no relay. Reach *.google.com (and any configured fronting_groups) directly. Useful as a bootstrap to open script.google.com and deploy Code.gs."
             Mode.FULL ->
                 "All traffic tunneled end-to-end through Apps Script + remote tunnel node. No certificate needed."
         }
@@ -1430,7 +1430,7 @@ private fun CollapsibleSection(
  * this device relayed.
  *
  * Hidden when the handle is 0 (proxy not running) or the JSON comes back
- * empty (google_only / full-only configs don't run a DomainFronter and so
+ * empty (direct / full-only configs don't run a DomainFronter and so
  * have nothing to report).
  */
 @Composable

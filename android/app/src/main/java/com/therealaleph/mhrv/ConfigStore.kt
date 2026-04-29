@@ -64,14 +64,18 @@ enum class UiLang { AUTO, FA, EN }
  *
  * - [APPS_SCRIPT] (default) — full DPI bypass through the user's deployed
  *   Apps Script relay. Requires a Deployment ID + Auth key.
- * - [GOOGLE_ONLY] — bootstrap mode. Only the SNI-rewrite tunnel to the
- *   Google edge is active, so the user can reach `script.google.com` to
- *   deploy Code.gs in the first place. No Deployment ID / Auth key needed.
- *   Non-Google traffic goes direct (no relay).
+ * - [DIRECT] — no Apps Script relay. Only the SNI-rewrite tunnel is
+ *   active: Google edge by default, plus any user-configured
+ *   `fronting_groups` (Vercel, Fastly, …). Useful as a bootstrap to
+ *   reach `script.google.com` and deploy Code.gs, or as a standalone
+ *   mode for users who only need fronting-group targets. No Deployment
+ *   ID / Auth key needed. Non-matching traffic goes raw (no relay).
+ *   Was named `GOOGLE_ONLY` before fronting_groups was added — the
+ *   string `"google_only"` is still accepted on parse for back-compat.
  * - [FULL] — full tunnel mode. ALL traffic is tunneled end-to-end through
  *   Apps Script + a remote tunnel node. No certificate installation needed.
  */
-enum class Mode { APPS_SCRIPT, GOOGLE_ONLY, FULL }
+enum class Mode { APPS_SCRIPT, DIRECT, FULL }
 
 data class MhrvConfig(
     val mode: Mode = Mode.APPS_SCRIPT,
@@ -177,14 +181,14 @@ data class MhrvConfig(
             // "missing field `mode`" and startProxy silently returns 0.
             put("mode", when (mode) {
                 Mode.APPS_SCRIPT -> "apps_script"
-                Mode.GOOGLE_ONLY -> "google_only"
+                Mode.DIRECT -> "direct"
                 Mode.FULL -> "full"
             })
             put("listen_host", listenHost)
             put("listen_port", listenPort)
             socks5Port?.let { put("socks5_port", it) }
 
-            // In google_only mode these are unused by the Rust side, but we
+            // In direct mode these are unused by the Rust side, but we
             // still persist whatever the user typed so flipping back to
             // apps_script mode doesn't wipe their settings.
             put("script_ids", JSONArray().apply { ids.forEach { put(it) } })
@@ -286,7 +290,7 @@ object ConfigStore {
         // Always include essential fields.
         obj.put("mode", when (cfg.mode) {
             Mode.APPS_SCRIPT -> "apps_script"
-            Mode.GOOGLE_ONLY -> "google_only"
+            Mode.DIRECT -> "direct"
             Mode.FULL -> "full"
         })
         val ids = cfg.appsScriptUrls.mapNotNull { url ->
@@ -391,7 +395,10 @@ object ConfigStore {
 
         return MhrvConfig(
             mode = when (obj.optString("mode", "apps_script")) {
-                "google_only" -> Mode.GOOGLE_ONLY
+                "direct" -> Mode.DIRECT
+                // Deprecated alias kept forever for back-compat with
+                // configs written before the rename.
+                "google_only" -> Mode.DIRECT
                 "full" -> Mode.FULL
                 else -> Mode.APPS_SCRIPT
             },

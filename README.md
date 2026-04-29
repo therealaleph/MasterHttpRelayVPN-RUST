@@ -104,12 +104,12 @@ This part is unchanged from the original project. Follow @masterking32's guide o
 
 #### Can't reach `script.google.com` from your network?
 
-If your ISP is already blocking Google Apps Script (or all of Google), you need Step 1's browser connection to succeed *before* you have a relay to use. `mhrv-rs` ships a small bootstrap mode for exactly this: `google_only`.
+If your ISP is already blocking Google Apps Script (or all of Google), you need Step 1's browser connection to succeed *before* you have a relay to use. `mhrv-rs` ships a `direct` mode for exactly this — SNI-rewrite tunnel only, no Apps Script relay required. (Was named `google_only` before v1.9 — the old name is still accepted in config files.)
 
 1. Build / download the binary as in Step 2 below.
-2. Copy [`config.google-only.example.json`](config.google-only.example.json) to `config.json` — no `script_id`, no `auth_key` required.
+2. Copy [`config.direct.example.json`](config.direct.example.json) to `config.json` — no `script_id`, no `auth_key` required.
 3. Run `mhrv-rs serve` and set your browser's HTTP proxy to `127.0.0.1:8085`.
-4. In `google_only` mode the proxy only relays `*.google.com`, `*.youtube.com`, and the other Google-edge hosts via the same SNI-rewrite tunnel the full client uses. Other traffic goes direct — no Apps Script relay exists yet.
+4. In `direct` mode the proxy only routes `*.google.com`, `*.youtube.com`, and the other Google-edge hosts (plus any [`fronting_groups`](docs/fronting-groups.md) you've configured) via the SNI-rewrite tunnel. Other traffic goes raw — no Apps Script relay exists yet.
 5. Do Step 1 in your browser (the connection to `script.google.com` will be SNI-fronted). Deploy Code.gs, copy the Deployment ID.
 6. In the desktop UI or the Android app (or by editing `config.json`) switch the mode back to `apps_script`, paste the Deployment ID and your auth key, and restart.
 
@@ -501,15 +501,15 @@ Donations cover hosting, self-hosted CI runner costs, and continued maintenance.
 
 #### به `script.google.com` هم دسترسی ندارید؟
 
-اگر `ISP` شما از قبل `Apps Script` (یا کل گوگل) را مسدود کرده، برای مرحلهٔ ۱ باید مرورگرتان **اول** به `script.google.com` برسد — قبل از اینکه رله‌ای داشته باشید. `mhrv-rs` یک حالت بوت‌استرپ کوچک دقیقاً برای همین دارد: `google_only`.
+اگر `ISP` شما از قبل `Apps Script` (یا کل گوگل) را مسدود کرده، برای مرحلهٔ ۱ باید مرورگرتان **اول** به `script.google.com` برسد — قبل از اینکه رله‌ای داشته باشید. `mhrv-rs` یک حالت `direct` دقیقاً برای همین دارد — فقط تونل بازنویسی `SNI`، بدون نیاز به رلهٔ `Apps Script`. (قبل از v1.9 این حالت `google_only` نام داشت — نام قدیمی همچنان در فایل کانفیگ پذیرفته می‌شود.)
 
 ۱. برنامه را طبق مرحلهٔ ۲ پایین دانلود کنید
 
-۲. فایل [`config.google-only.example.json`](config.google-only.example.json) را در کنار فایل اجرایی به نام `config.json` کپی کنید — نه `script_id` لازم دارد و نه `auth_key`
+۲. فایل [`config.direct.example.json`](config.direct.example.json) را در کنار فایل اجرایی به نام `config.json` کپی کنید — نه `script_id` لازم دارد و نه `auth_key`
 
 ۳. برنامه را اجرا کنید و `HTTP proxy` مرورگرتان را روی `127.0.0.1:8085` تنظیم کنید
 
-۴. در حالت `google_only`، پروکسی فقط `*.google.com`، `*.youtube.com` و بقیهٔ میزبان‌های لبهٔ گوگل را از طریق همان تونل بازنویسی `SNI` رد می‌کند. بقیهٔ ترافیک مستقیم می‌رود — هنوز رله‌ای در کار نیست
+۴. در حالت `direct`، پروکسی فقط `*.google.com`، `*.youtube.com` و بقیهٔ میزبان‌های لبهٔ گوگل (به علاوهٔ هر [`fronting_groups`](docs/fronting-groups.md) که تنظیم کرده باشید) را از طریق تونل بازنویسی `SNI` رد می‌کند. بقیهٔ ترافیک مستقیم می‌رود — هنوز رله‌ای در کار نیست
 
 ۵. حالا مرحلهٔ ۱ را در مرورگر انجام دهید (اتصال به `script.google.com` با `SNI` فرونت می‌شود). `Code.gs` را مستقر کنید و `Deployment ID` را کپی کنید
 

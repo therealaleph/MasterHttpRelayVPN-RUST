@@ -15,7 +15,7 @@ use tokio_rustls::rustls::server::Acceptor;
 use tokio_rustls::rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use tokio_rustls::{LazyConfigAcceptor, TlsAcceptor, TlsConnector};
 
-use crate::config::{Config, Mode};
+use crate::config::{Config, FrontingGroup, Mode};
 use crate::domain_fronter::DomainFronter;
 use crate::mitm::MitmCertManager;
 use crate::tunnel_client::{decode_udp_packets, TunnelMux};
@@ -210,8 +210,9 @@ pub struct ProxyServer {
     host: String,
     port: u16,
     socks5_port: u16,
-    /// `None` in `google_only` (bootstrap) mode: no Apps Script relay is
-    /// wired up, only the SNI-rewrite tunnel path is live.
+    /// `None` in `direct` mode: no Apps Script relay is wired up,
+    /// only the SNI-rewrite tunnel path (Google edge + any configured
+    /// `fronting_groups`) is live.
     fronter: Option<Arc<DomainFronter>>,
     mitm: Arc<Mutex<MitmCertManager>>,
     rewrite_ctx: Arc<RewriteCtx>,
@@ -247,6 +248,14 @@ pub struct RewriteCtx {
     /// User-supplied DoH hostnames added to the built-in default list.
     /// Same matching semantics as `passthrough_hosts`.
     pub bypass_doh_hosts: Vec<String>,
+    /// Multi-edge fronting groups, resolved at startup. Each group's
+    /// `ServerName` is parsed once so the per-connection dial path
+    /// is allocation-free. Wrapped in `Arc` so a per-CONNECT match
+    /// can hand the dispatcher a refcount-clone instead of cloning
+    /// the whole struct (which holds a `Vec<String>` of normalized
+    /// domains used only for matching). Empty = feature off (only
+    /// the built-in Google edge SNI-rewrite is active).
+    pub fronting_groups: Vec<Arc<FrontingGroupResolved>>,
 }
 
 /// True if `host` matches a known DoH endpoint — either the built-in
@@ -282,6 +291,88 @@ pub fn matches_doh_host(host: &str, extra: &[String]) -> bool {
     extra.iter().any(|s| host_matches_doh_entry(h, s))
 }
 
+/// A `FrontingGroup` after one-time validation: the group's `sni` is
+/// parsed into a `ServerName` so we don't repay that on every dialed
+/// connection, and domain entries are pre-lower-cased + dot-trimmed
+/// so the per-request match path is just byte comparisons.
+#[derive(Debug, Clone)]
+pub struct FrontingGroupResolved {
+    pub name: String,
+    pub ip: String,
+    pub sni: String,
+    pub server_name: ServerName<'static>,
+    domains_normalized: Vec<String>,
+}
+
+impl FrontingGroupResolved {
+    fn from_config(g: &FrontingGroup) -> Result<Self, String> {
+        let server_name = ServerName::try_from(g.sni.clone())
+            .map_err(|e| format!("invalid sni '{}': {}", g.sni, e))?;
+        let domains_normalized = g
+            .domains
+            .iter()
+            .map(|d| d.trim().trim_end_matches('.').to_ascii_lowercase())
+            .filter(|d| !d.is_empty())
+            .collect();
+        Ok(Self {
+            name: g.name.clone(),
+            ip: g.ip.clone(),
+            sni: g.sni.clone(),
+            server_name,
+            domains_normalized,
+        })
+    }
+}
+
+/// First fronting group whose domain list contains `host`, if any.
+/// Match is case-insensitive and unconditionally suffix-anchored: an
+/// entry `vercel.com` matches both `vercel.com` and `*.vercel.com`.
+/// This is the right shape for fronting because every legitimate
+/// subdomain of a fronted domain is itself fronted by the same edge
+/// — requiring users to spell out every subdomain would be a footgun.
+/// Same matching shape as the DoH host list. First match wins, so
+/// users can put more-specific groups earlier when entries would
+/// otherwise overlap.
+pub fn match_fronting_group<'a>(
+    host: &str,
+    groups: &'a [Arc<FrontingGroupResolved>],
+) -> Option<&'a Arc<FrontingGroupResolved>> {
+    if groups.is_empty() {
+        return None;
+    }
+    let h = host.to_ascii_lowercase();
+    let h = h.trim_end_matches('.');
+    if h.is_empty() {
+        return None;
+    }
+    for g in groups {
+        for d in &g.domains_normalized {
+            if is_dot_anchored_match(h, d) {
+                return Some(g);
+            }
+        }
+    }
+    None
+}
+
+/// True if `host` equals `entry` exactly OR is a strict dot-anchored
+/// suffix of it (i.e. `entry == "vercel.com"` matches `host ==
+/// "app.vercel.com"` but not `host == "xvercel.com"`). Both inputs
+/// must already be lowercase + trailing-dot trimmed; the function
+/// does no allocation, unlike the obvious `format!(".{}", entry)`
+/// implementation that allocates per call.
+#[inline]
+fn is_dot_anchored_match(host: &str, entry: &str) -> bool {
+    if host == entry {
+        return true;
+    }
+    let hb = host.as_bytes();
+    let eb = entry.as_bytes();
+    hb.len() > eb.len()
+        && hb.ends_with(eb)
+        && hb[hb.len() - eb.len() - 1] == b'.'
+}
+
 /// True if `host` matches any entry in the user's passthrough list.
 /// Match is case-insensitive. Entries match either exactly, or as a
 /// suffix if they start with "." (e.g. ".internal.example" matches
@@ -313,16 +404,16 @@ impl ProxyServer {
             .mode_kind()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{e}")))?;
 
-        // `google_only` mode skips the Apps Script relay entirely, so we must
+        // `direct` mode skips the Apps Script relay entirely, so we must
         // not try to construct the DomainFronter — it errors on a missing
-        // `script_id`, which is exactly the state a bootstrapping user is in.
+        // `script_id`, which is exactly the state a direct-mode user is in.
         let fronter = match mode {
             Mode::AppsScript | Mode::Full => {
                 let f = DomainFronter::new(config)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
                 Some(Arc::new(f))
             }
-            Mode::GoogleOnly => None,
+            Mode::Direct => None,
         };
 
         let tls_config = if config.verify_ssl {
@@ -353,6 +444,54 @@ impl ProxyServer {
             );
         }
 
+        // Same-shape warning for fronting_groups in full mode. The dispatch
+        // short-circuits to the tunnel mux before the fronting_groups check
+        // (full mode preserves end-to-end TLS, fronting_groups requires
+        // MITM), so groups configured here will never fire. Surface this
+        // at startup rather than letting users wonder why their Vercel
+        // domains never hit the configured edge.
+        if mode == Mode::Full && !config.fronting_groups.is_empty() {
+            tracing::warn!(
+                "config: fronting_groups has {} entries but mode=full — \
+                 full mode tunnels everything end-to-end through Apps Script \
+                 (no MITM), so groups never fire. Switch to mode=apps_script \
+                 or mode=direct to use them, or remove the groups to silence \
+                 this warning.",
+                config.fronting_groups.len()
+            );
+        }
+
+        let mut fronting_groups: Vec<Arc<FrontingGroupResolved>> =
+            Vec::with_capacity(config.fronting_groups.len());
+        let mut seen_names: std::collections::HashSet<String> = Default::default();
+        for g in &config.fronting_groups {
+            let resolved = FrontingGroupResolved::from_config(g).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("fronting_groups['{}']: {}", g.name, e),
+                )
+            })?;
+            // Surface duplicate group names at startup. Not a hard
+            // error — copy-pasted configs can land here legitimately
+            // — but log lines key on `name` and dedup ambiguity makes
+            // them unreadable.
+            if !seen_names.insert(resolved.name.clone()) {
+                tracing::warn!(
+                    "fronting group name '{}' is used by more than one group; \
+                     log lines that reference the name will be ambiguous",
+                    resolved.name
+                );
+            }
+            tracing::info!(
+                "fronting group '{}': sni={} ip={} domains={}",
+                resolved.name,
+                resolved.sni,
+                resolved.ip,
+                resolved.domains_normalized.len()
+            );
+            fronting_groups.push(Arc::new(resolved));
+        }
+
         let rewrite_ctx = Arc::new(RewriteCtx {
             google_ip: config.google_ip.clone(),
             front_domain: config.front_domain.clone(),
@@ -365,6 +504,7 @@ impl ProxyServer {
             block_quic: config.block_quic,
             bypass_doh: !config.tunnel_doh,
             bypass_doh_hosts: config.bypass_doh_hosts.clone(),
+            fronting_groups,
         });
 
         let socks5_port = config.socks5_port.unwrap_or(config.listen_port + 1);
@@ -410,8 +550,8 @@ impl ProxyServer {
         );
         // Pre-warm the outbound connection pool so the user's first request
         // doesn't pay a fresh TLS handshake to Google edge. Best-effort;
-        // failures are logged and ignored. Skipped in `google_only` — there
-        // is no fronter to warm.
+        // failures are logged and ignored. Skipped in `direct` mode —
+        // there is no fronter to warm.
         //
         // Sized to roughly match a browser's parallel-connection burst at
         // startup. The previous fixed `3` was fine for a single deployment
@@ -431,7 +571,7 @@ impl ProxyServer {
         // goes cold after ~5min idle and costs 1-3s to wake. A periodic
         // HEAD ping prevents the cold-start lag on the first request
         // after a quiet pause (most visible as YouTube player stalls).
-        // Skipped in google_only mode for the same reason as warm —
+        // Skipped in direct mode for the same reason as warm —
         // there's no fronter to ping.
         //
         // The handle is captured (not fire-and-forget) so the shutdown
@@ -680,12 +820,13 @@ async fn handle_http_client(
         // apps_script mode: relay through the Apps Script fronter (which
         // is the whole point of the relay).
         //
-        // google_only bootstrap mode: no fronter exists, so passthrough as
-        // direct TCP. Same contract as `dispatch_tunnel` honors for CONNECT
-        // in google_only — anything not on the Google edge is forwarded
-        // direct (or via `upstream_socks5`) so the user's browser still
-        // works while they finish setting up Apps Script. Issue: typing a
-        // bare `http://example.com` URL used to return a 502 here even
+        // direct mode: no fronter exists, so passthrough as raw TCP.
+        // Same contract as `dispatch_tunnel` honors for CONNECT in
+        // direct mode — anything not on the Google edge / not in a
+        // configured fronting_group is forwarded direct (or via
+        // `upstream_socks5`) so the user's browser still works while
+        // they finish setting up Apps Script. Issue: typing a bare
+        // `http://example.com` URL used to return a 502 here even
         // though `https://example.com` (CONNECT) worked fine.
         match fronter {
             Some(f) => do_plain_http(sock, &head, &leftover, f).await,
@@ -1480,6 +1621,40 @@ async fn dispatch_tunnel(
         return Ok(());
     }
 
+    // 2a. User-configured fronting groups (Vercel, Fastly, etc.). Wins
+    //     over the built-in Google SNI-rewrite suffix list — if a user
+    //     adds e.g. `vercel.com` to a Vercel fronting group, we hit
+    //     Vercel's edge with sni=react.dev rather than trying to resolve
+    //     it through Google's. Port-gated to 443: SNI-rewrite needs a
+    //     real ClientHello and a non-TLS CONNECT to the same hostname
+    //     would just hang. Only HTTPS sites are fronted by these CDNs in
+    //     practice, so the gate has no false negatives we care about.
+    if port == 443 {
+        // `Arc::clone` here is refcount-only; we hold it across the
+        // await below without keeping `rewrite_ctx` borrowed.
+        let group_match =
+            match_fronting_group(&host, &rewrite_ctx.fronting_groups).map(Arc::clone);
+        if let Some(group) = group_match {
+            tracing::info!(
+                "dispatch {}:{} -> sni-rewrite tunnel (fronting group '{}', edge {} sni={})",
+                host,
+                port,
+                group.name,
+                group.ip,
+                group.sni
+            );
+            return do_sni_rewrite_tunnel_from_tcp(
+                sock,
+                &host,
+                port,
+                mitm,
+                rewrite_ctx,
+                Some(group),
+            )
+            .await;
+        }
+    }
+
     // 2. Explicit hosts override or SNI-rewrite suffix: for HTTPS targets,
     //    use the TLS SNI-rewrite tunnel (skipped in full mode above).
     if should_use_sni_rewrite(
@@ -1493,17 +1668,18 @@ async fn dispatch_tunnel(
             host,
             port
         );
-        return do_sni_rewrite_tunnel_from_tcp(sock, &host, port, mitm, rewrite_ctx).await;
+        return do_sni_rewrite_tunnel_from_tcp(sock, &host, port, mitm, rewrite_ctx, None).await;
     }
 
-    // 3. google_only bootstrap: no Apps Script relay exists. Anything that
-    //    isn't SNI-rewrite-matched gets direct TCP passthrough so the user's
-    //    browser still works while they're deploying Code.gs. They'd switch
-    //    to apps_script mode for the real DPI bypass.
-    if rewrite_ctx.mode == Mode::GoogleOnly {
+    // 3. direct mode: no Apps Script relay exists. Anything that isn't
+    //    SNI-rewrite-matched (Google edge or a configured fronting_group)
+    //    gets raw TCP passthrough so the user's browser still works while
+    //    they're deploying Code.gs. They'd switch to apps_script mode for
+    //    full DPI bypass.
+    if rewrite_ctx.mode == Mode::Direct {
         let via = rewrite_ctx.upstream_socks5.as_deref();
         tracing::info!(
-            "dispatch {}:{} -> raw-tcp ({}) (google_only: no relay)",
+            "dispatch {}:{} -> raw-tcp ({}) (direct mode: no relay)",
             host,
             port,
             via.unwrap_or("direct")
@@ -1969,17 +2145,37 @@ async fn do_sni_rewrite_tunnel_from_tcp(
     port: u16,
     mitm: Arc<Mutex<MitmCertManager>>,
     rewrite_ctx: Arc<RewriteCtx>,
+    // When Some, overrides the default Google edge target with a
+    // user-configured fronting group's (ip, sni). `Arc` so the
+    // dispatcher hands us a refcount-only clone — the resolved
+    // group also carries the matcher's normalized domain list which
+    // we don't need here. None = built-in Google edge path.
+    group: Option<Arc<FrontingGroupResolved>>,
 ) -> std::io::Result<()> {
-    let target_ip = hosts_override(&rewrite_ctx.hosts, host)
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| rewrite_ctx.google_ip.clone());
+    let (target_ip, outbound_sni, server_name) = match &group {
+        Some(g) => (g.ip.clone(), g.sni.clone(), g.server_name.clone()),
+        None => {
+            let ip = hosts_override(&rewrite_ctx.hosts, host)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| rewrite_ctx.google_ip.clone());
+            let sni = rewrite_ctx.front_domain.clone();
+            let sn = match ServerName::try_from(sni.clone()) {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::error!("invalid front_domain '{}': {}", sni, e);
+                    return Ok(());
+                }
+            };
+            (ip, sni, sn)
+        }
+    };
 
     tracing::info!(
         "SNI-rewrite tunnel -> {}:{} via {} (outbound SNI={})",
         host,
         port,
         target_ip,
-        rewrite_ctx.front_domain
+        outbound_sni
     );
 
     // Accept browser TLS with a cert we sign for `host`.
@@ -2023,13 +2219,6 @@ async fn do_sni_rewrite_tunnel_from_tcp(
     };
     let _ = upstream_tcp.set_nodelay(true);
 
-    let server_name = match ServerName::try_from(rewrite_ctx.front_domain.clone()) {
-        Ok(n) => n,
-        Err(e) => {
-            tracing::error!("invalid front_domain '{}': {}", rewrite_ctx.front_domain, e);
-            return Ok(());
-        }
-    };
     let outbound = match rewrite_ctx
         .tls_connector
         .connect(server_name, upstream_tcp)
@@ -2512,10 +2701,10 @@ async fn do_plain_http(
     Ok(())
 }
 
-/// google_only mode plain-HTTP passthrough. The CONNECT path already
-/// falls through to direct TCP for non-Google-edge hosts in google_only;
-/// this is the same idea for the `GET http://…` proxy form so a bare
-/// `http://example.com` typed in the address bar doesn't 502.
+/// `direct` mode plain-HTTP passthrough. The CONNECT path already
+/// falls through to raw TCP for hosts outside the SNI-rewrite set in
+/// `direct`; this is the same idea for the `GET http://…` proxy form
+/// so a bare `http://example.com` typed in the address bar doesn't 502.
 ///
 /// We rewrite the absolute-form request URI (`GET http://host/path`) to
 /// origin form (`GET /path`), strip hop-by-hop headers, force
@@ -2542,7 +2731,7 @@ async fn do_plain_http_passthrough(
     };
 
     tracing::info!(
-        "dispatch http {}:{} -> raw-tcp ({}) (google_only: no relay)",
+        "dispatch http {}:{} -> raw-tcp ({}) (direct mode: no relay)",
         host,
         port,
         rewrite_ctx.upstream_socks5.as_deref().unwrap_or("direct"),
@@ -3093,5 +3282,93 @@ mod tests {
         assert!(matches_doh_host("tenant.doh.acme.test", &extra));
         // But substring overlap must still be rejected.
         assert!(!matches_doh_host("xdoh.acme.test", &extra));
+    }
+
+    fn fg(name: &str, sni: &str, domains: &[&str]) -> Arc<FrontingGroupResolved> {
+        Arc::new(
+            FrontingGroupResolved::from_config(&FrontingGroup {
+                name: name.into(),
+                ip: "127.0.0.1".into(),
+                sni: sni.into(),
+                domains: domains.iter().map(|s| s.to_string()).collect(),
+            })
+            .expect("test fronting group should resolve"),
+        )
+    }
+
+    #[test]
+    fn fronting_group_match_exact_and_suffix() {
+        let groups = vec![fg("vercel", "react.dev", &["vercel.com", "nextjs.org"])];
+        // Exact.
+        assert_eq!(
+            match_fronting_group("vercel.com", &groups).map(|g| g.name.as_str()),
+            Some("vercel")
+        );
+        // Suffix.
+        assert_eq!(
+            match_fronting_group("app.vercel.com", &groups).map(|g| g.name.as_str()),
+            Some("vercel")
+        );
+        // Different member.
+        assert_eq!(
+            match_fronting_group("docs.nextjs.org", &groups).map(|g| g.name.as_str()),
+            Some("vercel")
+        );
+        // Non-member.
+        assert!(match_fronting_group("example.com", &groups).is_none());
+        // Substring overlap is NOT a match (xvercel.com isn't *.vercel.com).
+        assert!(match_fronting_group("xvercel.com", &groups).is_none());
+    }
+
+    #[test]
+    fn fronting_group_match_case_and_trailing_dot() {
+        let groups = vec![fg("fastly", "www.python.org", &["reddit.com"])];
+        assert_eq!(
+            match_fronting_group("Reddit.COM", &groups).map(|g| g.name.as_str()),
+            Some("fastly")
+        );
+        assert_eq!(
+            match_fronting_group("reddit.com.", &groups).map(|g| g.name.as_str()),
+            Some("fastly")
+        );
+        assert_eq!(
+            match_fronting_group("WWW.Reddit.com.", &groups).map(|g| g.name.as_str()),
+            Some("fastly")
+        );
+    }
+
+    #[test]
+    fn fronting_group_match_first_wins() {
+        // When a host is in two groups, the earlier group is chosen.
+        // Lets users put more-specific groups first.
+        let groups = vec![
+            fg("specific", "a.example", &["api.example.com"]),
+            fg("broad", "b.example", &["example.com"]),
+        ];
+        assert_eq!(
+            match_fronting_group("api.example.com", &groups).map(|g| g.name.as_str()),
+            Some("specific")
+        );
+        assert_eq!(
+            match_fronting_group("example.com", &groups).map(|g| g.name.as_str()),
+            Some("broad")
+        );
+    }
+
+    #[test]
+    fn fronting_group_match_empty_list() {
+        let groups: Vec<Arc<FrontingGroupResolved>> = Vec::new();
+        assert!(match_fronting_group("vercel.com", &groups).is_none());
+    }
+
+    #[test]
+    fn fronting_group_resolve_rejects_invalid_sni() {
+        let bad = FrontingGroup {
+            name: "bad".into(),
+            ip: "127.0.0.1".into(),
+            sni: "not a valid hostname".into(),
+            domains: vec!["x.com".into()],
+        };
+        assert!(FrontingGroupResolved::from_config(&bad).is_err());
     }
 }

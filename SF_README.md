@@ -23,7 +23,7 @@ A free way to bypass internet censorship by routing your traffic through your ow
 **1. Set up the relay in your Google account (one-time).**
 Go to <https://script.google.com>, sign in, click **New project**. Delete the sample code, paste in the [Code.gs file from this repo](assets/apps_script/Code.gs), change `AUTH_KEY = "..."` to a password only you know. Click **Deploy → New deployment → Web app**, set "Execute as: Me", "Who has access: Anyone". Copy the long ID from the URL — that's your **Deployment ID**.
 
-> Can't reach `script.google.com` because it's blocked? Run mhrv-rs first in `google_only` mode (use [`config.google-only.example.json`](config.google-only.example.json)). It only relays Google sites and lets you reach the Apps Script editor through the bypass tunnel. Do step 1 in your browser, then switch back to normal mode.
+> Can't reach `script.google.com` because it's blocked? Run mhrv-rs first in `direct` mode (use [`config.direct.example.json`](config.direct.example.json)). It only relays Google sites (plus any [fronting_groups](docs/fronting-groups.md) you've configured) and lets you reach the Apps Script editor through the bypass tunnel. Do step 1 in your browser, then switch back to normal mode. (`direct` was named `google_only` before v1.9 — the old name still works.)
 
 **2. Install and run mhrv-rs.**
 Download the package for your system from [Releases](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases/latest) and unzip it.
@@ -94,7 +94,7 @@ This project is free and run by volunteers. If it helped you and you can spare a
 **۱. ساخت ریله در حساب گوگل (فقط یک بار).**
 به <https://script.google.com> بروید، وارد حساب گوگل شوید و روی **New project** بزنید. کد پیش‌فرض را پاک کنید و محتوای [فایل Code.gs](assets/apps_script/Code.gs) همین مخزن را در آن جای‌گذاری کنید. خط `AUTH_KEY = "..."` را به یک رمز دلخواه که فقط خودتان می‌دانید تغییر دهید. سپس **Deploy → New deployment → Web app** را بزنید، گزینهٔ "Execute as: Me" و "Who has access: Anyone" را انتخاب کنید. آی‌دی طولانی توی URL را کپی کنید — این **Deployment ID** شماست.
 
-> اگر `script.google.com` خودش بسته است، اول mhrv-rs را در حالت `google_only` اجرا کنید (از [`config.google-only.example.json`](config.google-only.example.json) استفاده کنید). این حالت فقط سایت‌های گوگل را تونل می‌کند تا بتوانید به ویرایشگر Apps Script برسید. مرحلهٔ ۱ را در مرورگر انجام دهید و بعد به حالت معمولی برگردید.
+> اگر `script.google.com` خودش بسته است، اول mhrv-rs را در حالت `direct` اجرا کنید (از [`config.direct.example.json`](config.direct.example.json) استفاده کنید). این حالت فقط سایت‌های گوگل (به علاوهٔ هر [fronting_groups](docs/fronting-groups.md) که تنظیم کرده باشید) را تونل می‌کند تا بتوانید به ویرایشگر Apps Script برسید. مرحلهٔ ۱ را در مرورگر انجام دهید و بعد به حالت معمولی برگردید. (نام قبلی این حالت `google_only` بود — همچنان پذیرفته می‌شود.)
 
 **۲. نصب و اجرای mhrv-rs.**
 بستهٔ مخصوص سیستم خودتان را از [بخش Releases](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases/latest) دانلود کنید و از حالت فشرده در بیاورید.

@@ -10,7 +10,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 
 use mhrv_rs::cert_installer::{install_ca, reconcile_sudo_environment, remove_ca};
-use mhrv_rs::config::{Config, ScriptId};
+use mhrv_rs::config::{Config, FrontingGroup, ScriptId};
 use mhrv_rs::data_dir;
 use mhrv_rs::domain_fronter::{DomainFronter, DEFAULT_GOOGLE_SNI_POOL};
 use mhrv_rs::mitm::{MitmCertManager, CA_CERT_FILE};
@@ -216,9 +216,11 @@ struct App {
 
 #[derive(Clone)]
 struct FormState {
-    /// `"apps_script"` (default) or `"google_only"`. Controls whether the
-    /// Apps Script relay is wired up at all. In `google_only`, the form
-    /// tolerates an empty script_id / auth_key.
+    /// `"apps_script"` (default), `"direct"`, or `"full"`. Controls
+    /// whether the Apps Script relay is wired up at all. In `direct`,
+    /// the form tolerates an empty script_id / auth_key.
+    /// On load we normalize the legacy `"google_only"` string to
+    /// `"direct"` so the next save rewrites the on-disk config.
     mode: String,
     script_id: String,
     auth_key: String,
@@ -265,6 +267,11 @@ struct FormState {
     /// User-supplied DoH hostnames added to the built-in default list,
     /// round-tripped from config.json. See config.rs `bypass_doh_hosts`.
     bypass_doh_hosts: Vec<String>,
+    /// Multi-edge fronting groups. Round-tripped from config.json so
+    /// the UI's Save doesn't drop the user's hand-edited groups —
+    /// there is no UI editor for these yet, only file-edited config.
+    /// See config.rs `fronting_groups`.
+    fronting_groups: Vec<FrontingGroup>,
 }
 
 #[derive(Clone, Debug)]
@@ -322,8 +329,18 @@ fn load_form() -> (FormState, Option<String>) {
             },
         };
         let sni_pool = sni_pool_for_form(c.sni_hosts.as_deref(), &c.front_domain);
+        // Normalize the legacy `google_only` mode string on load. The
+        // backend's `mode_kind()` accepts the alias forever, but storing
+        // it as `direct` in the form means the next Save rewrites the
+        // on-disk config to the new name — one-way migration, no warn
+        // on every startup.
+        let mode_normalized = if c.mode == "google_only" {
+            "direct".to_string()
+        } else {
+            c.mode.clone()
+        };
         FormState {
-            mode: c.mode.clone(),
+            mode: mode_normalized,
             script_id: sid,
             auth_key: c.auth_key,
             google_ip: c.google_ip,
@@ -351,6 +368,7 @@ fn load_form() -> (FormState, Option<String>) {
             disable_padding: c.disable_padding,
             tunnel_doh: c.tunnel_doh,
             bypass_doh_hosts: c.bypass_doh_hosts.clone(),
+            fronting_groups: c.fronting_groups.clone(),
         }
     } else {
         FormState {
@@ -382,6 +400,7 @@ fn load_form() -> (FormState, Option<String>) {
             disable_padding: false,
             tunnel_doh: false,
             bypass_doh_hosts: Vec::new(),
+            fronting_groups: Vec::new(),
         }
     };
     (form, load_err)
@@ -433,8 +452,10 @@ fn sni_pool_for_form(user: Option<&[String]>, front_domain: &str) -> Vec<SniRow>
 
 impl FormState {
     fn to_config(&self) -> Result<Config, String> {
-        let is_google_only = self.mode == "google_only";
-        if !is_google_only {
+        // `direct` and the legacy `google_only` alias both run without
+        // an Apps Script relay, so neither requires a script_id.
+        let is_direct = self.mode == "direct" || self.mode == "google_only";
+        if !is_direct {
             if self.script_id.trim().is_empty() {
                 return Err("Apps Script ID is required".into());
             }
@@ -536,6 +557,9 @@ impl FormState {
             // added) so save doesn't drop them.
             tunnel_doh: self.tunnel_doh,
             bypass_doh_hosts: self.bypass_doh_hosts.clone(),
+            // Multi-edge fronting groups: file-edited only for now,
+            // round-tripped through the UI so Save doesn't drop them.
+            fronting_groups: self.fronting_groups.clone(),
             // PR #448 (Android): adaptive coalesce window. Desktop UI
             // doesn't expose sliders for these yet (Android does), so
             // we pass 0 to keep the compiled defaults (40ms step,
@@ -600,6 +624,8 @@ struct ConfigWire<'a> {
     tunnel_doh: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     bypass_doh_hosts: &'a Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    fronting_groups: &'a Vec<FrontingGroup>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -650,6 +676,7 @@ impl<'a> From<&'a Config> for ConfigWire<'a> {
             google_ip_validation: c.google_ip_validation,
             tunnel_doh: c.tunnel_doh,
             bypass_doh_hosts: &c.bypass_doh_hosts,
+            fronting_groups: &c.fronting_groups,
         }
     }
 }
@@ -787,19 +814,20 @@ impl eframe::App for App {
 
             // ── Section: Mode ─────────────────────────────────────────────
             // Surfacing the mode at the top of the form because it changes
-            // which of the sections below are actually used. google_only is
-            // a bootstrap mode for users who don't yet have internet access
-            // to deploy Code.gs — once deployed, they switch back to
-            // apps_script.
+            // which of the sections below are actually used. `direct` runs
+            // without the Apps Script relay (Google edge + any configured
+            // fronting_groups via the SNI-rewrite tunnel only) — useful as
+            // a bootstrap to deploy Code.gs, or as a standalone mode for
+            // users who only need access to fronting-group targets.
             section(ui, "Mode", |ui| {
                 form_row(ui, "Mode", Some(
                     "apps_script: DPI bypass via Apps Script relay (needs cert).\n\
                      full: tunnel ALL traffic through Apps Script + tunnel node (no cert needed).\n\
-                     google_only: bootstrap — direct SNI-rewrite tunnel to *.google.com only."
+                     direct: SNI-rewrite tunnel only — no relay (Google edge + any fronting_groups)."
                 ), |ui| {
                     egui::ComboBox::from_id_source("mode")
                         .selected_text(match self.form.mode.as_str() {
-                            "google_only" => "Google-only (bootstrap)",
+                            "direct" | "google_only" => "Direct (no relay)",
                             "full" => "Full tunnel (no cert)",
                             _ => "Apps Script (MITM)",
                         })
@@ -816,16 +844,16 @@ impl eframe::App for App {
                             );
                             ui.selectable_value(
                                 &mut self.form.mode,
-                                "google_only".into(),
-                                "Google-only (bootstrap)",
+                                "direct".into(),
+                                "Direct (no relay)",
                             );
                         });
                 });
-                if self.form.mode == "google_only" {
+                if self.form.mode == "direct" || self.form.mode == "google_only" {
                     ui.horizontal(|ui| {
                         ui.add_space(120.0 + 8.0);
                         ui.small(egui::RichText::new(
-                            "Bootstrap mode — reach script.google.com to deploy Code.gs, then switch back to Apps Script.",
+                            "Direct mode — SNI-rewrite tunnel only. Reach the Google edge (and any configured fronting_groups) without an Apps Script relay.",
                         )
                         .color(OK_GREEN));
                     });
@@ -841,11 +869,11 @@ impl eframe::App for App {
                 }
             });
 
-            let google_only = self.form.mode == "google_only";
+            let direct_mode = self.form.mode == "direct" || self.form.mode == "google_only";
 
             // ── Section: Apps Script relay ────────────────────────────────
             section(ui, "Apps Script relay", |ui| {
-                ui.add_enabled_ui(!google_only, |ui| {
+                ui.add_enabled_ui(!direct_mode, |ui| {
                     form_row(ui, "Deployment IDs", Some(
                         "One deployment ID per line. Proxy round-robins between them and sidelines \
                          any ID that hits its daily quota for 10 minutes before retrying."
@@ -1916,7 +1944,7 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                             return;
                         }
                     };
-                    // `fronter()` is `None` in google_only (bootstrap) mode — the
+                    // `fronter()` is `None` in direct mode — the
                     // status panel's relay stats simply show no data in that case.
                     *fronter_slot2.lock().await = server.fronter();
                     {

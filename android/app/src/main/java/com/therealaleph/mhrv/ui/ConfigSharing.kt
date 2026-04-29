@@ -264,7 +264,7 @@ private fun ImportConfirmDialog(
     val preview = ids.take(3).joinToString("\n") { "  ${it.take(20)}…" }
     val modeLabel = when (cfg.mode) {
         com.therealaleph.mhrv.Mode.APPS_SCRIPT -> "apps_script"
-        com.therealaleph.mhrv.Mode.GOOGLE_ONLY -> "google_only"
+        com.therealaleph.mhrv.Mode.DIRECT -> "direct"
         com.therealaleph.mhrv.Mode.FULL -> "full"
     }
 

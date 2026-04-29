@@ -177,7 +177,7 @@ TUNNEL_AUTH_KEY=your-secret PORT=8080 ./target/release/tunnel-node
 
 برای **حالت `apps_script`** (browsing فقط HTTPS): **خیر، نیاز به VPS نیست** — فقط نیاز به Apps Script setup روی Google account داری.
 
-برای **حالت `google_only`** (فقط Google services مثل Search/Gmail/YouTube ساده): **نه VPS لازمه نه Apps Script** — بوت‌استرپ ساده.
+برای **حالت `direct`** (Google services مثل Search/Gmail/YouTube، به علاوهٔ هر `fronting_groups` که تنظیم کرده باشید): **نه VPS لازمه نه Apps Script** — فقط تونل بازنویسی `SNI`. (نام قبلی این حالت `google_only` بود.)
 
 ### چه VPS‌ای پیشنهاد می‌شه؟
 

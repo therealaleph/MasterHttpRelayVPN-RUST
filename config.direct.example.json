@@ -1,5 +1,5 @@
 {
-  "mode": "google_only",
+  "mode": "direct",
   "google_ip": "216.239.38.120",
   "front_domain": "www.google.com",
   "listen_host": "127.0.0.1",

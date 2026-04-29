@@ -104,10 +104,10 @@ class MhrvVpnService : VpnService() {
         startForeground(NOTIF_ID, buildNotif(cfg.listenPort, notifSocks5Port))
 
         // Deployment ID + auth key are required for apps_script and full
-        // modes — both talk to Apps Script. Only google_only (bootstrap)
-        // runs without them. Closes #73 regression where google_only
-        // users hit this branch and crashed on startForeground timeout.
-        val needsCreds = cfg.mode != Mode.GOOGLE_ONLY
+        // modes — both talk to Apps Script. Only `direct` mode runs
+        // without them. Closes #73 regression where direct-mode users
+        // hit this branch and crashed on startForeground timeout.
+        val needsCreds = cfg.mode != Mode.DIRECT
         if (needsCreds && (!cfg.hasDeploymentId || cfg.authKey.isBlank())) {
             Log.e(TAG, "Config is incomplete — deployment ID + auth key required for ${cfg.mode}")
             try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Throwable) {}

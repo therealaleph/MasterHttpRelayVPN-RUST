@@ -288,11 +288,12 @@ async fn main() -> ExitCode {
                 tracing::info!("Script ID: {}", sids[0]);
             }
         }
-        mhrv_rs::config::Mode::GoogleOnly => {
+        mhrv_rs::config::Mode::Direct => {
             tracing::warn!(
-                "google_only bootstrap: direct SNI-rewrite tunnel to {} only. \
-                 Open https://script.google.com in your browser (proxy set to \
-                 {}:{}), deploy Code.gs, then switch to apps_script mode.",
+                "direct mode: SNI-rewrite tunnel only (Google edge {} + any \
+                 configured fronting_groups). Open https://script.google.com \
+                 in your browser (proxy set to {}:{}), deploy Code.gs, then \
+                 switch to apps_script mode for full DPI bypass.",
                 config.google_ip,
                 config.listen_host,
                 config.listen_port

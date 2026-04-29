@@ -83,7 +83,7 @@ object Native {
      * Live traffic/usage counters for a running proxy handle. Returns a
      * JSON blob with the StatsSnapshot fields — or an empty string if the
      * handle is unknown or the proxy isn't using the Apps Script relay
-     * (google_only / full-only modes).
+     * (direct / full-only modes).
      *
      * Schema (all integer fields unless noted):
      *   relay_calls, relay_failures, coalesced, bytes_relayed,
