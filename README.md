@@ -102,6 +102,8 @@ This part is unchanged from the original project. Follow @masterking32's guide o
    - Who has access: **Anyone**
 6. Copy the **Deployment ID** (the long random string in the URL).
 
+> **Alternative backend — Apps Script + Cloudflare Worker.** A variant in [`assets/apps_script/Code.cfw.gs`](assets/apps_script/Code.cfw.gs) + [`assets/cloudflare/worker.js`](assets/cloudflare/worker.js) turns Apps Script into a thin forwarder and offloads the actual fetch to a Cloudflare Worker you deploy. The win on day one is **latency** (~10-50 ms at the CF edge vs ~250-500 ms in Apps Script — visibly snappier for browsing and Telegram). It does **not** reduce your daily 20k Apps Script `UrlFetchApp` count, because today's mhrv-rs always sends single-URL relay requests; the batch path on the GAS+Worker side is wired and ready (`ceil(N/40)` quota per N-URL batch) but no shipping client emits it. Trade-offs: worse for YouTube long-form (30 s wall vs 6 min), no fix for Cloudflare anti-bot, **not compatible with `mode: "full"`** (no tunnel-ops support → won't help WhatsApp/messengers on Android full mode). Full setup and trade-off table in [`assets/cloudflare/README.md`](assets/cloudflare/README.md). mhrv-rs needs no config changes — same `mode: "apps_script"`, same `script_id`, same `auth_key`.
+
 #### Can't reach `script.google.com` from your network?
 
 If your ISP is already blocking Google Apps Script (or all of Google), you need Step 1's browser connection to succeed *before* you have a relay to use. `mhrv-rs` ships a `direct` mode for exactly this — SNI-rewrite tunnel only, no Apps Script relay required. (Was named `google_only` before v1.9 — the old name is still accepted in config files.)
@@ -498,6 +500,10 @@ Donations cover hosting, self-hosted CI runner costs, and continued maintenance.
 ۷. روی **`Deploy`** کلیک کنید. گوگل یک **`Deployment ID`** نشان می‌دهد — رشتهٔ طولانی تصادفی که داخل آدرس `URL` است. کپی‌اش کنید؛ در برنامه لازم دارید  
 
 > **نکته:** اگر نمی‌دانید رمز `AUTH_KEY` چه بگذارید، یک رشتهٔ تصادفی ۱۶ تا ۲۴ کاراکتری بسازید. مهم فقط این است که **دقیقاً همان رشته** را در برنامه هم وارد کنید.
+
+<!-- -->
+
+> **پشتیبان جایگزین — `Apps Script` + `Cloudflare Worker`.** نسخه‌ای در [`assets/apps_script/Code.cfw.gs`](assets/apps_script/Code.cfw.gs) به‌همراه [`assets/cloudflare/worker.js`](assets/cloudflare/worker.js) وجود دارد که `Apps Script` را به یک رلهٔ نازک تبدیل می‌کند و کار `fetch` واقعی را به یک `Cloudflare Worker` که خودتان مستقر می‌کنید می‌سپارد. سود روز اول این کار **کاهش تأخیر** است (~۱۰ تا ۵۰ میلی‌ثانیه روی لبهٔ `CF` به جای ۲۵۰ تا ۵۰۰ میلی‌ثانیه روی `Apps Script` — برای مرور وب و تلگرام محسوس). سهمیهٔ روزانهٔ `UrlFetchApp` (~۲۰٬۰۰۰) را کاهش **نمی‌دهد**، چون امروز `mhrv-rs` همیشه درخواست تک‌آدرسی می‌فرستد؛ مسیر دسته‌ای روی `GAS+Worker` آماده و سیم‌کشی شده (`ceil(N/40)` سهمیه به‌ازای دستهٔ `N` آدرسی) ولی هیچ کلاینتی فعلاً آن را تولید نمی‌کند. مبادلات: ویدیوی طولانی یوتیوب بدتر می‌شود (دیوار ۳۰ ثانیه به جای ۶ دقیقه)، ضدبات `Cloudflare` را حل نمی‌کند، و **با `mode: "full"` سازگار نیست** (پشتیبانی از عملیات تونل ندارد → برای واتس‌اَپ و سایر مسنجرها روی اندرویدِ تونل کامل کمکی نمی‌کند). راهنمای کامل استقرار و جدول مبادلات در [`assets/cloudflare/README.fa.md`](assets/cloudflare/README.fa.md). در `mhrv-rs` هیچ تنظیمی تغییر نمی‌کند — همان `mode: "apps_script"`، همان `script_id`، همان `auth_key`.
 
 #### به `script.google.com` هم دسترسی ندارید؟
 

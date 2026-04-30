@@ -1,13 +1,18 @@
-# Apps Script source (mirrored)
+# Apps Script source
 
-The file `Code.gs` next to this README is a verbatim snapshot of the upstream script you deploy in your own Google Apps Script project:
+Three deploy-ready Apps Script files live here. They all speak the same `{k, m, u, h, b, ct, r}` wire protocol with `mhrv-rs`, so the client just points its `script_id` at whichever deployment you want — no mode change required.
 
-- Upstream: <https://github.com/masterking32/MasterHttpRelayVPN/blob/python_testing/apps_script/Code.gs>
-- Raw link: <https://raw.githubusercontent.com/masterking32/MasterHttpRelayVPN/refs/heads/python_testing/apps_script/Code.gs>
+## Variants and origins
 
-This copy lives in our repo for two reasons:
+- **`Code.gs`** — standard relay. **Verbatim mirror of upstream.** Apps Script does the outbound fetch itself. This is the default choice for most users.
+  - Upstream: <https://github.com/masterking32/MasterHttpRelayVPN/blob/python_testing/apps_script/Code.gs>
+  - Credit: [@masterking32](https://github.com/masterking32). We do not modify this file.
+  - The mirror lives here so that (a) users on networks where `raw.githubusercontent.com` is unreachable can still deploy from a `git clone` / ZIP, and (b) we have a snapshot to diff against if upstream changes silently break the informal relay protocol.
 
-1. **Survives upstream outages**: if the user is on a network where raw.githubusercontent.com is temporarily unreachable but they can clone or ZIP this repo, they still have the deploy-ready file.
-2. **Pins what we tested against**: the relay protocol between `mhrv-rs` and the script is informal; upstream changes can silently break us. Keeping a snapshot here lets us diff and see if a spec drift is responsible for any reported breakage.
+- **`CodeFull.gs`** — superset of `Code.gs` that additionally proxies raw-TCP / UDP via `tunnel-node` (used by `mode: "full"`). **Maintained in this repo** — written for this Rust port and not present upstream. Deploy this if you want full-tunnel mode; details in the file's header comment.
 
-All credit for `Code.gs` goes to [@masterking32](https://github.com/masterking32) — we do not modify it. If you're using mhrv-rs, follow the upstream deploy instructions in the script's header comment. The only edit **you** must make is the `AUTH_KEY` constant — set it to a strong secret and reuse that exact string in your `mhrv-rs` config.
+- **`Code.cfw.gs`** — Apps Script becomes a thin auth+forward layer; the actual outbound fetch happens on a Cloudflare Worker you also deploy ([`assets/cloudflare/`](../cloudflare/)). **Derivative work — not unmodified upstream.** The pattern of forwarding through a Cloudflare Worker came from [denuitt1/mhr-cfw](https://github.com/denuitt1/mhr-cfw); this file inherits hardening from `Code.gs` (decoy-on-bad-auth, fail-closed sentinels) and adds chunked batch forwarding (`Promise.all` on the Worker side, `ceil(N/40)` GAS calls per batch) that the upstream `mhr-cfw` does not have. Faster per-call latency, worse YouTube long-form, no fix for Cloudflare anti-bot. Read [`assets/cloudflare/README.md`](../cloudflare/README.md) before choosing this one.
+
+## What you must edit before deploying
+
+For every variant: change `AUTH_KEY` from its placeholder to a strong secret, and use that same string in your `mhrv-rs` config's `auth_key`. `Code.cfw.gs` additionally requires setting `WORKER_URL` to your deployed Cloudflare Worker URL; `CodeFull.gs` additionally requires `TUNNEL_SERVER_URL` and `TUNNEL_AUTH_KEY` for the tunnel-node leg.
