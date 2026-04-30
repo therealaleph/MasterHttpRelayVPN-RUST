@@ -67,6 +67,8 @@
     <!-- Advanced section -->
     <string name="adv_verify_tls">بررسی TLS طرف مقابل</string>
     <string name="adv_verify_tls_help">خاموش کردن، بررسی گواهی را برای لبهٔ گوگل غیرفعال می‌کند. فقط برای اشکال‌زدایی کاربرد دارد.</string>
+    <string name="adv_youtube_via_relay">ارسال یوتیوب از طریق رله</string>
+    <string name="adv_youtube_via_relay_help">ترافیک youtube.com / youtu.be / ytimg.com را به‌جای تونل SNI-rewrite از رلهٔ Apps Script عبور می‌دهد. حالت محدود را دور می‌زند ولی پخش ویدیو کندتر می‌شود.</string>
     <string name="adv_log_level">log_level</string>
     <string name="adv_parallel_relay">parallel_relay: %1$d</string>
     <string name="adv_parallel_relay_help">تعداد درخواست‌های موازی هر بار. ۱ عادی است؛ روی لینک‌های با افت، ۲-۳ را امتحان کنید.</string>

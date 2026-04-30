@@ -1196,6 +1196,25 @@ private fun AdvancedSettings(
             )
         }
 
+        // youtube_via_relay
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(stringResource(R.string.adv_youtube_via_relay), style = MaterialTheme.typography.bodyMedium)
+                Text(
+                    stringResource(R.string.adv_youtube_via_relay_help),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Switch(
+                checked = cfg.youtubeViaRelay,
+                onCheckedChange = { onChange(cfg.copy(youtubeViaRelay = it)) },
+            )
+        }
+
         // log_level dropdown
         var expanded by remember { mutableStateOf(false) }
         val levels = listOf("trace", "debug", "info", "warn", "error", "off")

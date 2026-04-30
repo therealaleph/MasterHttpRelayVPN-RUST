@@ -67,6 +67,8 @@
     <!-- Advanced section -->
     <string name="adv_verify_tls">Verify upstream TLS</string>
     <string name="adv_verify_tls_help">Off disables cert checks for the Google edge. Only useful for debugging.</string>
+    <string name="adv_youtube_via_relay">Send YouTube through relay</string>
+    <string name="adv_youtube_via_relay_help">Route youtube.com / youtu.be / ytimg.com through Apps Script relay instead of SNI-rewrite tunnel. Avoids restricted mode but slower for video.</string>
     <string name="adv_log_level">log_level</string>
     <string name="adv_parallel_relay">parallel_relay: %1$d</string>
     <string name="adv_parallel_relay_help">Fan-out per request. 1 is normal; bump to 2-3 on lossy links.</string>
