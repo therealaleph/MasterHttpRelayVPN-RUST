@@ -357,9 +357,15 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_drainLogs<'a>(
 ///
 /// Returned shape, one of:
 ///   {"kind":"upToDate","current":"1.0.0","latest":"1.0.0"}
-///   {"kind":"updateAvailable","current":"1.0.0","latest":"1.1.0","url":"https://..."}
+///   {"kind":"updateAvailable","current":"1.0.0","latest":"1.1.0","url":"https://...",
+///    "assetName":"mhrv-rs-android-arm64-v8a-v1.1.0.apk",
+///    "assetUrl":"https://...","assetSize":12345678}
 ///   {"kind":"offline","reason":"..."}
 ///   {"kind":"error","reason":"..."}
+///
+/// `assetName/Url/Size` are only present on `updateAvailable` and only when
+/// the picker matched a per-ABI APK in the release. The Kotlin updater
+/// uses these fields to fetch the right APK and hand it to PackageInstaller.
 ///
 /// Blocking — hit from a background dispatcher.
 #[no_mangle]
@@ -398,10 +404,19 @@ fn update_check_to_json(u: &crate::update_check::UpdateCheck) -> String {
             r#"{{"kind":"upToDate","current":"{}","latest":"{}"}}"#,
             esc(current), esc(latest),
         ),
-        crate::update_check::UpdateCheck::UpdateAvailable { current, latest, release_url, .. } => format!(
-            r#"{{"kind":"updateAvailable","current":"{}","latest":"{}","url":"{}"}}"#,
-            esc(current), esc(latest), esc(release_url),
-        ),
+        crate::update_check::UpdateCheck::UpdateAvailable { current, latest, release_url, asset } => {
+            let asset_fields = match asset {
+                Some(a) => format!(
+                    r#","assetName":"{}","assetUrl":"{}","assetSize":{}"#,
+                    esc(&a.name), esc(&a.download_url), a.size_bytes,
+                ),
+                None => String::new(),
+            };
+            format!(
+                r#"{{"kind":"updateAvailable","current":"{}","latest":"{}","url":"{}"{}}}"#,
+                esc(current), esc(latest), esc(release_url), asset_fields,
+            )
+        }
         crate::update_check::UpdateCheck::Offline(reason) => format!(
             r#"{{"kind":"offline","reason":"{}"}}"#,
             esc(reason),
@@ -411,6 +426,106 @@ fn update_check_to_json(u: &crate::update_check::UpdateCheck) -> String {
             esc(reason),
         ),
     }
+}
+
+/// `Native.downloadAsset(url, destPath)` -> String. Downloads a release
+/// asset to `destPath` using the same rustls + redirect-following client
+/// the desktop UI uses (so we go through CA-pinned TLS, no Java/OkHttp
+/// dependency on the Kotlin side). When this build embeds
+/// `MHRV_UPDATE_PUBKEY`, also downloads `<url>.minisig` and verifies the
+/// asset before returning success. BLOCKS — call from IO dispatcher.
+///
+/// Returns a JSON blob:
+///   {"ok":true,"bytes":12345678}
+///   {"ok":false,"error":"..."}
+///
+/// Always uses Route::Direct on Android — the proxy-route trick that
+/// helps shared-NAT desktop users isn't needed here (Android users
+/// generally have working clear-net to GitHub for the asset CDN, which
+/// `objects.githubusercontent.com` redirects to). Can be revisited if
+/// users on Iranian networks report the asset host blocked.
+#[no_mangle]
+pub extern "system" fn Java_com_therealaleph_mhrv_Native_downloadAsset<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass,
+    url: JString,
+    dest: JString,
+) -> jstring {
+    let result_json = safe(
+        r#"{"ok":false,"error":"panic"}"#.to_string(),
+        AssertUnwindSafe(|| {
+            install_logging_once();
+            let url_s = jstring_to_string(&mut env, &url);
+            let dest_s = jstring_to_string(&mut env, &dest);
+            if url_s.is_empty() || dest_s.is_empty() {
+                return r#"{"ok":false,"error":"empty url or dest"}"#.to_string();
+            }
+            let Some(rt) = one_shot_runtime() else {
+                return r#"{"ok":false,"error":"tokio init failed"}"#.to_string();
+            };
+            let dest_path = std::path::PathBuf::from(&dest_s);
+            let res = rt.block_on(async {
+                let bytes = crate::update_check::download_asset(
+                    crate::update_check::Route::Direct,
+                    &url_s,
+                    &dest_path,
+                )
+                .await?;
+
+                if let Some(pubkey) = crate::update_apply::embedded_update_pubkey() {
+                    let sig_url = crate::update_apply::signature_url_for_asset(&url_s);
+                    let sig_path = {
+                        let Some(file_name) = dest_path.file_name() else {
+                            return Err("dest path has no filename".to_string());
+                        };
+                        let mut sig_name = file_name.to_os_string();
+                        sig_name.push(".minisig");
+                        dest_path.with_file_name(sig_name)
+                    };
+                    crate::update_check::download_asset(
+                        crate::update_check::Route::Direct,
+                        &sig_url,
+                        &sig_path,
+                    )
+                    .await
+                    .map_err(|e| format!("signature missing: {}", e))?;
+                    let sig_text = tokio::fs::read_to_string(&sig_path)
+                        .await
+                        .map_err(|e| format!("read signature: {}", e))?;
+                    crate::update_apply::verify_minisign_signature(
+                        pubkey,
+                        &dest_path,
+                        &sig_text,
+                    )
+                    .map_err(|e| format!("signature invalid: {}", e))?;
+                    let _ = tokio::fs::remove_file(&sig_path).await;
+                    tracing::info!("android: minisign signature verified for {}", dest_s);
+                } else {
+                    tracing::warn!(
+                        "android: MHRV_UPDATE_PUBKEY was not set at build time — \
+                         installing update without minisign check (rollout mode)."
+                    );
+                }
+
+                Ok::<u64, String>(bytes)
+            });
+            match res {
+                Ok(bytes) => {
+                    tracing::info!("android: downloadAsset {} -> {} ({} bytes)", url_s, dest_s, bytes);
+                    format!(r#"{{"ok":true,"bytes":{}}}"#, bytes)
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&dest_path);
+                    tracing::warn!("android: downloadAsset failed: {}", e);
+                    let cleaned = e.replace('\\', "\\\\").replace('"', "\\\"");
+                    format!(r#"{{"ok":false,"error":"{}"}}"#, cleaned)
+                }
+            }
+        }),
+    );
+    env.new_string(result_json)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
 }
 
 /// `Native.testSni(googleIp, sni)` -> String. Returns a small JSON blob

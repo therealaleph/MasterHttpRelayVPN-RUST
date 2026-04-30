@@ -28,6 +28,8 @@ const REPO_NAME: &str = "MasterHttpRelayVPN-RUST";
 const GITHUB_API_HOST: &str = "api.github.com";
 const GITHUB_HOST: &str = "github.com";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+const API_READ_LIMIT_BYTES: usize = 512 * 1024;
+const BINARY_READ_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 
 /// Where to route the HTTPS GET. Direct = straight rustls to the target.
 /// Proxy = HTTP CONNECT through our local MITM proxy (so GitHub sees
@@ -137,6 +139,9 @@ pub async fn check(route: Route) -> UpdateCheck {
 }
 
 /// Download a release asset to `out_path`. Returns Ok(bytes written) or Err(reason).
+/// The body is currently buffered in memory and then written directly to
+/// `out_path`; callers that expose the path to users should stage into a
+/// scratch location first.
 pub async fn download_asset(
     route: Route,
     asset_url: &str,
@@ -148,7 +153,10 @@ pub async fn download_asset(
     let (host, path) = split_url(asset_url)
         .ok_or_else(|| format!("bad asset URL: {}", asset_url))?;
     let body = https_raw_get(&route, &host, &path, true).await?;
-    std::fs::write(out_path, &body).map_err(|e| format!("write {}: {}", out_path.display(), e))?;
+    // Async write so we don't stall the executor on a 50 MB-class spool.
+    tokio::fs::write(out_path, &body)
+        .await
+        .map_err(|e| format!("write {}: {}", out_path.display(), e))?;
     Ok(body.len() as u64)
 }
 
@@ -272,7 +280,11 @@ async fn https_raw_get(
     tls.flush().await.ok();
 
     let mut buf = Vec::with_capacity(if binary { 1024 * 1024 } else { 16 * 1024 });
-    let read_limit: usize = if binary { 128 * 1024 * 1024 } else { 512 * 1024 };
+    let read_limit: usize = if binary {
+        BINARY_READ_LIMIT_BYTES
+    } else {
+        API_READ_LIMIT_BYTES
+    };
     let read_fut = async {
         let mut chunk = [0u8; 8192];
         loop {
@@ -282,7 +294,15 @@ async fn https_raw_get(
                 Err(e) => return Err(format!("read: {}", e)),
             }
             if buf.len() > read_limit {
-                return Err("response too large".into());
+                let limit_label = if read_limit >= 1_048_576 {
+                    format!("{:.0} MiB", read_limit as f64 / 1_048_576.0)
+                } else {
+                    format!("{} KiB", read_limit / 1024)
+                };
+                return Err(format!(
+                    "response too large (>{} limit)",
+                    limit_label
+                ));
             }
         }
         Ok::<(), String>(())
@@ -403,13 +423,14 @@ fn split_url(url: &str) -> Option<(String, String)> {
 /// Given the GitHub API's `assets` array, pick the one that best matches
 /// this platform + arch. Returns None if nothing reasonable matched.
 fn pick_asset_for_platform(assets: &[serde_json::Value]) -> Option<ReleaseAsset> {
-    let os = std::env::consts::OS;
-    let arch = std::env::consts::ARCH;
+    pick_asset_for_target(assets, std::env::consts::OS, std::env::consts::ARCH)
+}
 
+fn asset_preferences(os: &str, arch: &str) -> &'static [&'static [&'static str]] {
     // Priority-ordered preference list of name *patterns* — first pattern
     // that matches any asset wins. All matches are case-insensitive
     // substrings.
-    let prefs: &[&[&str]] = match (os, arch) {
+    match (os, arch) {
         // macOS: .app.zip is the nicest user experience (double-click).
         ("macos", "aarch64") => &[&["macos-arm64-app", ".zip"], &["macos-arm64", ".tar.gz"]],
         ("macos", "x86_64") => &[&["macos-amd64-app", ".zip"], &["macos-amd64", ".tar.gz"]],
@@ -417,10 +438,21 @@ fn pick_asset_for_platform(assets: &[serde_json::Value]) -> Option<ReleaseAsset>
         ("linux", "aarch64") => &[&["linux-arm64", ".tar.gz"], &["linux-musl-arm64", ".tar.gz"]],
         ("linux", "arm") => &[&["raspbian-armhf", ".tar.gz"]],
         ("linux", "x86_64") => &[&["linux-amd64", ".tar.gz"], &["linux-musl-amd64", ".tar.gz"]],
+        // Android: each per-arch APK matches its ABI. Universal is the
+        // fallback when no per-arch build is published. The running
+        // process's target_arch picks the right one — `Build.SUPPORTED_ABIS[0]`
+        // and `target_arch` agree because the Rust cdylib was built for
+        // exactly the ABI the device loaded.
+        ("android", "aarch64") => &[&["android-arm64-v8a", ".apk"], &["android-universal", ".apk"]],
+        ("android", "arm") => &[&["android-armeabi-v7a", ".apk"], &["android-universal", ".apk"]],
+        ("android", "x86_64") => &[&["android-x86_64", ".apk"], &["android-universal", ".apk"]],
+        ("android", "x86") => &[&["android-x86-", ".apk"], &["android-universal", ".apk"]],
         _ => &[],
-    };
+    }
+}
 
-    for needles in prefs {
+fn pick_asset_for_target(assets: &[serde_json::Value], os: &str, arch: &str) -> Option<ReleaseAsset> {
+    for needles in asset_preferences(os, arch) {
         for a in assets {
             let name = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let lower = name.to_ascii_lowercase();
@@ -497,6 +529,28 @@ mod tests {
         ]);
         let arr = assets.as_array().unwrap();
         assert!(pick_asset_for_platform(arr).is_none());
+    }
+
+    #[test]
+    fn pick_asset_android_picks_per_abi_apk_over_universal() {
+        let assets = serde_json::json!([
+            {"name": "mhrv-rs-android-universal-v1.9.1.apk", "browser_download_url": "https://x/universal", "size": 1},
+            {"name": "mhrv-rs-android-arm64-v8a-v1.9.1.apk", "browser_download_url": "https://x/arm64", "size": 2},
+            {"name": "mhrv-rs-android-armeabi-v7a-v1.9.1.apk", "browser_download_url": "https://x/armv7", "size": 3},
+            {"name": "mhrv-rs-android-x86_64-v1.9.1.apk", "browser_download_url": "https://x/x86_64", "size": 4},
+            {"name": "mhrv-rs-android-x86-v1.9.1.apk", "browser_download_url": "https://x/x86", "size": 5},
+        ]);
+        let arr = assets.as_array().unwrap();
+        let cases = [
+            ("aarch64", "mhrv-rs-android-arm64-v8a-v1.9.1.apk"),
+            ("arm", "mhrv-rs-android-armeabi-v7a-v1.9.1.apk"),
+            ("x86_64", "mhrv-rs-android-x86_64-v1.9.1.apk"),
+            ("x86", "mhrv-rs-android-x86-v1.9.1.apk"),
+        ];
+        for (arch, expected) in cases {
+            let picked = pick_asset_for_target(arr, "android", arch).expect("should pick");
+            assert_eq!(picked.name, expected, "arch={arch}");
+        }
     }
 
     #[test]

@@ -30,6 +30,31 @@ permissions:
   # well-scoped permissions block.
   packages: write
 
+# Auto-updater public key, embedded into every release binary at compile
+# time via `option_env!("MHRV_UPDATE_PUBKEY")` (see src/update_apply.rs).
+# Read from the repo variable `MINISIGN_PUBLIC_KEY` — the bare base64 line
+# from a `minisign -G` .pub file (the one *after* the `untrusted comment`).
+#
+# This env var is populated only when `MINISIGN_SIGNING_ENABLED == 'true'`.
+# Empty/whitespace values are treated as "unset" by `src/update_apply.rs`:
+# binaries log a runtime warning + apply updates without a sig check. When
+# it IS non-empty, desktop and Android update flows refuse to apply an asset
+# that doesn't have a matching `.minisig` next to it on the release page.
+#
+# To enable signed updates end-to-end:
+#   1. Generate a keypair (one-time, offline):
+#        rsign generate -p mhrv-update.pub -s mhrv-update.key
+#   2. `gh variable set MINISIGN_PUBLIC_KEY --body "$(tail -1 mhrv-update.pub)"`
+#   3. `gh secret set MINISIGN_SECRET_KEY < mhrv-update.key`
+#   4. Optional, for passphrased keys:
+#        `gh secret set MINISIGN_KEY_PASSWORD --body 'your-passphrase'`
+#   5. `gh variable set MINISIGN_SIGNING_ENABLED --body true`
+#
+# Once those are set, the next tag push produces signed artifacts
+# and the freshly-built binaries enforce verification on the next update.
+env:
+  MHRV_UPDATE_PUBKEY: ${{ vars.MINISIGN_SIGNING_ENABLED == 'true' && vars.MINISIGN_PUBLIC_KEY || '' }}
+
 # Runner strategy:
 #   - Linux + Android + mipsel:       self-hosted (mhrv-hetzner-*, Hetzner
 #                                     8-core / 31 GB Ubuntu 24.04 box with
@@ -248,6 +273,7 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
           docker run --rm -v "$PWD":/src -w /src \
+            -e MHRV_UPDATE_PUBKEY \
             messense/rust-musl-cross:x86_64-musl \
             cargo build --release --target x86_64-unknown-linux-musl --bin mhrv-rs
           sudo chown -R "$(id -u):$(id -g)" target
@@ -256,6 +282,7 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: |
           docker run --rm -v "$PWD":/src -w /src \
+            -e MHRV_UPDATE_PUBKEY \
             messense/rust-musl-cross:aarch64-musl \
             cargo build --release --target aarch64-unknown-linux-musl --bin mhrv-rs
           sudo chown -R "$(id -u):$(id -g)" target
@@ -293,6 +320,7 @@ jobs:
           trap 'sudo chown -R "$(id -u):$(id -g)" target 2>/dev/null || true' EXIT
           docker run --rm -v "$PWD":/src -w /src \
             -e RUSTFLAGS='-C target-feature=+soft-float' \
+            -e MHRV_UPDATE_PUBKEY \
             messense/rust-musl-cross:mipsel-musl \
             bash -c '
               set -eux
@@ -514,6 +542,136 @@ jobs:
           path: dist/*.apk
           if-no-files-found: error
 
+  # Sign every release artifact with minisign — see src/update_apply.rs
+  # for the threat model. Produces `<asset>.minisig` files alongside the
+  # build artifacts so the auto-updater can verify provenance before
+  # swapping the running binary.
+  #
+  # Gracefully no-ops when `vars.MINISIGN_SIGNING_ENABLED != 'true'` so
+  # the workflow keeps shipping releases until the maintainer sets up
+  # the keypair (see workflow-level `env` block at the top for the
+  # one-time setup commands).
+  #
+  # Tool: rsign2 (Frank Denis, Rust port of minisign). Produces signatures
+  # binary-compatible with the OG `minisign` and verifiable by the
+  # `minisign-verify` crate the updater uses. Picked over apt-installing
+  # `minisign` because rsign2 cross-installs the same way on every runner
+  # we have (Linux self-hosted, Linux GH-hosted) via `cargo install`.
+  sign:
+    needs: [build, android]
+    if: ${{ vars.MINISIGN_SIGNING_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    env:
+      RSIGN2_VERSION: 0.6.5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Cache the pinned `cargo install rsign2` output so we're not
+      # rebuilding it from scratch every release. The key includes the
+      # rsign2 version so tool upgrades invalidate the cache deliberately.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: rsign2-${{ env.RSIGN2_VERSION }}-stable
+          cache-bin: "false"
+
+      - name: Install rsign2
+        run: |
+          # `--version` pins the signing tool itself; `--locked` uses that
+          # crate release's Cargo.lock so transitive bumps are deliberate too.
+          cargo install --quiet --locked --version "${RSIGN2_VERSION}" rsign2
+
+      - name: Download all build artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p dist
+          # Same retry pattern as the `release` job — the artifacts API
+          # has been intermittently 5-retries-exhausted on this workflow,
+          # `gh run download` against the current run ID is more reliable.
+          for attempt in 1 2 3; do
+            if gh run download "${GITHUB_RUN_ID}" --dir dist --repo "${GITHUB_REPOSITORY}"; then
+              echo "downloaded all artifacts on attempt $attempt"
+              # `gh run download` puts each artifact in its own subdir;
+              # flatten so the sign loop sees `dist/<file>` directly.
+              find dist -type f -mindepth 2 -exec mv -f {} dist/ \;
+              find dist -type d -empty -delete
+              ls -la dist/
+              exit 0
+            fi
+            echo "download attempt $attempt failed; retrying in 30s..."
+            sleep 30
+          done
+          echo "::error::failed to download artifacts after 3 attempts"
+          exit 1
+
+      - name: Sign artifacts
+        env:
+          # Whole secret-key file content (multi-line — the `untrusted
+          # comment` line plus the base64 key line). Pass it via env to
+          # avoid quoting issues inside a heredoc.
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          # rsign2 reads the key passphrase from RSIGN_PASSWORD when set
+          # (so we can sign non-interactively in CI). For passwordless
+          # keys (generated with `rsign generate -p ... -s ... -W`), an
+          # empty string here is correct.
+          RSIGN_PASSWORD: ${{ secrets.MINISIGN_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MHRV_UPDATE_PUBKEY:-}" ]; then
+            echo "::error::MINISIGN_SIGNING_ENABLED is true but MINISIGN_PUBLIC_KEY repo variable is empty"
+            exit 1
+          fi
+          if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
+            echo "::error::MINISIGN_SIGNING_ENABLED is true but MINISIGN_SECRET_KEY secret is empty"
+            exit 1
+          fi
+          # Write the key to a temp file. Use a strict umask so a stray
+          # `set -x` later doesn't expose it to other steps' logs (the
+          # file path is fine; the contents aren't).
+          umask 077
+          KEY_FILE="$(mktemp -t mhrv-sign-XXXXXX.key)"
+          # `printf` rather than `echo`: preserves the secret body without
+          # shell-specific escapes, while ensuring the file ends with a
+          # newline for tools that expect line-oriented minisign keys.
+          printf '%s\n' "${MINISIGN_SECRET_KEY}" > "${KEY_FILE}"
+
+          # Trap to wipe the key on any exit (success, failure, signal).
+          trap 'rm -f "${KEY_FILE}"' EXIT
+
+          shopt -s nullglob
+          signed=0
+          for f in dist/*.tar.gz dist/*.zip dist/*.apk; do
+            [ -f "$f" ] || continue
+            echo "::group::sign $(basename "$f")"
+            # `-W` = no password prompt (read from RSIGN_PASSWORD env)
+            # `-x <out>` = write the signature to a specific path so it
+            # lands as `<asset>.minisig` instead of rsign's default
+            # next-to-binary location.
+            rsign sign \
+              -W \
+              -s "${KEY_FILE}" \
+              -x "${f}.minisig" \
+              "$f"
+            ls -la "${f}.minisig"
+            echo "::endgroup::"
+            signed=$((signed + 1))
+          done
+          echo "signed ${signed} artifacts"
+          if [ "${signed}" -eq 0 ]; then
+            echo "::warning::no artifacts matched dist/*.{tar.gz,zip,apk}"
+          fi
+
+      - name: Upload signatures
+        uses: actions/upload-artifact@v4
+        with:
+          name: minisign-signatures
+          path: dist/*.minisig
+          if-no-files-found: error
+
   # Build + publish the tunnel-node Docker image to GHCR. Issue: every
   # full-mode user has to set up tunnel-node on a VPS, and "rustup +
   # cargo build --release" on a 1GB VPS is non-trivial — fails on memory,
@@ -589,7 +747,17 @@ jobs:
   # off the self-hosted runners avoids contention with Linux build jobs from
   # the next tag if two releases overlap.
   release:
-    needs: [build, android]
+    needs: [build, android, sign]
+    # When `sign` is skipped (signing not yet enabled in repo vars) we
+    # still want the release to proceed with unsigned artifacts. GH
+    # Actions' default behaviour skips dependent jobs whenever ANY needed
+    # job is skipped — this `if:` overrides that so a skipped `sign`
+    # doesn't block release, but a `sign` *failure* still does.
+    if: |
+      always()
+      && needs.build.result == 'success'
+      && needs.android.result == 'success'
+      && (needs.sign.result == 'success' || needs.sign.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -706,7 +874,16 @@ jobs:
   # `https://github.com/.../releases/tag/v...` for users who can reach
   # that URL — this in-repo folder is the fallback for users who can't.
   commit-releases:
-    needs: [build, android, release]
+    needs: [build, android, sign, release]
+    # Same skipped-sign escape hatch as the `release` job: `always()` keeps
+    # this job evaluable when `sign` is skipped, while the explicit success
+    # checks still block cancellations/failures from build/android/release.
+    if: |
+      always()
+      && needs.build.result == 'success'
+      && needs.android.result == 'success'
+      && needs.release.result == 'success'
+      && (needs.sign.result == 'success' || needs.sign.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -748,7 +925,8 @@ jobs:
             --dir artifacts \
             --pattern '*.tar.gz' \
             --pattern '*.zip' \
-            --pattern '*.apk'
+            --pattern '*.apk' \
+            --pattern '*.minisig'
           echo "--- artifacts/ contents ---"
           ls -la artifacts/
 
@@ -760,12 +938,12 @@ jobs:
 
           mkdir -p releases
 
-          # Wipe old binary artifacts (.apk, .tar.gz, .zip) but keep
-          # README.md and .gitattributes — those are folder-level docs
-          # that stay constant across versions and shouldn't be
+          # Wipe old binary artifacts (.apk, .tar.gz, .zip, .minisig) but
+          # keep README.md and .gitattributes — those are folder-level
+          # docs that stay constant across versions and shouldn't be
           # regenerated on every release.
           find releases -maxdepth 1 -type f \
-            \( -name '*.apk' -o -name '*.tar.gz' -o -name '*.zip' \) \
+            \( -name '*.apk' -o -name '*.tar.gz' -o -name '*.zip' -o -name '*.minisig' \) \
             -delete
 
           # Copy desktop archives. Their names already include the
@@ -781,6 +959,16 @@ jobs:
           # users on slow connections can grab a per-ABI APK (~37 MB)
           # instead of the universal (~110 MB).
           for f in artifacts/mhrv-rs-android-*.apk; do
+            [ -f "$f" ] || continue
+            cp "$f" "releases/$(basename "$f")"
+          done
+
+          # Minisign signatures, when present (signing is opt-in via the
+          # MINISIGN_SIGNING_ENABLED repo variable). Naming follows the
+          # `<asset>.minisig` convention the auto-updater expects, so a
+          # user who hits the in-repo `releases/` fallback path
+          # (GitHub-Releases-page filtered ISP) gets verified updates too.
+          for f in artifacts/*.minisig; do
             [ -f "$f" ] || continue
             cp "$f" "releases/$(basename "$f")"
           done

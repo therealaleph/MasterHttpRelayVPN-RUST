@@ -23,6 +23,12 @@ const WIN_HEIGHT: f32 = 680.0;
 const LOG_MAX: usize = 200;
 
 fn main() -> eframe::Result<()> {
+    // Auto-updater finalize step — must run before *anything* else
+    // because on Windows a staged `<exe>.new` is what got launched, and we
+    // need to rename it back to the canonical exe and re-exec before
+    // touching state, opening windows, etc.
+    mhrv_rs::update_apply::finalize_pending_at_startup();
+
     let _ = rustls::crypto::ring::default_provider().install_default();
     // Re-point HOME at the invoking user if this binary was launched
     // under sudo (see cert_installer::reconcile_sudo_environment). Must
@@ -153,6 +159,16 @@ struct UiState {
     /// One-line status of the most recent download (Ok(path) or Err(msg)).
     last_download: Option<Result<std::path::PathBuf, String>>,
     last_download_at: Option<Instant>,
+    /// Set while a stage-update (download + verify + extract + stage) is
+    /// in flight. Used to disable the Install button so a double-click
+    /// doesn't kick off two parallel downloads.
+    install_in_progress: bool,
+    /// Result of the most recent staging:
+    ///   - Ok(StagedUpdate)  → ready, show "Restart now" button
+    ///   - Err(msg)          → show the error inline
+    /// Cleared on next install attempt.
+    last_install: Option<Result<mhrv_rs::update_apply::StagedUpdate, String>>,
+    last_install_at: Option<Instant>,
 }
 
 #[derive(Clone, Debug)]
@@ -204,6 +220,18 @@ enum Cmd {
         url: String,
         name: String,
     },
+    /// Download + verify + extract + stage a release asset, ready to swap
+    /// in on next launch (or via restart_to_apply). Fires when the user
+    /// clicks the "Install update" button after a successful CheckUpdate
+    /// surfaces an UpdateAvailable with a matching platform asset.
+    InstallUpdate {
+        route: mhrv_rs::update_check::Route,
+        url: String,
+        name: String,
+    },
+    /// Perform the binary swap and re-launch. Fires when the user clicks
+    /// "Restart now" after staging completed.
+    RestartToApply,
 }
 
 struct App {
@@ -1452,7 +1480,7 @@ impl eframe::App for App {
             // Priority: update-check in flight > fresh test msg > fresh CA
             // result > update-check result. Old/expired entries are dropped.
             const TRANSIENT_TTL: Duration = Duration::from_secs(10);
-            let (test_msg_fresh, ca_trusted_fresh, update_check_fresh, download_fresh) = {
+            let (test_msg_fresh, ca_trusted_fresh, update_check_fresh, download_fresh, install_fresh) = {
                 let s = self.shared.state.lock().unwrap();
                 (
                     s.last_test_msg_at
@@ -1463,6 +1491,13 @@ impl eframe::App for App {
                         .map_or(false, |t| t.elapsed() < TRANSIENT_TTL),
                     s.last_download_at
                         .map_or(false, |t| t.elapsed() < TRANSIENT_TTL),
+                    // Install state stays "fresh" for as long as a successful
+                    // staging is parked — TTL only applies to errors. We need
+                    // the "Restart now" button to remain visible until the
+                    // user acts on it.
+                    s.install_in_progress
+                        || matches!(s.last_install, Some(Ok(_)))
+                        || s.last_install_at.map_or(false, |t| t.elapsed() < TRANSIENT_TTL),
                 )
             };
 
@@ -1496,24 +1531,49 @@ impl eframe::App for App {
                         {
                             ui.hyperlink_to("open release", release_url);
                             if let Some(a) = asset {
-                                let dl_in_flight = self.shared.state.lock().unwrap().download_in_progress;
+                                let (dl_in_flight, install_in_flight) = {
+                                    let s = self.shared.state.lock().unwrap();
+                                    (s.download_in_progress, s.install_in_progress)
+                                };
                                 if dl_in_flight {
                                     ui.small(
                                         egui::RichText::new("downloading…")
                                             .color(egui::Color32::GRAY),
                                     );
+                                } else if install_in_flight {
+                                    ui.small(
+                                        egui::RichText::new("installing…")
+                                            .color(egui::Color32::GRAY),
+                                    );
                                 } else {
-                                    let btn = egui::Button::new(
+                                    // Primary action: Install (download + verify
+                                    // + extract + stage + restart). Secondary:
+                                    // plain download, for users who'd rather
+                                    // place the asset in Downloads and apply it
+                                    // by hand.
+                                    let install_btn = egui::Button::new(
                                         egui::RichText::new(format!(
-                                            "⤓ Download {} ({:.1} MB)",
-                                            a.name,
+                                            "⟳ Install update ({:.1} MB)",
                                             a.size_bytes as f64 / 1_048_576.0
                                         ))
                                         .color(egui::Color32::WHITE),
                                     )
                                     .fill(ACCENT)
                                     .rounding(4.0);
-                                    if ui.add(btn).clicked() {
+                                    if ui.add(install_btn).clicked() {
+                                        let route = self.update_check_route();
+                                        let _ = self.cmd_tx.send(Cmd::InstallUpdate {
+                                            route,
+                                            url: a.download_url.clone(),
+                                            name: a.name.clone(),
+                                        });
+                                    }
+                                    if ui.small_button(format!(
+                                        "download only ({:.1} MB)",
+                                        a.size_bytes as f64 / 1_048_576.0
+                                    ))
+                                    .clicked()
+                                    {
                                         let route = self.update_check_route();
                                         let _ = self.cmd_tx.send(Cmd::DownloadUpdate {
                                             route,
@@ -1534,6 +1594,47 @@ impl eframe::App for App {
                     ERR_RED
                 };
                 ui.small(egui::RichText::new(last_test_msg).color(color));
+                shown_any = true;
+            } else if install_fresh {
+                let install_state = {
+                    let s = self.shared.state.lock().unwrap();
+                    (s.install_in_progress, s.last_install.clone())
+                };
+                match install_state {
+                    (true, _) => {
+                        ui.small(
+                            egui::RichText::new("Installing update… (downloading + verifying)")
+                                .color(egui::Color32::GRAY),
+                        );
+                    }
+                    (false, Some(Ok(staged))) => {
+                        ui.horizontal(|ui| {
+                            ui.small(
+                                egui::RichText::new(format!(
+                                    "Update staged → {}",
+                                    staged.staged_path.display()
+                                ))
+                                .color(OK_GREEN),
+                            );
+                            let restart_btn = egui::Button::new(
+                                egui::RichText::new("⟳ Restart now to apply")
+                                    .color(egui::Color32::WHITE),
+                            )
+                            .fill(ACCENT)
+                            .rounding(4.0);
+                            if ui.add(restart_btn).clicked() {
+                                let _ = self.cmd_tx.send(Cmd::RestartToApply);
+                            }
+                        });
+                    }
+                    (false, Some(Err(msg))) => {
+                        ui.small(
+                            egui::RichText::new(format!("Install failed: {}", msg))
+                                .color(ERR_RED),
+                        );
+                    }
+                    (false, None) => {}
+                }
                 shown_any = true;
             } else if download_fresh {
                 let dl = self.shared.state.lock().unwrap().last_download.clone();
@@ -2275,28 +2376,110 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                     let dir = downloads_dir();
                     let out = dir.join(&name);
                     let result = mhrv_rs::update_check::download_asset(route, &url, &out).await;
-                    let mut st = shared2.state.lock().unwrap();
-                    st.download_in_progress = false;
-                    st.last_download_at = Some(Instant::now());
-                    match result {
+                    let log_msg = match result {
                         Ok(bytes) => {
-                            push_log(
-                                &shared2,
-                                &format!(
-                                    "[ui] download ok: {} ({} bytes) -> {}",
-                                    name,
-                                    bytes,
-                                    out.display()
-                                ),
+                            let log_msg = format!(
+                                "[ui] download ok: {} ({} bytes) -> {}",
+                                name,
+                                bytes,
+                                out.display()
                             );
+                            let mut st = shared2.state.lock().unwrap();
+                            st.download_in_progress = false;
+                            st.last_download_at = Some(Instant::now());
                             st.last_download = Some(Ok(out));
+                            log_msg
                         }
                         Err(e) => {
-                            push_log(&shared2, &format!("[ui] download failed: {}", e));
+                            let log_msg = format!("[ui] download failed: {}", e);
+                            let mut st = shared2.state.lock().unwrap();
+                            st.download_in_progress = false;
+                            st.last_download_at = Some(Instant::now());
                             st.last_download = Some(Err(e));
+                            log_msg
                         }
-                    }
+                    };
+                    push_log(&shared2, &log_msg);
                 });
+            }
+            Ok(Cmd::InstallUpdate { route, url, name }) => {
+                let shared2 = shared.clone();
+                let already_in_progress = {
+                    let mut st = shared2.state.lock().unwrap();
+                    if st.install_in_progress {
+                        true
+                    } else {
+                        st.install_in_progress = true;
+                        st.last_install = None;
+                        st.last_install_at = Some(Instant::now());
+                        false
+                    }
+                };
+                if already_in_progress {
+                    push_log(
+                        &shared,
+                        "[ui] install already in progress; ignoring duplicate request",
+                    );
+                    continue;
+                }
+                push_log(&shared, &format!("[ui] installing {}", name));
+                rt.spawn(async move {
+                    let result =
+                        mhrv_rs::update_apply::download_and_stage(route, &url, &name).await;
+                    let log_msg = match result {
+                        Ok(staged) => {
+                            let log_msg = format!(
+                                "[ui] update staged → {} (restart to apply)",
+                                staged.staged_path.display()
+                            );
+                            let mut st = shared2.state.lock().unwrap();
+                            st.install_in_progress = false;
+                            st.last_install_at = Some(Instant::now());
+                            st.last_install = Some(Ok(staged));
+                            log_msg
+                        }
+                        Err(e) => {
+                            let log_msg = format!("[ui] install failed: {}", e);
+                            let mut st = shared2.state.lock().unwrap();
+                            st.install_in_progress = false;
+                            st.last_install_at = Some(Instant::now());
+                            st.last_install = Some(Err(e.to_string()));
+                            log_msg
+                        }
+                    };
+                    push_log(&shared2, &log_msg);
+                });
+            }
+            Ok(Cmd::RestartToApply) => {
+                // Pull the staged update out of UiState. If it's missing
+                // we have nothing to do — the user shouldn't have been able
+                // to click Restart in that case, but a UI race could let it
+                // through. Also need to do the swap on this thread so the
+                // process can exec/exit cleanly without the egui loop
+                // continuing afterwards.
+                let staged = shared
+                    .state
+                    .lock()
+                    .unwrap()
+                    .last_install
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok().cloned());
+                if let Some(staged) = staged {
+                    push_log(&shared, "[ui] restarting to apply update");
+                    if let Err(e) = mhrv_rs::update_apply::restart_to_apply(&staged) {
+                        push_log(&shared, &format!("[ui] restart failed: {}", e));
+                        let mut st = shared.state.lock().unwrap();
+                        st.last_install = Some(Err(format!("restart failed: {}", e)));
+                        st.last_install_at = Some(Instant::now());
+                    }
+                    // restart_to_apply doesn't return on success — control
+                    // never reaches here in the happy path.
+                } else {
+                    push_log(
+                        &shared,
+                        "[ui] restart requested but no staged update is available",
+                    );
+                }
             }
             Err(_) => {}
         }

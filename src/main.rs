@@ -136,6 +136,12 @@ fn init_logging(level: &str) {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Auto-updater finalize step. If a previous run staged a `<exe>.new`
+    // next to us, finish the swap (Windows: rename + re-exec; Unix:
+    // late-apply rename) before any other init touches state. Best-effort:
+    // a failure logs and falls through.
+    mhrv_rs::update_apply::finalize_pending_at_startup();
+
     // Install default rustls crypto provider (ring).
     let _ = rustls::crypto::ring::default_provider().install_default();
 

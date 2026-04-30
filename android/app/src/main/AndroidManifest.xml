@@ -19,6 +19,15 @@
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
 
     <!--
+      Required so we can hand a downloaded APK to the system installer
+      via Intent(ACTION_VIEW, application/vnd.android.package-archive).
+      On API 26+ the user additionally has to grant "Install unknown apps"
+      for this package in system settings — we route them there from
+      UpdateInstaller.openUnknownSourcesSettings when the toggle is off.
+    -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+    <!--
       App-launcher visibility filter. Complements QUERY_ALL_PACKAGES:
       the system uses `<queries>` as the allowlist for metadata reads
       (labels, icons) so we can render the picker rows with the app

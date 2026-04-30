@@ -2,5 +2,6 @@
 /dist
 /ca
 /config.json
+/android/.kotlin/
 .DS_Store
 /SCR-*.png

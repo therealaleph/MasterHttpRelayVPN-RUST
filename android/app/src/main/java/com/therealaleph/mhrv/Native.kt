@@ -70,14 +70,30 @@ object Native {
      * Ask GitHub's Releases API whether a newer version of mhrv-rs is
      * out. Returns a JSON blob, one of:
      *   - `{"kind":"upToDate","current":"1.0.0","latest":"1.0.0"}`
-     *   - `{"kind":"updateAvailable","current":"1.0.0","latest":"1.1.0","url":"https://..."}`
+     *   - `{"kind":"updateAvailable","current":"1.0.0","latest":"1.1.0","url":"https://...",`
+     *     `"assetName":"...apk","assetUrl":"https://...","assetSize":12345}`
      *   - `{"kind":"offline","reason":"..."}`
      *   - `{"kind":"error","reason":"..."}`
+     *
+     * The `assetName/Url/Size` fields appear on `updateAvailable` when the
+     * Rust-side picker matched a per-ABI APK in the release. The auto-
+     * updater (UpdateInstaller.kt) uses these to fetch the right APK.
      *
      * BLOCKS (HTTPS round-trip); call from a background dispatcher.
      * Same check the desktop UI runs — same result format.
      */
     external fun checkUpdate(): String
+
+    /**
+     * Download a release asset (typically an APK) to `destPath` using the
+     * Rust-side rustls client. Signed release builds also fetch and verify
+     * the sibling `.minisig` before returning success. Returns a JSON blob:
+     *   - `{"ok":true,"bytes":12345678}`
+     *   - `{"ok":false,"error":"..."}`
+     *
+     * BLOCKS (large download); call from `Dispatchers.IO`.
+     */
+    external fun downloadAsset(url: String, destPath: String): String
 
     /**
      * Live traffic/usage counters for a running proxy handle. Returns a

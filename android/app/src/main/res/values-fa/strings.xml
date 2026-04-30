@@ -81,6 +81,15 @@
     <string name="snack_google_ip_current">google_ip قبلاً به‌روز است (%1$s)</string>
     <string name="snack_dns_lookup_failed">خطای DNS — اتصال شبکه را بررسی کنید</string>
     <string name="snack_logs_copied">لاگ‌ها در کلیپ‌بورد کپی شدند</string>
+    <string name="snack_update_available_url">به‌روزرسانی نسخهٔ %1$s → %2$s  %3$s</string>
+    <string name="snack_update_available">به‌روزرسانی موجود است: نسخهٔ %1$s → %2$s</string>
+    <string name="snack_update_enable_unknown_apps">برای mhrv-rs گزینهٔ «Install unknown apps» را فعال کنید، سپس برای تلاش دوباره روی برچسب نسخه بزنید.</string>
+    <string name="snack_update_downloading">در حال دانلود و بررسی به‌روزرسانی… (%1$.1f MB)</string>
+    <string name="snack_update_open_installer_failed">باز کردن نصب‌کننده ممکن نبود: %1$s</string>
+    <string name="snack_update_download_failed">دانلود ناموفق بود: %1$s</string>
+    <string name="snack_update_download_crashed">دانلود متوقف شد: %1$s</string>
+    <string name="snack_update_apk_empty">فایل APK دانلودشده خالی است.</string>
+    <string name="snack_update_apk_size_mismatch">اندازهٔ APK دانلودشده ناهماهنگ است (%1$d از %2$d بایت).</string>
 
     <!-- Usage today card -->
     <string name="sec_usage_today">مصرف امروز (تخمینی)</string>

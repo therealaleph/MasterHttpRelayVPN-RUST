@@ -27,7 +27,7 @@ default = []
 ui = ["dep:eframe"]
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "signal", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "signal", "sync", "fs"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
@@ -49,6 +49,7 @@ http = "1"
 flate2 = "1"
 directories = "5"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+minisign-verify = "0.2"
 # 64-bit atomics on 32-bit MIPS/ARMv5 targets. Rust's std AtomicU64 is
 # only available on targets that expose native 64-bit atomics, which
 # mipsel-unknown-linux-musl does not — `AtomicU64` resolves to "no
@@ -82,6 +83,17 @@ url = "2.5.8"
 # pulled in transitively via tokio, so zero new weight.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Desktop auto-updater deps. Android uses Android's PackageInstaller for
+# APK swap, so it doesn't need any of this — keeping these scoped to
+# non-android keeps the Android cdylib lean.
+#   zip                 → unpack windows-amd64.zip / macos-*-app.zip release assets
+#   tar                 → unpack linux/macos *.tar.gz release assets
+#   tempfile            → scratch dir for download/extract before staging
+[target.'cfg(not(target_os = "android"))'.dependencies]
+zip = { version = "2", default-features = false, features = ["deflate"] }
+tar = "0.4.45"
+tempfile = "3"
 
 # Android-only deps: jni gives us the extern "system" wrappers used in
 # src/android_jni.rs; zero cost on any other platform because the whole

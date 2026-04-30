@@ -96,6 +96,15 @@
     <string name="snack_google_ip_current">google_ip already current (%1$s)</string>
     <string name="snack_dns_lookup_failed">DNS lookup failed — check network</string>
     <string name="snack_logs_copied">Logs copied to clipboard</string>
+    <string name="snack_update_available_url">Update v%1$s → v%2$s  %3$s</string>
+    <string name="snack_update_available">Update available: v%1$s → v%2$s</string>
+    <string name="snack_update_enable_unknown_apps">Enable "Install unknown apps" for mhrv-rs, then tap the version label to retry.</string>
+    <string name="snack_update_downloading">Downloading and verifying update… (%1$.1f MB)</string>
+    <string name="snack_update_open_installer_failed">Couldn\'t open installer: %1$s</string>
+    <string name="snack_update_download_failed">Download failed: %1$s</string>
+    <string name="snack_update_download_crashed">Download crashed: %1$s</string>
+    <string name="snack_update_apk_empty">Downloaded APK was empty.</string>
+    <string name="snack_update_apk_size_mismatch">Downloaded APK size mismatch (%1$d of %2$d bytes).</string>
 
     <!-- Usage today card -->
     <string name="sec_usage_today">Usage today (estimated)</string>

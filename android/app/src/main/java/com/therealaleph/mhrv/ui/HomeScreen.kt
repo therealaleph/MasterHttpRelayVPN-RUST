@@ -44,6 +44,7 @@ import com.therealaleph.mhrv.NetworkDetect
 import com.therealaleph.mhrv.R
 import com.therealaleph.mhrv.SplitMode
 import com.therealaleph.mhrv.UiLang
+import com.therealaleph.mhrv.UpdateInstaller
 import com.therealaleph.mhrv.VpnState
 import androidx.compose.ui.res.stringResource
 import com.therealaleph.mhrv.ui.theme.ErrRed
@@ -118,15 +119,9 @@ fun HomeScreen(
         val json = withContext(Dispatchers.IO) {
             runCatching { Native.checkUpdate() }.getOrNull()
         }
-        if (json != null) {
-            val obj = runCatching { JSONObject(json) }.getOrNull()
-            if (obj?.optString("kind") == "updateAvailable") {
-                snackbar.showSnackbar(
-                    "Update available: v${obj.optString("current")} → " +
-                    "v${obj.optString("latest")}  ${obj.optString("url")}",
-                    withDismissAction = true,
-                )
-            }
+        val state = UpdateInstaller.parseCheckResult(json)
+        if (state is UpdateInstaller.State.Available) {
+            offerInstall(ctx, scope, snackbar, state)
         }
     }
 
@@ -223,8 +218,15 @@ fun HomeScreen(
                                 val json = withContext(Dispatchers.IO) {
                                     runCatching { Native.checkUpdate() }.getOrNull()
                                 }
-                                val msg = summarizeUpdateCheck(json)
-                                snackbar.showSnackbar(msg, withDismissAction = true)
+                                val state = UpdateInstaller.parseCheckResult(json)
+                                if (state is UpdateInstaller.State.Available) {
+                                    offerInstall(ctx, scope, snackbar, state)
+                                } else {
+                                    snackbar.showSnackbar(
+                                        summarizeUpdateCheck(json),
+                                        withDismissAction = true,
+                                    )
+                                }
                                 checking = false
                             }
                         },
@@ -1097,6 +1099,108 @@ private fun ProbeBadge(state: ProbeState) {
                 tint = MaterialTheme.colorScheme.error,
                 modifier = Modifier.size(16.dp),
             )
+        }
+    }
+}
+
+/**
+ * Show the "Update available" snackbar with an `Install` action. Tapping
+ * Install kicks off the full sideload flow:
+ *   1. If the device is API 26+ and "Install unknown apps" isn't yet
+ *      granted for us, route the user to that settings page (single
+ *      one-time tap by the user — Android remembers the choice). After
+ *      they grant it, they tap the version label again to retry.
+ *   2. Download and verify the per-ABI APK via `Native.downloadAsset`
+ *      (rustls + minisign when the build embeds an update public key).
+ *   3. Hand the APK to the OS installer; the user confirms the install
+ *      in the standard "Update existing app?" dialog. After install the
+ *      OS replaces our process — no callback, but the new build launches
+ *      from the home screen icon as normal.
+ *
+ * If the API response didn't include an `assetUrl` (e.g. the user is on
+ * an unsupported ABI, or the release didn't ship a per-ABI APK we
+ * recognise) we fall back to a plain message with the release URL.
+ */
+private fun offerInstall(
+    ctx: android.content.Context,
+    scope: kotlinx.coroutines.CoroutineScope,
+    snackbar: SnackbarHostState,
+    state: UpdateInstaller.State.Available,
+) {
+    scope.launch {
+        val asset = state.asset
+        if (asset == null) {
+            snackbar.showSnackbar(
+                ctx.getString(
+                    R.string.snack_update_available_url,
+                    state.current,
+                    state.latest,
+                    state.releaseUrl,
+                ),
+                withDismissAction = true,
+            )
+            return@launch
+        }
+
+        val msg = ctx.getString(
+            R.string.snack_update_available,
+            state.current,
+            state.latest,
+        )
+        val result = snackbar.showSnackbar(
+            message = msg,
+            actionLabel = ctx.getString(R.string.btn_install),
+            withDismissAction = true,
+            duration = SnackbarDuration.Indefinite,
+        )
+        if (result != SnackbarResult.ActionPerformed) return@launch
+
+        if (!UpdateInstaller.canInstallUnknownApps(ctx)) {
+            UpdateInstaller.openUnknownSourcesSettings(ctx)
+            snackbar.showSnackbar(
+                ctx.getString(R.string.snack_update_enable_unknown_apps),
+                withDismissAction = true,
+            )
+            return@launch
+        }
+
+        // `showSnackbar` is a suspend fun that suspends until the snackbar
+        // is dismissed or replaced. With Indefinite + no action button +
+        // no dismiss button, the only way to release that suspension is
+        // a sibling coroutine cancelling/replacing it — running the
+        // download on the same coroutine would deadlock here.
+        val snackJob = scope.launch {
+            snackbar.showSnackbar(
+                ctx.getString(
+                    R.string.snack_update_downloading,
+                    asset.sizeBytes.toDouble() / 1_048_576.0,
+                ),
+                withDismissAction = false,
+                duration = SnackbarDuration.Indefinite,
+            )
+        }
+        val dl = try {
+            UpdateInstaller.downloadApk(ctx, asset)
+        } finally {
+            snackJob.cancel()
+        }
+        when (dl) {
+            is UpdateInstaller.State.ReadyToInstall -> {
+                runCatching { UpdateInstaller.launchInstaller(ctx, dl.apk) }
+                    .onFailure {
+                        snackbar.showSnackbar(
+                            ctx.getString(
+                                R.string.snack_update_open_installer_failed,
+                                it.message ?: "",
+                            ),
+                            withDismissAction = true,
+                        )
+                    }
+            }
+            is UpdateInstaller.State.Failed -> {
+                snackbar.showSnackbar(dl.reason, withDismissAction = true)
+            }
+            else -> { /* unreachable for downloadApk's return type */ }
         }
     }
 }
