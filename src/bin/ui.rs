@@ -272,6 +272,14 @@ struct FormState {
     /// there is no UI editor for these yet, only file-edited config.
     /// See config.rs `fronting_groups`.
     fronting_groups: Vec<FrontingGroup>,
+    /// Auto-blacklist tuning + per-batch timeout. Config-only knobs (no UI
+    /// fields yet — power-user file edit). Round-tripped through FormState
+    /// so Save preserves the user's hand-edited values. See config.rs
+    /// `auto_blacklist_*` and `request_timeout_secs`.
+    auto_blacklist_strikes: u32,
+    auto_blacklist_window_secs: u64,
+    auto_blacklist_cooldown_secs: u64,
+    request_timeout_secs: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -369,6 +377,10 @@ fn load_form() -> (FormState, Option<String>) {
             tunnel_doh: c.tunnel_doh,
             bypass_doh_hosts: c.bypass_doh_hosts.clone(),
             fronting_groups: c.fronting_groups.clone(),
+            auto_blacklist_strikes: c.auto_blacklist_strikes,
+            auto_blacklist_window_secs: c.auto_blacklist_window_secs,
+            auto_blacklist_cooldown_secs: c.auto_blacklist_cooldown_secs,
+            request_timeout_secs: c.request_timeout_secs,
         }
     } else {
         FormState {
@@ -401,6 +413,12 @@ fn load_form() -> (FormState, Option<String>) {
             tunnel_doh: true,
             bypass_doh_hosts: Vec::new(),
             fronting_groups: Vec::new(),
+            // Defaults match `default_auto_blacklist_*` and
+            // `default_request_timeout_secs` in src/config.rs.
+            auto_blacklist_strikes: 3,
+            auto_blacklist_window_secs: 30,
+            auto_blacklist_cooldown_secs: 120,
+            request_timeout_secs: 30,
         }
     };
     (form, load_err)
@@ -567,6 +585,14 @@ impl FormState {
             // batch alongside the system-proxy toggle (#432).
             coalesce_step_ms: 0,
             coalesce_max_ms: 0,
+            // Auto-blacklist + batch timeout: config-only knobs (#391,
+            // #444, #430). Round-trip through FormState so Save doesn't
+            // drop hand-edited values. UI editor planned alongside the
+            // v1.8.x desktop UI batch.
+            auto_blacklist_strikes: self.auto_blacklist_strikes,
+            auto_blacklist_window_secs: self.auto_blacklist_window_secs,
+            auto_blacklist_cooldown_secs: self.auto_blacklist_cooldown_secs,
+            request_timeout_secs: self.request_timeout_secs,
         })
     }
 }
@@ -626,7 +652,24 @@ struct ConfigWire<'a> {
     bypass_doh_hosts: &'a Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     fronting_groups: &'a Vec<FrontingGroup>,
+    /// Auto-blacklist tuning + batch timeout (#391, #444, #430). Skip
+    /// serialization when matching the historical defaults so unchanged
+    /// configs stay clean — only emitted when the user has explicitly
+    /// tuned them.
+    #[serde(skip_serializing_if = "is_default_strikes")]
+    auto_blacklist_strikes: u32,
+    #[serde(skip_serializing_if = "is_default_window_secs")]
+    auto_blacklist_window_secs: u64,
+    #[serde(skip_serializing_if = "is_default_cooldown_secs")]
+    auto_blacklist_cooldown_secs: u64,
+    #[serde(skip_serializing_if = "is_default_timeout_secs")]
+    request_timeout_secs: u64,
 }
+
+fn is_default_strikes(v: &u32) -> bool { *v == 3 }
+fn is_default_window_secs(v: &u64) -> bool { *v == 30 }
+fn is_default_cooldown_secs(v: &u64) -> bool { *v == 120 }
+fn is_default_timeout_secs(v: &u64) -> bool { *v == 30 }
 
 fn is_false(b: &bool) -> bool {
     !*b
@@ -677,6 +720,10 @@ impl<'a> From<&'a Config> for ConfigWire<'a> {
             tunnel_doh: c.tunnel_doh,
             bypass_doh_hosts: &c.bypass_doh_hosts,
             fronting_groups: &c.fronting_groups,
+            auto_blacklist_strikes: c.auto_blacklist_strikes,
+            auto_blacklist_window_secs: c.auto_blacklist_window_secs,
+            auto_blacklist_cooldown_secs: c.auto_blacklist_cooldown_secs,
+            request_timeout_secs: c.request_timeout_secs,
         }
     }
 }

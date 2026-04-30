@@ -1405,7 +1405,24 @@ async fn main() {
         .init();
 
     let auth_key = std::env::var("TUNNEL_AUTH_KEY").unwrap_or_else(|_| {
-        tracing::warn!("TUNNEL_AUTH_KEY not set — using default (INSECURE)");
+        // Catch the recurring `MHRV_AUTH_KEY` typo (#391, #444). Several old
+        // copy-paste guides used `MHRV_AUTH_KEY` for the docker run; tunnel-node
+        // never read that name and silently fell through to `changeme`,
+        // producing baffling AUTH_KEY-mismatch decoys on the client. If
+        // `MHRV_AUTH_KEY` is set, point at it specifically so the user sees
+        // why their value isn't taking effect.
+        if std::env::var("MHRV_AUTH_KEY").is_ok() {
+            tracing::warn!(
+                "MHRV_AUTH_KEY is set but TUNNEL_AUTH_KEY is not — \
+                 tunnel-node only reads TUNNEL_AUTH_KEY (uppercase, with \
+                 underscores). Rename your env var: \
+                 `docker run ... -e TUNNEL_AUTH_KEY=<your-secret>`. Falling \
+                 back to default `changeme` for now (INSECURE — clients will \
+                 fail with AUTH_KEY mismatch decoys until this is fixed)."
+            );
+        } else {
+            tracing::warn!("TUNNEL_AUTH_KEY not set — using default (INSECURE)");
+        }
         "changeme".into()
     });
     let port: u16 = std::env::var("PORT")

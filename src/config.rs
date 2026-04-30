@@ -291,6 +291,47 @@ pub struct Config {
     /// to the DoH bypass. Empty / missing = feature off.
     #[serde(default)]
     pub fronting_groups: Vec<FrontingGroup>,
+
+    /// Auto-blacklist tuning — how many timeouts within the window
+    /// trip a per-deployment cooldown.
+    ///
+    /// Default `3` matches the historical behavior. Single-deployment
+    /// users who hit transient network blips have reported (#391, #444)
+    /// that 3 strikes are too few — one cold-start stall plus two
+    /// network glitches lock out their only relay path. Bumping to
+    /// `5` or `6` is a reasonable workaround for that case.
+    ///
+    /// Multi-deployment users with 10+ healthy alternatives can lower
+    /// this (e.g. `2`) to fail-fast off a flaky deployment without
+    /// burning latency on retries.
+    #[serde(default = "default_auto_blacklist_strikes")]
+    pub auto_blacklist_strikes: u32,
+
+    /// Window (seconds) for the auto-blacklist strike counter. Strikes
+    /// older than this are dropped. Default `30`. Larger windows make
+    /// the heuristic less twitchy at the cost of holding state longer
+    /// for deployments that have already recovered.
+    #[serde(default = "default_auto_blacklist_window_secs")]
+    pub auto_blacklist_window_secs: u64,
+
+    /// Cooldown (seconds) when the strike threshold trips. Default
+    /// `120`. Single-deployment users who can't afford a 2-min lockout
+    /// when their only relay misbehaves can drop to `30` or `60`. Multi-
+    /// deployment users with healthy alternatives can extend to `600`
+    /// to keep a known-bad deployment out of rotation longer.
+    #[serde(default = "default_auto_blacklist_cooldown_secs")]
+    pub auto_blacklist_cooldown_secs: u64,
+
+    /// Per-batch HTTP round-trip timeout (seconds). Default `30` —
+    /// matches Apps Script's typical response cliff and historical
+    /// `BATCH_TIMEOUT` constant. Slow Iran ISP networks may want `45`
+    /// or `60` to give Apps Script time to respond past throttle
+    /// windows. Networks with fail-fast preference may want `15` to
+    /// retry sooner when a deployment hangs. Floor `5`, ceiling `300`
+    /// (anything beyond exceeds Apps Script's hard 6-min cap with
+    /// no benefit).
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
 }
 
 /// One multi-edge fronting group. Edge CDNs like Vercel and Fastly
@@ -341,6 +382,16 @@ fn default_google_ip_validation() -> bool {true}
 /// dominant userbase. Users on networks where direct DoH works can
 /// opt back in with `tunnel_doh: false`.
 fn default_tunnel_doh() -> bool { true }
+
+/// Defaults for the auto-blacklist tuning knobs (#391, #444). These
+/// preserve historical behavior — `3 strikes / 30s window / 120s cooldown`.
+fn default_auto_blacklist_strikes() -> u32 { 3 }
+fn default_auto_blacklist_window_secs() -> u64 { 30 }
+fn default_auto_blacklist_cooldown_secs() -> u64 { 120 }
+
+/// Default for `request_timeout_secs`: 30s, matching the historical
+/// hard-coded `BATCH_TIMEOUT` and Apps Script's typical response cliff.
+fn default_request_timeout_secs() -> u64 { 30 }
 
 fn default_google_ip() -> String {
     "216.239.38.120".into()

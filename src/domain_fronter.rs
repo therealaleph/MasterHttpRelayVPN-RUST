@@ -140,6 +140,17 @@ pub struct DomainFronter {
     /// payloads. Mirrors `Config::disable_padding` (#391). Default false
     /// (padding active = stronger DPI defense at +25% bandwidth cost).
     disable_padding: bool,
+    /// Per-instance auto-blacklist tuning. Mirrors `Config::auto_blacklist_*`
+    /// (#391, #444). Cached here so the hot path in `record_timeout_strike`
+    /// doesn't have to reach back through the Config (which we don't keep
+    /// a reference to).
+    auto_blacklist_strikes: u32,
+    auto_blacklist_window: Duration,
+    auto_blacklist_cooldown: Duration,
+    /// Per-batch HTTP timeout. Mirrors `Config::request_timeout_secs`
+    /// (#430, masterking32 PR #25). Read by `tunnel_client::fire_batch`
+    /// so a single config field tunes the timeout used everywhere.
+    batch_timeout: Duration,
 }
 
 /// Aggregated stats for one remote host.
@@ -163,20 +174,11 @@ impl HostStat {
 
 const BLACKLIST_COOLDOWN_SECS: u64 = 600;
 
-/// Sliding window for the timeout-strike blacklist heuristic. Three
-/// timeouts within this window on a single deployment trip the
-/// blacklist. Tuned so a single cold-start stall plus one transient
-/// network blip won't false-trigger, but a deployment that's actually
-/// dead (stale `TUNNEL_SERVER_URL`, paused project, dropped script)
-/// fails fast instead of poisoning round-robin until the user notices.
-const TIMEOUT_STRIKE_WINDOW: Duration = Duration::from_secs(30);
-const TIMEOUT_STRIKE_LIMIT: u32 = 3;
-
-/// Cooldown for a deployment blacklisted via the timeout-strike path.
-/// Distinct from `BLACKLIST_COOLDOWN_SECS` (10 min) because timeouts
-/// are a much noisier signal than quota errors — if the deployment
-/// recovers, we want to rejoin in minutes, not after a 10-min penalty.
-const TIMEOUT_BLACKLIST_COOLDOWN_SECS: u64 = 120;
+/// Auto-blacklist defaults are now per-instance fields on `DomainFronter`,
+/// driven by `Config::auto_blacklist_strikes` / `_window_secs` /
+/// `_cooldown_secs` (#391, #444). The constants below are gone — see the
+/// `Config` doc comments for tuning guidance and `default_auto_blacklist_*`
+/// for the historical defaults (3 strikes / 30s window / 120s cooldown).
 
 /// Request payload sent to Apps Script (single, non-batch).
 #[derive(Serialize)]
@@ -299,7 +301,24 @@ impl DomainFronter {
             today_bytes: AtomicU64::new(0),
             today_key: std::sync::Mutex::new(current_pt_day_key()),
             disable_padding: config.disable_padding,
+            auto_blacklist_strikes: config.auto_blacklist_strikes.max(1),
+            auto_blacklist_window: Duration::from_secs(
+                config.auto_blacklist_window_secs.clamp(1, 3600),
+            ),
+            auto_blacklist_cooldown: Duration::from_secs(
+                config.auto_blacklist_cooldown_secs.clamp(1, 86400),
+            ),
+            batch_timeout: Duration::from_secs(
+                config.request_timeout_secs.clamp(5, 300),
+            ),
         })
+    }
+
+    /// Per-batch HTTP round-trip timeout. Read by `tunnel_client` so the
+    /// `BATCH_TIMEOUT` constant doesn't have to be touched on every config
+    /// change. Clamped to `[5s, 300s]` at construction.
+    pub(crate) fn batch_timeout(&self) -> Duration {
+        self.batch_timeout
     }
 
     /// Record one relay call toward the daily budget. Called once per
@@ -483,22 +502,22 @@ impl DomainFronter {
         let entry = counts
             .entry(script_id.to_string())
             .or_insert((now, 0));
-        if now.duration_since(entry.0) > TIMEOUT_STRIKE_WINDOW {
+        if now.duration_since(entry.0) > self.auto_blacklist_window {
             *entry = (now, 1);
         } else {
             entry.1 += 1;
         }
         let strikes = entry.1;
-        if strikes >= TIMEOUT_STRIKE_LIMIT {
+        if strikes >= self.auto_blacklist_strikes {
             counts.remove(script_id);
             drop(counts);
             self.blacklist_script_for(
                 script_id,
-                Duration::from_secs(TIMEOUT_BLACKLIST_COOLDOWN_SECS),
+                self.auto_blacklist_cooldown,
                 &format!(
                     "{} timeouts in {}s",
                     strikes,
-                    TIMEOUT_STRIKE_WINDOW.as_secs()
+                    self.auto_blacklist_window.as_secs()
                 ),
             );
         }

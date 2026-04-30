@@ -38,10 +38,11 @@ const MAX_BATCH_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 /// serializing too many sessions behind a single HTTP round-trip.
 const MAX_BATCH_OPS: usize = 50;
 
-/// Timeout for a single batch HTTP round-trip. If the tunnel-node or Apps
-/// Script takes longer than this, the batch fails and sessions get error
-/// replies rather than hanging forever.
-const BATCH_TIMEOUT: Duration = Duration::from_secs(30);
+// Per-batch HTTP round-trip timeout is now read from
+// `DomainFronter::batch_timeout()`, sourced from `Config::request_timeout_secs`
+// (#430, masterking32 PR #25). The historical default — 30 s, matching Apps
+// Script's typical response cliff — lives in `default_request_timeout_secs`
+// in `config.rs`.
 
 /// Timeout for a session waiting for its batch reply. If the batch task
 /// is slow (e.g. one op in the batch has a dead target on the tunnel-node
@@ -820,10 +821,12 @@ async fn fire_batch(
         let t0 = std::time::Instant::now();
         let n_ops = data_ops.len();
 
-        // Bounded-wait: if the batch takes longer than BATCH_TIMEOUT,
-        // all sessions in this batch get an error and can retry.
+        // Bounded-wait: if the batch takes longer than the configured
+        // batch timeout (Config::request_timeout_secs), all sessions in
+        // this batch get an error and can retry.
+        let batch_timeout = f.batch_timeout();
         let result = tokio::time::timeout(
-            BATCH_TIMEOUT,
+            batch_timeout,
             f.tunnel_batch_request_to(&script_id, &data_ops),
         )
         .await;
@@ -930,14 +933,14 @@ async fn fire_batch(
                 }
             }
             Err(_) => {
-                // Whole-batch budget (`BATCH_TIMEOUT`, 30 s) elapsed. Even
-                // stronger signal than a per-read timeout — count it the same
-                // way so a truly-stuck deployment exits round-robin fast.
+                // Whole-batch budget elapsed. Even stronger signal than a
+                // per-read timeout — count it the same way so a truly-stuck
+                // deployment exits round-robin fast.
                 f.record_timeout_strike(&script_id);
                 let sid_short = &script_id[..script_id.len().min(8)];
                 tracing::warn!(
                     "batch timed out after {:?} (script {}, {} ops)",
-                    BATCH_TIMEOUT,
+                    batch_timeout,
                     sid_short,
                     n_ops
                 );

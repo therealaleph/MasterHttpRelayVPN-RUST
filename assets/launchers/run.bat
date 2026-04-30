@@ -60,10 +60,21 @@ if not "%UI_EXIT%"=="0" (
         echo   - running inside RDP or a VM without GPU acceleration
         echo   - antivirus blocking the exe — whitelist the folder and retry
         echo.
-        echo Copy everything above and open an issue on:
-        echo   https://github.com/therealaleph/MasterHttpRelayVPN-RUST/issues
+        echo You can still use mhrv-rs without the UI. Run the CLI directly:
+        echo.
+        echo     mhrv-rs.exe
+        echo.
+        echo Set your config in %%APPDATA%%\mhrv-rs\config\config.json (or
+        echo place a config.json next to mhrv-rs.exe in this folder), then
+        echo point your browser proxy at 127.0.0.1:8085 (HTTP) or
+        echo 127.0.0.1:8086 (SOCKS5). The CLI is the same proxy without
+        echo the UI shell, so all functionality is available.
+        echo.
+        echo Falling back to the CLI now so you can keep using the proxy.
+        echo Press Ctrl+C in the CLI window to stop it.
         echo ---------------------------------------------------
-        pause
+        echo.
+        mhrv-rs.exe
     )
 )
 
