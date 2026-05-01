@@ -652,11 +652,9 @@ jobs:
           {
             echo 'body<<__RELEASE_BODY_EOF__'
             # Strip leading HTML comment blocks (single-line OR multi-line)
-            # using the SAME regex as
-            # .github/scripts/telegram_release_notify.py:parse_changelog,
-            # so the GitHub Release page and the Telegram post agree on
-            # exactly what counts as "the leading comment block." Both
-            # also strip any leading whitespace/blank lines that follow.
+            # so the GitHub Release page sees only the body content, not
+            # the file-format header comment that every changelog has.
+            # Also strips any leading whitespace/blank lines that follow.
             #
             # Quoted heredoc (`<<'PY'`) so backticks/$ in the python
             # snippet aren't shell-interpolated; CHANGELOG is passed in
@@ -828,99 +826,15 @@ jobs:
           # isn't gated by the same protection.
           git push origin HEAD:main
 
-  # ─────────── LEGACY — DORMANT BY DEFAULT ───────────
+  # The legacy `telegram` job that posted a universal APK + changelog
+  # bundle to the main Telegram channel was removed in v1.9.4. It was
+  # superseded by `.github/workflows/telegram-publish-files.yml` (per-
+  # platform per-file posts to the files channel + a single cross-link
+  # to the main channel). With both running together, every release
+  # produced a duplicate APK post on the main channel — the legacy
+  # bundled post AND the new cross-link.
   #
-  # Posts the universal APK + per-version changelog to the **main**
-  # Telegram channel as one big sendDocument + sendMessage pair.
-  #
-  # Superseded as of v1.8.0+ by `.github/workflows/telegram-publish-files.yml`,
-  # which posts each platform's artifact individually to the **files**
-  # channel (with SHA-256 captions) and then a single cross-link
-  # message to the main channel pointing at the files-channel anchor.
-  #
-  # This job stays in the source tree, dormant, in case we ever want
-  # to revert to the bundled-changelog-on-main-channel pattern (or
-  # use both at once during a transition). To turn it back on:
-  #
-  #     gh variable set TELEGRAM_NOTIFY_ENABLED --body true
-  #
-  # Note: with the new workflow active too, that produces TWO posts
-  # to the main channel per release (the legacy APK+changelog *and*
-  # the new cross-link). Pick one.
-  #
-  # Default state is disabled.
-  telegram:
-    needs: [android, release]
-    runs-on: ubuntu-latest
-    # Gated on the repo variable `TELEGRAM_NOTIFY_ENABLED`. Default is
-    # off — the job skips silently unless the variable is set to the
-    # literal string "true".
-    if: ${{ vars.TELEGRAM_NOTIFY_ENABLED == 'true' && needs.android.result == 'success' }}
-    steps:
-      - uses: actions/checkout@v4
-
-      # Same retry pattern as the `release` job above — `actions/download-artifact@v4`
-      # has been flaking on this workflow with 5-retries-exhausted errors.
-      - name: Download universal APK (with retries)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          mkdir -p apk
-          for attempt in 1 2 3; do
-            if gh run download "${GITHUB_RUN_ID}" \
-                 --name mhrv-rs-android-universal \
-                 --dir apk \
-                 --repo "${GITHUB_REPOSITORY}"; then
-              echo "downloaded universal APK on attempt $attempt"
-              ls -la apk/
-              exit 0
-            fi
-            echo "download attempt $attempt failed; retrying in 30s..."
-            sleep 30
-          done
-          echo "::error::failed to download universal APK after 3 attempts"
-          exit 1
-
-      - name: Post to Telegram
-        env:
-          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          INCLUDE_CHANGELOG: ${{ vars.TELEGRAM_INCLUDE_CHANGELOG }}
-        # Python over curl/bash so we don't have to fight curl's -F
-        # value-interpretation rules. curl treats `-F "caption=<..."`
-        # as "read the caption from file named ..." when the value
-        # starts with `<`, which matches our `<b>` HTML-bold tags and
-        # silently turns the whole job into a "file not found" exit
-        # 26. Python stdlib has no such wart.
-        run: |
-          set -euo pipefail
-          VER="${{ inputs.version || github.ref_name }}"
-          VER="${VER#v}"
-          APK="apk/mhrv-rs-android-universal-v${VER}.apk"
-
-          if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
-            echo "::notice::TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set, skipping Telegram post"
-            exit 0
-          fi
-
-          if [ ! -f "$APK" ]; then
-            echo "::error::expected $APK to exist; got:"
-            ls -la apk/
-            exit 1
-          fi
-
-          # --with-changelog is opt-in. Default post is just the APK
-          # plus a short caption with the SHA-256, repo URL, and release
-          # URL — no long body. To include the Persian/English bullets
-          # for a specific tag, set the repo variable
-          # TELEGRAM_INCLUDE_CHANGELOG=true before pushing that tag.
-          INCLUDE_CHANGELOG_FLAG=""
-          if [ "${INCLUDE_CHANGELOG:-}" = "true" ]; then
-            INCLUDE_CHANGELOG_FLAG="--with-changelog"
-          fi
-          python3 .github/scripts/telegram_release_notify.py \
-            --apk "$APK" \
-            --version "$VER" \
-            --repo "$GITHUB_REPOSITORY" \
-            --changelog "docs/changelog/v${VER}.md" \
-            $INCLUDE_CHANGELOG_FLAG
+  # If you ever need to bring back the bundled-APK-on-main pattern, the
+  # commit history before v1.9.4 has the full job — `git log -- .github/workflows/release.yml`.
+  # The `TELEGRAM_NOTIFY_ENABLED` repo variable + `telegram_release_notify.py`
+  # script that the legacy job called are no longer referenced.

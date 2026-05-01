@@ -280,6 +280,10 @@ struct FormState {
     auto_blacklist_window_secs: u64,
     auto_blacklist_cooldown_secs: u64,
     request_timeout_secs: u64,
+    /// Optional second-hop exit node for CF-anti-bot bypass (chatgpt.com /
+    /// claude.ai / grok.com / x.com). Config-only — no UI editor yet.
+    /// See `assets/exit_node/` for the val.town deployment script.
+    exit_node: mhrv_rs::config::ExitNodeConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -381,6 +385,7 @@ fn load_form() -> (FormState, Option<String>) {
             auto_blacklist_window_secs: c.auto_blacklist_window_secs,
             auto_blacklist_cooldown_secs: c.auto_blacklist_cooldown_secs,
             request_timeout_secs: c.request_timeout_secs,
+            exit_node: c.exit_node.clone(),
         }
     } else {
         FormState {
@@ -419,6 +424,7 @@ fn load_form() -> (FormState, Option<String>) {
             auto_blacklist_window_secs: 30,
             auto_blacklist_cooldown_secs: 120,
             request_timeout_secs: 30,
+            exit_node: mhrv_rs::config::ExitNodeConfig::default(),
         }
     };
     (form, load_err)
@@ -593,6 +599,10 @@ impl FormState {
             auto_blacklist_window_secs: self.auto_blacklist_window_secs,
             auto_blacklist_cooldown_secs: self.auto_blacklist_cooldown_secs,
             request_timeout_secs: self.request_timeout_secs,
+            // Exit-node config (CF-anti-bot bypass for chatgpt.com / claude.ai
+            // / grok.com / x.com). Round-trip through FormState — config-only
+            // editing for now, UI editor planned for v1.9.x desktop UI batch.
+            exit_node: self.exit_node.clone(),
         })
     }
 }
@@ -664,12 +674,26 @@ struct ConfigWire<'a> {
     auto_blacklist_cooldown_secs: u64,
     #[serde(skip_serializing_if = "is_default_timeout_secs")]
     request_timeout_secs: u64,
+    /// Exit-node config (CF-anti-bot bypass for chatgpt.com / claude.ai /
+    /// grok.com / x.com via val.town second-hop relay). Skip when fully
+    /// default (disabled with no URL/PSK/hosts) so configs without
+    /// exit-node setup stay clean. Round-tripped through FormState so
+    /// Save preserves user-edited values.
+    #[serde(skip_serializing_if = "is_default_exit_node")]
+    exit_node: &'a mhrv_rs::config::ExitNodeConfig,
 }
 
 fn is_default_strikes(v: &u32) -> bool { *v == 3 }
 fn is_default_window_secs(v: &u64) -> bool { *v == 30 }
 fn is_default_cooldown_secs(v: &u64) -> bool { *v == 120 }
 fn is_default_timeout_secs(v: &u64) -> bool { *v == 30 }
+fn is_default_exit_node(en: &&mhrv_rs::config::ExitNodeConfig) -> bool {
+    !en.enabled
+        && en.relay_url.is_empty()
+        && en.psk.is_empty()
+        && en.hosts.is_empty()
+        && (en.mode.is_empty() || en.mode == "selective")
+}
 
 fn is_false(b: &bool) -> bool {
     !*b
@@ -724,6 +748,7 @@ impl<'a> From<&'a Config> for ConfigWire<'a> {
             auto_blacklist_window_secs: c.auto_blacklist_window_secs,
             auto_blacklist_cooldown_secs: c.auto_blacklist_cooldown_secs,
             request_timeout_secs: c.request_timeout_secs,
+            exit_node: &c.exit_node,
         }
     }
 }

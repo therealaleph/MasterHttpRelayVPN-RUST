@@ -151,6 +151,21 @@ pub struct DomainFronter {
     /// (#430, masterking32 PR #25). Read by `tunnel_client::fire_batch`
     /// so a single config field tunes the timeout used everywhere.
     batch_timeout: Duration,
+    /// Optional second-hop exit node (val.town / Deno Deploy / etc.)
+    /// to bypass CF-anti-bot blocks on sites that flag Google datacenter
+    /// IPs (chatgpt.com, claude.ai, grok.com, x.com). Mirrors
+    /// `Config::exit_node`. When `exit_node_enabled` is false (the more
+    /// common state), all relay traffic takes the regular Apps Script
+    /// path. When true, hosts matching `exit_node_hosts` (or all hosts
+    /// when `exit_node_full`) route through the exit-node URL inside
+    /// the Apps Script call.
+    exit_node_enabled: bool,
+    exit_node_url: String,
+    exit_node_psk: String,
+    exit_node_full: bool,
+    /// Pre-normalized (lowercased, leading-dot stripped) host list for
+    /// fast O(N) match in `exit_node_matches`.
+    exit_node_hosts: Vec<String>,
 }
 
 /// Aggregated stats for one remote host.
@@ -311,7 +326,52 @@ impl DomainFronter {
             batch_timeout: Duration::from_secs(
                 config.request_timeout_secs.clamp(5, 300),
             ),
+            exit_node_enabled: config.exit_node.enabled
+                && !config.exit_node.relay_url.is_empty()
+                && !config.exit_node.psk.is_empty(),
+            exit_node_url: config
+                .exit_node
+                .relay_url
+                .trim_end_matches('/')
+                .to_string(),
+            exit_node_psk: config.exit_node.psk.clone(),
+            exit_node_full: matches!(
+                config.exit_node.mode.to_ascii_lowercase().as_str(),
+                "full"
+            ),
+            exit_node_hosts: config
+                .exit_node
+                .hosts
+                .iter()
+                .map(|h| h.trim().trim_start_matches('.').to_ascii_lowercase())
+                .filter(|h| !h.is_empty())
+                .collect(),
         })
+    }
+
+    /// True when the configured exit node should handle this URL.
+    /// In `selective` mode (default), checks the host against the
+    /// pre-normalized `exit_node_hosts` list (exact match OR
+    /// dot-anchored suffix, mirroring `passthrough_hosts` semantics).
+    /// In `full` mode, every URL routes through the exit node.
+    pub(crate) fn exit_node_matches(&self, url: &str) -> bool {
+        if !self.exit_node_enabled {
+            return false;
+        }
+        if self.exit_node_full {
+            return true;
+        }
+        let host = match extract_host(url) {
+            Some(h) => h,
+            None => return false,
+        };
+        let host_lc = host.to_ascii_lowercase();
+        for entry in &self.exit_node_hosts {
+            if host_lc == *entry || host_lc.ends_with(&format!(".{}", entry)) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Per-batch HTTP round-trip timeout. Read by `tunnel_client` so the
@@ -708,6 +768,40 @@ impl DomainFronter {
         } else {
             url
         };
+
+        // Exit-node short-circuit: route through the configured second-hop
+        // relay (val.town / Deno Deploy / etc.) for hosts that need a
+        // non-Google exit IP. The cache + coalesce layer below is bypassed
+        // for these — exit-node-eligible hosts are the ones with active
+        // anti-bot challenges (CF Turnstile, ChatGPT login, Claude.ai,
+        // grok.com), and serving cached responses across users for those
+        // would be wrong (auth tokens, session state, per-user
+        // personalization). Falls back to the regular Apps Script relay
+        // if the exit node fails (network error, 5xx from val.town, etc.)
+        // so a misconfigured or down exit node doesn't take the user
+        // offline for the sites that DON'T need it.
+        if self.exit_node_matches(url) {
+            let t0 = Instant::now();
+            match self.relay_via_exit_node(method, url, headers, body).await {
+                Ok(bytes) => {
+                    self.record_site(
+                        url,
+                        false,
+                        bytes.len() as u64,
+                        t0.elapsed().as_nanos() as u64,
+                    );
+                    return bytes;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "exit node failed for {}: {} — falling back to direct Apps Script",
+                        url,
+                        e
+                    );
+                    // fall through to the regular relay path below
+                }
+            }
+        }
 
         // Range requests are partial-content responses; caching or
         // coalescing them against a non-range key would be catastrophic
@@ -1183,6 +1277,185 @@ impl DomainFronter {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Send a request through the configured exit node, chained inside
+    /// an Apps Script call. Path:
+    ///
+    /// ```text
+    /// client → SNI rewrite → Apps Script (Google IP)
+    ///        → UrlFetchApp.fetch(exit_node_url)
+    ///        → exit node (val.town, non-Google IP)
+    ///        → fetch(real_url)
+    ///        → response back through both layers
+    /// ```
+    ///
+    /// Apps Script sees the outer call (URL = exit_node_url, method =
+    /// POST, body = inner relay JSON authenticated with the exit-node
+    /// PSK). The exit node sees the inner JSON, fetches the real
+    /// destination, returns a `{s, h, b}` JSON envelope. Apps Script
+    /// returns that envelope as the body of its raw HTTP response
+    /// (because we set `r: true`). We then unwrap one extra layer:
+    /// extract Apps Script's body → parse the val.town JSON → reconstruct
+    /// the destination's raw HTTP response so the rest of the proxy
+    /// pipeline (MITM TLS write-back) sees the same shape it gets from
+    /// the regular path.
+    async fn relay_via_exit_node(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Result<Vec<u8>, FronterError> {
+        let inner_json = self.build_exit_node_inner_payload(method, url, headers, body)?;
+
+        // The outer payload is just a normal Apps Script relay request
+        // pointing at the exit-node URL with POST + the inner JSON as body.
+        // Reusing build_payload_json keeps the outer envelope consistent
+        // with everything else (including the random padding for DPI
+        // evasion). The `r: true` flag in RelayRequest makes Code.gs
+        // return val.town's raw HTTP response, which is what we want to
+        // unwrap below.
+        let exit_url = self.exit_node_url.clone();
+        let outer_headers = vec![(
+            "Content-Type".to_string(),
+            "application/json".to_string(),
+        )];
+        let outer_payload =
+            self.build_payload_json("POST", &exit_url, &outer_headers, &inner_json)?;
+
+        // Send the outer payload through the relay machinery and get back
+        // Apps Script's response body (which is val.town's JSON envelope).
+        let app_body = self
+            .send_prebuilt_payload_through_relay(outer_payload)
+            .await?;
+
+        // val.town's JSON envelope: {s: u16, h: {...}, b: "<base64>"} on
+        // success, {e: "..."} on its own internal error.
+        parse_exit_node_response(&app_body)
+    }
+
+    /// Build the inner-layer payload that the exit node will execute.
+    /// Same wire shape as a normal `RelayRequest` (`{k, m, u, h, b, ct, r}`)
+    /// but `k` is the exit-node PSK rather than the user's Apps Script
+    /// `auth_key`, and we skip the random-padding field — padding only
+    /// helps DPI evasion on the Iran-side leg, which the inner payload
+    /// is invisible to (it's encrypted inside the Apps Script HTTPS
+    /// connection that the ISP can't inspect).
+    fn build_exit_node_inner_payload(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Result<Vec<u8>, FronterError> {
+        let filtered = filter_forwarded_headers(headers);
+        let hmap = if filtered.is_empty() {
+            None
+        } else {
+            let mut m = serde_json::Map::with_capacity(filtered.len());
+            for (k, v) in &filtered {
+                m.insert(k.clone(), Value::String(v.clone()));
+            }
+            Some(m)
+        };
+        let b_encoded = if body.is_empty() {
+            None
+        } else {
+            Some(B64.encode(body))
+        };
+        let ct = if body.is_empty() {
+            None
+        } else {
+            find_header(headers, "content-type")
+        };
+        let req = RelayRequest {
+            k: &self.exit_node_psk,
+            m: method,
+            u: url,
+            h: hmap,
+            b: b_encoded,
+            ct,
+            r: false, // val.town returns its own JSON envelope, not raw HTTP
+        };
+        Ok(serde_json::to_vec(&req)?)
+    }
+
+    /// Drive the standard script-id rotation + TLS pool send path with
+    /// a payload we already built. Mirrors `do_relay_once_with` but
+    /// returns the **raw response body bytes** (Apps Script's HTTP body)
+    /// instead of running the body through `parse_relay_json` — the
+    /// exit-node path needs to peel off val.town's JSON envelope, which
+    /// has a different shape from Code.gs's raw-HTTP wrapping.
+    async fn send_prebuilt_payload_through_relay(
+        &self,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, FronterError> {
+        let script_id = self.next_script_id();
+        let path = format!("/macros/s/{}/exec", script_id);
+
+        let mut entry = self.acquire().await?;
+        let req_head = format!(
+            "POST {path} HTTP/1.1\r\n\
+             Host: {host}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {len}\r\n\
+             Accept-Encoding: gzip\r\n\
+             Connection: keep-alive\r\n\
+             \r\n",
+            path = path,
+            host = self.http_host,
+            len = payload.len(),
+        );
+        entry.stream.write_all(req_head.as_bytes()).await?;
+        entry.stream.write_all(&payload).await?;
+        entry.stream.flush().await?;
+
+        let (mut status, mut resp_headers, mut resp_body) =
+            read_http_response(&mut entry.stream).await?;
+
+        // Follow Apps Script's /exec → /macros/.../exec redirect chain
+        // (typical: 1-2 hops to script.googleusercontent.com). Mirrors
+        // the redirect handling in do_relay_once_with.
+        for _ in 0..5 {
+            if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+                break;
+            }
+            let Some(loc) = header_get(&resp_headers, "location") else {
+                break;
+            };
+            let (rpath, rhost) = parse_redirect(&loc);
+            let rhost = rhost.unwrap_or_else(|| self.http_host.to_string());
+            let req = format!(
+                "GET {rpath} HTTP/1.1\r\n\
+                 Host: {rhost}\r\n\
+                 Accept-Encoding: gzip\r\n\
+                 Connection: keep-alive\r\n\
+                 \r\n",
+            );
+            entry.stream.write_all(req.as_bytes()).await?;
+            entry.stream.flush().await?;
+            let (s, h, b) = read_http_response(&mut entry.stream).await?;
+            status = s;
+            resp_headers = h;
+            resp_body = b;
+        }
+
+        // Don't return to pool — the exit-node path is rare enough that
+        // the connection-reuse semantics aren't worth replicating here.
+        drop(entry);
+
+        if status != 200 {
+            let body_txt = String::from_utf8_lossy(&resp_body)
+                .chars()
+                .take(200)
+                .collect::<String>();
+            return Err(FronterError::Relay(format!(
+                "Apps Script HTTP {} (exit-node outer call): {}",
+                status, body_txt
+            )));
+        }
+        Ok(resp_body)
     }
 
     fn build_payload_json(
@@ -1858,6 +2131,117 @@ fn unix_to_ymd_utc(secs: u64) -> (i64, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
     let y = if m <= 2 { y + 1 } else { y };
     (y, m as u32, d as u32)
+}
+
+/// Parse the val.town exit-node JSON envelope back into a raw HTTP/1.1
+/// response. The envelope shape is:
+///
+/// - On success: `{ "s": <status u16>, "h": { ... }, "b": "<base64>" }`
+/// - On exit-node-side error: `{ "e": "<message>" }` with HTTP 4xx/5xx
+///   from val.town's own status code (decoded from the outer Apps Script
+///   layer, not the inner field).
+///
+/// We synthesize a complete HTTP/1.1 response from these fields so the
+/// MITM TLS write-back path sees the same shape it gets from the regular
+/// Apps Script relay (status line + headers + body).
+fn parse_exit_node_response(body: &[u8]) -> Result<Vec<u8>, FronterError> {
+    let v: Value = serde_json::from_slice(body).map_err(|e| {
+        FronterError::Relay(format!(
+            "exit-node response not valid JSON ({}): {}",
+            e,
+            String::from_utf8_lossy(&body[..body.len().min(200)])
+        ))
+    })?;
+
+    // Surface val.town's internal errors clearly rather than as a 502
+    // from the outer envelope. The `{e: "..."}` shape is what the val.town
+    // script emits on bad PSK, malformed URL, or any caught exception.
+    if let Some(err_msg) = v.get("e").and_then(|x| x.as_str()) {
+        return Err(FronterError::Relay(format!(
+            "exit node refused or errored: {}",
+            err_msg
+        )));
+    }
+
+    let status = v
+        .get("s")
+        .and_then(|x| x.as_u64())
+        .map(|n| n as u16)
+        .unwrap_or(502);
+    let body_b64 = v.get("b").and_then(|x| x.as_str()).unwrap_or("");
+    let body_bytes = if body_b64.is_empty() {
+        Vec::new()
+    } else {
+        B64.decode(body_b64).map_err(|e| {
+            FronterError::Relay(format!("exit-node body base64 decode failed: {}", e))
+        })?
+    };
+
+    // Reconstruct headers. Skip hop-by-hop / would-double-up headers
+    // (Content-Length comes from our own length count below; the outer
+    // Apps Script transport already handled Transfer-Encoding/chunked).
+    const SKIP_RESPONSE_HEADERS: &[&str] = &[
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "keep-alive",
+    ];
+
+    let mut out = Vec::with_capacity(body_bytes.len() + 256);
+    let _ = std::io::Write::write_fmt(
+        &mut out,
+        format_args!("HTTP/1.1 {} {}\r\n", status, status_reason(status)),
+    );
+    if let Some(headers_obj) = v.get("h").and_then(|x| x.as_object()) {
+        for (k, v_val) in headers_obj {
+            let lc = k.to_ascii_lowercase();
+            if SKIP_RESPONSE_HEADERS.contains(&lc.as_str()) {
+                continue;
+            }
+            if let Some(val_str) = v_val.as_str() {
+                let _ = std::io::Write::write_fmt(
+                    &mut out,
+                    format_args!("{}: {}\r\n", k, val_str),
+                );
+            }
+        }
+    }
+    let _ = std::io::Write::write_fmt(
+        &mut out,
+        format_args!("Content-Length: {}\r\n\r\n", body_bytes.len()),
+    );
+    out.extend_from_slice(&body_bytes);
+    Ok(out)
+}
+
+/// Minimal HTTP status reason-phrase table for synthesizing status
+/// lines in `parse_exit_node_response`. Browsers don't actually parse
+/// the reason phrase (only the status code matters), but a recognizable
+/// string makes log lines readable.
+fn status_reason(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        303 => "See Other",
+        304 => "Not Modified",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        408 => "Request Timeout",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        _ => "Status",
+    }
 }
 
 fn extract_host(url: &str) -> Option<String> {
