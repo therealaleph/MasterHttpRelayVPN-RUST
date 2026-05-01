@@ -2482,8 +2482,27 @@ where
         while body.len() < cl {
             let need = cl - body.len();
             let want = need.min(tmp.len());
-            let n = timeout(Duration::from_secs(20), stream.read(&mut tmp[..want])).await
-                .map_err(|_| FronterError::Timeout)??;
+            // Handle ungraceful TLS close-without-close_notify (rustls
+            // surfaces this as `io::ErrorKind::UnexpectedEof`). Some
+            // origins — notably val.town's exit-node path through Apps
+            // Script (#585, v1.9.4) and certain Apps Script `Connection:
+            // close` responses — terminate the underlying TCP without
+            // sending the TLS close_notify alert first. Treat that the
+            // same as a clean `n == 0`: if we already have the full body
+            // declared by Content-Length, the response *is* complete.
+            // Only propagate the error if Content-Length couldn't be
+            // satisfied (real truncation, not a polite-protocol violation).
+            let read_res = timeout(
+                Duration::from_secs(20),
+                stream.read(&mut tmp[..want]),
+            )
+            .await
+            .map_err(|_| FronterError::Timeout)?;
+            let n = match read_res {
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => 0,
+                Err(e) => return Err(e.into()),
+            };
             if n == 0 {
                 return Err(FronterError::BadResponse(
                     "connection closed before full response body".into(),
@@ -2492,11 +2511,17 @@ where
             body.extend_from_slice(&tmp[..n]);
         }
     } else {
-        // No framing — read until short timeout.
+        // No framing — read until short timeout, EOF, or ungraceful
+        // TLS close (UnexpectedEof). Each is treated as "we got what
+        // the peer wanted to send"; the response we already have is
+        // returned to the caller. UnexpectedEof here is the most common
+        // case for `Connection: close` responses from servers that
+        // don't bother with TLS close_notify (#585).
         loop {
             match timeout(Duration::from_secs(2), stream.read(&mut tmp)).await {
                 Ok(Ok(0)) => break,
                 Ok(Ok(n)) => body.extend_from_slice(&tmp[..n]),
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
                 Ok(Err(e)) => return Err(e.into()),
                 Err(_) => break,
             }
@@ -2542,8 +2567,18 @@ where
             }
         }
         while buf.len() < size + 2 {
-            let n = timeout(Duration::from_secs(20), stream.read(&mut tmp)).await
-                .map_err(|_| FronterError::Timeout)??;
+            // UnexpectedEof tolerance — see read_http_response for
+            // rationale. Treated as `n == 0`; if we haven't accumulated
+            // the full chunk yet, that's still a real truncation and
+            // we return BadResponse below.
+            let read_res = timeout(Duration::from_secs(20), stream.read(&mut tmp))
+                .await
+                .map_err(|_| FronterError::Timeout)?;
+            let n = match read_res {
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => 0,
+                Err(e) => return Err(e.into()),
+            };
             if n == 0 {
                 return Err(FronterError::BadResponse(
                     "connection closed mid-chunked response".into(),
@@ -2899,7 +2934,117 @@ impl ServerCertVerifier for NoVerify {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{duplex, AsyncWriteExt};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{duplex, AsyncRead, AsyncWriteExt, ReadBuf};
+
+    // Test fixture for ungraceful TLS close: emit a fixed prefix of bytes
+    // then return io::ErrorKind::UnexpectedEof on the next read. Mirrors
+    // what rustls surfaces when the peer closes TCP without sending a
+    // TLS close_notify alert (#585).
+    struct UnexpectedEofAfter {
+        bytes: Vec<u8>,
+        position: usize,
+    }
+
+    impl AsyncRead for UnexpectedEofAfter {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.position >= self.bytes.len() {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "peer closed connection without sending TLS close_notify",
+                )));
+            }
+            let remaining = &self.bytes[self.position..];
+            let take = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..take]);
+            self.position += take;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn read_http_response_tolerates_unexpected_eof_with_content_length() {
+        // Issue #585 / v1.9.4 exit-node bug. Some peers (val.town in
+        // particular, certain Apps Script `Connection: close` paths) close
+        // the TCP without TLS close_notify. Body should still be returned
+        // when Content-Length is satisfied, even though the read after
+        // the body closes ungracefully.
+        let body = b"{\"ok\":true}";
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let mut full = header.into_bytes();
+        full.extend_from_slice(body);
+        let mut stream = UnexpectedEofAfter {
+            bytes: full,
+            position: 0,
+        };
+
+        let (status, _headers, got_body) =
+            read_http_response(&mut stream).await.expect("must succeed despite UnexpectedEof");
+        assert_eq!(status, 200);
+        assert_eq!(got_body, body);
+    }
+
+    #[tokio::test]
+    async fn read_http_response_tolerates_unexpected_eof_no_framing() {
+        // Same #585 fix, but for the no-framing branch (server didn't
+        // send Content-Length or Transfer-Encoding). Read until peer
+        // closes — UnexpectedEof should terminate the loop with the
+        // body we accumulated so far, not bubble up as an error.
+        let header = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
+        let body = b"hello world";
+        let mut full = header.to_vec();
+        full.extend_from_slice(body);
+        let mut stream = UnexpectedEofAfter {
+            bytes: full,
+            position: 0,
+        };
+
+        let (status, _headers, got_body) =
+            read_http_response(&mut stream).await.expect("must succeed despite UnexpectedEof");
+        assert_eq!(status, 200);
+        assert_eq!(got_body, body);
+    }
+
+    #[tokio::test]
+    async fn parse_exit_node_response_unwraps_valtown_envelope() {
+        // The exit-node path through Apps Script returns val.town's JSON
+        // envelope as the response body. parse_exit_node_response must
+        // unwrap it back into a raw HTTP/1.1 response so the MITM TLS
+        // write-back path sees the same shape it gets from the regular
+        // Apps Script relay.
+        let envelope = br#"{"s":200,"h":{"content-type":"application/json","x-cf-cache":"DYNAMIC"},"b":"eyJtZXNzYWdlIjoiaGVsbG8ifQ=="}"#;
+        let raw = parse_exit_node_response(envelope).expect("envelope unwrap should succeed");
+        let raw_str = String::from_utf8_lossy(&raw);
+        assert!(raw_str.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(raw_str.contains("content-type: application/json\r\n"));
+        assert!(raw_str.contains("x-cf-cache: DYNAMIC\r\n"));
+        assert!(raw_str.contains("Content-Length: 19\r\n"));
+        // Body is `{"message":"hello"}` (19 bytes; the base64-decoded
+        // contents of the b field).
+        assert!(raw.ends_with(b"{\"message\":\"hello\"}"));
+    }
+
+    #[tokio::test]
+    async fn parse_exit_node_response_surfaces_explicit_error() {
+        // When val.town returns `{e: "..."}` instead of the {s,h,b} shape,
+        // surface that error message specifically rather than letting
+        // it through as an unparseable 502 — the message string is what
+        // tells the user what went wrong (placeholder PSK, bad URL,
+        // unauthorized, etc.).
+        let envelope = br#"{"e":"unauthorized"}"#;
+        let err = parse_exit_node_response(envelope).expect_err("must surface error");
+        let msg = format!("{}", err);
+        assert!(msg.contains("unauthorized"), "got: {}", msg);
+        assert!(msg.contains("exit node"), "got: {}", msg);
+    }
 
     #[test]
     fn unix_to_ymd_utc_handles_known_epochs() {
