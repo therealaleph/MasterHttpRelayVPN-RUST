@@ -2654,14 +2654,38 @@ fn parse_relay_json(body: &[u8]) -> Result<Vec<u8>, FronterError> {
     let data: RelayResponse = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(_) => {
-            // Apps Script may prepend HTML fallback; try to extract first {...}
-            let start = text.find('{').ok_or_else(|| {
-                FronterError::BadResponse(format!("no json in: {}", &text[..text.len().min(200)]))
-            })?;
-            let end = text.rfind('}').ok_or_else(|| {
-                FronterError::BadResponse(format!("no json end in: {}", &text[..text.len().min(200)]))
-            })?;
-            serde_json::from_str(&text[start..=end])?
+            // Some deployments (legacy Code.gs that used HtmlService for
+            // _json, or our own doGet hit accidentally via a redirect
+            // chain) wrap the JSON inside the goog.script sandbox iframe
+            // as `goog.script.init("\x7b...userHtml...\x7d", "", undefined)`.
+            // Try that unwrap first — if it succeeds, the inner userHtml
+            // *is* our JSON. Mirrors upstream's Python client extractor.
+            if let Some(unwrapped) = extract_apps_script_user_html(text) {
+                if let Ok(v) = serde_json::from_str(&unwrapped) {
+                    v
+                } else {
+                    return Err(FronterError::BadResponse(format!(
+                        "no json in apps_script user_html: {}",
+                        &unwrapped[..unwrapped.len().min(200)]
+                    )));
+                }
+            } else {
+                // Last resort: extract first { ... last }, in case Apps
+                // Script prepended HTML preamble before the raw JSON.
+                let start = text.find('{').ok_or_else(|| {
+                    FronterError::BadResponse(format!(
+                        "no json in: {}",
+                        &text[..text.len().min(200)]
+                    ))
+                })?;
+                let end = text.rfind('}').ok_or_else(|| {
+                    FronterError::BadResponse(format!(
+                        "no json end in: {}",
+                        &text[..text.len().min(200)]
+                    ))
+                })?;
+                serde_json::from_str(&text[start..=end])?
+            }
         }
     };
 
@@ -2715,6 +2739,98 @@ fn parse_relay_json(body: &[u8]) -> Result<Vec<u8>, FronterError> {
     out.extend_from_slice(format!("Content-Length: {}\r\n\r\n", resp_body.len()).as_bytes());
     out.extend_from_slice(&resp_body);
     Ok(out)
+}
+
+/// Unwrap the `goog.script.init` sandbox iframe that wraps every
+/// HtmlService web-app response. The wrapper text looks roughly like:
+///
+/// ```text
+/// <html>...
+/// goog.script.init("\x7b\x22userHtml\x22:\x22{...}\x22,...\x7d", "", undefined);
+/// ...
+/// ```
+///
+/// where the first parameter is a JSON string (with `\xNN` byte-escapes
+/// for `{`, `"`, etc.) whose `userHtml` field carries our actual JSON
+/// body. We find the marker, decode the byte-escapes, parse the outer
+/// JSON, and return `userHtml`. Returns `None` if any step doesn't
+/// match — the caller falls back to the brace-scan path.
+///
+/// Mirrors `_extract_apps_script_user_html` in upstream Python client.
+fn extract_apps_script_user_html(text: &str) -> Option<String> {
+    let marker = "goog.script.init(\"";
+    let start_idx = text.find(marker)? + marker.len();
+    // The marker is closed by `", "", undefined` (Apps Script always
+    // emits this exact literal — there are two more positional args after
+    // the JSON string, both empty / undefined).
+    let end_marker = "\", \"\", undefined";
+    let end_idx = text[start_idx..].find(end_marker)? + start_idx;
+    let encoded = &text[start_idx..end_idx];
+
+    // Decode `\xNN` and `\u00NN` byte-escapes that Apps Script uses to
+    // protect `{`, `"`, `\`, etc. inside the JS string literal.
+    let decoded = decode_js_string_escapes(encoded)?;
+
+    // Outer JSON — typically `{"userHtml":"<our JSON>", ...}`.
+    let outer: Value = serde_json::from_str(&decoded).ok()?;
+    let user_html = outer.get("userHtml")?.as_str()?;
+    Some(user_html.to_string())
+}
+
+/// Minimal JS string-literal escape decoder for `\xNN`, `\uNNNN`, and
+/// the standard backslash forms (`\\`, `\"`, `\n`, `\r`, `\t`, `\/`).
+/// Used to unwrap the `goog.script.init("...")` parameter — Apps Script
+/// emits ASCII-only `\xNN` for every non-alphanumeric byte, so the
+/// decoder doesn't need to handle full Unicode surrogates.
+fn decode_js_string_escapes(s: &str) -> Option<String> {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c != b'\\' {
+            // Fast path: copy ASCII / valid UTF-8 byte through.
+            out.push(c as char);
+            i += 1;
+            continue;
+        }
+        if i + 1 >= bytes.len() {
+            return None;
+        }
+        let esc = bytes[i + 1];
+        match esc {
+            b'x' => {
+                if i + 3 >= bytes.len() {
+                    return None;
+                }
+                let hex = std::str::from_utf8(&bytes[i + 2..i + 4]).ok()?;
+                let v = u8::from_str_radix(hex, 16).ok()?;
+                out.push(v as char);
+                i += 4;
+            }
+            b'u' => {
+                if i + 5 >= bytes.len() {
+                    return None;
+                }
+                let hex = std::str::from_utf8(&bytes[i + 2..i + 6]).ok()?;
+                let v = u32::from_str_radix(hex, 16).ok()?;
+                let ch = char::from_u32(v)?;
+                out.push(ch);
+                i += 6;
+            }
+            b'\\' => { out.push('\\'); i += 2; }
+            b'"' => { out.push('"'); i += 2; }
+            b'\'' => { out.push('\''); i += 2; }
+            b'/' => { out.push('/'); i += 2; }
+            b'n' => { out.push('\n'); i += 2; }
+            b'r' => { out.push('\r'); i += 2; }
+            b't' => { out.push('\t'); i += 2; }
+            b'b' => { out.push('\x08'); i += 2; }
+            b'f' => { out.push('\x0c'); i += 2; }
+            _ => return None,
+        }
+    }
+    Some(out)
 }
 
 #[derive(Debug, Clone)]
@@ -3427,6 +3543,73 @@ hello";
         let s = String::from_utf8_lossy(&raw);
         assert!(s.contains("Set-Cookie: a=1\r\n"));
         assert!(s.contains("Set-Cookie: b=2\r\n"));
+    }
+
+    #[test]
+    fn decode_js_string_escapes_xnn_and_unicode() {
+        // \x7b = '{', \x22 = '"', \x7d = '}', \x5b = '[', \x5d = ']'
+        let inner = r#"\x7b\x22s\x22:200,\x22b\x22:\x22\x22\x7d"#;
+        let out = decode_js_string_escapes(inner).unwrap();
+        assert_eq!(out, r#"{"s":200,"b":""}"#);
+
+        // A = 'A', mixed with literal
+        assert_eq!(decode_js_string_escapes(r"ABC").unwrap(), "ABC");
+
+        // standard escapes
+        assert_eq!(decode_js_string_escapes(r#"a\nb\t\\\"c"#).unwrap(), "a\nb\t\\\"c");
+
+        // truncated escape returns None instead of panicking
+        assert!(decode_js_string_escapes(r"\x7").is_none());
+        assert!(decode_js_string_escapes(r"\u00").is_none());
+    }
+
+    /// Hand-build the `goog.script.init("...", "", undefined)` wrapper for
+    /// a given inner relay JSON, matching the form Apps Script HtmlService
+    /// emits when the deployment uses HtmlService for its response. Every
+    /// `{`/`}` becomes `\x7b`/`\x7d`, every `"` becomes `\"`, every `:`
+    /// stays — that's the realistic subset our unwrapper has to cope with.
+    fn build_goog_script_init_wrapper(inner_relay_json: &str) -> String {
+        // Step 1: build the outer JSON object {"userHtml": "<inner>", ...}
+        // using serde so the inner JSON is properly JSON-escaped (including
+        // each `"` → `\"`).
+        let outer = serde_json::json!({ "userHtml": inner_relay_json });
+        let outer_str = serde_json::to_string(&outer).unwrap();
+        // Step 2: re-escape `{`/`}` → `\xNN` and `"` → `\"` to match the
+        // form Apps Script wraps inside the `goog.script.init("…")`
+        // JS string literal.
+        let mut wire = String::with_capacity(outer_str.len() * 2);
+        for ch in outer_str.chars() {
+            match ch {
+                '{' => wire.push_str(r"\x7b"),
+                '}' => wire.push_str(r"\x7d"),
+                '"' => wire.push_str(r#"\""#),
+                other => wire.push(other),
+            }
+        }
+        format!(
+            "<html><body><script>goog.script.init(\"{}\", \"\", undefined);</script></body></html>",
+            wire
+        )
+    }
+
+    #[test]
+    fn extract_apps_script_user_html_unwraps_goog_init() {
+        let inner_json = r#"{"s":200,"h":{},"b":"aGk="}"#;
+        let wrapped = build_goog_script_init_wrapper(inner_json);
+        let extracted = extract_apps_script_user_html(&wrapped).unwrap();
+        assert_eq!(extracted, inner_json);
+    }
+
+    #[test]
+    fn parse_relay_json_unwraps_goog_script_init() {
+        // End-to-end: an iframe-wrapped body should still parse correctly
+        // through parse_relay_json. Without the unwrap helper this used
+        // to fail with `key must be a string at line 2`.
+        let inner_json = r#"{"s":200,"h":{},"b":""}"#;
+        let wrapped = build_goog_script_init_wrapper(inner_json);
+        let raw = parse_relay_json(wrapped.as_bytes()).unwrap();
+        let s = String::from_utf8_lossy(&raw);
+        assert!(s.starts_with("HTTP/1.1 200 "), "got: {}", s);
     }
 
     #[tokio::test(flavor = "current_thread")]

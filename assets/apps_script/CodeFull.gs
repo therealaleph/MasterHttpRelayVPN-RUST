@@ -29,11 +29,25 @@ const TUNNEL_AUTH_KEY = "YOUR_TUNNEL_AUTH_KEY";
 // (Inspired by #365 Section 3, mhrv-rs v1.8.0+.)
 const DIAGNOSTIC_MODE = false;
 
+// Connection-level + IP-leak request headers we strip before forwarding
+// to the destination. UrlFetchApp rejects most of the connection-level
+// names anyway, but we also drop the `X-Forwarded-*` / `Forwarded` /
+// `Via` family so that a misconfigured upstream proxy on the user side
+// can't leak the user's real IP through the relay path. Mirrors
+// upstream `masterking32/MasterHttpRelayVPN@3094288`.
 const SKIP_HEADERS = {
   host: 1, connection: 1, "content-length": 1,
   "transfer-encoding": 1, "proxy-connection": 1, "proxy-authorization": 1,
   "priority": 1, te: 1,
+  "x-forwarded-for": 1, "x-forwarded-host": 1, "x-forwarded-proto": 1,
+  "x-forwarded-port": 1, "x-real-ip": 1, "forwarded": 1, "via": 1,
 };
+
+// Methods we consider safe to replay if `UrlFetchApp.fetchAll()` raises.
+// GET/HEAD/OPTIONS are idempotent per RFC 9110; POST/PUT/PATCH/DELETE
+// can have side-effects so we surface the error instead of silently
+// re-firing them.
+const SAFE_REPLAY_METHODS = { GET: 1, HEAD: 1, OPTIONS: 1 };
 
 // HTML body for the bad-auth decoy. Mimics a minimal Apps Script-style
 // placeholder page — no proxy-shaped JSON, nothing distinctive enough
@@ -279,33 +293,85 @@ function _doSingle(req) {
 
 function _doBatch(items) {
   var fetchArgs = [];
+  var fetchIndex = [];
+  var fetchMethods = [];
   var errorMap = {};
   for (var i = 0; i < items.length; i++) {
     var item = items[i];
+    if (!item || typeof item !== "object") {
+      errorMap[i] = "bad item";
+      continue;
+    }
     if (!item.u || typeof item.u !== "string" || !item.u.match(/^https?:\/\//i)) {
       errorMap[i] = "bad url";
       continue;
     }
-    var opts = _buildOpts(item);
-    opts.url = item.u;
-    fetchArgs.push({ _i: i, _o: opts });
+    try {
+      var opts = _buildOpts(item);
+      opts.url = item.u;
+      fetchArgs.push(opts);
+      fetchIndex.push(i);
+      fetchMethods.push(String(item.m || "GET").toUpperCase());
+    } catch (buildErr) {
+      errorMap[i] = String(buildErr);
+    }
   }
+
+  // fetchAll() runs all requests in parallel inside Google. If it
+  // throws as a whole (e.g. one URL violates UrlFetchApp limits and
+  // poisons the whole batch), degrade to per-item fetch so a single
+  // bad request does not zero out the entire batch's responses.
+  // Mirrors upstream `masterking32/MasterHttpRelayVPN@3094288`.
   var responses = [];
   if (fetchArgs.length > 0) {
-    responses = UrlFetchApp.fetchAll(fetchArgs.map(function(x) { return x._o; }));
+    try {
+      responses = UrlFetchApp.fetchAll(fetchArgs);
+    } catch (fetchAllErr) {
+      responses = [];
+      for (var j = 0; j < fetchArgs.length; j++) {
+        try {
+          if (!SAFE_REPLAY_METHODS[fetchMethods[j]]) {
+            errorMap[fetchIndex[j]] =
+              "batch fetchAll failed; unsafe method not replayed";
+            responses[j] = null;
+            continue;
+          }
+          var fallbackReq = fetchArgs[j];
+          var fallbackUrl = fallbackReq.url;
+          var fallbackOpts = {};
+          for (var key in fallbackReq) {
+            if (
+              Object.prototype.hasOwnProperty.call(fallbackReq, key) &&
+              key !== "url"
+            ) {
+              fallbackOpts[key] = fallbackReq[key];
+            }
+          }
+          responses[j] = UrlFetchApp.fetch(fallbackUrl, fallbackOpts);
+        } catch (singleErr) {
+          errorMap[fetchIndex[j]] = String(singleErr);
+          responses[j] = null;
+        }
+      }
+    }
   }
+
   var results = [];
   var rIdx = 0;
   for (var i = 0; i < items.length; i++) {
-    if (errorMap.hasOwnProperty(i)) {
+    if (Object.prototype.hasOwnProperty.call(errorMap, i)) {
       results.push({ e: errorMap[i] });
     } else {
       var resp = responses[rIdx++];
-      results.push({
-        s: resp.getResponseCode(),
-        h: _respHeaders(resp),
-        b: Utilities.base64Encode(resp.getContent()),
-      });
+      if (!resp) {
+        results.push({ e: "fetch failed" });
+      } else {
+        results.push({
+          s: resp.getResponseCode(),
+          h: _respHeaders(resp),
+          b: Utilities.base64Encode(resp.getContent()),
+        });
+      }
     }
   }
   return _json({ q: results });
@@ -346,13 +412,17 @@ function _respHeaders(resp) {
   return resp.getHeaders();
 }
 
+// `doGet` is what active scanners hit first (HTTP GET probes are cheaper
+// than POSTs). We use ContentService here so the response body is the
+// raw HTML we wrote — `HtmlService.createHtmlOutput` would wrap it in
+// a `goog.script.init` sandbox iframe, which the Rust client would then
+// see if it ever GET-followed a redirect back onto /macros/.../exec
+// (decoy/no-json error path). ContentService keeps the doGet response
+// indistinguishable from a forgotten static-HTML web app.
 function doGet(e) {
-  return HtmlService.createHtmlOutput(
-    "<!DOCTYPE html><html><head><title>My App</title></head>" +
-      '<body style="font-family:sans-serif;max-width:600px;margin:40px auto">' +
-      "<h1>Welcome</h1><p>This application is running normally.</p>" +
-      "</body></html>"
-  );
+  return ContentService
+    .createTextOutput(DECOY_HTML)
+    .setMimeType(ContentService.MimeType.HTML);
 }
 
 function _json(obj) {
