@@ -18,6 +18,11 @@
     <img src="https://img.youtube.com/vi/voCwxgvWR5U/maxresdefault.jpg" alt="راهنمای راه اندازی mhrv-rs به فارسی" width="560">
   </a>
 </p>
+<p align="center">
+  <a href="https://kian-irani.github.io/mhrv-setup-full-tunell/" target="_blank" rel="noopener noreferrer">راهنمای جامع راه اندازی به زبان فارسی با تشکر از Kian Irani</a>
+  <br>
+  <sub>(<a href="https://github.com/KIAN-IRANi" target="_blank" rel="noopener noreferrer">github.com/KIAN-IRANi</a>)</sub>
+</p>
 
 ---
 
