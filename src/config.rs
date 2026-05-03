@@ -104,7 +104,7 @@ pub struct Config {
     pub parallel_relay: u8,
     /// Adaptive batch coalesce: after each op arrives, wait this many ms
     /// for more ops before firing the batch. Resets on every arrival.
-    /// 0 = use compiled default (40ms).
+    /// 0 = use compiled default (10ms).
     #[serde(default)]
     pub coalesce_step_ms: u16,
     /// Hard cap on total coalesce wait (ms). 0 = use compiled default (1000ms).

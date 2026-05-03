@@ -47,8 +47,8 @@ const ACTIVE_DRAIN_DEADLINE: Duration = Duration::from_millis(350);
 /// still arriving. Stops when no new data arrived in the last STEP (the
 /// burst is over) or MAX is reached. Packing more session responses into
 /// one batch saves quota on high-latency relays (~1.5s Apps Script overhead).
-const STRAGGLER_SETTLE_STEP: Duration = Duration::from_millis(40);
-const STRAGGLER_SETTLE_MAX: Duration = Duration::from_millis(500);
+const STRAGGLER_SETTLE_STEP: Duration = Duration::from_millis(10);
+const STRAGGLER_SETTLE_MAX: Duration = Duration::from_millis(1000);
 
 /// Drain-phase deadline when the batch is a pure poll (no writes, no new
 /// connections — clients just asking "any push data?"). Holding the

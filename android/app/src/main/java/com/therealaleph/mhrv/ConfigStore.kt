@@ -96,7 +96,7 @@ data class MhrvConfig(
     val verifySsl: Boolean = true,
     val logLevel: String = "info",
     val parallelRelay: Int = 1,
-    val coalesceStepMs: Int = 40,
+    val coalesceStepMs: Int = 10,
     val coalesceMaxMs: Int = 1000,
     val upstreamSocks5: String = "",
 
@@ -210,7 +210,7 @@ data class MhrvConfig(
             put("verify_ssl", verifySsl)
             put("log_level", logLevel)
             put("parallel_relay", parallelRelay)
-            if (coalesceStepMs != 40) put("coalesce_step_ms", coalesceStepMs)
+            if (coalesceStepMs != 10) put("coalesce_step_ms", coalesceStepMs)
             if (coalesceMaxMs != 1000) put("coalesce_max_ms", coalesceMaxMs)
             if (upstreamSocks5.isNotBlank()) {
                 put("upstream_socks5", upstreamSocks5.trim())
@@ -422,7 +422,7 @@ object ConfigStore {
             verifySsl = obj.optBoolean("verify_ssl", true),
             logLevel = obj.optString("log_level", "info"),
             parallelRelay = obj.optInt("parallel_relay", 1),
-            coalesceStepMs = obj.optInt("coalesce_step_ms", 40),
+            coalesceStepMs = obj.optInt("coalesce_step_ms", 10),
             coalesceMaxMs = obj.optInt("coalesce_max_ms", 1000),
             upstreamSocks5 = obj.optString("upstream_socks5", ""),
             passthroughHosts = obj.optJSONArray("passthrough_hosts")?.let { arr ->

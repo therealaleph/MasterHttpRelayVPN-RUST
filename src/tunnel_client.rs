@@ -59,7 +59,18 @@ const CLIENT_FIRST_DATA_WAIT: Duration = Duration::from_millis(50);
 /// Adaptive coalesce defaults: after each new op arrives, wait another
 /// step for more ops. Resets on every arrival, up to max from the first
 /// op. Overridable via config `coalesce_step_ms` / `coalesce_max_ms`.
-const DEFAULT_COALESCE_STEP_MS: u64 = 40;
+///
+/// 10 ms is enough to catch ops that arrive in the same event-loop tick
+/// (e.g. a browser opening 6 parallel connections) without adding
+/// perceptible latency to downloads where the tunnel-node reply — not
+/// coalescing — is the real bottleneck.  When both sides *do* have data
+/// in flight (uploads, bursty page loads), the adaptive reset still
+/// packs batches efficiently: each arriving op resets the step timer, so
+/// a rapid burst naturally coalesces up to `DEFAULT_COALESCE_MAX_MS`
+/// without an explicit upload/download distinction.  The net effect is
+/// "don't wait when there's nothing to wait for; batch aggressively when
+/// there is."
+const DEFAULT_COALESCE_STEP_MS: u64 = 10;
 const DEFAULT_COALESCE_MAX_MS: u64 = 1000;
 
 /// Structured error code the tunnel-node returns when it doesn't know the
