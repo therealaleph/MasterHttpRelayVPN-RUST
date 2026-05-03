@@ -29,14 +29,46 @@
       "ip": "151.101.1.140",
       "sni": "www.python.org",
       "domains": [
+        "redd.it",
         "reddit.com",
         "redditstatic.com",
         "redditmedia.com",
-        "redd.it",
+        "reddit.app.link",
+        "redditblog.com",
+        "reddithelp.com",
+        "redditinc.com",
+        "redditmail.com",
+        "redditspace.com",
+        "redditstatus.com",
+        "reddit.map.fastly.net",
+
         "githubassets.com",
         "githubusercontent.com",
+
         "pypi.org",
-        "fastly.com"
+
+        "fastly.com",
+        "fastly-edge.com",
+        "fastly-terrarium.com",
+        "fastly.io",
+        "fastly.net",
+        "fastlylabs.com",
+        "fastlylb.net",
+
+        "www.pinterest.com",
+        "pinimg.com",
+        
+        "cnn.com",
+        "cnn.io",
+        "cnn.it",
+        "cnnarabic.com",
+        "cnnlabs.com",
+        "cnnmoney.ch",
+        "cnnmoney.com",
+        "cnnmoneystream.com",
+        "cnnpolitics.com",
+
+        "buzzfeed.com"
       ]
     },
     {
