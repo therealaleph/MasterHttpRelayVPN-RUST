@@ -45,6 +45,49 @@
 
 ISPs can't read inside encrypted HTTPS. They only see the address — `www.google.com`. The actual page lookup happens inside Google's network, hidden in the encrypted tunnel.
 
+### Full Tunnel mode
+
+The default **apps_script** mode relays each HTTP request through Google. This works great for browsing, but has limits: YouTube video chunks are blocked by Google internally, UDP protocols (Telegram voice, gaming) can't pass through, and every request counts against your daily Apps Script quota.
+
+**Full Tunnel mode** removes those limits by adding a small relay server (tunnel-node) on a VPS you control:
+
+```
+   you  →  browser  →  mhrv-rs  ──┐
+                                  │ ISP only sees:  www.google.com
+                                  ▼
+                          Google's network
+                                  │
+                                  ▼
+                     Apps Script forwards to your VPS
+                                  │
+                                  ▼
+                        tunnel-node (your VPS)
+                                  │
+                                  ▼
+                    real TCP connection to any site
+```
+
+Every TCP connection from your device is tunneled end-to-end: mhrv-rs multiplexes all your traffic into batched requests through Apps Script, your tunnel-node opens real TCP sockets to the destination. YouTube, Telegram, WebSockets, anything TCP — it all works.
+
+**What you need:**
+- Everything from the Quick Start (Apps Script + auth key)
+- A VPS with a public IP (any cheap $5/mo provider works)
+- Deploy [`CodeFull.gs`](assets/apps_script/CodeFull.gs) instead of `Code.gs`
+- Deploy the [tunnel-node](tunnel-node/) on your VPS (Docker one-liner)
+
+**In your config:**
+```json
+{
+  "mode": "full",
+  "script_ids": ["your-deployment-id"],
+  "auth_key": "your-secret"
+}
+```
+
+No certificate installation needed — Full Tunnel doesn't MITM your TLS. The tunnel-node handles real connections server-side.
+
+For step-by-step setup, see the [tunnel-node README](tunnel-node/README.md).
+
 ## Quick Start
 
 **About 5 minutes.** You need:
