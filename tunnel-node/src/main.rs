@@ -584,7 +584,10 @@ async fn wait_and_drain(session: &SessionInner, max_wait: Duration) -> (Vec<u8>,
 struct AppState {
     sessions: Arc<Mutex<HashMap<String, ManagedSession>>>,
     udp_sessions: Arc<Mutex<HashMap<String, ManagedUdpSession>>>,
-    auth_key: String,
+    /// Shared, immutable after startup. `Arc<str>` so each `state.clone()`
+    /// — once per phase-1 spawn in the batch handler — is a refcount bump
+    /// instead of a fresh String allocation.
+    auth_key: Arc<str>,
     /// Active probing defense: when false (default, production), bad
     /// AUTH_KEY responses are a generic-looking 404 with no JSON-shaped
     /// "unauthorized" body — same as a static nginx 404. Active scanners
@@ -669,7 +672,7 @@ async fn handle_tunnel(
     State(state): State<AppState>,
     Json(req): Json<TunnelRequest>,
 ) -> axum::response::Response {
-    if req.k != state.auth_key {
+    if req.k != *state.auth_key {
         return decoy_or_unauthorized(state.diagnostic_mode);
     }
     let resp: TunnelResponse = match req.op.as_str() {
@@ -738,7 +741,7 @@ async fn handle_batch(
         }
     };
 
-    if req.k != state.auth_key {
+    if req.k != *state.auth_key {
         if state.diagnostic_mode {
             let resp = serde_json::to_vec(&BatchResponse {
                 r: vec![TunnelResponse::error("unauthorized")],
@@ -855,13 +858,26 @@ async fn handle_batch(
                     *inner.last_active.lock().await = Instant::now();
                     if let Some(ref data_b64) = op.d {
                         if !data_b64.is_empty() {
-                            had_writes_or_connects = true;
-                            if let Ok(bytes) = B64.decode(data_b64) {
-                                if !bytes.is_empty() {
-                                    let mut w = inner.writer.lock().await;
-                                    let _ = w.write_all(&bytes).await;
-                                    let _ = w.flush().await;
+                            // Decode first; only count this op as a real
+                            // write (and demote the batch out of long-poll)
+                            // after a successful non-empty decode. Mirrors
+                            // the udp_data branch and avoids silently
+                            // dropping bytes on bad base64.
+                            let bytes = match B64.decode(data_b64) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    results.push((
+                                        i,
+                                        TunnelResponse::error(format!("bad base64: {}", e)),
+                                    ));
+                                    continue;
                                 }
+                            };
+                            if !bytes.is_empty() {
+                                had_writes_or_connects = true;
+                                let mut w = inner.writer.lock().await;
+                                let _ = w.write_all(&bytes).await;
+                                let _ = w.flush().await;
                             }
                         }
                     }
@@ -992,7 +1008,7 @@ async fn handle_batch(
             // Adaptive settle: keep waiting in steps while new data
             // keeps arriving. Break when:
             //  1. No new data arrived in the last step (burst is over)
-            //  2. 500ms max reached
+            //  2. STRAGGLER_SETTLE_MAX reached
             let settle_end = Instant::now() + STRAGGLER_SETTLE_MAX;
             let mut prev_tcp_bytes: usize = 0;
             let mut prev_udp_pkts: usize = 0;
@@ -1311,19 +1327,27 @@ async fn handle_data_single(state: &AppState, sid: Option<String>, data: Option<
         Some(s) if !s.is_empty() => s,
         _ => return TunnelResponse::error("missing sid"),
     };
-    let sessions = state.sessions.lock().await;
-    let session = match sessions.get(&sid) {
-        Some(s) => s,
+    // Clone the inner Arc under the global sessions map lock and release
+    // the map lock before any await. The previous shape held the map
+    // across last_active.lock(), writer.lock(), write_all, flush, AND
+    // wait_and_drain — up to 5 s of head-of-line blocking on every other
+    // single-op or batch request. Mirrors the batch-handler "data" path.
+    let inner = {
+        let sessions = state.sessions.lock().await;
+        sessions.get(&sid).map(|s| s.inner.clone())
+    };
+    let inner = match inner {
+        Some(i) => i,
         None => return TunnelResponse::error("unknown session"),
     };
-    *session.inner.last_active.lock().await = Instant::now();
+    *inner.last_active.lock().await = Instant::now();
     if let Some(ref data_b64) = data {
         if !data_b64.is_empty() {
             if let Ok(bytes) = B64.decode(data_b64) {
                 if !bytes.is_empty() {
-                    let mut w = session.inner.writer.lock().await;
+                    let mut w = inner.writer.lock().await;
                     if let Err(e) = w.write_all(&bytes).await {
-                        drop(w); drop(sessions);
+                        drop(w);
                         state.sessions.lock().await.remove(&sid);
                         return TunnelResponse::error(format!("write failed: {}", e));
                     }
@@ -1332,8 +1356,7 @@ async fn handle_data_single(state: &AppState, sid: Option<String>, data: Option<
             }
         }
     }
-    let (data, eof) = wait_and_drain(&session.inner, Duration::from_secs(5)).await;
-    drop(sessions);
+    let (data, eof) = wait_and_drain(&inner, Duration::from_secs(5)).await;
     if eof {
         if let Some(s) = state.sessions.lock().await.remove(&sid) {
             s.reader_handle.abort();
@@ -1486,7 +1509,12 @@ async fn main() {
              before exposing this tunnel-node to the public internet."
         );
     }
-    let state = AppState { sessions, udp_sessions, auth_key, diagnostic_mode };
+    let state = AppState {
+        sessions,
+        udp_sessions,
+        auth_key: Arc::from(auth_key),
+        diagnostic_mode,
+    };
 
     let app = Router::new()
         .route("/tunnel", post(handle_tunnel))
