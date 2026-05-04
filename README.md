@@ -154,7 +154,7 @@ If something doesn't work:
 
 **YouTube videos don't play.** YouTube's video chunks come from `googlevideo.com`, which Apps Script can't reach (Google blocks Apps Script from accessing Google's own video CDN). The page itself loads fine; only video playback is affected. Fix: Full Tunnel + VPS, or add `.googlevideo.com` to `passthrough_hosts` in your config (browser hits it directly, but on Iran ISPs it's still throttled).
 
-**ChatGPT / Claude / Grok shows a Cloudflare CAPTCHA.** Cloudflare flags Google datacenter IPs as bots. Fix: set up an **exit node** (a free 5-minute thing on val.town that bridges Apps Script → val.town → claude.ai). See [`assets/exit_node/README.md`](assets/exit_node/README.md).
+**ChatGPT / Claude / Grok shows a Cloudflare CAPTCHA.** Cloudflare flags Google datacenter IPs as bots. Fix: set up an **exit node** — a small TypeScript handler you deploy on a serverless host (Deno Deploy, fly.io, your own VPS) that bridges Apps Script → your exit node → claude.ai. See [`assets/exit_node/README.md`](assets/exit_node/README.md).
 
 **Telegram is unstable.** Telegram uses MTProto, which Apps Script doesn't speak. Pair with [xray](https://github.com/XTLS/Xray-core) on your machine — see [Telegram via xray in the full guide](docs/guide.md#telegram-via-xray).
 
@@ -324,7 +324,7 @@ System Settings → Network → Wi-Fi → Details → **Proxies** → هر دو 
 
 **ویدیوی یوتیوب پخش نمی‌شود.** chunkهای ویدیوی یوتیوب از `googlevideo.com` می‌آیند و Apps Script نمی‌تواند به آن برسد (گوگل اجازهٔ دسترسی Apps Script به CDN ویدیوی خودش را نمی‌دهد). صفحهٔ خود یوتیوب لود می‌شود، فقط پخش ویدیو تحت تأثیر است. راه‌حل: Full Tunnel + VPS، یا `.googlevideo.com` را به `passthrough_hosts` در کانفیگت اضافه کن (مرورگر مستقیم می‌رود اما روی ISP ایران throttle می‌خورد).
 
-**ChatGPT / Claude / Grok کپچای Cloudflare نشان می‌دهد.** Cloudflare آی‌پی‌های دیتاسنتر گوگل را به‌عنوان bot شناسایی می‌کند. راه‌حل: یک **exit node** راه‌اندازی کن (پنج دقیقه روی val.town رایگان — پل بین Apps Script و سایت Cloudflare). [`assets/exit_node/README.fa.md`](assets/exit_node/README.fa.md).
+**ChatGPT / Claude / Grok کپچای Cloudflare نشان می‌دهد.** Cloudflare آی‌پی‌های دیتاسنتر گوگل را به‌عنوان bot شناسایی می‌کند. راه‌حل: یک **exit node** راه‌اندازی کن — یک handler کوچک TypeScript که روی یک host serverless (Deno Deploy، fly.io، VPS شخصی) deploy می‌کنی و پل می‌سازه از Apps Script به سایت Cloudflare. [`assets/exit_node/README.fa.md`](assets/exit_node/README.fa.md).
 
 **تلگرام پایدار نیست.** تلگرام از MTProto استفاده می‌کند که Apps Script نمی‌فهمد. روی کامپیوترت با [xray](https://github.com/XTLS/Xray-core) جفتش کن — [بخش تلگرام در راهنمای کامل](docs/guide.fa.md#تلگرام-با-xray).
 

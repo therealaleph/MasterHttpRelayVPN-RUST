@@ -257,13 +257,13 @@ More deployments = more total concurrency = lower per-session latency. Each batc
 
 ## Exit node
 
-Cloudflare-fronted services (chatgpt.com, claude.ai, grok.com, x.com, openai.com) flag traffic from Google datacenter IPs as bots and serve a Turnstile / CAPTCHA challenge. The exit node fix is a small TypeScript HTTP endpoint you deploy on val.town (free) that sits between Apps Script and the destination:
+Cloudflare-fronted services (chatgpt.com, claude.ai, grok.com, x.com, openai.com) flag traffic from Google datacenter IPs as bots and serve a Turnstile / CAPTCHA challenge. The exit node fix is a small TypeScript HTTP handler you deploy on a serverless host (Deno Deploy, fly.io, or your own VPS) that sits between Apps Script and the destination:
 
 ```
-client → Apps Script (Google IP) → val.town (non-Google IP) → CF-protected site
+client → Apps Script (Google IP) → your exit node (non-Google IP) → CF-protected site
 ```
 
-The destination sees val.town's IP, not Google's, so the anti-bot heuristic doesn't fire.
+The destination sees the exit node's IP, not Google's, so the anti-bot heuristic doesn't fire.
 
 **Setup:** [`assets/exit_node/README.md`](../assets/exit_node/README.md). 5 min, free tier.
 

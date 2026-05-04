@@ -151,7 +151,7 @@ pub struct DomainFronter {
     /// (#430, masterking32 PR #25). Read by `tunnel_client::fire_batch`
     /// so a single config field tunes the timeout used everywhere.
     batch_timeout: Duration,
-    /// Optional second-hop exit node (val.town / Deno Deploy / etc.)
+    /// Optional second-hop exit node (Deno Deploy / fly.io / etc.)
     /// to bypass CF-anti-bot blocks on sites that flag Google datacenter
     /// IPs (chatgpt.com, claude.ai, grok.com, x.com). Mirrors
     /// `Config::exit_node`. When `exit_node_enabled` is false (the more
@@ -770,14 +770,14 @@ impl DomainFronter {
         };
 
         // Exit-node short-circuit: route through the configured second-hop
-        // relay (val.town / Deno Deploy / etc.) for hosts that need a
+        // relay (Deno Deploy / fly.io / etc.) for hosts that need a
         // non-Google exit IP. The cache + coalesce layer below is bypassed
         // for these — exit-node-eligible hosts are the ones with active
         // anti-bot challenges (CF Turnstile, ChatGPT login, Claude.ai,
         // grok.com), and serving cached responses across users for those
         // would be wrong (auth tokens, session state, per-user
         // personalization). Falls back to the regular Apps Script relay
-        // if the exit node fails (network error, 5xx from val.town, etc.)
+        // if the exit node fails (network error, 5xx from the exit node, etc.)
         // so a misconfigured or down exit node doesn't take the user
         // offline for the sites that DON'T need it.
         if self.exit_node_matches(url) {
@@ -1285,7 +1285,7 @@ impl DomainFronter {
     /// ```text
     /// client → SNI rewrite → Apps Script (Google IP)
     ///        → UrlFetchApp.fetch(exit_node_url)
-    ///        → exit node (val.town, non-Google IP)
+    ///        → exit node (non-Google IP)
     ///        → fetch(real_url)
     ///        → response back through both layers
     /// ```
@@ -1296,7 +1296,7 @@ impl DomainFronter {
     /// destination, returns a `{s, h, b}` JSON envelope. Apps Script
     /// returns that envelope as the body of its raw HTTP response
     /// (because we set `r: true`). We then unwrap one extra layer:
-    /// extract Apps Script's body → parse the val.town JSON → reconstruct
+    /// extract Apps Script's body → parse the exit-node JSON → reconstruct
     /// the destination's raw HTTP response so the rest of the proxy
     /// pipeline (MITM TLS write-back) sees the same shape it gets from
     /// the regular path.
@@ -1314,7 +1314,7 @@ impl DomainFronter {
         // Reusing build_payload_json keeps the outer envelope consistent
         // with everything else (including the random padding for DPI
         // evasion). The `r: true` flag in RelayRequest makes Code.gs
-        // return val.town's raw HTTP response, which is what we want to
+        // return exit-node's raw HTTP response, which is what we want to
         // unwrap below.
         let exit_url = self.exit_node_url.clone();
         let outer_headers = vec![(
@@ -1325,12 +1325,12 @@ impl DomainFronter {
             self.build_payload_json("POST", &exit_url, &outer_headers, &inner_json)?;
 
         // Send the outer payload through the relay machinery and get back
-        // Apps Script's response body (which is val.town's JSON envelope).
+        // Apps Script's response body (which is exit-node's JSON envelope).
         let app_body = self
             .send_prebuilt_payload_through_relay(outer_payload)
             .await?;
 
-        // val.town's JSON envelope: {s: u16, h: {...}, b: "<base64>"} on
+        // exit-node's JSON envelope: {s: u16, h: {...}, b: "<base64>"} on
         // success, {e: "..."} on its own internal error.
         parse_exit_node_response(&app_body)
     }
@@ -1376,7 +1376,7 @@ impl DomainFronter {
             h: hmap,
             b: b_encoded,
             ct,
-            r: false, // val.town returns its own JSON envelope, not raw HTTP
+            r: false, // the exit node returns its own JSON envelope, not raw HTTP
         };
         Ok(serde_json::to_vec(&req)?)
     }
@@ -1385,7 +1385,7 @@ impl DomainFronter {
     /// a payload we already built. Mirrors `do_relay_once_with` but
     /// returns the **raw response body bytes** (Apps Script's HTTP body)
     /// instead of running the body through `parse_relay_json` — the
-    /// exit-node path needs to peel off val.town's JSON envelope, which
+    /// exit-node path needs to peel off exit-node's JSON envelope, which
     /// has a different shape from Code.gs's raw-HTTP wrapping.
     async fn send_prebuilt_payload_through_relay(
         &self,
@@ -2133,12 +2133,12 @@ fn unix_to_ymd_utc(secs: u64) -> (i64, u32, u32) {
     (y, m as u32, d as u32)
 }
 
-/// Parse the val.town exit-node JSON envelope back into a raw HTTP/1.1
+/// Parse the exit-node JSON envelope back into a raw HTTP/1.1
 /// response. The envelope shape is:
 ///
 /// - On success: `{ "s": <status u16>, "h": { ... }, "b": "<base64>" }`
 /// - On exit-node-side error: `{ "e": "<message>" }` with HTTP 4xx/5xx
-///   from val.town's own status code (decoded from the outer Apps Script
+///   from exit-node's own status code (decoded from the outer Apps Script
 ///   layer, not the inner field).
 ///
 /// We synthesize a complete HTTP/1.1 response from these fields so the
@@ -2153,8 +2153,8 @@ fn parse_exit_node_response(body: &[u8]) -> Result<Vec<u8>, FronterError> {
         ))
     })?;
 
-    // Surface val.town's internal errors clearly rather than as a 502
-    // from the outer envelope. The `{e: "..."}` shape is what the val.town
+    // Surface exit-node's internal errors clearly rather than as a 502
+    // from the outer envelope. The `{e: "..."}` shape is what the exit-node's
     // script emits on bad PSK, malformed URL, or any caught exception.
     if let Some(err_msg) = v.get("e").and_then(|x| x.as_str()) {
         return Err(FronterError::Relay(format!(
@@ -2484,7 +2484,7 @@ where
             let want = need.min(tmp.len());
             // Handle ungraceful TLS close-without-close_notify (rustls
             // surfaces this as `io::ErrorKind::UnexpectedEof`). Some
-            // origins — notably val.town's exit-node path through Apps
+            // origins — notably exit-node path through Apps
             // Script (#585, v1.9.4) and certain Apps Script `Connection:
             // close` responses — terminate the underlying TCP without
             // sending the TLS close_notify alert first. Treat that the
@@ -3085,7 +3085,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_http_response_tolerates_unexpected_eof_with_content_length() {
-        // Issue #585 / v1.9.4 exit-node bug. Some peers (val.town in
+        // Issue #585 / v1.9.4 exit-node bug. Some peers (the deployed exit-node in
         // particular, certain Apps Script `Connection: close` paths) close
         // the TCP without TLS close_notify. Body should still be returned
         // when Content-Length is satisfied, even though the read after
@@ -3130,8 +3130,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parse_exit_node_response_unwraps_valtown_envelope() {
-        // The exit-node path through Apps Script returns val.town's JSON
+    async fn parse_exit_node_response_unwraps_exit_node_envelope() {
+        // The exit-node path through Apps Script returns exit node's JSON
         // envelope as the response body. parse_exit_node_response must
         // unwrap it back into a raw HTTP/1.1 response so the MITM TLS
         // write-back path sees the same shape it gets from the regular
@@ -3150,7 +3150,7 @@ mod tests {
 
     #[tokio::test]
     async fn parse_exit_node_response_surfaces_explicit_error() {
-        // When val.town returns `{e: "..."}` instead of the {s,h,b} shape,
+        // When the exit node returns `{e: "..."}` instead of the {s,h,b} shape,
         // surface that error message specifically rather than letting
         // it through as an unparseable 502 — the message string is what
         // tells the user what went wrong (placeholder PSK, bad URL,

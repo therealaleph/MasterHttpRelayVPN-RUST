@@ -283,7 +283,7 @@ struct FormState {
     request_timeout_secs: u64,
     /// Optional second-hop exit node for CF-anti-bot bypass (chatgpt.com /
     /// claude.ai / grok.com / x.com). Config-only — no UI editor yet.
-    /// See `assets/exit_node/` for the val.town deployment script.
+    /// See `assets/exit_node/` for the generic exit-node handler.
     exit_node: mhrv_rs::config::ExitNodeConfig,
 }
 
@@ -676,7 +676,7 @@ struct ConfigWire<'a> {
     #[serde(skip_serializing_if = "is_default_timeout_secs")]
     request_timeout_secs: u64,
     /// Exit-node config (CF-anti-bot bypass for chatgpt.com / claude.ai /
-    /// grok.com / x.com via val.town second-hop relay). Skip when fully
+    /// grok.com / x.com via exit-node second-hop relay). Skip when fully
     /// default (disabled with no URL/PSK/hosts) so configs without
     /// exit-node setup stay clean. Round-tripped through FormState so
     /// Save preserves user-edited values.

@@ -341,7 +341,7 @@ pub struct Config {
     ///
     /// Architecture: chain becomes
     ///   `client → SNI rewrite → Apps Script (Google IP) → exit node
-    ///    (val.town / Deno Deploy / etc., non-Google IP) → destination`
+    ///    (Deno Deploy / fly.io / etc., non-Google IP) → destination`
     ///
     /// The destination sees the exit node's outbound IP, not Google's.
     /// CF anti-bot's "this is a Google datacenter" heuristic doesn't
@@ -362,9 +362,9 @@ pub struct ExitNodeConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// HTTPS URL of the exit-node endpoint. Typically a val.town /
-    /// Deno Deploy / fly.io serverless deployment running the
-    /// `assets/exit_node/valtown.ts` script (or an equivalent). The
+    /// HTTPS URL of the exit-node endpoint. Typically a Deno Deploy /
+    /// fly.io serverless deployment (or your own VPS) running the
+    /// `assets/exit_node/exit_node.ts` script (or an equivalent). The
     /// exit node is what makes the outbound `fetch()` call to the
     /// destination, so its IP is what the destination sees.
     #[serde(default)]

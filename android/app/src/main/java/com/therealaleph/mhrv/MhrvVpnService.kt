@@ -332,19 +332,37 @@ class MhrvVpnService : VpnService() {
      *
      * Steps, with the bound on each one called out so a hung native call
      * cannot stall the whole teardown thread:
-     *   1. Signal tun2proxy to stop (cooperative). Bounded by a 2s
-     *      side-thread join — if the JNI call hangs we proceed anyway.
-     *   2. Drop our `ParcelFileDescriptor` reference. Because we already
+     *   1. Shut down the Rust proxy FIRST. This closes the listening
+     *      SOCKS5 socket that tun2proxy's worker thread is blocked on
+     *      a read() from. Killing the upstream socket is what makes the
+     *      worker's blocking native call return — we have no other lever
+     *      to wake it. Bounded by `rt.shutdown_timeout(3s)` Rust-side.
+     *   2. Signal tun2proxy to stop (cooperative). Mostly redundant after
+     *      step 1, but cheap and covers the rare path where the worker is
+     *      blocked on something other than its socket read (e.g. a
+     *      smoltcp internal queue waiting on a wake). Bounded by a 2s
+     *      side-thread join.
+     *   3. Drop our `ParcelFileDescriptor` reference. Because we already
      *      called detachFd() at startup, this is a no-op for the
      *      underlying fd — the worker (closeFdOnDrop=true) owns it.
      *      We keep the call only so the PROXY_ONLY / failed-establish
      *      paths still null out the field cleanly.
-     *   3. Join the tun2proxy thread, bounded at 4s. If the worker is
-     *      stuck we log and move on — the runtime shutdown below will
-     *      knock the rest of the world over.
-     *   4. Shut down the Rust proxy runtime, bounded by `rt.shutdown_timeout`
-     *      on the Rust side (5s). This is the hard backstop: the listener
-     *      socket is released here regardless of what the worker is doing.
+     *   4. Join the tun2proxy thread, bounded at 4s. With step 1 having
+     *      already closed the socket the worker was reading from, this
+     *      join almost always completes well under the deadline.
+     *
+     * History (#700 from @ilok67): the original order was
+     * tun2proxy → tun.close → join → stopProxy. That ordering crashed
+     * SIGSEGV ~2s after Disconnect because Native.stopProxy() freed the
+     * Rust runtime (including the SOCKS5 listener) while tun2proxy's
+     * worker was still in a blocking native read against it — classic
+     * use-after-free. The previous comment claimed "the runtime shutdown
+     * below will knock the rest of the world over," but Native.stopProxy
+     * cannot forcibly terminate a separate native thread; it just frees
+     * memory the other thread is still using. Reversing the order means
+     * the worker's blocking read returns with an EOF / socket-closed
+     * error, the worker exits through its own error path, and the join
+     * is effectively just confirming a clean shutdown.
      */
     private fun teardown() {
         // Idempotency guard. Without this, onDestroy racing the
@@ -363,11 +381,24 @@ class MhrvVpnService : VpnService() {
             "(tun2proxy running=${tun2proxyRunning.get()}, proxyHandle=$proxyHandle)",
         )
 
-        // 1. Cooperative stop signal — bounded so a hung Rust call cannot
-        //    stall the entire teardown thread. We've never observed
-        //    Tun2proxy.stop() block in practice, but the contract isn't
-        //    documented as bounded and the rest of teardown already takes
-        //    care to be timeout-bounded; this closes the gap.
+        // 1. Stop the Rust proxy FIRST. Closing the SOCKS5 listener is
+        //    what makes tun2proxy's worker thread's blocking read return
+        //    — without this the worker stays in native code and a later
+        //    Native.stopProxy would race it into use-after-free (#700).
+        val handle = proxyHandle
+        proxyHandle = 0L
+        if (handle != 0L) {
+            Log.i(TAG, "teardown: stopping proxy handle=$handle")
+            try { Native.stopProxy(handle) } catch (t: Throwable) {
+                Log.e(TAG, "Native.stopProxy threw: ${t.message}", t)
+            }
+        }
+
+        // 2. Cooperative stop signal — mostly redundant now that step 1
+        //    has yanked the socket out from under the worker, but cheap
+        //    and covers any future code path where the worker might be
+        //    blocked on something other than its upstream socket read.
+        //    Bounded so a hung JNI call can't stall teardown.
         if (tun2proxyRunning.get()) {
             val stopper = Thread({
                 try { Tun2proxy.stop() } catch (t: Throwable) {
@@ -380,7 +411,7 @@ class MhrvVpnService : VpnService() {
             }
         }
 
-        // 2. Drop our PFD reference. detachFd at startup means this
+        // 3. Drop our PFD reference. detachFd at startup means this
         //    close() is a no-op for the underlying fd — tun2proxy owns
         //    it (closeFdOnDrop = true) and closes it on return from
         //    run(). The call is kept only to null the field cleanly on
@@ -391,9 +422,9 @@ class MhrvVpnService : VpnService() {
         }
         tun = null
 
-        // 3. Join the worker. 4s is enough in the happy case; if tun2proxy
-        //    is stuck on something untoward we'd rather move on and force
-        //    the runtime shutdown than hang forever.
+        // 4. Join the worker. With step 1 having killed its upstream this
+        //    almost always completes immediately; the 4s budget is just
+        //    headroom for tun2proxy's internal close path to drain.
         try {
             tun2proxyThread?.join(4_000)
         } catch (_: InterruptedException) {}
@@ -403,18 +434,6 @@ class MhrvVpnService : VpnService() {
             Log.w(TAG, "tun2proxy thread still alive after join timeout — proceeding anyway")
         }
 
-        // 4. Shut down the Rust proxy. Backed by `rt.shutdown_timeout(3s)`
-        //    on the Rust side, so this is bounded even if the runtime
-        //    has in-flight tasks (common when the Apps Script relay has
-        //    piled up pending 30s timeouts).
-        val handle = proxyHandle
-        proxyHandle = 0L
-        if (handle != 0L) {
-            Log.i(TAG, "teardown: stopping proxy handle=$handle")
-            try { Native.stopProxy(handle) } catch (t: Throwable) {
-                Log.e(TAG, "Native.stopProxy threw: ${t.message}", t)
-            }
-        }
         // Flip UI state last — the button reverts to Connect only after
         // the native-side cleanup actually happened, not optimistically.
         VpnState.setProxyHandle(0L)

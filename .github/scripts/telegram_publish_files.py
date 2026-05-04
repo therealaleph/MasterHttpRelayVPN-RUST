@@ -231,6 +231,89 @@ def load_changelog(repo_root: Path, version: str) -> tuple[str | None, str | Non
     return persian, english
 
 
+def brief_changelog(text: str, max_total: int = 1500) -> str:
+    """Compress a changelog body to top-level bullets only, with each bullet
+    trimmed to a short readable headline.
+
+    Sub-bullets, prose explanations, contributor @-mentions, and embedded
+    "by @user with full root cause + fix" prefatory phrases are stripped.
+    Markdown link `[text](url)` becomes plain `text`, with the special case
+    of `[#nnn](url)` → `#nnn` (issue/PR number stays readable without the
+    visual clutter of the URL). The result still goes through
+    `md_to_tg_html` for backtick → <code> conversion.
+
+    Why bullets-only: Telegram channel readers want "what shipped" in a
+    glance, not the architectural detail that lives in the git log + the
+    full `docs/changelog/v*.md` file. The full English text is still in
+    the repo for archival.
+
+    `max_total` caps the assembled brief so the announcement stays well
+    under Telegram's 4096-char sendMessage budget after header / footer
+    chrome is added.
+    """
+    out: list[str] = []
+    total_len = 0
+
+    for raw in text.splitlines():
+        if not raw.startswith("• "):
+            continue
+        body = raw[2:].strip()
+
+        # Strip "by @user with full root cause + fix" / "from @user" /
+        # "by @user". The "with ..." clause after "by @user" runs to the
+        # next closing paren — greedy `[^)]*` is what consumes it
+        # cleanly. Without the greedy form, the trailing "with full
+        # root cause + fix" remained in the headline.
+        body = re.sub(r" by @[\w-]+(?: with [^)]*)?", "", body)
+        body = re.sub(r" from @[\w-]+", "", body)
+
+        # `(PR [#nnn](url))` → `(#nnn)` and bare `[#nnn](url)` → `#nnn`.
+        # Done before generic `[text](url)` so the issue-number form
+        # wins over the catch-all (which would expand the link text).
+        body = re.sub(r"PR \[#(\d+)\]\([^)]+\)", r"#\1", body)
+        body = re.sub(r"\[#(\d+)\]\([^)]+\)", r"#\1", body)
+        body = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", body)
+
+        # Cut at the first natural sentence boundary that isn't too
+        # early. ":" anchored to position ≥ 30 catches "Title: details"
+        # without truncating short headers like "Tests:" / "API:" /
+        # "Build:" that are themselves the headline. ". " catches the
+        # rest. " — " (em-dash with spaces) is our explicit "headline
+        # — body" form in the changelogs.
+        candidates = []
+        for sep, min_pos in ((":", 30), (". ", 5), (" — ", 5)):
+            idx = body.find(sep)
+            if idx >= min_pos and idx < 200:
+                candidates.append(idx)
+        if candidates:
+            body = body[: min(candidates)].rstrip()
+
+        # Hard cap at 200 chars so a single sentence-less bullet
+        # (e.g. comma-separated list) can't dominate the brief.
+        if len(body) > 200:
+            body = body[:197].rstrip() + "…"
+
+        # If our truncation left an unclosed `(`, strip from there. A
+        # dangling `(` reads as a typo in the channel post; better to
+        # drop the parenthesised aside than to show a half-open one.
+        # Same for `[`. Counts compare: if open > close, find the last
+        # offending char and trim back to the previous space.
+        for open_ch, close_ch in (("(", ")"), ("[", "]")):
+            if body.count(open_ch) > body.count(close_ch):
+                last = body.rfind(open_ch)
+                if last > 0:
+                    body = body[:last].rstrip()
+
+        line = f"• {body}"
+        # +1 for the line separator we'll insert when joining.
+        if total_len + len(line) + 1 > max_total:
+            break
+        out.append(line)
+        total_len += len(line) + 1
+
+    return "\n".join(out)
+
+
 def md_to_tg_html(md: str, max_len: int = TG_CHANGELOG_BUDGET) -> str:
     """Convert a subset of Markdown to Telegram-flavoured HTML.
 
@@ -479,7 +562,7 @@ def post_main_channel_pointer(
     hashtag: str,
     channel_username_link: str = "",
     channel_invite_link: str = "",
-    persian_notes: str | None = None,
+    english_notes_brief: str | None = None,
 ) -> bool:
     """Post a short cross-link to the main announcement channel pointing
     at the anchor post in the files channel. Replaces the previous
@@ -487,32 +570,36 @@ def post_main_channel_pointer(
     to the main channel — the main channel becomes a discovery surface
     while the files channel hosts the actual artifacts.
 
-    When `persian_notes` is supplied (the Persian half of the matching
-    `docs/changelog/v{version}.md`), it's rendered between the title
-    and the files-channel link so subscribers see what's actually new
-    without needing to click through. Falls back to the bare pointer
-    if notes aren't available.
+    When `english_notes_brief` is supplied (the brief-extracted English
+    half of `docs/changelog/v{version}.md` via `brief_changelog`), it's
+    rendered between the title and the files-channel link so subscribers
+    see what's new without clicking through. Falls back to the bare
+    pointer if notes aren't available.
+
+    English brief (not Persian full) is what we ship to TG: the audience
+    is the worldwide channel, and short brief-tone bullets read cleanly
+    in a chat client where Persian RTL prose mixed with `<code>` /
+    `<b>` spans rendered awkwardly. The full Persian + full English
+    changelog stays in `docs/changelog/v*.md` for archival.
 
     Includes channel-join links (public username + invite hash) at the
     bottom so recipients who aren't yet members can subscribe before
     clicking through to the specific release post.
     """
     parts = [
-        f"<b>📦 mhrv-rs v{html_escape(version)} منتشر شد</b>",
+        f"<b>📦 mhrv-rs v{html_escape(version)} released</b>",
         "",
     ]
-    if persian_notes:
-        # Use a slightly tighter budget here since the cross-link has
-        # extra footer chrome (channel-join links) the files-channel
-        # announcement doesn't.
-        parts.append(md_to_tg_html(persian_notes, max_len=TG_CHANGELOG_BUDGET - 400))
+    if english_notes_brief:
+        # Tighter budget than the files-channel announcement since the
+        # cross-link has extra footer chrome (channel-join links).
+        parts.append(md_to_tg_html(english_notes_brief, max_len=TG_CHANGELOG_BUDGET - 400))
         parts.append("")
     parts.extend([
-        f"برای دانلود فایل‌ها (Android، Windows، macOS، Linux و ...) "
-        f"به کانال فایل‌ها مراجعه کنید:",
+        f"Files (Android APKs, Windows, macOS, Linux, OpenWRT) on the files channel:",
         "",
         f"👉 <a href=\"{html_escape(files_channel_post_link)}\">"
-        f"v{html_escape(version)} — همه فایل‌ها + SHA-256</a>",
+        f"v{html_escape(version)} — all files with SHA-256</a>",
     ])
     # Channel-join links. Two forms handle different states of the
     # files channel: the `t.me/<username>` form works for public
@@ -522,7 +609,7 @@ def post_main_channel_pointer(
     # is forgiving — recipients click whichever works for them.
     if channel_username_link or channel_invite_link:
         parts.append("")
-        parts.append("لینک کانال:")
+        parts.append("Channel:")
         if channel_username_link:
             # Render as plain URL (not HTML <a>) so the text shows the
             # link itself — useful when users share the message via
@@ -530,7 +617,7 @@ def post_main_channel_pointer(
             # strip the <a href> wrapper.
             parts.append(html_escape(channel_username_link))
         if channel_invite_link:
-            parts.append(f"و یا: {html_escape(channel_invite_link)}")
+            parts.append(f"or: {html_escape(channel_invite_link)}")
     parts.append("")
     parts.append(hashtag)
     text = "\n".join(parts)
@@ -603,23 +690,25 @@ def main() -> int:
     # saying "new release, click here." Recipients land on this anchor
     # and scroll down to see all the platform-specific files.
     #
-    # We pull the Persian half of `docs/changelog/v{version}.md` if it
-    # exists and inject it into the announcement, so the channel post
-    # actually tells subscribers what changed instead of just "new
-    # release dropped." Falls back to the old skeleton when the file
-    # isn't there (e.g. an out-of-band re-publish for an old tag whose
-    # changelog file was never landed).
-    persian_notes, _english_notes = load_changelog(repo_root_from_script(), args.version)
+    # We pull the English half of `docs/changelog/v{version}.md`, run it
+    # through `brief_changelog` to keep just the top-level bullets (no
+    # sub-bullets, no contributor mentions, no embedded prose), and
+    # inject that into the announcement. Brief English (not full Persian)
+    # is the right tone for a Telegram channel post: subscribers want
+    # "what shipped" in one glance; the full archival changelog stays in
+    # the repo. Falls back to the bare skeleton if the changelog file
+    # doesn't exist (e.g. an out-of-band re-publish for an old tag).
+    _persian_notes, english_notes = load_changelog(repo_root_from_script(), args.version)
+    english_brief = brief_changelog(english_notes) if english_notes else None
     announce_lines = [
-        f"<b>📦 mhrv-rs {html_escape('v' + args.version)} منتشر شد</b>",
+        f"<b>📦 mhrv-rs {html_escape('v' + args.version)} released</b>",
         "",
     ]
-    if persian_notes:
-        announce_lines.append(md_to_tg_html(persian_notes))
+    if english_brief:
+        announce_lines.append(md_to_tg_html(english_brief))
         announce_lines.append("")
     announce_lines.extend([
-        "فایل‌ها در ادامه به ترتیب پلتفرم ارسال می‌شن.",
-        "هر فایل با SHA-256 (تایید اصالت) همراه هست.",
+        "Per-platform files follow with SHA-256 captions for verification.",
         "",
         args.hashtag,
     ])
@@ -689,7 +778,7 @@ def main() -> int:
             args.hashtag,
             channel_username_link=username_link,
             channel_invite_link=invite_link,
-            persian_notes=persian_notes,
+            english_notes_brief=english_brief,
         )
         if not ok:
             failures += 1
