@@ -57,7 +57,9 @@ pub enum FronterError {
 }
 
 type PooledStream = TlsStream<TcpStream>;
-const POOL_TTL_SECS: u64 = 45;
+const POOL_TTL_SECS: u64 = 60;
+const POOL_MIN: usize = 8;
+const POOL_REFILL_INTERVAL_SECS: u64 = 5;
 const POOL_MAX: usize = 80;
 const REQUEST_TIMEOUT_SECS: u64 = 25;
 const RANGE_PARALLEL_CHUNK_BYTES: u64 = 256 * 1024;
@@ -644,38 +646,86 @@ impl DomainFronter {
         Ok(tls)
     }
 
-    /// Open `n` outbound TLS connections in parallel and park them in the
-    /// pool so the first few user requests don't pay the handshake cost.
-    /// Errors are logged but not returned — best-effort.
+    /// Open `n` outbound TLS connections sequentially (500 ms apart) and
+    /// park them in the pool. Staggered so we don't burst N TLS handshakes
+    /// at Google edge simultaneously, and each connection gets an 8 s
+    /// expiry offset so they roll off gradually instead of all hitting
+    /// POOL_TTL_SECS at once.
     pub async fn warm(self: &Arc<Self>, n: usize) {
-        let mut set = tokio::task::JoinSet::new();
-        for _ in 0..n {
-            let me = self.clone();
-            set.spawn(async move {
-                match me.open().await {
-                    Ok(s) => Some(PoolEntry {
+        let mut warmed = 0usize;
+        for i in 0..n {
+            if i > 0 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            match self.open().await {
+                Ok(s) => {
+                    let entry = PoolEntry {
                         stream: s,
-                        created: Instant::now(),
-                    }),
-                    Err(e) => {
-                        tracing::debug!("pool warm: open failed: {}", e);
-                        None
+                        created: Instant::now() - Duration::from_secs(8 * i as u64),
+                    };
+                    let mut pool = self.pool.lock().await;
+                    if pool.len() < POOL_MAX {
+                        pool.push(entry);
+                        warmed += 1;
                     }
                 }
-            });
-        }
-        let mut warmed = 0;
-        while let Some(res) = set.join_next().await {
-            if let Ok(Some(entry)) = res {
-                let mut pool = self.pool.lock().await;
-                if pool.len() < POOL_MAX {
-                    pool.push(entry);
-                    warmed += 1;
+                Err(e) => {
+                    tracing::debug!("pool warm: open failed: {}", e);
                 }
             }
         }
         if warmed > 0 {
             tracing::info!("pool pre-warmed with {} connection(s)", warmed);
+        }
+    }
+
+    /// Background loop that keeps at least `POOL_MIN` valid connections
+    /// ready. A connection only counts toward the minimum if it has at
+    /// least 20 s of TTL remaining — nearly-expired entries don't help.
+    /// Checks every `POOL_REFILL_INTERVAL_SECS`, evicts expired entries,
+    /// and opens replacements one at a time so there's no burst.
+    pub async fn run_pool_refill(self: Arc<Self>) {
+        const MIN_REMAINING_SECS: u64 = 20;
+        loop {
+            tokio::time::sleep(Duration::from_secs(POOL_REFILL_INTERVAL_SECS)).await;
+
+            // Evict expired entries first.
+            {
+                let mut pool = self.pool.lock().await;
+                pool.retain(|e| e.created.elapsed().as_secs() < POOL_TTL_SECS);
+            }
+
+            // Count only connections with enough life left.
+            // Refill one at a time to avoid bursting TLS handshakes.
+            loop {
+                let healthy = {
+                    let pool = self.pool.lock().await;
+                    pool.iter()
+                        .filter(|e| {
+                            let age = e.created.elapsed().as_secs();
+                            age + MIN_REMAINING_SECS < POOL_TTL_SECS
+                        })
+                        .count()
+                };
+                if healthy >= POOL_MIN {
+                    break;
+                }
+                match self.open().await {
+                    Ok(s) => {
+                        let mut pool = self.pool.lock().await;
+                        if pool.len() < POOL_MAX {
+                            pool.push(PoolEntry {
+                                stream: s,
+                                created: Instant::now(),
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("pool refill: open failed: {}", e);
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -721,12 +771,17 @@ impl DomainFronter {
     async fn acquire(&self) -> Result<PoolEntry, FronterError> {
         {
             let mut pool = self.pool.lock().await;
-            while let Some(entry) = pool.pop() {
-                if entry.created.elapsed().as_secs() < POOL_TTL_SECS {
-                    return Ok(entry);
-                }
-                // expired — drop it
-                drop(entry);
+            // Evict expired, then hand out the freshest (most remaining TTL).
+            pool.retain(|e| e.created.elapsed().as_secs() < POOL_TTL_SECS);
+            if !pool.is_empty() {
+                // Freshest = smallest elapsed time. swap_remove is O(1).
+                let freshest = pool
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, e)| e.created.elapsed())
+                    .map(|(i, _)| i)
+                    .unwrap();
+                return Ok(pool.swap_remove(freshest));
             }
         }
         let stream = self.open().await?;

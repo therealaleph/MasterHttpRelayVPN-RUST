@@ -60,17 +60,16 @@ const CLIENT_FIRST_DATA_WAIT: Duration = Duration::from_millis(50);
 /// step for more ops. Resets on every arrival, up to max from the first
 /// op. Overridable via config `coalesce_step_ms` / `coalesce_max_ms`.
 ///
-/// 10 ms is enough to catch ops that arrive in the same event-loop tick
-/// (e.g. a browser opening 6 parallel connections) without adding
-/// perceptible latency to downloads where the tunnel-node reply — not
-/// coalescing — is the real bottleneck.  When both sides *do* have data
-/// in flight (uploads, bursty page loads), the adaptive reset still
-/// packs batches efficiently: each arriving op resets the step timer, so
-/// a rapid burst naturally coalesces up to `DEFAULT_COALESCE_MAX_MS`
-/// without an explicit upload/download distinction.  The net effect is
-/// "don't wait when there's nothing to wait for; batch aggressively when
-/// there is."
-const DEFAULT_COALESCE_STEP_MS: u64 = 10;
+/// 200 ms balances latency against batching efficiency. The dominant
+/// bottleneck is the Apps Script round-trip (~1.5 s), so the extra
+/// 200 ms wait is negligible to the user but lets significantly more
+/// ops land in each batch — a page load that would fire 10 separate
+/// 1-op batches at 10 ms now packs 3–5 ops per batch, cutting the
+/// number of round-trips roughly in half. On idle sessions the step
+/// timer fires once with nothing queued (no cost); under load each
+/// arriving op resets the timer, so rapid bursts still coalesce up to
+/// `DEFAULT_COALESCE_MAX_MS` naturally.
+const DEFAULT_COALESCE_STEP_MS: u64 = 200;
 const DEFAULT_COALESCE_MAX_MS: u64 = 1000;
 
 /// Structured error code the tunnel-node returns when it doesn't know the
