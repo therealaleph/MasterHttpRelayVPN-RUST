@@ -44,7 +44,7 @@ Otherwise:
 1. In your repository, go to the **Actions** tab
 2. Click **New workflow**
 3. Click the **set up a workflow yourself** link
-4. Delete the default content and paste the contents of `ngrok.yml`
+4. Delete the default content and paste the contents of `ngrok.yml` [[here]]
 5. Click **Commit changes...**, add a commit message, then click **Commit changes**
 
 The workflow file will be saved to `.github/workflows/ngrok.yml`.
@@ -120,3 +120,5 @@ The tunnel shuts down after 6 hours. To start a new session:
 | No tunnel URL appears in logs | Check that the **Expose tunnel** step completed. The URL is fetched from the ngrok API — allow 10 seconds for the tunnel to establish. |
 | Connection limit reached | ngrok's free tier limits connections per minute. Wait a moment and retry. |
 | `CodeFull.gs` returns 502 or timeout | Verify the tunnel URL is correct and the workflow is still running. Check that `TUNNEL_AUTH_KEY` matches in both the secret and `CodeFull.gs`. |
+
+[here]: ngrok.yml
