@@ -268,6 +268,11 @@ struct FormState {
     /// User-supplied DoH hostnames added to the built-in default list,
     /// round-tripped from config.json. See config.rs `bypass_doh_hosts`.
     bypass_doh_hosts: Vec<String>,
+    /// PR #763: when true, immediately reject browser DoH CONNECTs so the
+    /// browser falls back to system DNS (tun2proxy virtual DNS — instant).
+    /// Round-tripped from config.json. Desktop UI doesn't expose a toggle
+    /// yet — Android does. See config.rs `block_doh`.
+    block_doh: bool,
     /// Multi-edge fronting groups. Round-tripped from config.json so
     /// the UI's Save doesn't drop the user's hand-edited groups —
     /// there is no UI editor for these yet, only file-edited config.
@@ -381,6 +386,7 @@ fn load_form() -> (FormState, Option<String>) {
             disable_padding: c.disable_padding,
             tunnel_doh: c.tunnel_doh,
             bypass_doh_hosts: c.bypass_doh_hosts.clone(),
+            block_doh: c.block_doh,
             fronting_groups: c.fronting_groups.clone(),
             auto_blacklist_strikes: c.auto_blacklist_strikes,
             auto_blacklist_window_secs: c.auto_blacklist_window_secs,
@@ -418,6 +424,7 @@ fn load_form() -> (FormState, Option<String>) {
             disable_padding: false,
             tunnel_doh: true,
             bypass_doh_hosts: Vec::new(),
+            block_doh: true,
             fronting_groups: Vec::new(),
             // Defaults match `default_auto_blacklist_*` and
             // `default_request_timeout_secs` in src/config.rs.
@@ -582,6 +589,12 @@ impl FormState {
             // added) so save doesn't drop them.
             tunnel_doh: self.tunnel_doh,
             bypass_doh_hosts: self.bypass_doh_hosts.clone(),
+            // PR #763: block_doh defaults to true (rejects browser DoH so
+            // tun2proxy's virtual DNS handles name lookups, saving the
+            // ~1.5s tunnel round-trip per DNS query). Desktop UI doesn't
+            // expose a toggle yet (Android does), so this is a config-only
+            // round-trip — we keep whatever the user has in config.json.
+            block_doh: self.block_doh,
             // Multi-edge fronting groups: file-edited only for now,
             // round-tripped through the UI so Save doesn't drop them.
             fronting_groups: self.fronting_groups.clone(),
@@ -661,6 +674,11 @@ struct ConfigWire<'a> {
     tunnel_doh: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     bypass_doh_hosts: &'a Vec<String>,
+    /// PR #763: default true (= browser DoH rejected, system DNS used).
+    /// Skip when matching default to keep unchanged configs clean —
+    /// emit only when the user has explicitly disabled the block.
+    #[serde(skip_serializing_if = "is_true")]
+    block_doh: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     fronting_groups: &'a Vec<FrontingGroup>,
     /// Auto-blacklist tuning + batch timeout (#391, #444, #430). Skip
@@ -698,6 +716,10 @@ fn is_default_exit_node(en: &&mhrv_rs::config::ExitNodeConfig) -> bool {
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 fn is_zero_u8(v: &u8) -> bool {
@@ -744,6 +766,7 @@ impl<'a> From<&'a Config> for ConfigWire<'a> {
             google_ip_validation: c.google_ip_validation,
             tunnel_doh: c.tunnel_doh,
             bypass_doh_hosts: &c.bypass_doh_hosts,
+            block_doh: c.block_doh,
             fronting_groups: &c.fronting_groups,
             auto_blacklist_strikes: c.auto_blacklist_strikes,
             auto_blacklist_window_secs: c.auto_blacklist_window_secs,
