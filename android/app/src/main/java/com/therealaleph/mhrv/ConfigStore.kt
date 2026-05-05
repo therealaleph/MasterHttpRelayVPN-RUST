@@ -118,7 +118,7 @@ data class MhrvConfig(
      * per name lookup with no real privacy gain. Set this to true to
      * keep DoH inside the tunnel. See `src/config.rs` `tunnel_doh`.
      */
-    val tunnelDoh: Boolean = false,
+    val tunnelDoh: Boolean = true,
 
     /**
      * Extra hostnames added to the built-in DoH default list. Same
@@ -126,6 +126,13 @@ data class MhrvConfig(
      * suffix). Use to cover private / enterprise DoH endpoints.
      */
     val bypassDohHosts: List<String> = emptyList(),
+
+    /**
+     * When true, reject all connections to known DoH endpoints.
+     * Browsers fall back to system DNS (tun2proxy virtual DNS — instant).
+     * Takes priority over tunnel_doh / bypass_doh.
+     */
+    val blockDoh: Boolean = true,
 
     /** VPN_TUN (everything routed) vs PROXY_ONLY (user configures per-app). */
     val connectionMode: ConnectionMode = ConnectionMode.VPN_TUN,
@@ -218,7 +225,8 @@ data class MhrvConfig(
             if (passthroughHosts.isNotEmpty()) {
                 put("passthrough_hosts", JSONArray().apply { passthroughHosts.forEach { put(it) } })
             }
-            if (tunnelDoh) put("tunnel_doh", true)
+            put("tunnel_doh", tunnelDoh)
+            put("block_doh", blockDoh)
             if (youtubeViaRelay) put("youtube_via_relay", true)
             // Trim/drop-empty/dedupe before serializing — symmetric with the
             // read-side normalization in loadFromJson(), so a user typing
@@ -325,6 +333,7 @@ object ConfigStore {
         if (cfg.upstreamSocks5.isNotBlank()) obj.put("upstream_socks5", cfg.upstreamSocks5)
         if (cfg.passthroughHosts.isNotEmpty()) obj.put("passthrough_hosts", JSONArray().apply { cfg.passthroughHosts.forEach { put(it) } })
         if (cfg.tunnelDoh != defaults.tunnelDoh) obj.put("tunnel_doh", cfg.tunnelDoh)
+        if (cfg.blockDoh != defaults.blockDoh) obj.put("block_doh", cfg.blockDoh)
         if (cfg.youtubeViaRelay != defaults.youtubeViaRelay) obj.put("youtube_via_relay", cfg.youtubeViaRelay)
         val cleanBypassDohHosts = cfg.bypassDohHosts
             .map { it.trim() }
@@ -428,7 +437,8 @@ object ConfigStore {
             passthroughHosts = obj.optJSONArray("passthrough_hosts")?.let { arr ->
                 buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }
             }?.filter { it.isNotBlank() }.orEmpty(),
-            tunnelDoh = obj.optBoolean("tunnel_doh", false),
+            tunnelDoh = obj.optBoolean("tunnel_doh", true),
+            blockDoh = obj.optBoolean("block_doh", true),
             youtubeViaRelay = obj.optBoolean("youtube_via_relay", false),
             bypassDohHosts = obj.optJSONArray("bypass_doh_hosts")?.let { arr ->
                 buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }

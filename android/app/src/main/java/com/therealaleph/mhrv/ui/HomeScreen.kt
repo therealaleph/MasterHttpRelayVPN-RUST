@@ -1265,6 +1265,51 @@ private fun AdvancedSettings(
             )
         }
 
+        // Block DoH toggle
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    "Block DoH",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Text(
+                    "Reject browser DoH — forces instant system DNS via tun2proxy. Saves ~1.5s per domain lookup.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Switch(
+                checked = cfg.blockDoh,
+                onCheckedChange = { onChange(cfg.copy(blockDoh = it)) },
+            )
+        }
+
+        // Bypass DoH toggle
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    "Bypass DoH",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Text(
+                    "Send browser DoH direct, not through tunnel. Faster DNS — queries are still encrypted.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Switch(
+                checked = !cfg.tunnelDoh,
+                onCheckedChange = { onChange(cfg.copy(tunnelDoh = !it)) },
+                enabled = !cfg.blockDoh,
+            )
+        }
+
         // Batch coalesce step slider
         Column {
             Text(

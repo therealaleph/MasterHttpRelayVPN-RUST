@@ -269,6 +269,22 @@ pub struct Config {
     #[serde(default)]
     pub bypass_doh_hosts: Vec<String>,
 
+    /// When true, immediately reject (close) any CONNECT to a known DoH
+    /// endpoint. Takes priority over `tunnel_doh` — the connection is
+    /// never established in either direction. Browsers fall back to system
+    /// DNS, which tun2proxy handles via virtual DNS (instant, no tunnel
+    /// round-trip). This eliminates the ~1.5s per-domain DoH overhead
+    /// that #468's `tunnel_doh: true` default introduced.
+    ///
+    /// Background: #468 changed `tunnel_doh` from false (bypass) to true
+    /// (tunnel) because Iranian ISPs block direct DoH endpoints. But
+    /// tunneling DoH costs an extra ~1.5s Apps Script round-trip per DNS
+    /// lookup, which made every page load noticeably slower. Blocking
+    /// DoH entirely avoids both problems: no ISP-visible DoH connection,
+    /// no tunnel round-trip — browsers use the system DNS path instead.
+    #[serde(default)]
+    pub block_doh: bool,
+
     /// Multi-edge domain-fronting groups. Each group is a triple of
     /// (edge IP, front SNI, member domains): when a CONNECT to one of
     /// the member domains arrives, the proxy MITMs at the local CA
