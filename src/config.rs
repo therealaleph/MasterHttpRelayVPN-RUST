@@ -282,7 +282,15 @@ pub struct Config {
     /// lookup, which made every page load noticeably slower. Blocking
     /// DoH entirely avoids both problems: no ISP-visible DoH connection,
     /// no tunnel round-trip — browsers use the system DNS path instead.
-    #[serde(default)]
+    ///
+    /// Default `true` (NOT `bool::default() = false`). Critical for
+    /// upgrading users — see #773: with the v1.9.13 default-derive bug,
+    /// existing configs got `block_doh = false` paired with `tunnel_doh
+    /// = true` (the new tunnel-DoH default from #468), routing every
+    /// browser DNS lookup through Apps Script and adding ~1.5s per page
+    /// load. The named-default function fixes the upgrade path so the
+    /// fast block-then-system-DNS behaviour is what users actually get.
+    #[serde(default = "default_block_doh")]
     pub block_doh: bool,
 
     /// Multi-edge domain-fronting groups. Each group is a triple of
@@ -472,6 +480,18 @@ fn default_google_ip_validation() -> bool {true}
 /// dominant userbase. Users on networks where direct DoH works can
 /// opt back in with `tunnel_doh: false`.
 fn default_tunnel_doh() -> bool { true }
+
+/// Default for `block_doh`: `true` (browser DoH is rejected so the
+/// browser falls back to system DNS, which `tun2proxy` resolves
+/// instantly via virtual DNS — saves the ~1.5s tunnel round-trip per
+/// name lookup that #468's `tunnel_doh: true` default would otherwise
+/// pay). #773 — without this named-default function, `#[serde(default)]`
+/// on `bool` resolves to `false`, and existing configs upgrading to
+/// v1.9.13 silently lost the block-and-fall-back behaviour, paying
+/// the full DoH-via-Apps-Script penalty on every page load. Power
+/// users who specifically want browser DoH (with the latency cost)
+/// can opt back in by setting `block_doh: false`.
+fn default_block_doh() -> bool { true }
 
 /// Defaults for the auto-blacklist tuning knobs (#391, #444). These
 /// preserve historical behavior — `3 strikes / 30s window / 120s cooldown`.
