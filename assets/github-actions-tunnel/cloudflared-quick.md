@@ -35,10 +35,11 @@ You will use this same password later in `CodeFull.gs`.
 1. In your repository, go to the **Actions** tab
 2. Click **New workflow** (or go to the next step)
 3. Click the **set up a workflow yourself** link
-4. Delete the default content (if exists) and paste the contents of `cloudflared-quick.yml`
+4. Delete the default content (if exists) and paste the contents of `cloudflared-quick.yml` [[here]]
 5. Click **Commit changes...**, add a commit message, then click **Commit changes**
 
 The workflow file will be saved to `.github/workflows/main.yml`.
+(name does not matter and you can change it to anything)
 
 ### Step 4: Run the Workflow
 
@@ -107,3 +108,5 @@ The tunnel shuts down after 6 hours. To start a new session:
 | Workflow fails at Docker step | GitHub Actions may be pulling the image for the first time. Wait 2-3 minutes and retry. |
 | No tunnel URL appears in logs | Check that the **Expose tunnel** step completed. The URL is extracted from `cloudflared` output — allow 15 seconds for the tunnel to establish. |
 | `CodeFull.gs` returns 502 or timeout | Verify the tunnel URL is correct and the workflow is still running. Check that `TUNNEL_AUTH_KEY` matches in both the secret and `CodeFull.gs`. |
+
+[here]: cloudflared-quick.yml
