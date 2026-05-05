@@ -1,0 +1,48 @@
+name: Full Tunnel (ngrok)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tunnel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Start mhrv-tunnel-node
+        run: |
+          docker run -d --name mhrv-tunnel \
+            -p 8080:8080 \
+            -e TUNNEL_AUTH_KEY="${{ secrets.TUNNEL_AUTH_KEY }}" \
+            ghcr.io/therealaleph/mhrv-tunnel-node:latest
+          sleep 5
+          curl -s http://localhost:8080/health || sleep 5
+
+      - name: Install ngrok
+        run: |
+          curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
+            | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null \
+            && echo "deb https://ngrok-agent.s3.amazonaws.com bookworm main" \
+            | sudo tee /etc/apt/sources.list.d/ngrok.list \
+            && sudo apt update \
+            && sudo apt install ngrok
+          ngrok config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
+
+      - name: Expose tunnel
+        id: expose
+        run: |
+          ngrok http 8080 --log=stdout > ngrok.log &
+          sleep 5
+          URL=$(curl -s http://localhost:4040/api/tunnels | python3 -c "import sys,json;print(json.load(sys.stdin)['tunnels'][0]['public_url'])")
+          echo "TUNNEL_URL=$URL" >> $GITHUB_OUTPUT
+          echo "::notice::Tunnel URL: $URL"
+          echo "TUNNEL_SERVER_URL = $URL"
+          sleep 21000
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker stop mhrv-tunnel || true
+          pkill ngrok || true
