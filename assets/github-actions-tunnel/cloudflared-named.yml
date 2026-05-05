@@ -1,0 +1,52 @@
+name: Full Tunnel (cloudflared Named)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tunnel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Start mhrv-tunnel-node
+        run: |
+          docker run -d --name mhrv-tunnel \
+            -p 8080:8080 \
+            -e TUNNEL_AUTH_KEY="${{ secrets.TUNNEL_AUTH_KEY }}" \
+            ghcr.io/therealaleph/mhrv-tunnel-node:latest
+          sleep 5
+          curl -s http://localhost:8080/health || sleep 5
+
+      - name: Install cloudflared
+        run: |
+          curl -L --output cloudflared.deb \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+
+      - name: Configure tunnel
+        run: |
+          mkdir -p ~/.cloudflared
+          echo "${{ secrets.CLOUDFLARE_TUNNEL_CREDENTIALS }}" > ~/.cloudflared/credentials.json
+          cat > ~/.cloudflared/config.yml << EOF
+          tunnel: ${{ secrets.CLOUDFLARE_TUNNEL_ID }}
+          credentials-file: /home/runner/.cloudflared/credentials.json
+          ingress:
+            - hostname: ${{ secrets.CLOUDFLARE_TUNNEL_HOSTNAME }}
+              service: http://localhost:8080
+            - service: http_status:404
+          EOF
+
+      - name: Run tunnel
+        run: |
+          cloudflared tunnel --config ~/.cloudflared/config.yml run &
+          echo "TUNNEL_SERVER_URL = https://${{ secrets.CLOUDFLARE_TUNNEL_HOSTNAME }}"
+          sleep 21000
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker stop mhrv-tunnel || true
+          pkill cloudflared || true
