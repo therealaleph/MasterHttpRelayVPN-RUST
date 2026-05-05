@@ -593,6 +593,16 @@ impl ProxyServer {
             tokio::spawn(async move { std::future::pending::<()>().await })
         };
 
+        // Background pool refill: keeps at least POOL_MIN ready TLS
+        // connections so acquire() never pays a cold handshake.
+        let refill_task = if let Some(refill_fronter) = self.fronter.clone() {
+            tokio::spawn(async move {
+                refill_fronter.run_pool_refill().await;
+            })
+        } else {
+            tokio::spawn(async move { std::future::pending::<()>().await })
+        };
+
         let stats_task = if let Some(stats_fronter) = self.fronter.clone() {
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -701,6 +711,7 @@ impl ProxyServer {
                 tracing::info!("Shutdown signal received, stopping listeners");
                 stats_task.abort();
                 keepalive_task.abort();
+                refill_task.abort();
                 http_task.abort();
                 socks_task.abort();
             }
