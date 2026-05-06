@@ -1265,6 +1265,28 @@ private fun AdvancedSettings(
             )
         }
 
+        // Block QUIC toggle
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    "Block QUIC",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Text(
+                    "Drop UDP/443 so browsers use TCP/HTTPS. QUIC over TCP tunnel causes meltdown.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Switch(
+                checked = cfg.blockQuic,
+                onCheckedChange = { onChange(cfg.copy(blockQuic = it)) },
+            )
+        }
+
         // Block DoH toggle
         Row(
             verticalAlignment = Alignment.CenterVertically,

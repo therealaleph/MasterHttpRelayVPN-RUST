@@ -98,6 +98,8 @@ data class MhrvConfig(
     val parallelRelay: Int = 1,
     val coalesceStepMs: Int = 10,
     val coalesceMaxMs: Int = 1000,
+    /** Block QUIC (UDP/443). QUIC over TCP tunnel causes meltdown. */
+    val blockQuic: Boolean = true,
     val upstreamSocks5: String = "",
 
     /**
@@ -219,6 +221,7 @@ data class MhrvConfig(
             put("parallel_relay", parallelRelay)
             if (coalesceStepMs != 10) put("coalesce_step_ms", coalesceStepMs)
             if (coalesceMaxMs != 1000) put("coalesce_max_ms", coalesceMaxMs)
+            put("block_quic", blockQuic)
             if (upstreamSocks5.isNotBlank()) {
                 put("upstream_socks5", upstreamSocks5.trim())
             }
@@ -330,6 +333,7 @@ object ConfigStore {
         if (cfg.parallelRelay != defaults.parallelRelay) obj.put("parallel_relay", cfg.parallelRelay)
         if (cfg.coalesceStepMs != defaults.coalesceStepMs) obj.put("coalesce_step_ms", cfg.coalesceStepMs)
         if (cfg.coalesceMaxMs != defaults.coalesceMaxMs) obj.put("coalesce_max_ms", cfg.coalesceMaxMs)
+        if (cfg.blockQuic != defaults.blockQuic) obj.put("block_quic", cfg.blockQuic)
         if (cfg.upstreamSocks5.isNotBlank()) obj.put("upstream_socks5", cfg.upstreamSocks5)
         if (cfg.passthroughHosts.isNotEmpty()) obj.put("passthrough_hosts", JSONArray().apply { cfg.passthroughHosts.forEach { put(it) } })
         if (cfg.tunnelDoh != defaults.tunnelDoh) obj.put("tunnel_doh", cfg.tunnelDoh)
@@ -433,6 +437,7 @@ object ConfigStore {
             parallelRelay = obj.optInt("parallel_relay", 1),
             coalesceStepMs = obj.optInt("coalesce_step_ms", 10),
             coalesceMaxMs = obj.optInt("coalesce_max_ms", 1000),
+            blockQuic = obj.optBoolean("block_quic", true),
             upstreamSocks5 = obj.optString("upstream_socks5", ""),
             passthroughHosts = obj.optJSONArray("passthrough_hosts")?.let { arr ->
                 buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }
