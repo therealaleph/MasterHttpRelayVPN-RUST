@@ -71,6 +71,7 @@ eframe = { version = "0.28", default-features = false, features = [
     "glow",
     "wgpu",
     "persistence",
+    "accesskit",
 ], optional = true }
 url = "2.5.8"
 
