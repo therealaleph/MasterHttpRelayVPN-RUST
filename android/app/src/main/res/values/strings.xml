@@ -103,7 +103,10 @@
     <string name="sec_usage_today">Usage today (estimated)</string>
     <string name="label_calls_today">calls today</string>
     <string name="label_bytes_today">bytes today</string>
-    <string name="label_utc_day">UTC day</string>
+    <!-- Pacific Time day key — Apps Script's UrlFetchApp quota
+         resets at midnight Pacific, not midnight UTC, so the day
+         label and the reset countdown both use PT. -->
+    <string name="label_pt_day">PT day</string>
     <string name="label_resets_in">resets in</string>
     <string name="usage_calls_of_quota">%1$d / %2$d  (%3$.1f%%)</string>
     <string name="usage_resets_hm">%1$dh %2$dm</string>

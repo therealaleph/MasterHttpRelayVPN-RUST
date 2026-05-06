@@ -260,6 +260,10 @@ struct FormState {
     /// users edit `disable_padding` directly when needed (Issue #391).
     /// Default false (padding active).
     disable_padding: bool,
+    /// Round-tripped from config.json. Not exposed as a UI control —
+    /// users edit `force_http1` directly when needed. Default false
+    /// (HTTP/2 multiplexing on the relay leg active).
+    force_http1: bool,
     /// Round-tripped from config.json. Not exposed in the UI form yet —
     /// the bypass-DoH default is the right answer for almost everyone
     /// (DoH already encrypts, the tunnel was just adding latency), so
@@ -384,6 +388,7 @@ fn load_form() -> (FormState, Option<String>) {
             passthrough_hosts: c.passthrough_hosts.clone(),
             block_quic: c.block_quic,
             disable_padding: c.disable_padding,
+            force_http1: c.force_http1,
             tunnel_doh: c.tunnel_doh,
             bypass_doh_hosts: c.bypass_doh_hosts.clone(),
             block_doh: c.block_doh,
@@ -422,6 +427,7 @@ fn load_form() -> (FormState, Option<String>) {
             passthrough_hosts: Vec::new(),
             block_quic: false,
             disable_padding: false,
+            force_http1: false,
             tunnel_doh: true,
             bypass_doh_hosts: Vec::new(),
             block_doh: true,
@@ -584,6 +590,9 @@ impl FormState {
             // Issue #391: disable_padding is config-only for now.
             // Round-trip preserves the user's choice.
             disable_padding: self.disable_padding,
+            // HTTP/2 multiplexing kill switch. Config-only for now;
+            // round-trip preserves the user's choice across Save.
+            force_http1: self.force_http1,
             // DoH bypass is enabled-by-default with `tunnel_doh = false`.
             // Round-trip the user's choice (and any extra hostnames they
             // added) so save doesn't drop them.
@@ -693,6 +702,11 @@ struct ConfigWire<'a> {
     auto_blacklist_cooldown_secs: u64,
     #[serde(skip_serializing_if = "is_default_timeout_secs")]
     request_timeout_secs: u64,
+    /// HTTP/2 multiplexing kill switch. Default false (h2 active); only
+    /// emitted on save when the user has explicitly disabled h2, so
+    /// unchanged configs stay clean.
+    #[serde(skip_serializing_if = "is_false")]
+    force_http1: bool,
     /// Exit-node config (CF-anti-bot bypass for chatgpt.com / claude.ai /
     /// grok.com / x.com via exit-node second-hop relay). Skip when fully
     /// default (disabled with no URL/PSK/hosts) so configs without
@@ -772,6 +786,7 @@ impl<'a> From<&'a Config> for ConfigWire<'a> {
             auto_blacklist_window_secs: c.auto_blacklist_window_secs,
             auto_blacklist_cooldown_secs: c.auto_blacklist_cooldown_secs,
             request_timeout_secs: c.request_timeout_secs,
+            force_http1: c.force_http1,
             exit_node: &c.exit_node,
         }
     }

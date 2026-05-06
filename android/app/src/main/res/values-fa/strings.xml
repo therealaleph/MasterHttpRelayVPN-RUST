@@ -88,7 +88,7 @@
     <string name="sec_usage_today">مصرف امروز (تخمینی)</string>
     <string name="label_calls_today">درخواست‌های امروز</string>
     <string name="label_bytes_today">بایت امروز</string>
-    <string name="label_utc_day">روز (UTC)</string>
+    <string name="label_pt_day">روز (PT)</string>
     <string name="label_resets_in">ریست تا</string>
     <string name="usage_calls_of_quota">%1$d / %2$d  (%3$.1f%%)</string>
     <string name="usage_resets_hm">%1$d ساعت و %2$d دقیقه</string>

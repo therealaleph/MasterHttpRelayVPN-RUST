@@ -89,8 +89,22 @@ object Native {
      *   relay_calls, relay_failures, coalesced, bytes_relayed,
      *   cache_hits, cache_misses, cache_bytes,
      *   blacklisted_scripts, total_scripts,
-     *   today_calls, today_bytes, today_key (string "YYYY-MM-DD"),
-     *   today_reset_secs (seconds until 00:00 UTC rollover)
+     *   today_calls, today_bytes, today_key (string "YYYY-MM-DD" in
+     *     Pacific Time — matches Apps Script's actual quota reset),
+     *   today_reset_secs (seconds until the next 00:00 Pacific Time
+     *     rollover; ~7-8 h offset from UTC depending on DST),
+     *   h2_calls (calls served by the HTTP/2 multiplexed transport,
+     *     across all entry points — Apps-Script direct, exit-node
+     *     outer call, full-mode tunnel single op, full-mode tunnel
+     *     batch. NOT comparable to relay_calls, which only sees the
+     *     Apps-Script-direct path),
+     *   h2_fallbacks (calls that attempted h2 but had to fall back
+     *     to h1 — handshake failure, open backoff, sticky ALPN
+     *     refusal, post-send error retried on h1; same all-entry-
+     *     points scope as h2_calls. Compute h2 health as
+     *     h2_calls / (h2_calls + h2_fallbacks)),
+     *   h2_disabled (boolean: true when h2 fast path is permanently
+     *     off — config force_http1 set, or peer refused h2 via ALPN)
      *
      * Cheap — just reads atomics. Safe to poll on a second-scale timer.
      */

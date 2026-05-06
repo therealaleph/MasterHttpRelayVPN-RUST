@@ -587,7 +587,7 @@ impl ProxyServer {
         // accept loops.
         let keepalive_task = if let Some(keepalive_fronter) = self.fronter.clone() {
             tokio::spawn(async move {
-                keepalive_fronter.run_h1_keepalive().await;
+                keepalive_fronter.run_keepalive().await;
             })
         } else {
             tokio::spawn(async move { std::future::pending::<()>().await })

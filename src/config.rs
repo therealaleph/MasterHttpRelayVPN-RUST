@@ -220,6 +220,19 @@ pub struct Config {
     #[serde(default)]
     pub disable_padding: bool,
 
+    /// Disable HTTP/2 multiplexing on the Apps Script relay leg.
+    /// Default `false` (= h2 enabled): the TLS handshake to the Google
+    /// edge advertises ALPN `["h2", "http/1.1"]`; if the server picks
+    /// h2 we route all relay traffic over a single multiplexed
+    /// connection (~100 concurrent streams) instead of the legacy
+    /// per-request TLS pool of 8-80 sockets. Kills head-of-line
+    /// blocking on slow Apps Script responses (one stalled call no
+    /// longer pins a whole socket). Set to `true` to force the
+    /// pre-v1.9.x HTTP/1.1 path — useful as a kill switch if a specific
+    /// deployment, fronting domain, or middlebox refuses h2.
+    #[serde(default)]
+    pub force_http1: bool,
+
     /// Opt-out for the DoH bypass. Default `false` (= bypass active):
     /// CONNECTs to well-known DoH hostnames (Cloudflare, Google, Quad9,
     /// AdGuard, NextDNS, OpenDNS, browser-pinned variants like
@@ -865,6 +878,38 @@ mod rt_tests {
         );
         assert_eq!(cfg.fetch_ips_from_api, true);
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn force_http1_round_trips_through_config() {
+        let json = r#"{
+  "mode": "apps_script",
+  "google_ip": "216.239.38.120",
+  "front_domain": "www.google.com",
+  "script_id": "X",
+  "auth_key": "secretkey123",
+  "listen_host": "127.0.0.1",
+  "listen_port": 8085,
+  "log_level": "info",
+  "verify_ssl": true,
+  "force_http1": true
+}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert!(cfg.force_http1, "force_http1=true must round-trip");
+    }
+
+    #[test]
+    fn force_http1_defaults_false_when_omitted() {
+        // Existing configs from before v1.9.13 don't have the field.
+        // serde(default) must give false (h2 active) so older configs
+        // continue to work and unchanged users get the optimization.
+        let json = r#"{
+  "mode": "apps_script",
+  "auth_key": "secretkey123",
+  "script_id": "X"
+}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert!(!cfg.force_http1, "default must be false (h2 enabled)");
     }
 
     #[test]

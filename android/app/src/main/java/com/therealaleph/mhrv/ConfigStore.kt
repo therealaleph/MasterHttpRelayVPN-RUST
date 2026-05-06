@@ -96,6 +96,14 @@ data class MhrvConfig(
     val verifySsl: Boolean = true,
     val logLevel: String = "info",
     val parallelRelay: Int = 1,
+    /**
+     * Disable the HTTP/2 multiplexing on the Apps Script relay leg.
+     * Default false (h2 active); flip to true to force the legacy
+     * HTTP/1.1 keep-alive pool. Round-tripped from config.json so a
+     * hand-edited kill switch survives a save round trip from the
+     * Android UI. See `src/config.rs` `force_http1`.
+     */
+    val forceHttp1: Boolean = false,
     val coalesceStepMs: Int = 10,
     val coalesceMaxMs: Int = 1000,
     val upstreamSocks5: String = "",
@@ -217,6 +225,7 @@ data class MhrvConfig(
             put("verify_ssl", verifySsl)
             put("log_level", logLevel)
             put("parallel_relay", parallelRelay)
+            if (forceHttp1) put("force_http1", true)
             if (coalesceStepMs != 10) put("coalesce_step_ms", coalesceStepMs)
             if (coalesceMaxMs != 1000) put("coalesce_max_ms", coalesceMaxMs)
             if (upstreamSocks5.isNotBlank()) {
@@ -328,6 +337,7 @@ object ConfigStore {
         if (cfg.verifySsl != defaults.verifySsl) obj.put("verify_ssl", cfg.verifySsl)
         if (cfg.logLevel != defaults.logLevel) obj.put("log_level", cfg.logLevel)
         if (cfg.parallelRelay != defaults.parallelRelay) obj.put("parallel_relay", cfg.parallelRelay)
+        if (cfg.forceHttp1 != defaults.forceHttp1) obj.put("force_http1", cfg.forceHttp1)
         if (cfg.coalesceStepMs != defaults.coalesceStepMs) obj.put("coalesce_step_ms", cfg.coalesceStepMs)
         if (cfg.coalesceMaxMs != defaults.coalesceMaxMs) obj.put("coalesce_max_ms", cfg.coalesceMaxMs)
         if (cfg.upstreamSocks5.isNotBlank()) obj.put("upstream_socks5", cfg.upstreamSocks5)
@@ -431,6 +441,7 @@ object ConfigStore {
             verifySsl = obj.optBoolean("verify_ssl", true),
             logLevel = obj.optString("log_level", "info"),
             parallelRelay = obj.optInt("parallel_relay", 1),
+            forceHttp1 = obj.optBoolean("force_http1", false),
             coalesceStepMs = obj.optInt("coalesce_step_ms", 10),
             coalesceMaxMs = obj.optInt("coalesce_max_ms", 1000),
             upstreamSocks5 = obj.optString("upstream_socks5", ""),
