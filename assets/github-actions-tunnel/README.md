@@ -28,14 +28,25 @@ purchase a VPS. Uses GitHub Actions free hosted runners to run the official
 Three methods are provided, ordered by setup complexity. Each is documented in
 its own guide with step-by-step instructions.
 
-| # | Method | Guide | Account Required | URL Behavior |
-|---|---|---|---|---|
-| 1 | cloudflared Quick Tunnel | [cloudflared-quick.md][quick] | None | New URL each session |
-| 2 | ngrok Tunnel | [ngrok.md][ngrok] | ngrok (free) | New URL each session |
-| 3 | cloudflared Named Tunnel | [cloudflared-named.md][named] | Cloudflare + domain | **Permanent URL** |
+| # | Method | Guide | Account Required | URL Behavior | Iran ISP friendly? |
+|---|---|---|---|---|---|
+| 1 | cloudflared Quick Tunnel | [cloudflared-quick.md][quick] | None | New URL each session | ⚠️ See note below |
+| 2 | ngrok Tunnel | [ngrok.md][ngrok] | ngrok (free) | New URL each session | ✅ Works |
+| 3 | cloudflared Named Tunnel | [cloudflared-named.md][named] | Cloudflare + domain | **Permanent URL** | ⚠️ See note below |
 
-**New to Full tunnel mode?** Start with [Method 1][quick] — no accounts
-needed beyond GitHub and Google.
+> **⚠️ Important — cloudflared methods may not work from Iran ISP.** Apps Script
+> outbound runs from Google datacenter IPs, which Cloudflare's anti-bot system
+> flags as bots and serves a 403 / Persian Google Docs error page (#849). This
+> blocks the Apps Script → trycloudflare.com / your-domain step. **If you're on
+> Iran ISP, start with Method 2 (ngrok) instead** — ngrok's edge IPs are not
+> on Cloudflare's flagged list. cloudflared Methods 1 and 3 may still work for
+> users on networks where Cloudflare's anti-bot heuristics aren't firing
+> against Apps Script's outbound, so they're documented for completeness.
+
+**New to Full tunnel mode?** If you're on Iran ISP, start with [Method 2 (ngrok)][ngrok]
+— it's the most reliable. If you're on a network where CF anti-bot doesn't
+fire against Google datacenter IPs, [Method 1 (cloudflared Quick)][quick] is
+the simplest (no third-party signup).
 
 **Need a stable URL that survives restarts?** Use [Method 3][named] — requires
 a one-time Cloudflare CLI setup but the URL never changes.
