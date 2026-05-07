@@ -78,8 +78,10 @@ Copy the new Deployment ID and update your `mhrv-rs` config.
 
 ### Step 8: Verify
 
-Use `mhrv-rs test` or visit `https://ipleak.net` through your proxy.
-You should see a GitHub Actions or ngrok IP address.
+`mhrv-rs test` is wired only for the apps_script relay path; in Full mode it
+refuses to run. To verify a Full-mode tunnel, visit `https://ipleak.net` (or
+`https://whatismyipaddress.com`) through your proxy — you should see a
+GitHub Actions or ngrok IP address.
 
 ## How It Works
 
@@ -98,15 +100,23 @@ The tunnel shuts down after 6 hours. To start a new session:
 1. Go to the **Actions** tab
 2. Select **Full Tunnel (ngrok)**
 3. Click **Run workflow > Run workflow**
-4. Copy the **new** tunnel URL from the logs (it changes each time)
-5. Update `TUNNEL_SERVER_URL` in `CodeFull.gs` and redeploy
+4. Check the tunnel URL in the logs:
+   - **Free tier with a static domain assigned** (default for new ngrok accounts):
+     the URL is the same across runs — no `CodeFull.gs` update needed.
+   - **Free tier without a static domain** (older ngrok accounts, or after
+     `ngrok config delete-domain`): the URL is a fresh random
+     `*.ngrok-free.app` each time. Copy it and update `TUNNEL_SERVER_URL`
+     in `CodeFull.gs`, then redeploy.
 
 ## Limitations
 
 - Requires an ngrok account (free tier: 1 online tunnel, limited connections
   per minute)
-- The `*.ngrok-free.app` URL changes every time the workflow runs
-- `CodeFull.gs` must be updated and redeployed each session
+- ngrok's free tier now includes one **static domain** per account, so the
+  `*.ngrok-free.app` URL stays the same across workflow runs once assigned.
+  Older accounts that opted out, or accounts that explicitly deleted the
+  domain, get a fresh URL on every run and must redeploy `CodeFull.gs` each
+  session.
 - 6-hour maximum per session (GitHub Actions limit)
 - Slightly higher latency than cloudflared methods (extra hop through ngrok's
   relay servers)

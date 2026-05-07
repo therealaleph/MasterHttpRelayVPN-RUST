@@ -70,16 +70,21 @@ All methods share these requirements:
 4. Deploy `CodeFull.gs` (Deploy → New Deployment → Web App)
 5. Configure your `mhrv-rs` client to use the new deployment in Full mode
 
-For methods where the URL changes each session (1 and 2), steps 2–4 must be
-repeated each time the workflow runs. Method 3 uses a permanent URL — configure
-`CodeFull.gs` once and only re-trigger the workflow when needed.
+For Method 1 (cloudflared Quick) the URL is fresh every session, so steps 2–4
+must be repeated each time. For Method 2 (ngrok), free-tier accounts now get a
+**static domain** by default — once assigned, the URL is the same across runs
+and `CodeFull.gs` only needs to be updated once. Method 3 uses a permanent
+URL — configure `CodeFull.gs` once and only re-trigger the workflow when
+needed.
 
 ## Limitations
 
 - **6-hour maximum per session.** GitHub Actions enforces a 360-minute timeout
   on hosted runners. Re-trigger the workflow for another session.
-- **URL changes on restart (Methods 1 & 2).** The tunnel URL is assigned at
-  runtime. `CodeFull.gs` must be updated and redeployed each time.
+- **URL changes on restart (Method 1).** cloudflared Quick assigns a fresh
+  `*.trycloudflare.com` URL at runtime. `CodeFull.gs` must be updated and
+  redeployed each session. Method 2 (ngrok) keeps the same URL across runs
+  on accounts with a static domain assigned (the free-tier default).
 - **Shared IP ranges.** GitHub-hosted runners share IP ranges with other users.
   Some websites may already have these IPs flagged.(sometimes need re-run)
 - **GitHub Actions terms.** This workflow is intended for occasional personal
