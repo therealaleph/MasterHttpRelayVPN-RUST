@@ -2474,6 +2474,31 @@ where
     } else {
         fronter.relay(&method, &url, &headers, &body).await
     };
+
+    // CORS response-header injection. The preflight short-circuit
+    // above handles `OPTIONS`, but the *actual* fetch that follows
+    // also needs CORS-compliant headers on the way back, or the
+    // browser drops the response and the JS layer sees a CORS
+    // failure. Apps Script's `UrlFetchApp.fetch()` preserves the
+    // origin server's response headers inconsistently — sometimes the
+    // destination returns `Access-Control-Allow-Origin: *` (which is
+    // incompatible with `Allow-Credentials: true`), sometimes omits
+    // ACL headers entirely. The visible symptom on YouTube is comments
+    // not loading and the "restricted" gate firing on cross-origin
+    // XHR responses that the browser rejected before the JS handler
+    // could even read them. Idea credit: ThisIsDara/mhr-cfw-go.
+    //
+    // Only injects when the request had an `Origin` header — non-CORS
+    // requests (top-level navigation, plain image fetches) don't need
+    // the headers and adding them would be noise. The relay response
+    // is otherwise byte-identical, so this never affects non-browser
+    // clients (curl, wget, app-level HTTP clients).
+    let response = if let Some(origin) = header_value(&headers, "origin") {
+        inject_cors_response_headers(&response, origin)
+    } else {
+        response
+    };
+
     stream.write_all(&response).await?;
     stream.flush().await?;
 
@@ -2519,6 +2544,80 @@ fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a s
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(name))
         .map(|(_, v)| v.as_str())
+}
+
+/// Strip any `Access-Control-*` response headers the origin server
+/// emitted (or that Apps Script's `UrlFetchApp.fetch()` may have
+/// mangled / dropped) and inject a permissive set keyed on the
+/// browser's request `Origin`. Returns a new response buffer; never
+/// mutates in place.
+///
+/// The body is preserved byte-for-byte; only the header block before
+/// the first `\r\n\r\n` is rewritten. If the response can't be parsed
+/// as HTTP/1.x (no header/body separator), it's returned unchanged so
+/// edge-case responses (e.g. raw error blobs from upstream) aren't
+/// corrupted.
+///
+/// Why permissive (`Allow-Methods: *`, `Allow-Headers: *`,
+/// `Expose-Headers: *`): the browser already pre-cleared the request
+/// via the preflight short-circuit (line ~2435), and the relay path
+/// doesn't expose anything that wasn't already going to the
+/// destination through the user's own MITM trust anchor. The wide
+/// permissions only relax browser-side CORS gating; they don't widen
+/// the underlying network reach. `Allow-Credentials: true` is
+/// echo-only-with-explicit-origin (spec requires it; `*` is invalid
+/// alongside credentials) — that's why we echo the request's origin
+/// and never use `*`.
+fn inject_cors_response_headers(response: &[u8], origin: &str) -> Vec<u8> {
+    // Find the header / body separator. If we can't parse the
+    // response as HTTP/1.x, hand it back unchanged.
+    let sep = b"\r\n\r\n";
+    let Some(idx) = response
+        .windows(sep.len())
+        .position(|w| w == sep)
+    else {
+        return response.to_vec();
+    };
+    let head = &response[..idx];
+    let body = &response[idx + sep.len()..];
+
+    // Rebuild the header block, dropping any pre-existing
+    // `Access-Control-*` lines so the destination's value can't
+    // conflict with ours.
+    let head_str = match std::str::from_utf8(head) {
+        Ok(s) => s,
+        Err(_) => return response.to_vec(),
+    };
+    let mut out = String::with_capacity(head.len() + 256);
+    let mut lines = head_str.split("\r\n");
+    if let Some(status) = lines.next() {
+        out.push_str(status);
+        out.push_str("\r\n");
+    }
+    for line in lines {
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("access-control-") {
+            continue;
+        }
+        out.push_str(line);
+        out.push_str("\r\n");
+    }
+    // Inject our own. `Vary: Origin` tells downstream caches that the
+    // response varies per request origin (so CDN-shared caches don't
+    // serve one user's CORS-tagged response to a different origin).
+    out.push_str("Access-Control-Allow-Origin: ");
+    out.push_str(origin);
+    out.push_str("\r\n");
+    out.push_str("Access-Control-Allow-Credentials: true\r\n");
+    out.push_str("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD\r\n");
+    out.push_str("Access-Control-Allow-Headers: *\r\n");
+    out.push_str("Access-Control-Expose-Headers: *\r\n");
+    out.push_str("Vary: Origin\r\n");
+    out.push_str("\r\n");
+
+    let mut buf = out.into_bytes();
+    buf.extend_from_slice(body);
+    buf
 }
 
 fn expects_100_continue(headers: &[(String, String)]) -> bool {
@@ -3234,6 +3333,69 @@ mod tests {
         let list: Vec<String> = vec![];
         assert!(!matches_passthrough("anything.com", &list));
         assert!(!matches_passthrough("", &list));
+    }
+
+    #[test]
+    fn inject_cors_response_headers_replaces_existing_acl_with_origin_echo() {
+        // Origin server returned `Access-Control-Allow-Origin: *` which
+        // browsers reject when paired with `Allow-Credentials: true` (the
+        // YouTube comments failure mode). Our injection must strip the
+        // wildcard and substitute the request's actual origin so that
+        // credentialed requests succeed.
+        let response = b"HTTP/1.1 200 OK\r\n\
+                        Content-Type: application/json\r\n\
+                        Access-Control-Allow-Origin: *\r\n\
+                        Access-Control-Allow-Methods: GET\r\n\
+                        Content-Length: 12\r\n\
+                        \r\n\
+                        {\"a\":\"b\"}xx";
+        let injected = inject_cors_response_headers(response, "https://www.youtube.com");
+        let s = std::str::from_utf8(&injected).unwrap();
+        // Original wildcard must be gone.
+        assert!(
+            !s.contains("Access-Control-Allow-Origin: *"),
+            "wildcard origin must be stripped, got: {}",
+            s
+        );
+        // Echoed origin + credentials must be present.
+        assert!(s.contains("Access-Control-Allow-Origin: https://www.youtube.com\r\n"));
+        assert!(s.contains("Access-Control-Allow-Credentials: true\r\n"));
+        // Body preserved byte-for-byte.
+        assert!(injected.ends_with(b"{\"a\":\"b\"}xx"));
+        // Status line preserved.
+        assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
+    }
+
+    #[test]
+    fn inject_cors_response_headers_preserves_non_acl_headers() {
+        // Non-ACL headers (Content-Type, Set-Cookie, Cache-Control, …)
+        // must pass through unchanged. Only `Access-Control-*` lines
+        // are stripped.
+        let response = b"HTTP/1.1 200 OK\r\n\
+                        Content-Type: text/html\r\n\
+                        Set-Cookie: a=1\r\n\
+                        Cache-Control: max-age=300\r\n\
+                        Access-Control-Allow-Origin: https://other.example\r\n\
+                        \r\n\
+                        body";
+        let injected = inject_cors_response_headers(response, "https://www.youtube.com");
+        let s = std::str::from_utf8(&injected).unwrap();
+        assert!(s.contains("Content-Type: text/html\r\n"));
+        assert!(s.contains("Set-Cookie: a=1\r\n"));
+        assert!(s.contains("Cache-Control: max-age=300\r\n"));
+        // Wrong origin replaced.
+        assert!(!s.contains("Access-Control-Allow-Origin: https://other.example\r\n"));
+        assert!(s.contains("Access-Control-Allow-Origin: https://www.youtube.com\r\n"));
+    }
+
+    #[test]
+    fn inject_cors_response_headers_returns_unchanged_when_no_header_terminator() {
+        // A response missing the `\r\n\r\n` separator (e.g. raw error
+        // blob, truncated upstream) must round-trip unchanged so we
+        // don't corrupt non-HTTP/1.x bytes.
+        let response = b"not an http response";
+        let injected = inject_cors_response_headers(response, "https://x.com");
+        assert_eq!(injected.as_slice(), response);
     }
 
     #[test]
