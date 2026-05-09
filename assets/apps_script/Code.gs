@@ -10,9 +10,14 @@
  *   Set CACHE_SPREADSHEET_ID to a valid Google Sheet ID (must be owned by
  *   the same account). When enabled, public GET requests are stored in the
  *   sheet and served from there on repeat visits, reducing UrlFetchApp
- *   quota consumption. The cache is Vary-aware (Accept-Encoding and
- *   Accept-Language are hashed into the compound cache key). Leave
- *   CACHE_SPREADSHEET_ID as-is to disable caching entirely — zero overhead.
+ *   quota consumption. Bodies are gzipped before base64 storage so larger
+ *   responses fit under the per-cell character limit, and persistent
+ *   4xx (404/410/451) get a short negative-cache TTL so buggy clients
+ *   that hammer dead URLs cost zero quota; 5xx is never cached so a
+ *   flapping upstream cannot poison a 24h slot with a transient outage.
+ *   The cache is Vary-aware (Accept-Encoding and Accept-Language are
+ *   hashed into the compound cache key). Leave CACHE_SPREADSHEET_ID as-is
+ *   to disable caching entirely — zero overhead.
  *
  * DEPLOYMENT:
  *   1. Go to https://script.google.com → New project
@@ -53,6 +58,22 @@ const CACHE_META_CURSOR_CELL = "A1";
 const CACHE_MAX_ROWS = 5000;             // circular buffer capacity
 const CACHE_MAX_BODY_BYTES = 35000;      // skip responses larger than ~35 KB
 const CACHE_DEFAULT_TTL_SECONDS = 86400; // 24-hour fallback when no Cache-Control
+
+// ── Negative Caching ────────────────────────────────────────
+// Persistent 4xx errors get a short TTL when the upstream is silent on
+// Cache-Control. Buggy clients hammer dead URLs (favicons, telemetry
+// pixels, dev-tools probes); a 5-minute floor absorbs the storm at
+// zero quota cost while letting transient 404s self-heal quickly.
+// 5xx is never cached — see _fetchAndCache.
+const NEGATIVE_CACHE_STATUSES = { 404: 1, 410: 1, 451: 1 };
+const NEGATIVE_CACHE_TTL_SECONDS = 300;
+
+// ── Body Compression ────────────────────────────────────────
+// Bodies are gzipped before base64 storage when worthwhile. Gzip has
+// ~20 bytes of header overhead, so very small payloads can bloat;
+// skip below this threshold. Already-encoded responses (gzip/br/etc.)
+// are stored as-is to avoid double-compression.
+const GZIP_MIN_BYTES = 256;
 
 // ── Vary-Aware Cache Key ────────────────────────────────────
 // These request headers are hashed into the compound cache key
@@ -320,9 +341,12 @@ function _initCacheSheet() {
     var sheet = ss.getSheetByName(CACHE_SHEET_NAME);
     if (!sheet) {
       sheet = ss.insertSheet(CACHE_SHEET_NAME);
-      // Schema: URL_Hash | URL | Status | Headers | Body | Timestamp | Expires_At
-      sheet.getRange(1, 1, 1, 7).setValues([[
-        "URL_Hash", "URL", "Status", "Headers", "Body", "Timestamp", "Expires_At"
+      // Schema: URL_Hash | URL | Status | Headers | Body | Timestamp | Expires_At | Z
+      // Z is 1 when Body is base64(gzip(rawBytes)), 0/empty when base64(rawBytes).
+      // Legacy 7-column rows from older deployments read back as Z=undefined,
+      // which the cache hit path treats as "not gzipped" — fully compatible.
+      sheet.getRange(1, 1, 1, 8).setValues([[
+        "URL_Hash", "URL", "Status", "Headers", "Body", "Timestamp", "Expires_At", "Z"
       ]]);
     }
     return sheet;
@@ -539,17 +563,34 @@ function _getFromCache(url, reqHeaders) {
   var found = finder.findNext();
 
   if (found) {
-    var row = sheet.getRange(found.getRow(), 1, 1, 7).getValues()[0];
+    // 8-column read. Legacy 7-column rows return undefined for the Z slot,
+    // which is falsy and falls through the not-gzipped branch below — fully
+    // compatible with caches written before the gzip-storage change.
+    var row = sheet.getRange(found.getRow(), 1, 1, 8).getValues()[0];
 
     var expiresAt = row[6];
     if (expiresAt && expiresAt instanceof Date && expiresAt < new Date()) {
       return null;
     }
 
+    var storedBody = row[4];
+    var body;
+    if (row[7]) {
+      // Stored as base64(gzip(rawBytes)). The relay protocol's `b` field
+      // is base64(rawBytes), so decompress and re-encode for the wire.
+      var gzipped = Utilities.base64Decode(storedBody);
+      var raw = Utilities
+        .ungzip(Utilities.newBlob(gzipped, "application/x-gzip"))
+        .getBytes();
+      body = Utilities.base64Encode(raw);
+    } else {
+      body = storedBody;
+    }
+
     return {
       status: row[2],
       headers: _refreshCachedHeaders(row[3], row[5]),
-      body: row[4],
+      body: body,
     };
   }
   return null;
@@ -557,9 +598,11 @@ function _getFromCache(url, reqHeaders) {
 
 /**
  * Fetch a URL and store the response in the spreadsheet cache
- * using a circular buffer (O(1) writes). Skips storage when the
- * encoded body exceeds CACHE_MAX_BODY_BYTES or when Cache-Control
- * forbids caching. Returns the fetch result regardless.
+ * using a circular buffer (O(1) writes). Skips storage on 5xx
+ * (transient outages must not poison a 24h slot), when Cache-Control
+ * forbids caching, or when the post-compression body exceeds
+ * CACHE_MAX_BODY_BYTES. Always returns the fetch result so the caller
+ * can serve the live response even when the cache write is skipped.
  */
 function _fetchAndCache(url, reqHeaders) {
   var sheet = _initCacheSheet();
@@ -569,21 +612,51 @@ function _fetchAndCache(url, reqHeaders) {
     var response = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
     var status = response.getResponseCode();
     var headers = _respHeaders(response);
-    var body = Utilities.base64Encode(response.getContent());
+    var bodyBytes = response.getContent();
+    var rawB64 = Utilities.base64Encode(bodyBytes);
+    var headersJson = JSON.stringify(headers);
+    var liveResult = { status: status, headers: headersJson, body: rawB64 };
 
-    // Cell-size safety gate
-    if (body.length > CACHE_MAX_BODY_BYTES) {
-      return { status: status, headers: JSON.stringify(headers), body: body };
-    }
+    // 5xx never enters the cache. A flapping upstream returning 503 once
+    // would otherwise pin that response for 24h and break the URL for
+    // every subsequent client until expiry.
+    if (status >= 500) return liveResult;
 
-    // TTL extraction
     var cacheControl =
       headers["Cache-Control"] || headers["cache-control"] || null;
     var ttlSeconds = _parseMaxAge(cacheControl);
 
-    if (ttlSeconds === 0) {
-      return { status: status, headers: JSON.stringify(headers), body: body };
+    if (ttlSeconds === 0) return liveResult;
+
+    // Negative caching: cap TTL on persistent 4xx when upstream is silent.
+    // If they explicitly stated a max-age for the 404, we honor it instead
+    // — the origin knows best when it spoke up.
+    if (NEGATIVE_CACHE_STATUSES[status] && !cacheControl) {
+      ttlSeconds = NEGATIVE_CACHE_TTL_SECONDS;
     }
+
+    // Decide whether to gzip-store. Skip when upstream is already encoded
+    // (avoids double-compressing gzip/br/zstd payloads) and when the body
+    // is too small to overcome gzip's header overhead.
+    var contentEncoding = String(
+      headers["Content-Encoding"] || headers["content-encoding"] || ""
+    ).toLowerCase();
+    var alreadyEncoded = contentEncoding && contentEncoding !== "identity";
+    var storedBody;
+    var storedZ;
+    if (alreadyEncoded || bodyBytes.length < GZIP_MIN_BYTES) {
+      storedBody = rawB64;
+      storedZ = 0;
+    } else {
+      storedBody = Utilities.base64Encode(
+        Utilities.gzip(Utilities.newBlob(bodyBytes)).getBytes()
+      );
+      storedZ = 1;
+    }
+
+    // Cell-size safety gate, applied after compression so that a 100 KB
+    // text body that gzips to ~15 KB now fits where it previously bailed.
+    if (storedBody.length > CACHE_MAX_BODY_BYTES) return liveResult;
 
     var hash = _getCacheKey(url, reqHeaders);
     var timestamp = new Date();
@@ -598,10 +671,11 @@ function _fetchAndCache(url, reqHeaders) {
       hash,
       url,
       status,
-      JSON.stringify(headers),
-      body,
+      headersJson,
+      storedBody,
       timestamp.toISOString(),
       expiresAt,
+      storedZ,
     ];
 
     // Circular buffer write (O(1))
@@ -609,14 +683,14 @@ function _fetchAndCache(url, reqHeaders) {
     if (metaSheet) {
       _ensureRowsAllocated(sheet);
       var writeRow = _getNextCursor(sheet, metaSheet);
-      sheet.getRange(writeRow, 1, 1, 7).setValues([rowData]);
+      sheet.getRange(writeRow, 1, 1, 8).setValues([rowData]);
       _advanceCursor(metaSheet, writeRow);
     } else {
       // Fallback: simple append if meta sheet is unavailable
       sheet.appendRow(rowData);
     }
 
-    return { status: status, headers: JSON.stringify(headers), body: body };
+    return liveResult;
   } catch (e) {
     return null;
   }
@@ -684,7 +758,7 @@ function clearExpiredCache() {
   }
 
   for (var j = 0; j < rowsToClear.length; j++) {
-    sheet.getRange(rowsToClear[j], 1, 1, 7).clearContent();
+    sheet.getRange(rowsToClear[j], 1, 1, 8).clearContent();
   }
 
   console.log("Cleared " + rowsToClear.length + " expired entries (" +
@@ -696,7 +770,7 @@ function clearEntireCache() {
   if (sheet) {
     var totalRows = sheet.getDataRange().getNumRows();
     if (totalRows > 1) {
-      sheet.getRange(2, 1, totalRows - 1, 7).clearContent();
+      sheet.getRange(2, 1, totalRows - 1, 8).clearContent();
     }
   }
 
