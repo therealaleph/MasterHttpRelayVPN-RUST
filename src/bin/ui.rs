@@ -294,6 +294,9 @@ struct FormState {
     /// claude.ai / grok.com / x.com). Config-only — no UI editor yet.
     /// See `assets/exit_node/` for the generic exit-node handler.
     exit_node: mhrv_rs::config::ExitNodeConfig,
+    /// "rustls" (default) or "chrome". Config-only round-trip until the
+    /// UI editor lands; #369 §2.
+    tls_fingerprint: String,
 }
 
 #[derive(Clone, Debug)]
@@ -398,6 +401,7 @@ fn load_form() -> (FormState, Option<String>) {
             auto_blacklist_cooldown_secs: c.auto_blacklist_cooldown_secs,
             request_timeout_secs: c.request_timeout_secs,
             exit_node: c.exit_node.clone(),
+            tls_fingerprint: c.tls_fingerprint.clone(),
         }
     } else {
         FormState {
@@ -439,6 +443,7 @@ fn load_form() -> (FormState, Option<String>) {
             auto_blacklist_cooldown_secs: 120,
             request_timeout_secs: 30,
             exit_node: mhrv_rs::config::ExitNodeConfig::default(),
+            tls_fingerprint: "rustls".into(),
         }
     };
     (form, load_err)
@@ -626,6 +631,10 @@ impl FormState {
             // / grok.com / x.com). Round-trip through FormState — config-only
             // editing for now, UI editor planned for v1.9.x desktop UI batch.
             exit_node: self.exit_node.clone(),
+            // tls_fingerprint isn't yet exposed in the UI form; preserve
+            // whatever was loaded from disk so config.json hand-edits
+            // round-trip through Save. UI editor queued behind #369 §2.
+            tls_fingerprint: self.tls_fingerprint.clone(),
         })
     }
 }
@@ -714,6 +723,12 @@ struct ConfigWire<'a> {
     /// Save preserves user-edited values.
     #[serde(skip_serializing_if = "is_default_exit_node")]
     exit_node: &'a mhrv_rs::config::ExitNodeConfig,
+    /// TLS fingerprint profile (#369 §2). Default `"rustls"` — skip when
+    /// matching default so unchanged configs stay clean. Without this
+    /// field on the wire struct, a hand-edited `"tls_fingerprint": "chrome"`
+    /// is silently dropped on the next UI Save.
+    #[serde(skip_serializing_if = "is_default_tls_fingerprint")]
+    tls_fingerprint: &'a str,
 }
 
 fn is_default_strikes(v: &u32) -> bool { *v == 3 }
@@ -726,6 +741,10 @@ fn is_default_exit_node(en: &&mhrv_rs::config::ExitNodeConfig) -> bool {
         && en.psk.is_empty()
         && en.hosts.is_empty()
         && (en.mode.is_empty() || en.mode == "selective")
+}
+
+fn is_default_tls_fingerprint(v: &&str) -> bool {
+    *v == "rustls"
 }
 
 fn is_false(b: &bool) -> bool {
@@ -788,6 +807,7 @@ impl<'a> From<&'a Config> for ConfigWire<'a> {
             request_timeout_secs: c.request_timeout_secs,
             force_http1: c.force_http1,
             exit_node: &c.exit_node,
+            tls_fingerprint: c.tls_fingerprint.as_str(),
         }
     }
 }
@@ -2686,5 +2706,140 @@ fn push_log(shared: &Shared, msg: &str) {
     s.log.push_back(line);
     while s.log.len() > LOG_MAX {
         s.log.pop_front();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mirror the default-state literal at the bottom of `load_form()`
+    /// so individual round-trip tests can mutate one field and assert
+    /// preservation without re-typing every field. If `load_form` grows
+    /// a new field, this builder must grow too — that's the regression
+    /// hook we want.
+    fn default_form() -> FormState {
+        FormState {
+            mode: "apps_script".into(),
+            script_id: "X".into(),
+            auth_key: "secretkey123".into(),
+            google_ip: "216.239.38.120".into(),
+            front_domain: "www.google.com".into(),
+            listen_host: "127.0.0.1".into(),
+            listen_port: "8085".into(),
+            socks5_port: "8086".into(),
+            log_level: "info".into(),
+            verify_ssl: true,
+            upstream_socks5: String::new(),
+            parallel_relay: 0,
+            show_auth_key: false,
+            sni_pool: sni_pool_for_form(None, "www.google.com"),
+            sni_custom_input: String::new(),
+            sni_editor_open: false,
+            show_log: true,
+            fetch_ips_from_api: false,
+            max_ips_to_scan: 100,
+            google_ip_validation: true,
+            scan_batch_size: 500,
+            normalize_x_graphql: false,
+            youtube_via_relay: false,
+            passthrough_hosts: Vec::new(),
+            block_quic: true,
+            disable_padding: false,
+            force_http1: false,
+            tunnel_doh: true,
+            bypass_doh_hosts: Vec::new(),
+            block_doh: true,
+            fronting_groups: Vec::new(),
+            auto_blacklist_strikes: 3,
+            auto_blacklist_window_secs: 30,
+            auto_blacklist_cooldown_secs: 120,
+            request_timeout_secs: 30,
+            exit_node: mhrv_rs::config::ExitNodeConfig::default(),
+            tls_fingerprint: "rustls".into(),
+        }
+    }
+
+    #[test]
+    fn form_state_default_round_trips_tls_fingerprint_rustls() {
+        let form = default_form();
+        let cfg = form.to_config().expect("default form must convert cleanly");
+        assert_eq!(cfg.tls_fingerprint, "rustls");
+    }
+
+    #[test]
+    fn form_state_round_trips_chrome_tls_fingerprint() {
+        // Regression guard: if anyone deletes
+        //   `tls_fingerprint: self.tls_fingerprint.clone()`
+        // from `to_config`, a user with `"tls_fingerprint": "chrome"` in
+        // config.json silently reverts to "rustls" on the next Save.
+        let mut form = default_form();
+        form.tls_fingerprint = "chrome".into();
+        let cfg = form.to_config().expect("chrome form must convert cleanly");
+        assert_eq!(cfg.tls_fingerprint, "chrome");
+    }
+
+    #[test]
+    fn form_state_round_trips_arbitrary_tls_fingerprint_string() {
+        // `to_config` itself doesn't validate — Config::validate() does.
+        // This pins the to_config copy: whatever the form holds, to_config
+        // must hand back. Validation is the next layer's job.
+        let mut form = default_form();
+        form.tls_fingerprint = "  ChRoMe  ".into();
+        let cfg = form.to_config().expect("to_config must not validate");
+        assert_eq!(cfg.tls_fingerprint, "  ChRoMe  ");
+    }
+
+    /// REGRESSION TEST — covers a bug where `ConfigWire` (the actual
+    /// on-disk save format) didn't include `tls_fingerprint`, so the UI
+    /// silently dropped a hand-edited `"chrome"` value on every Save.
+    /// The earlier `to_config` tests passed because they tested only
+    /// the FormState→Config conversion, not the Config→JSON wire path
+    /// that `save_config` actually uses. Pin both layers now.
+    #[test]
+    fn config_wire_emits_tls_fingerprint_chrome() {
+        let mut form = default_form();
+        form.tls_fingerprint = "chrome".into();
+        let cfg = form.to_config().unwrap();
+        let wire = ConfigWire::from(&cfg);
+        let json = serde_json::to_string(&wire).unwrap();
+        assert!(
+            json.contains("\"tls_fingerprint\":\"chrome\""),
+            "ConfigWire must serialize tls_fingerprint=chrome; got: {}",
+            json
+        );
+    }
+
+    #[test]
+    fn config_wire_omits_default_tls_fingerprint_to_keep_configs_clean() {
+        // Mirror the convention used by other recent additions
+        // (block_doh, force_http1, scan/blacklist tunables): the
+        // default value is skipped on save so unchanged configs don't
+        // accumulate noise. Pin that convention against an accidental
+        // unconditional emit.
+        let form = default_form();
+        let cfg = form.to_config().unwrap();
+        assert_eq!(cfg.tls_fingerprint, "rustls");
+        let wire = ConfigWire::from(&cfg);
+        let json = serde_json::to_string(&wire).unwrap();
+        assert!(
+            !json.contains("tls_fingerprint"),
+            "default rustls fingerprint must be skipped; got: {}",
+            json
+        );
+    }
+
+    #[test]
+    fn config_wire_round_trip_preserves_chrome_through_disk_format() {
+        // End-to-end: form → Config → ConfigWire JSON → parse JSON back
+        // into Config. Confirms what a user would see if they Saved a
+        // chrome config and re-loaded it. If anything in the chain
+        // stops carrying the field, this test fails.
+        let mut form = default_form();
+        form.tls_fingerprint = "chrome".into();
+        let cfg = form.to_config().unwrap();
+        let json = serde_json::to_string(&ConfigWire::from(&cfg)).unwrap();
+        let reparsed: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(reparsed.tls_fingerprint, "chrome");
     }
 }
