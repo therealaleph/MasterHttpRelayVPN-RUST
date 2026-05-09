@@ -161,6 +161,44 @@ pub struct Config {
     #[serde(default)]
     pub youtube_via_relay: bool,
 
+    /// URL path prefixes that are forced through the Apps Script relay
+    /// (instead of the SNI-rewrite tunnel) — pinned by host AND path,
+    /// so only the matching paths burn relay quota while other paths
+    /// on the same host stay on the fast SNI-rewrite forward path.
+    ///
+    /// Format: `host/path/prefix` (no scheme). Hosts here are pulled
+    /// out of the built-in SNI-rewrite suffix list so the proxy MITMs
+    /// them and can inspect URLs. A request whose URL starts with the
+    /// pattern goes through the relay; any other path on the same host
+    /// is forwarded over a fresh TLS connection to `google_ip` with
+    /// SNI=`front_domain` (i.e. the SNI-rewrite trick at the HTTP
+    /// layer instead of the TLS-tunnel layer).
+    ///
+    /// Default: `youtube.com/youtubei/` is prepended unless
+    /// `youtube_via_relay = true` OR `exit_node.mode == "full"` is
+    /// active (in which cases YouTube is fully relayed already, so the
+    /// per-path filter is redundant — and in exit-node-full the filter
+    /// would actively bypass the second hop, so it has to stay off).
+    /// User entries are appended to the default in apps_script mode.
+    ///
+    /// **Cannot disable the default by setting an empty list**:
+    /// `#[serde(default)]` collapses an omitted key and an explicit
+    /// `[]` to the same `Vec::new()`, so the default is always
+    /// prepended whenever the gate above doesn't suppress it. To turn
+    /// off the YouTube path filter entirely, flip `youtube_via_relay
+    /// = true` (full YT relay, redundant filter) or run in `direct` /
+    /// `full` mode (no apps_script path → no filter).
+    ///
+    /// Why this exists: YouTube's in-page RPC at `/youtubei/v1/...`
+    /// is where SafeSearch / live-video gating decisions are made.
+    /// Pre-port, the only fix was `youtube_via_relay = true`, which
+    /// burnt Apps Script quota on every static asset. Path-pinning
+    /// the relay to `/youtubei/` recovers the SafeSearch fix at ~1%
+    /// of the quota cost. Ported from upstream `RELAY_URL_PATTERNS` /
+    /// `relay_url_patterns` (commit b3b9220).
+    #[serde(default)]
+    pub relay_url_patterns: Vec<String>,
+
     /// User-configurable passthrough list. Any host whose name matches
     /// one of these entries bypasses the Apps Script relay entirely and
     /// is plain-TCP-passthroughed (optionally through `upstream_socks5`).
@@ -540,6 +578,90 @@ fn default_verify_ssl() -> bool {
     true
 }
 
+/// Validate a single `relay_url_patterns` entry. The expected shape is
+/// `host/path-prefix` (or bare `host`, equivalent to `host/`), with an
+/// optional `http://` / `https://` scheme that gets stripped at runtime.
+///
+/// Checks:
+/// * non-empty after trim
+/// * scheme strip leaves a non-empty host
+/// * host part is a syntactically valid DNS hostname per RFC 1123:
+///   labels of [a-zA-Z0-9-], ≤ 63 chars each, no leading/trailing
+///   hyphen, no empty labels (which would mean consecutive dots),
+///   total host ≤ 253 chars
+///
+/// What's intentionally NOT checked here:
+/// * whether the host is in `SNI_REWRITE_SUFFIXES` — that's a runtime
+///   `tracing::warn!` (see `ResolvedRouting::skipped_force_mitm_hosts`)
+///   because users may want a pattern to be no-op-pulled-out-of-MITM
+///   path filter while the matching half still routes via relay.
+/// * path syntax — any byte sequence after the first `/` is treated
+///   as a literal prefix to `starts_with` against URL paths, by design.
+fn validate_relay_url_pattern(p: &str) -> Result<(), String> {
+    let trimmed = p.trim();
+    if trimmed.is_empty() {
+        return Err("entry is empty / whitespace-only".to_string());
+    }
+    // Strip a scheme (case-insensitive) the same way ResolvedRouting
+    // does at startup, so user input like "https://Foo.com/path/" is
+    // validated as its post-normalization form.
+    let lower = trimmed.to_ascii_lowercase();
+    let no_scheme = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"))
+        .unwrap_or(&lower);
+    if no_scheme.is_empty() {
+        return Err("scheme present but no host follows".to_string());
+    }
+    // Bare hosts (no slash) are valid — they mean "any path on this host"
+    // and round-trip through the same matchers as `host/`.
+    let host = match no_scheme.find('/') {
+        Some(i) => &no_scheme[..i],
+        None => no_scheme,
+    };
+    let host = host.trim_end_matches('.');
+    if host.is_empty() {
+        return Err("host part is empty".to_string());
+    }
+    if host.len() > 253 {
+        return Err(format!(
+            "host exceeds 253 characters ({} chars)",
+            host.len()
+        ));
+    }
+    for label in host.split('.') {
+        if label.is_empty() {
+            return Err(format!(
+                "host '{}' contains an empty label (consecutive or leading dots)",
+                host
+            ));
+        }
+        if label.len() > 63 {
+            return Err(format!(
+                "host label '{}' exceeds 63 characters",
+                label
+            ));
+        }
+        let bytes = label.as_bytes();
+        if bytes[0] == b'-' || bytes[bytes.len() - 1] == b'-' {
+            return Err(format!(
+                "host label '{}' starts or ends with a hyphen",
+                label
+            ));
+        }
+        for c in label.chars() {
+            if !(c.is_ascii_alphanumeric() || c == '-') {
+                return Err(format!(
+                    "host label '{}' contains invalid character '{}' \
+                     (only ASCII letters, digits, and hyphens allowed)",
+                    label, c
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let data = std::fs::read_to_string(path)
@@ -622,6 +744,20 @@ impl Config {
                         "fronting_groups[{}] ('{}'): empty domain entry", i, g.name
                     )));
                 }
+            }
+        }
+        // `relay_url_patterns` is documented as `host/path-prefix` (no
+        // scheme) but `Vec<String>` deserializes anything. Validate the
+        // shape at load time so a typo like `///` or `host..com/` becomes
+        // a fail-fast error instead of a late routing surprise. Mirrors
+        // the fail-fast contract the rest of validate() applies to
+        // fronting_groups, scan_batch_size, etc.
+        for (i, p) in self.relay_url_patterns.iter().enumerate() {
+            if let Err(e) = validate_relay_url_pattern(p) {
+                return Err(ConfigError::Invalid(format!(
+                    "relay_url_patterns[{}] ('{}'): {}",
+                    i, p, e
+                )));
             }
         }
         Ok(())
@@ -859,6 +995,143 @@ mod tests {
         }"#;
         let cfg: Config = serde_json::from_str(s).unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    // ── relay_url_patterns validation ────────────────────────────────────
+
+    #[test]
+    fn validate_relay_url_pattern_accepts_canonical_forms() {
+        // The default pattern.
+        assert!(validate_relay_url_pattern("youtube.com/youtubei/").is_ok());
+        // Bare host (any path) — equivalent to `host/`.
+        assert!(validate_relay_url_pattern("youtube.com").is_ok());
+        // Trailing dot on host (FQDN form).
+        assert!(validate_relay_url_pattern("youtube.com./youtubei/").is_ok());
+        assert!(validate_relay_url_pattern("youtube.com.").is_ok());
+        // Mixed case is fine — runtime lowercases before matching.
+        assert!(validate_relay_url_pattern("YouTube.com/YouTubei/").is_ok());
+        // Scheme is stripped at runtime; validator accepts both forms.
+        assert!(validate_relay_url_pattern("https://youtube.com/youtubei/").is_ok());
+        assert!(validate_relay_url_pattern("http://youtube.com/api/").is_ok());
+        assert!(validate_relay_url_pattern("HTTPS://YouTube.com/api/").is_ok());
+        // Multi-label hosts, hyphens inside labels.
+        assert!(validate_relay_url_pattern("api-v2.example.com/path/").is_ok());
+        assert!(validate_relay_url_pattern("foo-bar.googleapis.com/v1/").is_ok());
+        // IPv4 literal — labels are all-digits, still passes the
+        // alphanumeric+hyphen rule. Realistic for `hosts`-overridden
+        // edges or local testing.
+        assert!(validate_relay_url_pattern("1.2.3.4/path/").is_ok());
+        // Path can be anything past the first `/` — it's just a
+        // `starts_with` prefix.
+        assert!(validate_relay_url_pattern("youtube.com/v1.0/").is_ok());
+        assert!(validate_relay_url_pattern("youtube.com/api?weird=ok").is_ok());
+        // Whitespace surrounding the entry is trimmed.
+        assert!(validate_relay_url_pattern("  youtube.com/youtubei/  ").is_ok());
+    }
+
+    #[test]
+    fn validate_relay_url_pattern_rejects_empty() {
+        assert!(validate_relay_url_pattern("").is_err());
+        assert!(validate_relay_url_pattern("   ").is_err());
+        assert!(validate_relay_url_pattern("\t\n").is_err());
+    }
+
+    #[test]
+    fn validate_relay_url_pattern_rejects_missing_host() {
+        // Just a path.
+        assert!(validate_relay_url_pattern("/").is_err());
+        assert!(validate_relay_url_pattern("/api/").is_err());
+        // Scheme but no host.
+        assert!(validate_relay_url_pattern("https://").is_err());
+        assert!(validate_relay_url_pattern("https:///path/").is_err());
+        // Just dots.
+        assert!(validate_relay_url_pattern(".").is_err());
+        assert!(validate_relay_url_pattern("./api/").is_err());
+        // Garbage.
+        assert!(validate_relay_url_pattern("///").is_err());
+    }
+
+    #[test]
+    fn validate_relay_url_pattern_rejects_malformed_host() {
+        // Consecutive dots → empty label in the middle.
+        assert!(validate_relay_url_pattern("host..com/path/").is_err());
+        // Leading hyphen on a label.
+        assert!(validate_relay_url_pattern("-host.com/path/").is_err());
+        // Trailing hyphen on a label.
+        assert!(validate_relay_url_pattern("host-.com/path/").is_err());
+        assert!(validate_relay_url_pattern("foo.host-.com/").is_err());
+        // Whitespace inside the host.
+        assert!(validate_relay_url_pattern("host with space/path/").is_err());
+        // Underscore — disallowed in DNS hostnames per RFC 1123.
+        assert!(validate_relay_url_pattern("ho_st.com/path/").is_err());
+        // Special characters that signal user pasted a URL with auth /
+        // query / fragment into the host slot.
+        assert!(validate_relay_url_pattern("user@host.com/path/").is_err());
+        assert!(validate_relay_url_pattern("ho?st.com/path/").is_err());
+        assert!(validate_relay_url_pattern("ho#st.com/path/").is_err());
+    }
+
+    #[test]
+    fn validate_relay_url_pattern_rejects_oversized_labels() {
+        // Per RFC 1123: each label ≤ 63 chars.
+        let long_label = "a".repeat(64);
+        let pat = format!("{}.com/path/", long_label);
+        assert!(validate_relay_url_pattern(&pat).is_err());
+
+        // Total host ≤ 253 chars.
+        let many_labels: Vec<String> = (0..40).map(|i| format!("label{:02}", i)).collect();
+        let very_long_host = many_labels.join(".");
+        // many_labels has 40 entries of 7 chars + 39 dots = 319 > 253.
+        let pat = format!("{}/path/", very_long_host);
+        assert!(validate_relay_url_pattern(&pat).is_err());
+    }
+
+    #[test]
+    fn config_validate_surfaces_relay_pattern_errors_with_index_and_pattern() {
+        // End-to-end: a malformed entry must fail Config::validate() with
+        // an error that names both the index and the offending pattern,
+        // so a user staring at a multi-line config can locate it. Mirrors
+        // the fronting_groups error shape.
+        let s = r#"{
+            "mode": "apps_script",
+            "auth_key": "secret-test-secret-test",
+            "script_id": "X",
+            "relay_url_patterns": [
+                "youtube.com/youtubei/",
+                "host..com/oops/"
+            ]
+        }"#;
+        let cfg: Config = serde_json::from_str(s).unwrap();
+        let err = cfg.validate().expect_err("malformed entry must fail");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("relay_url_patterns[1]"),
+            "error must name the entry index: {}",
+            msg
+        );
+        assert!(
+            msg.contains("host..com/oops/"),
+            "error must echo the offending pattern: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn config_validate_accepts_well_formed_relay_patterns() {
+        // Mixed canonical / scheme-prefixed / bare-host entries all pass.
+        let s = r#"{
+            "mode": "apps_script",
+            "auth_key": "secret-test-secret-test",
+            "script_id": "X",
+            "relay_url_patterns": [
+                "youtube.com/youtubei/",
+                "https://googleapis.com/api/",
+                "studio.youtube.com",
+                "1.2.3.4/health/"
+            ]
+        }"#;
+        let cfg: Config = serde_json::from_str(s).unwrap();
+        cfg.validate().expect("well-formed patterns must validate");
     }
 }
 

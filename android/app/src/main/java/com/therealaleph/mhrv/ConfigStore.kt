@@ -159,6 +159,31 @@ data class MhrvConfig(
      */
     val youtubeViaRelay: Boolean = false,
 
+    /**
+     * Path-pinned relay routing (Rust `relay_url_patterns`, upstream
+     * commit b3b9220). Each entry is a `host/path-prefix` (no scheme,
+     * lowercase) — paths matching go through the Apps Script relay,
+     * non-matching paths on the same host fall through to a direct
+     * SNI-rewrite HTTP forward (saving Apps Script quota).
+     *
+     * The Rust side prepends the default `youtube.com/youtubei/`
+     * pattern at startup, with two suppression gates:
+     *   - `youtubeViaRelay = true` (full YT through relay → filter is
+     *     redundant)
+     *   - exit-node "full" mode (every URL must route through the
+     *     second-hop exit node → filter would bypass it)
+     * Plus, when either gate is active, user-supplied patterns whose
+     * host overlaps `YOUTUBE_RELAY_HOSTS` (youtube.com, youtu.be,
+     * youtube-nocookie.com, youtubei.googleapis.com) are dropped at
+     * startup with a warning, since they would partially defeat the
+     * full-relay contract.
+     *
+     * This Android-side field is for *additional* user entries only —
+     * round-tripped through config.json so a hand-edited extension
+     * survives a save. No UI editor (power-user knob).
+     */
+    val relayUrlPatterns: List<String> = emptyList(),
+
     /** UI language toggle. Non-Rust; honoured only by the Android wrapper. */
     val uiLang: UiLang = UiLang.AUTO,
 ) {
@@ -240,6 +265,17 @@ data class MhrvConfig(
             put("tunnel_doh", tunnelDoh)
             put("block_doh", blockDoh)
             if (youtubeViaRelay) put("youtube_via_relay", true)
+            // Trim/drop-empty/dedupe before serializing — same pattern
+            // as bypass_doh_hosts. Skip the key entirely when the user
+            // hasn't added any extras so we don't leak an empty array
+            // into otherwise-clean configs.
+            val cleanRelayUrlPatterns = relayUrlPatterns
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+                .distinct()
+            if (cleanRelayUrlPatterns.isNotEmpty()) {
+                put("relay_url_patterns", JSONArray().apply { cleanRelayUrlPatterns.forEach { put(it) } })
+            }
             // Trim/drop-empty/dedupe before serializing — symmetric with the
             // read-side normalization in loadFromJson(), so a user typing
             // " doh.foo " or accidentally adding a duplicate doesn't end up
@@ -356,6 +392,13 @@ object ConfigStore {
         if (cleanBypassDohHosts.isNotEmpty()) {
             obj.put("bypass_doh_hosts", JSONArray().apply { cleanBypassDohHosts.forEach { put(it) } })
         }
+        val cleanRelayUrlPatterns = cfg.relayUrlPatterns
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+        if (cleanRelayUrlPatterns.isNotEmpty()) {
+            obj.put("relay_url_patterns", JSONArray().apply { cleanRelayUrlPatterns.forEach { put(it) } })
+        }
 
         // Compress with DEFLATE then base64.
         val jsonBytes = obj.toString().toByteArray(Charsets.UTF_8)
@@ -457,6 +500,9 @@ object ConfigStore {
             blockDoh = obj.optBoolean("block_doh", true),
             youtubeViaRelay = obj.optBoolean("youtube_via_relay", false),
             bypassDohHosts = obj.optJSONArray("bypass_doh_hosts")?.let { arr ->
+                buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }
+            }?.filter { it.isNotBlank() }.orEmpty(),
+            relayUrlPatterns = obj.optJSONArray("relay_url_patterns")?.let { arr ->
                 buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }
             }?.filter { it.isNotBlank() }.orEmpty(),
             connectionMode = when (obj.optString("connection_mode", "vpn_tun")) {

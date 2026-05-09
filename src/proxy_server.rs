@@ -118,6 +118,26 @@ const YOUTUBE_RELAY_HOSTS: &[&str] = &[
     "youtubei.googleapis.com",
 ];
 
+/// URL path-prefix patterns that are forced through the Apps Script relay.
+/// Each entry is `host/path-prefix` (no scheme, lowercase). The host is
+/// pulled out of `SNI_REWRITE_SUFFIXES` so the proxy MITMs and can inspect
+/// paths; only URLs starting with the pattern go to relay, all other paths
+/// on that host fall through to the SNI-rewrite HTTP forwarder
+/// (`forward_via_sni_rewrite_http`) — same SNI-rewrite trick as the
+/// CONNECT-tunnel path, but applied at the HTTP layer so we keep MITM
+/// for the matching paths. User-supplied entries from
+/// `Config::relay_url_patterns` are appended to this default.
+///
+/// `youtube.com/youtubei/`: YouTube's in-page RPC layer. Restricted Mode /
+/// SafeSearch / live-stream gating decisions land here. Relaying just
+/// this prefix recovers the SafeSearch fix that previously required the
+/// full `youtube_via_relay = true` knob (which routed every static
+/// asset through the relay too). Ported from upstream
+/// `RELAY_URL_PATTERNS` (commit b3b9220).
+const DEFAULT_RELAY_URL_PATTERNS: &[&str] = &[
+    "youtube.com/youtubei/",
+];
+
 /// Built-in list of DNS-over-HTTPS endpoints. CONNECTs to these (when
 /// `tunnel_doh` is left at the default of `false`, i.e. bypass enabled)
 /// skip the Apps Script tunnel and exit via plain TCP. Mix of the
@@ -156,7 +176,11 @@ const DEFAULT_DOH_HOSTS: &[&str] = &[
     "dns.mullvad.net",
 ];
 
-fn matches_sni_rewrite(host: &str, youtube_via_relay: bool) -> bool {
+fn matches_sni_rewrite(
+    host: &str,
+    youtube_via_relay: bool,
+    force_mitm_hosts: &[String],
+) -> bool {
     let h = host.to_ascii_lowercase();
     let h = h.trim_end_matches('.');
 
@@ -177,9 +201,87 @@ fn matches_sni_rewrite(host: &str, youtube_via_relay: bool) -> bool {
         }
     }
 
+    // Hosts pulled out of SNI-rewrite by `relay_url_patterns` (b3b9220).
+    // We need to MITM these so the per-path matcher in
+    // `handle_mitm_request` can decide between relay and the SNI-rewrite
+    // HTTP forwarder. Match shape MUST match `host_in_force_mitm_list`
+    // exactly — otherwise a host pulled out here wouldn't be recognised
+    // at dispatch and the path filter would silently no-op, which was a
+    // real bug in the first cut where this list also matched in the
+    // reverse direction (`forced.ends_with(.h)`). Reverse-matching
+    // pulled parent SNI suffixes for entries like `studio.youtube.com`,
+    // making the entire `youtube.com` subtree skip SNI-rewrite while
+    // dispatch only force-MITM-recognised the literal `studio.youtube.com`.
+    // One-directional match (`h == forced || h.ends_with(.forced)`)
+    // pulls only the configured host and its subdomains, leaving sibling
+    // subdomains on the natural SNI-rewrite path.
+    for forced in force_mitm_hosts {
+        if h == *forced || h.ends_with(&format!(".{}", forced)) {
+            return false;
+        }
+    }
+
     SNI_REWRITE_SUFFIXES
         .iter()
         .any(|s| h == *s || h.ends_with(&format!(".{}", s)))
+}
+
+/// True if `url` matches any entry in `patterns`. Each pattern is
+/// `host/path-prefix` (no scheme, lowercase). The URL host may have extra
+/// subdomains — `www.youtube.com` matches `youtube.com/youtubei/`. Path
+/// match is a plain prefix on the URL's path component.
+///
+/// Same matching shape as the upstream Python `_url_matches_relay_pattern`
+/// (b3b9220): scheme stripped, lowercased, host suffix-anchored, path
+/// `startswith`. Used in MITM dispatch to decide relay vs. SNI-rewrite
+/// HTTP forward for hosts pulled out of SNI-rewrite.
+pub(crate) fn url_matches_relay_pattern(url: &str, patterns: &[String]) -> bool {
+    if patterns.is_empty() {
+        return false;
+    }
+    let lower = url.to_ascii_lowercase();
+    let stripped = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"))
+        .unwrap_or(&lower);
+    let (raw_host, url_path) = match stripped.find('/') {
+        Some(i) => (&stripped[..i], &stripped[i..]),
+        None => (stripped, "/"),
+    };
+    // Strip an authority's port (`:443`) and any FQDN trailing dot so
+    // `www.youtube.com.` and `www.youtube.com:443` canonicalise to the
+    // same form that `host_in_force_mitm_list` and `extract_host` use.
+    // Without this, dispatch and pattern-match disagree: the host is
+    // pulled from SNI-rewrite but its `/youtubei/` URL fails the
+    // pattern check and ends up routed via the SNI-HTTP forwarder.
+    let host_no_port = raw_host.split(':').next().unwrap_or(raw_host);
+    let url_host = host_no_port.trim_end_matches('.');
+    for p in patterns {
+        let (pat_host, pat_path) = match p.find('/') {
+            Some(i) => (&p[..i], &p[i..]),
+            None => (p.as_str(), "/"),
+        };
+        let host_match = url_host == pat_host || url_host.ends_with(&format!(".{}", pat_host));
+        if host_match && url_path.starts_with(pat_path) {
+            return true;
+        }
+    }
+    false
+}
+
+/// True if the request's host is one we pulled out of SNI-rewrite to
+/// support `relay_url_patterns`. Used in `handle_mitm_request` as the
+/// gate for the SNI-rewrite-HTTP fallback path: if the host was forced
+/// to MITM but the URL didn't match any pattern, we forward over a fresh
+/// SNI-rewrite TLS connection instead of burning Apps Script quota.
+pub(crate) fn host_in_force_mitm_list(host: &str, list: &[String]) -> bool {
+    if list.is_empty() {
+        return false;
+    }
+    let h = host.to_ascii_lowercase();
+    let h = h.trim_end_matches('.');
+    list.iter()
+        .any(|forced| h == *forced || h.ends_with(&format!(".{}", forced)))
 }
 
 fn hosts_override<'a>(
@@ -230,9 +332,41 @@ pub struct RewriteCtx {
     pub upstream_socks5: Option<String>,
     pub mode: Mode,
     /// If true, YouTube traffic bypasses the SNI-rewrite tunnel and
-    /// goes through the Apps Script relay instead. See config.rs for
-    /// the trade-off. Issue #102.
+    /// goes through the Apps Script relay instead. Effective value:
+    /// `config.youtube_via_relay || (apps_script + exit_node.full)` —
+    /// when the exit node is in full mode it must intercept all traffic
+    /// including YouTube, so YT hosts get pulled from SNI-rewrite the
+    /// same way the explicit toggle does it. Ported from upstream
+    /// commit 88b2767. Issue #102.
     pub youtube_via_relay: bool,
+    /// Resolved URL path-prefix patterns (`host/path-prefix`, lowercase,
+    /// no scheme) that force the relay path inside MITM. Built at
+    /// startup from `DEFAULT_RELAY_URL_PATTERNS` plus
+    /// `Config::relay_url_patterns`. Empty when
+    /// `youtube_via_relay = true` because YouTube is then fully relayed
+    /// already and the per-path filter would just be redundant. Used
+    /// by `handle_mitm_request` to decide relay vs. SNI-rewrite HTTP
+    /// forward. Ported from upstream `_relay_url_patterns` (b3b9220).
+    pub relay_url_patterns: Vec<String>,
+    /// Hosts derived from `relay_url_patterns` that get pulled out of
+    /// `SNI_REWRITE_SUFFIXES` so the proxy MITMs them and the per-path
+    /// matcher can run. Lowercase, no scheme. Empty when
+    /// `relay_url_patterns` is empty. Used in `matches_sni_rewrite`
+    /// and `host_in_force_mitm_list`.
+    pub force_mitm_hosts: Vec<String>,
+    /// Set when `mode == AppsScript && exit_node.enabled &&
+    /// exit_node.mode == "full"` — the same condition that promotes
+    /// `youtube_via_relay_effective` (commit 88b2767). When true,
+    /// `handle_mitm_request` MUST NOT use `forward_via_sni_rewrite_http`
+    /// for non-matching paths, even on hosts in `force_mitm_hosts` —
+    /// the forwarder dials the Google edge directly, which would
+    /// completely bypass the second-hop exit node and violate the
+    /// documented "every URL routes through the exit node" contract
+    /// (`DomainFronter::exit_node_matches`). User-supplied
+    /// `relay_url_patterns` are still honoured: matching paths and
+    /// non-matching paths both end up in `DomainFronter::relay`,
+    /// which then routes through the exit node.
+    pub exit_node_full_mode_active: bool,
     /// User-configured hostnames that should skip the relay entirely
     /// and pass through as plain TCP (optionally via upstream_socks5).
     /// See config.rs `passthrough_hosts` for matching rules. Issues #39, #127.
@@ -261,6 +395,227 @@ pub struct RewriteCtx {
     /// domains used only for matching). Empty = feature off (only
     /// the built-in Google edge SNI-rewrite is active).
     pub fronting_groups: Vec<Arc<FrontingGroupResolved>>,
+}
+
+/// One-shot resolution of the YouTube routing knobs (`youtube_via_relay`,
+/// `relay_url_patterns`, `exit_node.mode == "full"`) for a given
+/// `Config` + `Mode`. Pulled out of `ProxyServer::new` so it can be
+/// unit-tested directly without spinning up the full proxy.
+///
+/// Two gates govern the resolved patterns:
+///
+/// 1. **Mode gate** — only `apps_script` mode has a relay path to route
+///    patterns through. In `direct` mode there's no Apps Script, so
+///    pulling hosts out of SNI-rewrite would just send them to raw-TCP
+///    fallback (a routing regression). In `full` mode the dispatcher
+///    short-circuits to the tunnel mux before MITM ever runs, so
+///    patterns would never be consulted. Outside `apps_script` the
+///    resolved sets are always empty.
+///
+/// 2. **youtube_via_relay-effective gate** — the explicit
+///    `youtube_via_relay` toggle OR exit-node-full mode (commit 88b2767).
+///    When *either* is on, YouTube is fully relayed already, so the
+///    per-path filter is redundant. Worse, in exit-node-full mode the
+///    filter is *harmful*: non-matching paths on `youtube.com` would
+///    route via `forward_via_sni_rewrite_http`, bypassing
+///    `DomainFronter::relay` and with it the exit node — defeating
+///    the whole point of full mode.
+///
+/// User-supplied `relay_url_patterns` entries always run inside
+/// `apps_script` mode regardless of the YT flag; they may target hosts
+/// other than `youtube.com` that the user wants path-pinned
+/// independently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedRouting {
+    /// Effective `youtube_via_relay` after OR-ing with exit-node-full
+    /// mode. Mirrors what `RewriteCtx::youtube_via_relay` ends up with.
+    pub youtube_via_relay_effective: bool,
+    /// Resolved patterns, lowercased, scheme-stripped, deduplicated.
+    /// Empty outside `apps_script` mode and when both gates above
+    /// allow the defaults to be skipped.
+    pub relay_url_patterns: Vec<String>,
+    /// Host parts of `relay_url_patterns` that ARE
+    /// SNI-rewrite-capable. Pulled out of SNI-rewrite at dispatch time
+    /// so MITM can run for them.
+    pub force_mitm_hosts: Vec<String>,
+    /// Host parts of `relay_url_patterns` that are NOT
+    /// SNI-rewrite-capable, retained only so `ProxyServer::new` can log
+    /// a startup warning. Patterns referencing them stay in
+    /// `relay_url_patterns` (so a matching path still routes through
+    /// the relay if the host is MITM'd via the regular TLS-detect
+    /// path), but the path-vs-forwarder filter is inert for them — the
+    /// forwarder would return a wrong-origin response from the Google
+    /// edge.
+    pub skipped_force_mitm_hosts: Vec<String>,
+    /// User patterns dropped because `youtube_via_relay_effective` is
+    /// true AND the pattern's host is already covered by
+    /// `YOUTUBE_RELAY_HOSTS`. Keeping them would partially defeat the
+    /// "full YT through relay" contract: the path filter would flag
+    /// non-matching paths as forwarder-eligible, and dispatch would
+    /// route them via `forward_via_sni_rewrite_http` instead of the
+    /// relay. Surfaced for the startup warning so the user knows their
+    /// extra entry was redundant + harmful.
+    pub suppressed_yt_patterns: Vec<String>,
+    /// True iff `exit_node.enabled && mode == "full"` AND we're in
+    /// apps_script mode. Used only for the startup log line that
+    /// announces the YT-via-relay implication of exit-node-full.
+    pub exit_node_full_mode_active: bool,
+}
+
+impl ResolvedRouting {
+    pub(crate) fn from_config(config: &Config, mode: Mode) -> Self {
+        let exit_node_full_mode = config.exit_node.enabled
+            && config.exit_node.mode.eq_ignore_ascii_case("full")
+            && !config.exit_node.relay_url.is_empty()
+            && !config.exit_node.psk.is_empty();
+        let exit_node_full_mode_active = exit_node_full_mode && mode == Mode::AppsScript;
+        let youtube_via_relay_effective =
+            config.youtube_via_relay || exit_node_full_mode_active;
+
+        let mut relay_url_patterns: Vec<String> = Vec::new();
+        let mut suppressed_yt_patterns: Vec<String> = Vec::new();
+        if mode == Mode::AppsScript {
+            if !youtube_via_relay_effective {
+                for p in DEFAULT_RELAY_URL_PATTERNS {
+                    relay_url_patterns.push((*p).to_string());
+                }
+            }
+            for p in &config.relay_url_patterns {
+                let trimmed = p.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let normalized = normalize_pattern(trimmed);
+                // YT-overlap suppression: when `youtube_via_relay_effective`
+                // is true, every YT-family host is already pulled out of
+                // SNI-rewrite by the `YOUTUBE_RELAY_HOSTS` carve-out, so
+                // every YT request flows through the relay regardless. A
+                // user pattern targeting a YT host adds it to
+                // `force_mitm_hosts`, which switches on the path filter;
+                // non-matching YT paths then route through
+                // `forward_via_sni_rewrite_http`, partially defeating the
+                // user's `youtube_via_relay = true` opt-in. Drop the
+                // pattern entirely (matching paths already go to relay
+                // without it) and surface it for the startup warning.
+                let pattern_host = normalized
+                    .split('/')
+                    .next()
+                    .unwrap_or("")
+                    .trim_start_matches('.');
+                if youtube_via_relay_effective && host_matches_youtube_relay(pattern_host) {
+                    suppressed_yt_patterns.push(normalized);
+                    continue;
+                }
+                relay_url_patterns.push(normalized);
+            }
+            let mut seen_patterns: std::collections::HashSet<String> = Default::default();
+            relay_url_patterns.retain(|p| seen_patterns.insert(p.clone()));
+        }
+
+        // Only hosts that would naturally take the SNI-rewrite tunnel
+        // (i.e. match `SNI_REWRITE_SUFFIXES`) are valid targets for the
+        // path-level filter. The non-matching path goes through
+        // `forward_via_sni_rewrite_http`, which dials `google_ip:443`
+        // with `SNI=front_domain` — the Google edge dispatches by the
+        // inner `Host` header, but only if that Host is actually served
+        // by the same edge. A user-supplied pattern like
+        // `evilsite.com/api/` would otherwise pull `evilsite.com` from
+        // the (already-not-matching) SNI list as a no-op AND make
+        // `host_in_force_mitm_list` true, sending non-matching paths
+        // through the forwarder which would return a wrong-origin
+        // response from the Google edge — silently treated as success.
+        // Filter at startup, log the skip, leave the pattern itself
+        // alone so a matching path still routes via relay if the host
+        // is reached via a different path (TLS-detect → MITM → relay).
+        // Fronting-group hosts are NOT eligible either: the forwarder
+        // only knows `(google_ip, front_domain)`, not the group's
+        // `(ip, sni)` pair. Path-routing on fronting groups is a
+        // separate feature.
+        let mut force_mitm_hosts: Vec<String> = Vec::new();
+        let mut skipped_hosts: Vec<String> = Vec::new();
+        let mut seen_hosts: std::collections::HashSet<String> = Default::default();
+        for p in &relay_url_patterns {
+            let host_part = p
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .trim_start_matches('.')
+                .to_string();
+            if host_part.is_empty() || !seen_hosts.insert(host_part.clone()) {
+                continue;
+            }
+            if host_is_sni_rewrite_capable(&host_part) {
+                force_mitm_hosts.push(host_part);
+            } else {
+                skipped_hosts.push(host_part);
+            }
+        }
+
+        Self {
+            youtube_via_relay_effective,
+            relay_url_patterns,
+            force_mitm_hosts,
+            skipped_force_mitm_hosts: skipped_hosts,
+            suppressed_yt_patterns,
+            exit_node_full_mode_active,
+        }
+    }
+}
+
+/// Canonicalise a `relay_url_patterns` entry to the form the runtime
+/// matchers expect: lowercase, no scheme, no trailing dot on the host.
+/// Lowercasing happens BEFORE scheme strip so `HTTPS://Foo.com/Bar/`
+/// normalises cleanly (`trim_start_matches("https://")` is
+/// case-sensitive). Trailing dots on the host (e.g. `foo.com./api/`,
+/// FQDN-form) are stripped so they match against the `extract_host` →
+/// trim-trailing-dot canonical form.
+pub(crate) fn normalize_pattern(raw: &str) -> String {
+    let lower = raw.trim().to_ascii_lowercase();
+    let no_scheme = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"))
+        .unwrap_or(&lower);
+    // Split into host + path-prefix, trim a trailing dot from the host,
+    // re-join. Patterns without a `/` are treated as host-only.
+    match no_scheme.find('/') {
+        Some(i) => {
+            let host = no_scheme[..i].trim_end_matches('.');
+            let rest = &no_scheme[i..];
+            format!("{}{}", host, rest)
+        }
+        None => no_scheme.trim_end_matches('.').to_string(),
+    }
+}
+
+/// True when `host` matches a `YOUTUBE_RELAY_HOSTS` entry under the
+/// same one-directional suffix shape as `host_in_force_mitm_list`.
+/// Used at startup to suppress user-supplied `relay_url_patterns`
+/// whose host is already covered by the `youtube_via_relay` carve-out
+/// — keeping such an entry would re-introduce the
+/// `forward_via_sni_rewrite_http` bypass (the path filter would mark
+/// non-matching paths as forwarder-eligible) and partially defeat the
+/// "full YT through relay" contract the user opted into.
+fn host_matches_youtube_relay(host: &str) -> bool {
+    let h = host.to_ascii_lowercase();
+    let h = h.trim_end_matches('.');
+    YOUTUBE_RELAY_HOSTS
+        .iter()
+        .any(|s| h == *s || h.ends_with(&format!(".{}", s)))
+}
+
+/// True when `host` is served by the Google edge — i.e. matches one of
+/// `SNI_REWRITE_SUFFIXES`. Used at startup to validate that
+/// `relay_url_patterns` host parts are actually safe targets for the
+/// SNI-rewrite HTTP forwarder. One-directional suffix match because we
+/// only need to know "would this host be SNI-rewrite-capable in the
+/// absence of force_mitm_hosts?" — bidirectional matching would falsely
+/// validate sub-suffixes that the SNI list doesn't really cover.
+fn host_is_sni_rewrite_capable(host: &str) -> bool {
+    let h = host.to_ascii_lowercase();
+    let h = h.trim_end_matches('.');
+    SNI_REWRITE_SUFFIXES
+        .iter()
+        .any(|s| h == *s || h.ends_with(&format!(".{}", s)))
 }
 
 /// True if `host` matches a known DoH endpoint — either the built-in
@@ -497,6 +852,78 @@ impl ProxyServer {
             fronting_groups.push(Arc::new(resolved));
         }
 
+        let resolved_routing = ResolvedRouting::from_config(config, mode);
+        if resolved_routing.exit_node_full_mode_active && !config.youtube_via_relay {
+            tracing::info!(
+                "exit_node.mode=full → routing YouTube through relay (upstream commit 88b2767)"
+            );
+        }
+        if !resolved_routing.relay_url_patterns.is_empty() {
+            tracing::info!(
+                "relay_url_patterns: MITM forced on {}; relay only for: {}",
+                resolved_routing.force_mitm_hosts.join(", "),
+                resolved_routing.relay_url_patterns.join(", "),
+            );
+        }
+        if !resolved_routing.skipped_force_mitm_hosts.is_empty() {
+            tracing::warn!(
+                "relay_url_patterns: ignoring path-routing for {} — host is not in \
+                 SNI_REWRITE_SUFFIXES, so the SNI-rewrite forwarder would return a \
+                 wrong-origin response from the Google edge. Patterns matching this \
+                 host still route through the relay if the host is reached, but \
+                 non-matching paths fall back to the regular dispatch.",
+                resolved_routing.skipped_force_mitm_hosts.join(", "),
+            );
+        }
+        if !resolved_routing.suppressed_yt_patterns.is_empty() {
+            tracing::warn!(
+                "relay_url_patterns: dropped {} — youtube_via_relay (or \
+                 exit_node.mode=full) routes all YouTube through the relay \
+                 already, so a YT-host path filter would route non-matching \
+                 paths through the SNI-rewrite forwarder and partially defeat \
+                 the full-relay contract. Remove these entries from \
+                 config.json to silence this warning.",
+                resolved_routing.suppressed_yt_patterns.join(", "),
+            );
+        }
+
+        // Fronting groups are dispatched BEFORE the force-MITM check
+        // (`dispatch_tunnel` step 2a vs 2). That precedence is intentional
+        // — a user adding `youtube.com` to a fronting group is making a
+        // deliberate "send all of YT through this alternate edge" choice
+        // and the path filter, which assumes the Google edge handles the
+        // request, would land at the wrong upstream. But the silent
+        // override is a footgun if the user didn't realise the two
+        // features overlap, so surface it at startup with both names
+        // and the resolved precedence.
+        for forced in &resolved_routing.force_mitm_hosts {
+            for g in &fronting_groups {
+                let overlaps = g.domains_normalized.iter().any(|d| {
+                    forced == d
+                        || forced.ends_with(&format!(".{}", d))
+                        || d.ends_with(&format!(".{}", forced))
+                });
+                if overlaps {
+                    tracing::warn!(
+                        "config: fronting group '{}' covers host '{}', which is also \
+                         in relay_url_patterns. Fronting-group dispatch wins — the \
+                         path filter will NOT run for this host. Remove the host \
+                         from the fronting group if you want path-pinned relay routing.",
+                        g.name,
+                        forced,
+                    );
+                }
+            }
+        }
+        let ResolvedRouting {
+            youtube_via_relay_effective,
+            relay_url_patterns: resolved_patterns,
+            force_mitm_hosts,
+            skipped_force_mitm_hosts: _,
+            suppressed_yt_patterns: _,
+            exit_node_full_mode_active,
+        } = resolved_routing;
+
         let rewrite_ctx = Arc::new(RewriteCtx {
             google_ip: config.google_ip.clone(),
             front_domain: config.front_domain.clone(),
@@ -504,7 +931,10 @@ impl ProxyServer {
             tls_connector,
             upstream_socks5: config.upstream_socks5.clone(),
             mode,
-            youtube_via_relay: config.youtube_via_relay,
+            youtube_via_relay: youtube_via_relay_effective,
+            relay_url_patterns: resolved_patterns,
+            force_mitm_hosts,
+            exit_node_full_mode_active,
             passthrough_hosts: config.passthrough_hosts.clone(),
             block_quic: config.block_quic,
             bypass_doh: !config.tunnel_doh,
@@ -1590,6 +2020,7 @@ fn should_use_sni_rewrite(
     host: &str,
     port: u16,
     youtube_via_relay: bool,
+    force_mitm_hosts: &[String],
 ) -> bool {
     // The SNI-rewrite path expects TLS from the client: it accepts inbound
     // TLS, then opens a second TLS connection to the Google edge with a front
@@ -1600,9 +2031,19 @@ fn should_use_sni_rewrite(
     // youtube_via_relay=true removes YouTube suffixes from the match so
     // YouTube traffic falls through to the Apps Script relay path instead
     // of the SNI-rewrite tunnel. An explicit hosts override still wins
-    // over the config toggle.
-    port == 443
-        && (matches_sni_rewrite(host, youtube_via_relay) || hosts_override(hosts, host).is_some())
+    // over the config toggle, except for hosts pulled out by
+    // `relay_url_patterns` — those need MITM for the per-path matcher
+    // even if the user has a hosts override (the override is still used
+    // as the upstream IP for the SNI-rewrite forwarder, just not as a
+    // CONNECT-tunnel target).
+    if port != 443 {
+        return false;
+    }
+    if host_in_force_mitm_list(host, force_mitm_hosts) {
+        return false;
+    }
+    matches_sni_rewrite(host, youtube_via_relay, force_mitm_hosts)
+        || hosts_override(hosts, host).is_some()
 }
 
 async fn dispatch_tunnel(
@@ -1726,6 +2167,7 @@ async fn dispatch_tunnel(
         &host,
         port,
         rewrite_ctx.youtube_via_relay,
+        &rewrite_ctx.force_mitm_hosts,
     ) {
         tracing::info!(
             "dispatch {}:{} -> sni-rewrite tunnel (Google edge direct)",
@@ -1805,7 +2247,7 @@ async fn dispatch_tunnel(
             host,
             port
         );
-        run_mitm_then_relay(sock, &host, port, mitm, &fronter).await;
+        run_mitm_then_relay(sock, &host, port, mitm, &fronter, rewrite_ctx.clone()).await;
         return Ok(());
     }
 
@@ -1819,7 +2261,7 @@ async fn dispatch_tunnel(
             port,
             scheme
         );
-        relay_http_stream_raw(sock, &host, port, scheme, &fronter).await;
+        relay_http_stream_raw(sock, &host, port, scheme, &fronter, rewrite_ctx.clone()).await;
         return Ok(());
     }
 
@@ -2102,6 +2544,7 @@ async fn run_mitm_then_relay(
     port: u16,
     mitm: Arc<Mutex<MitmCertManager>>,
     fronter: &DomainFronter,
+    rewrite_ctx: Arc<RewriteCtx>,
 ) {
     // Peek the TLS ClientHello BEFORE minting the MITM cert. When the client
     // resolves the hostname itself (DoH in Chrome/Firefox) and hands us a raw
@@ -2163,7 +2606,16 @@ async fn run_mitm_then_relay(
     // latter would produce an IP-in-Host request that Cloudflare/etc. reject
     // outright.
     loop {
-        match handle_mitm_request(&mut tls, &effective_host, port, fronter, "https").await {
+        match handle_mitm_request(
+            &mut tls,
+            &effective_host,
+            port,
+            fronter,
+            "https",
+            &rewrite_ctx,
+        )
+        .await
+        {
             Ok(true) => continue,
             Ok(false) => break,
             Err(e) => {
@@ -2190,9 +2642,10 @@ async fn relay_http_stream_raw(
     port: u16,
     scheme: &str,
     fronter: &DomainFronter,
+    rewrite_ctx: Arc<RewriteCtx>,
 ) {
     loop {
-        match handle_mitm_request(&mut sock, host, port, fronter, scheme).await {
+        match handle_mitm_request(&mut sock, host, port, fronter, scheme, &rewrite_ctx).await {
             Ok(true) => continue,
             Ok(false) => break,
             Err(e) => {
@@ -2307,6 +2760,201 @@ async fn do_sni_rewrite_tunnel_from_tcp(
     Ok(())
 }
 
+/// Build the HTTP/1.1 request bytes the SNI-rewrite forwarder writes
+/// upstream. Pure function — pulled out of `forward_via_sni_rewrite_http`
+/// so the request-rebuilding logic can be unit-tested directly without
+/// standing up a TLS connector.
+///
+/// Forces `Host` to the real origin (the Google edge dispatches by the
+/// inner Host even though the outer SNI is sanitised) and
+/// `Connection: close` so the upstream signals end-of-response by
+/// closing the TCP socket. That lets us read until EOF without parsing
+/// HTTP framing on the response side.
+///
+/// **Framing-header rewrite**: by the time we run, `read_body` has
+/// already decoded any chunked request body into a flat byte buffer.
+/// Forwarding the inbound `Transfer-Encoding: chunked` verbatim would
+/// leave the upstream waiting forever for chunk markers that aren't in
+/// the bytes we send. Strip every framing header (`Transfer-Encoding`,
+/// any pre-existing `Content-Length`, the hop-by-hop hints `TE`,
+/// `Trailer`, `Upgrade`, plus the connection-management headers
+/// `Connection`, `Proxy-Connection`, `Keep-Alive`) and emit a single
+/// fresh `Content-Length: <decoded body length>` for any method that
+/// can carry a body. The result is a request the upstream can frame
+/// unambiguously regardless of how the browser originally framed it.
+pub(crate) fn build_sni_forward_request_bytes(
+    method: &str,
+    host: &str,
+    port: u16,
+    path: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Vec<u8> {
+    let host_with_port = if port == 443 || port == 80 {
+        host.to_string()
+    } else {
+        format!("{}:{}", host, port)
+    };
+    let mut req: Vec<u8> = Vec::with_capacity(512 + body.len());
+    req.extend_from_slice(method.as_bytes());
+    req.extend_from_slice(b" ");
+    req.extend_from_slice(path.as_bytes());
+    req.extend_from_slice(b" HTTP/1.1\r\n");
+    req.extend_from_slice(b"Host: ");
+    req.extend_from_slice(host_with_port.as_bytes());
+    req.extend_from_slice(b"\r\n");
+    req.extend_from_slice(b"Connection: close\r\n");
+    // Emit Content-Length whenever we have a body or whenever the method
+    // is one that semantically carries a body (POST/PUT/PATCH). For body-
+    // less safe methods like GET/HEAD we omit it — adding `Content-Length: 0`
+    // is technically valid but some origins read it as "request expects
+    // a body" which has caused 400s in the past.
+    let needs_content_length = !body.is_empty()
+        || method.eq_ignore_ascii_case("POST")
+        || method.eq_ignore_ascii_case("PUT")
+        || method.eq_ignore_ascii_case("PATCH");
+    if needs_content_length {
+        req.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+    }
+    for (k, v) in headers {
+        if k.eq_ignore_ascii_case("host")
+            || k.eq_ignore_ascii_case("connection")
+            || k.eq_ignore_ascii_case("proxy-connection")
+            || k.eq_ignore_ascii_case("keep-alive")
+            || k.eq_ignore_ascii_case("transfer-encoding")
+            || k.eq_ignore_ascii_case("content-length")
+            || k.eq_ignore_ascii_case("te")
+            || k.eq_ignore_ascii_case("trailer")
+            || k.eq_ignore_ascii_case("upgrade")
+        {
+            continue;
+        }
+        req.extend_from_slice(k.as_bytes());
+        req.extend_from_slice(b": ");
+        req.extend_from_slice(v.as_bytes());
+        req.extend_from_slice(b"\r\n");
+    }
+    req.extend_from_slice(b"\r\n");
+    req.extend_from_slice(body);
+    req
+}
+
+/// Forward an HTTP request via the SNI-rewrite trick at the HTTP layer.
+///
+/// Used by `handle_mitm_request` for hosts that were pulled out of
+/// SNI-rewrite by `relay_url_patterns` but whose URL path did NOT match
+/// any pattern. Saves the Apps Script quota the per-path filter is
+/// designed to recover, while still letting matching paths fall through
+/// to the relay.
+///
+/// Wire mechanics: dial `google_ip:443` (or a `hosts`-overridden IP) with
+/// SNI=`front_domain`, then send a literal HTTP/1.1 request whose `Host`
+/// header is the *real* origin name. The Google edge dispatches on the
+/// inner `Host`, so the response comes from the right backend even though
+/// the outer SNI is a sanitised one. `Connection: close` is forced so we
+/// can read until EOF and never need to parse `Content-Length` /
+/// `Transfer-Encoding` ourselves — and the browser side then sees
+/// `Connection: close` and won't pipeline another request on the dead
+/// MITM stream.
+///
+/// Ported from upstream `_forward_via_sni_rewrite` (commit b3b9220).
+async fn forward_via_sni_rewrite_http(
+    method: &str,
+    host: &str,
+    port: u16,
+    path: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    rewrite_ctx: &RewriteCtx,
+) -> std::io::Result<Vec<u8>> {
+    let target_ip = hosts_override(&rewrite_ctx.hosts, host)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| rewrite_ctx.google_ip.clone());
+    let sni = rewrite_ctx.front_domain.clone();
+    let server_name = ServerName::try_from(sni.clone()).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid front_domain '{}': {}", sni, e),
+        )
+    })?;
+
+    let upstream_tcp = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        TcpStream::connect((target_ip.as_str(), port)),
+    )
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "upstream connect timeout"))??;
+    let _ = upstream_tcp.set_nodelay(true);
+
+    let mut tls = rewrite_ctx
+        .tls_connector
+        .connect(server_name, upstream_tcp)
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("tls: {}", e)))?;
+
+    let req = build_sni_forward_request_bytes(method, host, port, path, headers, body);
+    tls.write_all(&req).await?;
+    tls.flush().await?;
+
+    // Read response until EOF / ungraceful TLS close. The upstream is
+    // `Connection: close`, so EOF is a complete response. UnexpectedEof
+    // (rustls's signal for a TCP close without a close_notify alert) is
+    // treated the same as a clean EOF — same compromise that
+    // `read_http_response` makes.
+    //
+    // A read timeout means the upstream is hung mid-response and we
+    // can't prove what we have is complete. Return an error so the
+    // caller falls back to the relay path; serving a truncated
+    // response to the browser would silently corrupt it.
+    //
+    // **Cap is much tighter than the global 200 MB response ceiling**:
+    // this code path only runs for hosts in `force_mitm_hosts` AND paths
+    // that did NOT match a `relay_url_patterns` entry. With the default
+    // pattern set that's "non-`/youtubei/` GETs on `youtube.com`" —
+    // realistic responses are HTML pages, JS bundles, and small inline
+    // assets, capped at a few MB in practice. Cutting the per-call cap
+    // to 32 MB shrinks the memory blast radius under concurrent load on
+    // memory-constrained devices (OpenWRT routers, Android) by ~6× vs
+    // the original 200 MB, while still leaving comfortable headroom
+    // above the realistic max. Streaming the body straight back to the
+    // browser would avoid the buffer entirely — see followup TODO; the
+    // tighter cap is the cheap memory-pressure defense in the meantime.
+    const MAX_RESP_BYTES: usize = 32 * 1024 * 1024;
+    let mut response = Vec::with_capacity(16 * 1024);
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        let read_res =
+            tokio::time::timeout(std::time::Duration::from_secs(30), tls.read(&mut buf)).await;
+        match read_res {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => {
+                response.extend_from_slice(&buf[..n]);
+                if response.len() > MAX_RESP_BYTES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "sni-rewrite forward response exceeded cap",
+                    ));
+                }
+            }
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "sni-rewrite forward read timeout (response may be truncated)",
+                ));
+            }
+        }
+    }
+    if response.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "sni-rewrite forward got empty response",
+        ));
+    }
+    Ok(response)
+}
+
 #[derive(Debug)]
 struct NoVerify;
 
@@ -2370,6 +3018,7 @@ async fn handle_mitm_request<S>(
     port: u16,
     fronter: &DomainFronter,
     scheme: &str,
+    rewrite_ctx: &Arc<RewriteCtx>,
 ) -> std::io::Result<bool>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -2491,6 +3140,86 @@ where
             .iter()
             .any(|(k, v)| k.eq_ignore_ascii_case("connection") && v.eq_ignore_ascii_case("close"));
         return Ok(!connection_close);
+    }
+
+    // Path-level relay routing (b3b9220). Hosts that were pulled out of
+    // SNI-rewrite by `relay_url_patterns` are MITM'd so we can inspect the
+    // URL: paths that match a pattern go through the Apps Script relay
+    // (this is what fixes YouTube SafeSearch / live-stream gating on
+    // `/youtubei/`); every other path on the same host is forwarded over
+    // a fresh SNI-rewrite TLS connection, saving the relay quota that the
+    // pre-port `youtube_via_relay = true` knob would have spent on every
+    // static asset. A failed forward falls through to the relay path so a
+    // network blip on the Google edge doesn't take the host offline.
+    //
+    // **Safe-method gate**: the forwarder is only used for GET/HEAD/OPTIONS.
+    // The fallback-on-error semantics combined with non-idempotent methods
+    // (POST/PUT/PATCH/DELETE) would be a replay hazard: write_all may
+    // succeed against the upstream and then a read timeout / cap-exceeded
+    // / late TLS error fires fallback, which sends the same side-effecting
+    // request through Apps Script. POSTs to non-`/youtubei/` paths on
+    // youtube.com are uncommon, and the quota cost of routing them via
+    // relay is acceptable next to the correctness risk of duplicating
+    // them. Mirrors the same gate on idempotency that
+    // `relay_parallel_range` and `parallel_relay` apply elsewhere.
+    //
+    // **Exit-node-full gate**: when `exit_node.mode = "full"` is active
+    // (commit 88b2767), every relay request is required to route through
+    // the second-hop exit node. The forwarder dials the Google edge
+    // directly with no awareness of the exit node, so taking it for any
+    // path — even ones that look "skippable" by the path filter —
+    // silently bypasses the exit node and breaks the documented "every
+    // URL routes through the exit node" contract on
+    // `DomainFronter::exit_node_matches`. With the gate active,
+    // user-supplied `relay_url_patterns` still pull their hosts out of
+    // SNI-rewrite (so MITM runs); the path-vs-forwarder split just
+    // collapses, and every path on those hosts goes to relay → exit
+    // node. The default `youtube.com/youtubei/` is suppressed earlier
+    // in `ResolvedRouting` (because `youtube_via_relay_effective` is
+    // true here), so this only affects user-supplied entries — which
+    // is the case the reviewer flagged.
+    let method_is_safe_for_forwarder = method.eq_ignore_ascii_case("GET")
+        || method.eq_ignore_ascii_case("HEAD")
+        || method.eq_ignore_ascii_case("OPTIONS");
+    if scheme == "https"
+        && port == 443
+        && method_is_safe_for_forwarder
+        && !rewrite_ctx.exit_node_full_mode_active
+        && !rewrite_ctx.relay_url_patterns.is_empty()
+        && host_in_force_mitm_list(host, &rewrite_ctx.force_mitm_hosts)
+        && !url_matches_relay_pattern(&url, &rewrite_ctx.relay_url_patterns)
+    {
+        tracing::info!("sni-rewrite forward {} {}", method, url);
+        match forward_via_sni_rewrite_http(
+            &method,
+            host,
+            port,
+            &path,
+            &headers,
+            &body,
+            rewrite_ctx,
+        )
+        .await
+        {
+            Ok(response_bytes) => {
+                stream.write_all(&response_bytes).await?;
+                stream.flush().await?;
+                // The forwarder always sets `Connection: close` on the
+                // upstream request, so the upstream side has closed by
+                // the time we get here — propagate that to the inbound
+                // browser side too. The browser will reopen for the next
+                // request (and we'll mint a new MITM session).
+                return Ok(false);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "sni-rewrite forward failed for {}: {} — falling back to relay",
+                    url,
+                    e
+                );
+                // fall through
+            }
+        }
     }
 
     tracing::info!("relay {} {}", method, url);
@@ -3233,20 +3962,23 @@ mod tests {
     fn sni_rewrite_is_only_for_port_443() {
         let mut hosts = std::collections::HashMap::new();
         hosts.insert("example.com".to_string(), "1.2.3.4".to_string());
+        let no_force: Vec<String> = vec![];
 
-        assert!(should_use_sni_rewrite(&hosts, "google.com", 443, false));
-        assert!(!should_use_sni_rewrite(&hosts, "google.com", 80, false));
+        assert!(should_use_sni_rewrite(&hosts, "google.com", 443, false, &no_force));
+        assert!(!should_use_sni_rewrite(&hosts, "google.com", 80, false, &no_force));
         assert!(should_use_sni_rewrite(
             &hosts,
             "www.example.com",
             443,
-            false
+            false,
+            &no_force,
         ));
         assert!(!should_use_sni_rewrite(
             &hosts,
             "www.example.com",
             80,
-            false
+            false,
+            &no_force,
         ));
     }
 
@@ -3262,18 +3994,20 @@ mod tests {
         //     was incorrectly carved out alongside the API surfaces.
         //   - Non-YouTube Google suffixes are unaffected by the flag.
         let hosts = std::collections::HashMap::new();
+        let no_force: Vec<String> = vec![];
 
         // Default behaviour (flag off): everything in the SNI pool
         // rewrites including all YouTube assets.
-        assert!(should_use_sni_rewrite(&hosts, "www.youtube.com", 443, false));
-        assert!(should_use_sni_rewrite(&hosts, "i.ytimg.com", 443, false));
-        assert!(should_use_sni_rewrite(&hosts, "youtu.be", 443, false));
-        assert!(should_use_sni_rewrite(&hosts, "www.google.com", 443, false));
+        assert!(should_use_sni_rewrite(&hosts, "www.youtube.com", 443, false, &no_force));
+        assert!(should_use_sni_rewrite(&hosts, "i.ytimg.com", 443, false, &no_force));
+        assert!(should_use_sni_rewrite(&hosts, "youtu.be", 443, false, &no_force));
+        assert!(should_use_sni_rewrite(&hosts, "www.google.com", 443, false, &no_force));
         assert!(should_use_sni_rewrite(
             &hosts,
             "youtubei.googleapis.com",
             443,
-            false
+            false,
+            &no_force,
         ));
 
         // googlevideo.com is INTENTIONALLY NOT in SNI_REWRITE_SUFFIXES
@@ -3287,23 +4021,26 @@ mod tests {
             &hosts,
             "rr1---sn-abc.googlevideo.com",
             443,
-            false
+            false,
+            &no_force,
         ));
 
         // Flag on: only the API + HTML hosts opt out.
-        assert!(!should_use_sni_rewrite(&hosts, "www.youtube.com", 443, true));
-        assert!(!should_use_sni_rewrite(&hosts, "youtu.be", 443, true));
+        assert!(!should_use_sni_rewrite(&hosts, "www.youtube.com", 443, true, &no_force));
+        assert!(!should_use_sni_rewrite(&hosts, "youtu.be", 443, true, &no_force));
         assert!(!should_use_sni_rewrite(
             &hosts,
             "www.youtube-nocookie.com",
             443,
-            true
+            true,
+            &no_force,
         ));
         assert!(!should_use_sni_rewrite(
             &hosts,
             "youtubei.googleapis.com",
             443,
-            true
+            true,
+            &no_force,
         ));
 
         // Flag on: image / channel-asset CDNs STAY on SNI rewrite. Pre-#275
@@ -3311,20 +4048,21 @@ mod tests {
         // googlevideo.com still goes through the relay path (not in the
         // SNI list at all — see note above the SNI_REWRITE_SUFFIXES
         // entries) so the same flag-on assertion isn't applicable to it.
-        assert!(should_use_sni_rewrite(&hosts, "i.ytimg.com", 443, true));
-        assert!(should_use_sni_rewrite(&hosts, "yt3.ggpht.com", 443, true));
+        assert!(should_use_sni_rewrite(&hosts, "i.ytimg.com", 443, true, &no_force));
+        assert!(should_use_sni_rewrite(&hosts, "yt3.ggpht.com", 443, true, &no_force));
 
         // Flag on: non-YouTube Google suffixes are unaffected. Note
         // youtubei.googleapis.com (above) is the *carve-out* — the
         // broader googleapis.com suffix is NOT carved out, so e.g.
         // Drive / Calendar / etc. continue to SNI-rewrite.
-        assert!(should_use_sni_rewrite(&hosts, "www.google.com", 443, true));
-        assert!(should_use_sni_rewrite(&hosts, "fonts.gstatic.com", 443, true));
+        assert!(should_use_sni_rewrite(&hosts, "www.google.com", 443, true, &no_force));
+        assert!(should_use_sni_rewrite(&hosts, "fonts.gstatic.com", 443, true, &no_force));
         assert!(should_use_sni_rewrite(
             &hosts,
             "drive.googleapis.com",
             443,
-            true
+            true,
+            &no_force,
         ));
     }
 
@@ -3335,12 +4073,14 @@ mod tests {
         // user choice, the toggle is a default policy.
         let mut hosts = std::collections::HashMap::new();
         hosts.insert("rr4.googlevideo.com".to_string(), "1.2.3.4".to_string());
+        let no_force: Vec<String> = vec![];
 
         assert!(should_use_sni_rewrite(
             &hosts,
             "rr4.googlevideo.com",
             443,
-            true
+            true,
+            &no_force,
         ));
     }
 
@@ -3587,6 +4327,713 @@ mod tests {
         assert!(match_fronting_group("vercel.com", &groups).is_none());
     }
 
+    // ── SNI-rewrite forwarder request builder (b3b9220) ──────────────────
+
+    fn parse_request(req: &[u8]) -> (String, Vec<(String, String)>, Vec<u8>) {
+        let s = std::str::from_utf8(req).expect("request bytes must be utf-8");
+        let mut parts = s.split("\r\n\r\n");
+        let head = parts.next().unwrap();
+        let body_start = head.len() + 4;
+        let body = req[body_start..].to_vec();
+        let mut lines = head.split("\r\n");
+        let request_line = lines.next().unwrap().to_string();
+        let mut headers = Vec::new();
+        for line in lines {
+            if line.is_empty() {
+                continue;
+            }
+            let (k, v) = line.split_once(": ").expect("malformed header line");
+            headers.push((k.to_string(), v.to_string()));
+        }
+        (request_line, headers, body)
+    }
+
+    fn header_present(headers: &[(String, String)], name: &str) -> bool {
+        headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name))
+    }
+
+    fn header_get_raw<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn forwarder_request_get_emits_correct_request_line_and_host() {
+        let req = build_sni_forward_request_bytes(
+            "GET",
+            "www.youtube.com",
+            443,
+            "/watch?v=abc",
+            &[("User-Agent".into(), "Mozilla/5.0".into())],
+            b"",
+        );
+        let (line, headers, body) = parse_request(&req);
+        assert_eq!(line, "GET /watch?v=abc HTTP/1.1");
+        assert_eq!(header_get_raw(&headers, "Host"), Some("www.youtube.com"));
+        assert_eq!(header_get_raw(&headers, "Connection"), Some("close"));
+        assert_eq!(header_get_raw(&headers, "User-Agent"), Some("Mozilla/5.0"));
+        // GET without body must not emit Content-Length.
+        assert!(
+            !header_present(&headers, "Content-Length"),
+            "GET with no body must not emit Content-Length"
+        );
+        assert!(body.is_empty());
+    }
+
+    #[test]
+    fn forwarder_request_strips_inbound_chunked_and_sets_fresh_content_length() {
+        // `read_body` decodes chunked request bodies before they reach the
+        // forwarder, so the Transfer-Encoding header is a lie about the
+        // bytes we have. The builder MUST drop it AND any inbound
+        // Content-Length, then emit a single fresh Content-Length matching
+        // the decoded body length. Otherwise the upstream waits forever
+        // for chunk markers that aren't there (or reads the wrong number
+        // of bytes).
+        let body = b"hello-decoded-body";
+        let req = build_sni_forward_request_bytes(
+            "POST",
+            "example.com",
+            443,
+            "/api",
+            &[
+                ("Transfer-Encoding".into(), "chunked".into()),
+                ("Content-Length".into(), "999".into()), // stale lie
+                ("Content-Type".into(), "application/json".into()),
+            ],
+            body,
+        );
+        let (_line, headers, parsed_body) = parse_request(&req);
+        assert!(
+            !header_present(&headers, "Transfer-Encoding"),
+            "Transfer-Encoding must be stripped: {:?}",
+            headers
+        );
+        assert_eq!(
+            header_get_raw(&headers, "Content-Length"),
+            Some(body.len().to_string().as_str()),
+            "Content-Length must reflect actual body length"
+        );
+        // Make sure there is exactly ONE Content-Length header.
+        let cl_count = headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("Content-Length"))
+            .count();
+        assert_eq!(cl_count, 1, "must emit exactly one Content-Length header");
+        // Non-framing headers like Content-Type pass through.
+        assert_eq!(
+            header_get_raw(&headers, "Content-Type"),
+            Some("application/json")
+        );
+        assert_eq!(parsed_body, body);
+    }
+
+    #[test]
+    fn forwarder_request_drops_hop_by_hop_and_connection_headers() {
+        let req = build_sni_forward_request_bytes(
+            "GET",
+            "www.youtube.com",
+            443,
+            "/",
+            &[
+                ("Connection".into(), "keep-alive".into()),
+                ("Proxy-Connection".into(), "keep-alive".into()),
+                ("Keep-Alive".into(), "timeout=5".into()),
+                ("TE".into(), "trailers".into()),
+                ("Trailer".into(), "X-Foo".into()),
+                ("Upgrade".into(), "websocket".into()),
+                ("Host".into(), "spoofed.example.com".into()), // must be overwritten
+                ("Accept".into(), "text/html".into()),
+            ],
+            b"",
+        );
+        let (_line, headers, _body) = parse_request(&req);
+        // Forced headers we own.
+        assert_eq!(header_get_raw(&headers, "Host"), Some("www.youtube.com"));
+        assert_eq!(header_get_raw(&headers, "Connection"), Some("close"));
+        // None of the inbound copies of the headers we own may pass through.
+        let host_count = headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("Host"))
+            .count();
+        assert_eq!(host_count, 1, "must emit exactly one Host header");
+        // Hop-by-hop must be dropped.
+        assert!(!header_present(&headers, "Proxy-Connection"));
+        assert!(!header_present(&headers, "Keep-Alive"));
+        assert!(!header_present(&headers, "TE"));
+        assert!(!header_present(&headers, "Trailer"));
+        assert!(!header_present(&headers, "Upgrade"));
+        // Non-framing pass through.
+        assert_eq!(header_get_raw(&headers, "Accept"), Some("text/html"));
+    }
+
+    #[test]
+    fn forwarder_request_includes_port_in_host_for_nondefault_ports() {
+        let req = build_sni_forward_request_bytes(
+            "GET",
+            "youtube.com",
+            8443,
+            "/",
+            &[],
+            b"",
+        );
+        let (_line, headers, _body) = parse_request(&req);
+        assert_eq!(header_get_raw(&headers, "Host"), Some("youtube.com:8443"));
+    }
+
+    #[test]
+    fn forwarder_request_post_with_empty_body_still_emits_content_length() {
+        // POSTs may legitimately have no body, but origins generally
+        // expect Content-Length: 0 on a body-bearing method. The
+        // get/head/options branch is the one that omits CL.
+        let req = build_sni_forward_request_bytes(
+            "POST",
+            "youtube.com",
+            443,
+            "/youtubei/v1/no-body",
+            &[],
+            b"",
+        );
+        let (_line, headers, _body) = parse_request(&req);
+        assert_eq!(header_get_raw(&headers, "Content-Length"), Some("0"));
+    }
+
+    // ── normalize_pattern ─────────────────────────────────────────────────
+
+    #[test]
+    fn normalize_pattern_strips_scheme_case_insensitively() {
+        // The original implementation lowercased AFTER trim_start_matches,
+        // so `HTTPS://Foo.com/` slipped through with the scheme intact.
+        // Now we lowercase first.
+        assert_eq!(
+            normalize_pattern("HTTPS://YouTube.com/YouTubei/"),
+            "youtube.com/youtubei/"
+        );
+        assert_eq!(
+            normalize_pattern("HTTP://Example.com/api/"),
+            "example.com/api/"
+        );
+        // Bare patterns (no scheme) lower-cased.
+        assert_eq!(
+            normalize_pattern("YouTube.com/YouTubei/"),
+            "youtube.com/youtubei/"
+        );
+    }
+
+    #[test]
+    fn normalize_pattern_trims_trailing_dot_on_host() {
+        // FQDN-form host with trailing dot must canonicalise to the same
+        // form `extract_host` returns (it trims the dot).
+        assert_eq!(
+            normalize_pattern("youtube.com./youtubei/"),
+            "youtube.com/youtubei/"
+        );
+        assert_eq!(
+            normalize_pattern("https://YouTube.com./api/"),
+            "youtube.com/api/"
+        );
+        // Trailing dot on host-only patterns (no path) too.
+        assert_eq!(normalize_pattern("foo.com."), "foo.com");
+    }
+
+    #[test]
+    fn normalize_pattern_preserves_path_dots() {
+        // Only the host component gets its trailing dot stripped — path
+        // components keep theirs (a path like `/v1.0/` is legitimate).
+        assert_eq!(
+            normalize_pattern("youtube.com/v1.0/"),
+            "youtube.com/v1.0/"
+        );
+        assert_eq!(
+            normalize_pattern("youtube.com./v1.0/"),
+            "youtube.com/v1.0/"
+        );
+    }
+
+    #[test]
+    fn normalize_pattern_handles_whitespace() {
+        assert_eq!(
+            normalize_pattern("  youtube.com/youtubei/  "),
+            "youtube.com/youtubei/"
+        );
+    }
+
+    // ── host_is_sni_rewrite_capable ──────────────────────────────────────
+
+    #[test]
+    fn sni_capable_recognises_google_edge_hosts() {
+        // SNI_REWRITE_SUFFIXES coverage check.
+        assert!(host_is_sni_rewrite_capable("youtube.com"));
+        assert!(host_is_sni_rewrite_capable("www.youtube.com"));
+        assert!(host_is_sni_rewrite_capable("studio.youtube.com"));
+        assert!(host_is_sni_rewrite_capable("googleapis.com"));
+        assert!(host_is_sni_rewrite_capable("youtubei.googleapis.com"));
+        assert!(host_is_sni_rewrite_capable("YouTube.COM")); // case insensitive
+        assert!(host_is_sni_rewrite_capable("youtube.com.")); // trailing dot
+    }
+
+    #[test]
+    fn sni_capable_rejects_non_google_hosts() {
+        // The whole point of the check: don't let users pull non-Google
+        // hosts through the SNI-rewrite forwarder, which would return
+        // wrong-origin responses from the Google edge.
+        assert!(!host_is_sni_rewrite_capable("evilsite.com"));
+        assert!(!host_is_sni_rewrite_capable("googlevideo.com")); // not in list
+        assert!(!host_is_sni_rewrite_capable("api.example.com"));
+        // Suffix-attack: "x" + matching suffix must not pass.
+        assert!(!host_is_sni_rewrite_capable("notyoutube.com"));
+        // Empty / pathological input.
+        assert!(!host_is_sni_rewrite_capable(""));
+    }
+
+    #[test]
+    fn resolved_routing_skips_non_sni_capable_user_pattern_hosts() {
+        // Direct test of the wrong-origin defense: a user-supplied
+        // pattern targeting a non-Google host must NOT add to
+        // `force_mitm_hosts`, because the forwarder would dial Google's
+        // edge and return a wrong-origin response. The pattern itself
+        // is preserved in `relay_url_patterns` so a matching path still
+        // routes via relay if the host is reached through the regular
+        // TLS-detect → MITM → relay path.
+        //
+        // Uses `googleapis.com/api/` as the SNI-capable example —
+        // intentionally NOT a YT-family host, so the
+        // `youtube_via_relay`-driven YT-suppression doesn't drop it.
+        // youtube_via_relay is left off here so the SNI-capable filter
+        // is the only thing being exercised.
+        let s = r#"{
+            "mode": "apps_script",
+            "auth_key": "secret-test-secret-test",
+            "script_id": "X",
+            "relay_url_patterns": [
+                "evilsite.com/api/",
+                "googleapis.com/inner/"
+            ]
+        }"#;
+        let cfg: crate::config::Config = serde_json::from_str(s).unwrap();
+        let r = ResolvedRouting::from_config(&cfg, Mode::AppsScript);
+        // Pattern preserved.
+        assert!(r
+            .relay_url_patterns
+            .contains(&"evilsite.com/api/".to_string()));
+        assert!(r
+            .relay_url_patterns
+            .contains(&"googleapis.com/inner/".to_string()));
+        // Non-Google host filtered out of force_mitm_hosts.
+        assert!(
+            !r.force_mitm_hosts.contains(&"evilsite.com".to_string()),
+            "evilsite.com must not be force-MITM'd: {:?}",
+            r.force_mitm_hosts,
+        );
+        // Google-edge host kept.
+        assert!(r
+            .force_mitm_hosts
+            .contains(&"googleapis.com".to_string()));
+        // And the skip is surfaced for the startup warning.
+        assert!(r
+            .skipped_force_mitm_hosts
+            .contains(&"evilsite.com".to_string()));
+    }
+
+    // ── Regression: exit_node.mode=full + user pattern ──────────────────
+
+    #[test]
+    fn youtube_via_relay_drops_user_supplied_yt_patterns() {
+        // Critical: when youtube_via_relay is on, every YT request goes
+        // through the relay via the YOUTUBE_RELAY_HOSTS carve-out, so a
+        // user-supplied `youtube.com/youtubei/` pattern is redundant
+        // AND harmful — it would re-add youtube.com to force_mitm_hosts
+        // and the path filter would then route non-matching paths
+        // through `forward_via_sni_rewrite_http`, partially defeating
+        // the user's "full YT through relay" opt-in. Dropped at startup
+        // with a warning.
+        let s = r#"{
+            "mode": "apps_script",
+            "auth_key": "secret-test-secret-test",
+            "script_id": "X",
+            "youtube_via_relay": true,
+            "relay_url_patterns": [
+                "youtube.com/youtubei/",
+                "www.youtube.com/watch",
+                "googleapis.com/specific-api/"
+            ]
+        }"#;
+        let cfg: crate::config::Config = serde_json::from_str(s).unwrap();
+        let r = ResolvedRouting::from_config(&cfg, Mode::AppsScript);
+        // Both YT-host entries dropped; non-YT entry survives.
+        assert!(
+            !r.relay_url_patterns
+                .iter()
+                .any(|p| p.starts_with("youtube.com/")),
+            "youtube.com/* must be dropped: {:?}",
+            r.relay_url_patterns,
+        );
+        assert!(
+            !r.relay_url_patterns
+                .iter()
+                .any(|p| p.starts_with("www.youtube.com/")),
+            "www.youtube.com/* must be dropped: {:?}",
+            r.relay_url_patterns,
+        );
+        assert!(r
+            .relay_url_patterns
+            .contains(&"googleapis.com/specific-api/".to_string()));
+        // youtube.com NOT in force_mitm_hosts (would reactivate the path
+        // filter); googleapis.com IS.
+        assert!(!r.force_mitm_hosts.contains(&"youtube.com".to_string()));
+        assert!(!r.force_mitm_hosts.contains(&"www.youtube.com".to_string()));
+        assert!(r
+            .force_mitm_hosts
+            .contains(&"googleapis.com".to_string()));
+        // Suppressed list surfaces both for the startup warning.
+        assert!(r
+            .suppressed_yt_patterns
+            .contains(&"youtube.com/youtubei/".to_string()));
+        assert!(r
+            .suppressed_yt_patterns
+            .contains(&"www.youtube.com/watch".to_string()));
+    }
+
+    #[test]
+    fn youtube_via_relay_off_keeps_user_supplied_yt_patterns() {
+        // Sanity check the inverse: when youtube_via_relay is off, user
+        // YT patterns should remain (the path filter is the whole point
+        // of relay_url_patterns when YT isn't fully relayed).
+        let s = r#"{
+            "mode": "apps_script",
+            "auth_key": "secret-test-secret-test",
+            "script_id": "X",
+            "relay_url_patterns": ["youtube.com/youtubei/v2/"]
+        }"#;
+        let cfg: crate::config::Config = serde_json::from_str(s).unwrap();
+        let r = ResolvedRouting::from_config(&cfg, Mode::AppsScript);
+        assert!(r.suppressed_yt_patterns.is_empty());
+        // User pattern is in the resolved list (alongside the default).
+        assert!(r
+            .relay_url_patterns
+            .contains(&"youtube.com/youtubei/v2/".to_string()));
+        assert!(r.force_mitm_hosts.contains(&"youtube.com".to_string()));
+    }
+
+    #[test]
+    fn exit_node_full_also_drops_user_supplied_yt_patterns() {
+        // Belt-and-suspenders: in exit-node-full mode, the runtime
+        // forwarder gate already blocks bypass, but
+        // youtube_via_relay_effective is true and the same suppression
+        // logic applies. A user-supplied YT pattern would be dropped
+        // here too, which is fine — the exit-node-full contract makes
+        // it a no-op anyway.
+        let s = r#"{
+            "mode": "apps_script",
+            "auth_key": "secret-test-secret-test",
+            "script_id": "X",
+            "relay_url_patterns": ["youtube.com/youtubei/"],
+            "exit_node": {
+                "enabled": true,
+                "relay_url": "https://exit.example.com/relay",
+                "psk": "shared-psk-1234",
+                "mode": "full"
+            }
+        }"#;
+        let cfg: crate::config::Config = serde_json::from_str(s).unwrap();
+        let r = ResolvedRouting::from_config(&cfg, Mode::AppsScript);
+        assert!(r.youtube_via_relay_effective);
+        assert!(r.exit_node_full_mode_active);
+        assert!(r
+            .suppressed_yt_patterns
+            .contains(&"youtube.com/youtubei/".to_string()));
+        assert!(!r.force_mitm_hosts.contains(&"youtube.com".to_string()));
+    }
+
+    #[test]
+    fn host_matches_youtube_relay_one_directional() {
+        // Same shape as host_in_force_mitm_list — exact match or
+        // dot-anchored subdomain.
+        assert!(host_matches_youtube_relay("youtube.com"));
+        assert!(host_matches_youtube_relay("www.youtube.com"));
+        assert!(host_matches_youtube_relay("studio.youtube.com"));
+        assert!(host_matches_youtube_relay("youtu.be"));
+        assert!(host_matches_youtube_relay("youtube-nocookie.com"));
+        assert!(host_matches_youtube_relay("youtubei.googleapis.com"));
+        assert!(host_matches_youtube_relay("v1.youtubei.googleapis.com"));
+        // Case-insensitive + trailing dot.
+        assert!(host_matches_youtube_relay("YouTube.com"));
+        assert!(host_matches_youtube_relay("youtube.com."));
+        // Sibling subdomains of the parent SNI suffix don't match.
+        assert!(!host_matches_youtube_relay("drive.googleapis.com"));
+        // Substring attack must not match.
+        assert!(!host_matches_youtube_relay("notyoutube.com"));
+        assert!(!host_matches_youtube_relay("youtube.com.evil.test"));
+    }
+
+    #[test]
+    fn exit_node_full_mode_active_propagates_through_resolved_routing() {
+        // The flag must round-trip from config to ResolvedRouting so
+        // RewriteCtx can carry it to handle_mitm_request and gate the
+        // SNI-HTTP forwarder. Selective-mode exit-nodes don't set it.
+        let s = r#"{
+            "mode": "apps_script",
+            "auth_key": "secret-test-secret-test",
+            "script_id": "X",
+            "exit_node": {
+                "enabled": true,
+                "relay_url": "https://exit.example.com/relay",
+                "psk": "shared-psk-1234",
+                "mode": "full"
+            }
+        }"#;
+        let cfg: crate::config::Config = serde_json::from_str(s).unwrap();
+        let r = ResolvedRouting::from_config(&cfg, Mode::AppsScript);
+        assert!(r.exit_node_full_mode_active);
+
+        // Same config but in selective mode → flag NOT set.
+        let s = r#"{
+            "mode": "apps_script",
+            "auth_key": "secret-test-secret-test",
+            "script_id": "X",
+            "exit_node": {
+                "enabled": true,
+                "relay_url": "https://exit.example.com/relay",
+                "psk": "shared-psk-1234",
+                "mode": "selective",
+                "hosts": ["chatgpt.com"]
+            }
+        }"#;
+        let cfg: crate::config::Config = serde_json::from_str(s).unwrap();
+        let r = ResolvedRouting::from_config(&cfg, Mode::AppsScript);
+        assert!(!r.exit_node_full_mode_active);
+    }
+
+    #[test]
+    fn exit_node_full_keeps_user_patterns_for_relay_routing() {
+        // Critical correctness invariant: in exit_node.mode=full, a
+        // user's `relay_url_patterns` entry must NOT cause non-matching
+        // paths on its host to bypass the exit node. Two halves to the
+        // contract:
+        //   1. The user's pattern host is still pulled into
+        //      `force_mitm_hosts` so MITM runs and the in-relay
+        //      `exit_node_matches` can route through the second hop.
+        //   2. `exit_node_full_mode_active` is true so dispatch knows
+        //      to skip the SNI-HTTP forwarder for non-matching paths,
+        //      sending them to relay → exit node instead of bypassing
+        //      both via the Google edge.
+        let s = r#"{
+            "mode": "apps_script",
+            "auth_key": "secret-test-secret-test",
+            "script_id": "X",
+            "relay_url_patterns": ["googleapis.com/specific-api/"],
+            "exit_node": {
+                "enabled": true,
+                "relay_url": "https://exit.example.com/relay",
+                "psk": "shared-psk-1234",
+                "mode": "full"
+            }
+        }"#;
+        let cfg: crate::config::Config = serde_json::from_str(s).unwrap();
+        let r = ResolvedRouting::from_config(&cfg, Mode::AppsScript);
+
+        // The user pattern survives — they want googleapis.com to be
+        // MITM'd and routed via relay (which then routes through exit
+        // node by the full-mode contract).
+        assert_eq!(
+            r.relay_url_patterns,
+            vec!["googleapis.com/specific-api/".to_string()]
+        );
+        assert_eq!(r.force_mitm_hosts, vec!["googleapis.com".to_string()]);
+        // The default `youtube.com/youtubei/` is correctly suppressed
+        // because youtube_via_relay_effective is true via exit-node-full.
+        assert!(!r
+            .relay_url_patterns
+            .iter()
+            .any(|p| p.starts_with("youtube.com/youtubei/")));
+        // And the runtime gate fires.
+        assert!(r.exit_node_full_mode_active);
+        assert!(r.youtube_via_relay_effective);
+    }
+
+    #[test]
+    fn forwarder_dispatch_gate_off_when_exit_node_full() {
+        // RewriteCtx-level invariant: with exit_node_full_mode_active,
+        // the gate that decides whether to use the forwarder must be
+        // observably off — even when every other condition would
+        // dispatch through it.
+        // Reconstruct the gate logic that lives in handle_mitm_request,
+        // since pulling a real RewriteCtx through the test requires an
+        // I/O-bound DomainFronter.
+        let force_mitm_hosts = vec!["googleapis.com".to_string()];
+        let patterns = vec!["googleapis.com/specific-api/".to_string()];
+        let url = "https://api.googleapis.com/other-path";
+        let host = "api.googleapis.com";
+        let port = 443u16;
+        let scheme = "https";
+        let method = "GET";
+
+        let method_safe = method.eq_ignore_ascii_case("GET")
+            || method.eq_ignore_ascii_case("HEAD")
+            || method.eq_ignore_ascii_case("OPTIONS");
+
+        // Without the exit-node-full gate, every other condition would
+        // dispatch through the forwarder.
+        let pre_gate = scheme == "https"
+            && port == 443
+            && method_safe
+            && !patterns.is_empty()
+            && host_in_force_mitm_list(host, &force_mitm_hosts)
+            && !url_matches_relay_pattern(url, &patterns);
+        assert!(pre_gate, "test fixture must reach the forwarder gate");
+
+        // With exit_node_full_mode_active = true, the actual gate is off.
+        let exit_node_full_mode_active = true;
+        let actual_gate = scheme == "https"
+            && port == 443
+            && method_safe
+            && !exit_node_full_mode_active
+            && !patterns.is_empty()
+            && host_in_force_mitm_list(host, &force_mitm_hosts)
+            && !url_matches_relay_pattern(url, &patterns);
+        assert!(
+            !actual_gate,
+            "exit_node.mode=full must disable the forwarder dispatch even \
+             when host/path/method would otherwise route through it",
+        );
+    }
+
+    // ── Regression: trailing-dot URL hosts ────────────────────────────────
+
+    #[test]
+    fn url_matches_relay_pattern_trims_trailing_dot_on_url_host() {
+        // `host_in_force_mitm_list` trims trailing dots, so dispatch
+        // would force-MITM a `www.youtube.com.` request. Without the
+        // matching trim here, the URL-host-vs-pattern-host suffix
+        // check failed and `/youtubei/v1/...` would route through the
+        // SNI-HTTP forwarder instead of the relay — observable as
+        // SafeSearch staying sticky after a system that emits FQDN
+        // hostnames (some Linux DNS resolvers, browser DoH paths) hits
+        // YouTube.
+        let patterns = vec!["youtube.com/youtubei/".to_string()];
+        assert!(url_matches_relay_pattern(
+            "https://www.youtube.com./youtubei/v1/browse",
+            &patterns,
+        ));
+        assert!(url_matches_relay_pattern(
+            "https://youtube.com./youtubei/",
+            &patterns,
+        ));
+    }
+
+    #[test]
+    fn url_matches_relay_pattern_strips_authority_port() {
+        // Same canonicalisation: an authority with `:443` must match
+        // pattern hosts that don't include the default port. Otherwise
+        // the host-vs-pattern compare fails and the dispatcher treats
+        // the URL as non-matching → forwarder dispatch.
+        let patterns = vec!["youtube.com/youtubei/".to_string()];
+        assert!(url_matches_relay_pattern(
+            "https://www.youtube.com:443/youtubei/v1/browse",
+            &patterns,
+        ));
+        // Non-default port still match — the URL went through some
+        // explicit-port flow; the host part is what matters.
+        assert!(url_matches_relay_pattern(
+            "https://www.youtube.com:8443/youtubei/v1/browse",
+            &patterns,
+        ));
+    }
+
+    #[test]
+    fn dispatch_matchers_agree_under_trailing_dot() {
+        // End-to-end check: same input must lead to the same
+        // membership decision in both matchers, otherwise the dispatch
+        // and pattern-check layers disagree (the symptom the reviewer
+        // flagged: host force-MITM'd but URL-pattern check fails).
+        let force = vec!["youtube.com".to_string()];
+        let patterns = vec!["youtube.com/youtubei/".to_string()];
+        for variant in [
+            "www.youtube.com",
+            "www.youtube.com.",
+            "WWW.YouTube.COM",
+            "WWW.YouTube.COM.",
+        ] {
+            assert!(host_in_force_mitm_list(variant, &force), "{}", variant);
+            let url = format!("https://{}/youtubei/v1/browse", variant);
+            assert!(url_matches_relay_pattern(&url, &patterns), "{}", url);
+        }
+    }
+
+    // ── fronting_groups precedence ───────────────────────────────────────
+
+    #[test]
+    fn fronting_group_overlap_with_relay_pattern_resolves_dispatch_via_group() {
+        // Documented precedence: dispatch_tunnel checks fronting_groups
+        // BEFORE force_mitm_hosts (steps 2a vs 2 in dispatch_tunnel).
+        // A user adding `youtube.com` to a fronting group is making a
+        // deliberate "alternate edge for YT" choice; the path filter
+        // assumes the Google edge handles the request and would land
+        // at the wrong upstream if it ran. The override is intentional;
+        // this test pins it so a future refactor doesn't accidentally
+        // flip the precedence.
+        let s = r#"{
+            "mode": "apps_script",
+            "auth_key": "secret-test-secret-test",
+            "script_id": "X",
+            "fronting_groups": [{
+                "name": "alt-yt-edge",
+                "ip": "203.0.113.10",
+                "sni": "react.dev",
+                "domains": ["youtube.com"]
+            }]
+        }"#;
+        let cfg: crate::config::Config = serde_json::from_str(s).unwrap();
+        // ResolvedRouting still includes the default pattern — patterns
+        // are mode-gated, not fronting-group-gated. The actual override
+        // happens at dispatch time.
+        let r = ResolvedRouting::from_config(&cfg, Mode::AppsScript);
+        assert!(r
+            .relay_url_patterns
+            .contains(&"youtube.com/youtubei/".to_string()));
+
+        // Build the resolved fronting group and confirm
+        // `match_fronting_group` returns it for the YT host. This is
+        // the call dispatch_tunnel uses at step 2a, BEFORE the force-MITM
+        // check at step 2 — the YT request never reaches the path filter.
+        let group =
+            FrontingGroupResolved::from_config(&cfg.fronting_groups[0]).unwrap();
+        let groups = vec![Arc::new(group)];
+        assert!(match_fronting_group("www.youtube.com", &groups).is_some());
+        assert!(match_fronting_group("youtube.com", &groups).is_some());
+    }
+
+    #[test]
+    fn fronting_group_with_disjoint_domain_does_not_interfere() {
+        // Sanity check: a fronting group covering an unrelated host
+        // (vercel.com) does not affect the YT path filter. Guards
+        // against accidentally widening the precedence rule.
+        let s = r#"{
+            "mode": "apps_script",
+            "auth_key": "secret-test-secret-test",
+            "script_id": "X",
+            "fronting_groups": [{
+                "name": "vercel",
+                "ip": "76.76.21.21",
+                "sni": "react.dev",
+                "domains": ["vercel.com"]
+            }]
+        }"#;
+        let cfg: crate::config::Config = serde_json::from_str(s).unwrap();
+        let r = ResolvedRouting::from_config(&cfg, Mode::AppsScript);
+        // YT pattern survives untouched.
+        assert!(r
+            .relay_url_patterns
+            .contains(&"youtube.com/youtubei/".to_string()));
+
+        let group =
+            FrontingGroupResolved::from_config(&cfg.fronting_groups[0]).unwrap();
+        let groups = vec![Arc::new(group)];
+        // YT host doesn't match the unrelated group.
+        assert!(match_fronting_group("www.youtube.com", &groups).is_none());
+    }
+
     #[test]
     fn fronting_group_resolve_rejects_invalid_sni() {
         let bad = FrontingGroup {
@@ -3596,5 +5043,418 @@ mod tests {
             domains: vec!["x.com".into()],
         };
         assert!(FrontingGroupResolved::from_config(&bad).is_err());
+    }
+
+    #[test]
+    fn url_matches_relay_pattern_basic() {
+        // Default upstream pattern. Path-anchored — matches the
+        // youtubei prefix, NOT a similarly-named query string.
+        let patterns = vec!["youtube.com/youtubei/".to_string()];
+        assert!(url_matches_relay_pattern(
+            "https://www.youtube.com/youtubei/v1/browse",
+            &patterns,
+        ));
+        assert!(url_matches_relay_pattern(
+            "https://m.youtube.com/youtubei/v1/player",
+            &patterns,
+        ));
+        // Bare scheme variant
+        assert!(url_matches_relay_pattern(
+            "http://youtube.com/youtubei/",
+            &patterns,
+        ));
+        // Wrong path on the right host
+        assert!(!url_matches_relay_pattern(
+            "https://www.youtube.com/watch?v=abc",
+            &patterns,
+        ));
+        // Right path-shape on the wrong host
+        assert!(!url_matches_relay_pattern(
+            "https://example.com/youtubei/v1",
+            &patterns,
+        ));
+        // Suffix attack — trailing dot on host should not bypass match.
+        // (URL parsing strips the trailing dot before reaching here in
+        // practice; the matcher is strict on the host segment.)
+        assert!(!url_matches_relay_pattern(
+            "https://evil-youtube.com/youtubei/",
+            &patterns,
+        ));
+    }
+
+    #[test]
+    fn url_matches_relay_pattern_empty_patterns_never_matches() {
+        let empty: Vec<String> = vec![];
+        assert!(!url_matches_relay_pattern("https://www.youtube.com/", &empty));
+    }
+
+    #[test]
+    fn host_in_force_mitm_list_is_suffix_anchored() {
+        let list = vec!["youtube.com".to_string()];
+        assert!(host_in_force_mitm_list("youtube.com", &list));
+        assert!(host_in_force_mitm_list("www.youtube.com", &list));
+        assert!(host_in_force_mitm_list("m.youtube.com", &list));
+        // Strict suffix — trailing-dot trim should still match.
+        assert!(host_in_force_mitm_list("youtube.com.", &list));
+        // Substring attack must NOT match.
+        assert!(!host_in_force_mitm_list("notyoutube.com", &list));
+        assert!(!host_in_force_mitm_list("youtube.com.evil.test", &list));
+        // Empty list never matches.
+        let empty: Vec<String> = vec![];
+        assert!(!host_in_force_mitm_list("anything", &empty));
+    }
+
+    #[test]
+    fn force_mitm_pulls_host_out_of_sni_rewrite() {
+        // With `relay_url_patterns: ["youtube.com/youtubei/"]`, the host
+        // youtube.com gets pulled out of SNI-rewrite so MITM can run
+        // and inspect paths. Other YT-family hosts (ytimg, ggpht) stay
+        // on SNI-rewrite — they aren't in the patterns and the user
+        // hasn't asked for path-level routing on them.
+        let hosts = std::collections::HashMap::new();
+        let force = vec!["youtube.com".to_string()];
+
+        // youtube.com itself is force-MITM'd → not SNI-rewrite.
+        assert!(!should_use_sni_rewrite(
+            &hosts,
+            "www.youtube.com",
+            443,
+            false,
+            &force,
+        ));
+        assert!(!should_use_sni_rewrite(
+            &hosts,
+            "m.youtube.com",
+            443,
+            false,
+            &force,
+        ));
+        // Sibling YT hosts NOT in the force list still SNI-rewrite.
+        assert!(should_use_sni_rewrite(
+            &hosts,
+            "i.ytimg.com",
+            443,
+            false,
+            &force,
+        ));
+        assert!(should_use_sni_rewrite(
+            &hosts,
+            "yt3.ggpht.com",
+            443,
+            false,
+            &force,
+        ));
+    }
+
+    #[test]
+    fn force_mitm_overrides_hosts_override() {
+        // If the user has both an explicit hosts override AND a relay_url_patterns
+        // entry that pulls the same host out of SNI-rewrite, the pattern wins —
+        // we need MITM for the per-path matcher to run. The hosts override is
+        // still used as the upstream IP by `forward_via_sni_rewrite_http` /
+        // `do_sni_rewrite_tunnel_from_tcp`, just not as a CONNECT-tunnel target.
+        let mut hosts = std::collections::HashMap::new();
+        hosts.insert("www.youtube.com".to_string(), "1.2.3.4".to_string());
+        let force = vec!["youtube.com".to_string()];
+
+        assert!(!should_use_sni_rewrite(
+            &hosts,
+            "www.youtube.com",
+            443,
+            false,
+            &force,
+        ));
+    }
+
+    fn make_test_config(mode: &str) -> crate::config::Config {
+        let s = format!(
+            r#"{{
+                "mode": "{mode}",
+                "auth_key": "secret-test-secret-test",
+                "script_id": "X"
+            }}"#,
+        );
+        serde_json::from_str(&s).unwrap()
+    }
+
+    #[test]
+    fn resolved_routing_apps_script_default_prepends_youtubei_pattern() {
+        // The default-shipped pattern is `youtube.com/youtubei/`. With no
+        // user config and no exit node, apps_script mode should resolve
+        // exactly that one pattern and pull `youtube.com` from
+        // SNI-rewrite (so MITM can run for path inspection).
+        let cfg = make_test_config("apps_script");
+        let r = ResolvedRouting::from_config(&cfg, Mode::AppsScript);
+        assert_eq!(r.relay_url_patterns, vec!["youtube.com/youtubei/".to_string()]);
+        assert_eq!(r.force_mitm_hosts, vec!["youtube.com".to_string()]);
+        assert!(!r.youtube_via_relay_effective);
+        assert!(!r.exit_node_full_mode_active);
+    }
+
+    #[test]
+    fn resolved_routing_direct_mode_skips_default_pattern() {
+        // CRITICAL regression guard. In direct mode there is no
+        // Apps Script relay path. The `youtube.com/youtubei/` default
+        // would pull `youtube.com` from SNI-rewrite, and the dispatcher
+        // would then send YT requests to RAW TCP fallback because nothing
+        // would match SNI-rewrite OR Apps Script. Test asserts that
+        // direct mode resolves to empty pattern + force-MITM lists.
+        let cfg = make_test_config("direct");
+        let r = ResolvedRouting::from_config(&cfg, Mode::Direct);
+        assert!(
+            r.relay_url_patterns.is_empty(),
+            "direct mode must not populate relay_url_patterns: {:?}",
+            r.relay_url_patterns,
+        );
+        assert!(
+            r.force_mitm_hosts.is_empty(),
+            "direct mode must not populate force_mitm_hosts: {:?}",
+            r.force_mitm_hosts,
+        );
+    }
+
+    #[test]
+    fn resolved_routing_full_mode_skips_default_pattern() {
+        // Mode::Full's dispatcher short-circuits to the tunnel mux
+        // before MITM runs, so patterns would never be consulted —
+        // resolving them is dead weight. Same gate as direct mode.
+        let cfg = make_test_config("full");
+        let r = ResolvedRouting::from_config(&cfg, Mode::Full);
+        assert!(r.relay_url_patterns.is_empty());
+        assert!(r.force_mitm_hosts.is_empty());
+    }
+
+    #[test]
+    fn resolved_routing_direct_mode_youtube_still_sni_rewrites() {
+        // End-to-end check of the direct-mode regression: with the
+        // resolved sets empty, `should_use_sni_rewrite` should send
+        // www.youtube.com:443 to the SNI-rewrite tunnel, not raw-TCP
+        // fallback.
+        let cfg = make_test_config("direct");
+        let r = ResolvedRouting::from_config(&cfg, Mode::Direct);
+        let hosts = std::collections::HashMap::new();
+        assert!(should_use_sni_rewrite(
+            &hosts,
+            "www.youtube.com",
+            443,
+            r.youtube_via_relay_effective,
+            &r.force_mitm_hosts,
+        ));
+    }
+
+    #[test]
+    fn resolved_routing_youtube_via_relay_skips_default_pattern() {
+        // When the user explicitly opts in to `youtube_via_relay = true`,
+        // YouTube is fully relayed already — the per-path filter is
+        // redundant. User extras still resolve, just not the default.
+        // The user pattern host MUST be SNI-rewrite-capable to land in
+        // `force_mitm_hosts`; here we use `googleapis.com` since it's
+        // in `SNI_REWRITE_SUFFIXES`.
+        let s = r#"{
+            "mode": "apps_script",
+            "auth_key": "secret-test-secret-test",
+            "script_id": "X",
+            "youtube_via_relay": true,
+            "relay_url_patterns": ["googleapis.com/api/"]
+        }"#;
+        let cfg: crate::config::Config = serde_json::from_str(s).unwrap();
+        let r = ResolvedRouting::from_config(&cfg, Mode::AppsScript);
+        // Default `youtube.com/youtubei/` NOT prepended; user entry kept.
+        assert_eq!(r.relay_url_patterns, vec!["googleapis.com/api/".to_string()]);
+        assert_eq!(r.force_mitm_hosts, vec!["googleapis.com".to_string()]);
+        assert!(r.skipped_force_mitm_hosts.is_empty());
+        assert!(r.youtube_via_relay_effective);
+    }
+
+    #[test]
+    fn resolved_routing_exit_node_full_mode_skips_default_pattern() {
+        // CRITICAL regression guard. With `exit_node.mode = "full"`
+        // and `youtube_via_relay = false`, the prior code prepended
+        // `youtube.com/youtubei/` even though the YT-via-relay flag
+        // was effectively true. That made non-`/youtubei/` YouTube
+        // requests route through `forward_via_sni_rewrite_http`,
+        // bypassing `DomainFronter::relay` and with it the exit node
+        // — defeating the whole point of full mode. Now the effective
+        // flag gates the prepend, and YT goes fully through relay
+        // (and thus through the exit node).
+        let s = r#"{
+            "mode": "apps_script",
+            "auth_key": "secret-test-secret-test",
+            "script_id": "X",
+            "youtube_via_relay": false,
+            "exit_node": {
+                "enabled": true,
+                "relay_url": "https://exit.example.com/relay",
+                "psk": "shared-psk-1234",
+                "mode": "full"
+            }
+        }"#;
+        let cfg: crate::config::Config = serde_json::from_str(s).unwrap();
+        let r = ResolvedRouting::from_config(&cfg, Mode::AppsScript);
+        assert!(
+            r.youtube_via_relay_effective,
+            "exit_node.mode=full must imply youtube_via_relay (88b2767)",
+        );
+        assert!(r.exit_node_full_mode_active);
+        assert!(
+            r.relay_url_patterns.is_empty(),
+            "exit_node.mode=full must NOT prepend default pattern \
+             (would bypass exit node for non-/youtubei/ paths): {:?}",
+            r.relay_url_patterns,
+        );
+        assert!(r.force_mitm_hosts.is_empty());
+    }
+
+    #[test]
+    fn resolved_routing_exit_node_full_in_direct_mode_does_not_imply_yt_relay() {
+        // exit_node config is shared across modes but only applies to
+        // apps_script. In direct mode there's no relay → no exit node
+        // → the OR with exit-node-full must NOT promote
+        // youtube_via_relay_effective to true (would be misleading).
+        let s = r#"{
+            "mode": "direct",
+            "exit_node": {
+                "enabled": true,
+                "relay_url": "https://exit.example.com/relay",
+                "psk": "shared-psk-1234",
+                "mode": "full"
+            }
+        }"#;
+        let cfg: crate::config::Config = serde_json::from_str(s).unwrap();
+        let r = ResolvedRouting::from_config(&cfg, Mode::Direct);
+        assert!(!r.youtube_via_relay_effective);
+        assert!(!r.exit_node_full_mode_active);
+        assert!(r.relay_url_patterns.is_empty());
+    }
+
+    #[test]
+    fn resolved_routing_exit_node_selective_does_not_imply_yt_relay() {
+        // Exit-node `selective` (the default) only sends listed hosts
+        // through the second hop. YouTube isn't in the typical CF-anti-bot
+        // list, and the per-path filter is fine to keep — non-`/youtubei/`
+        // YT paths going via SNI-rewrite forward is the win the filter
+        // was designed for.
+        let s = r#"{
+            "mode": "apps_script",
+            "auth_key": "secret-test-secret-test",
+            "script_id": "X",
+            "exit_node": {
+                "enabled": true,
+                "relay_url": "https://exit.example.com/relay",
+                "psk": "shared-psk-1234",
+                "mode": "selective",
+                "hosts": ["chatgpt.com"]
+            }
+        }"#;
+        let cfg: crate::config::Config = serde_json::from_str(s).unwrap();
+        let r = ResolvedRouting::from_config(&cfg, Mode::AppsScript);
+        assert!(!r.youtube_via_relay_effective);
+        assert!(!r.exit_node_full_mode_active);
+        // Default pattern still prepended.
+        assert_eq!(r.relay_url_patterns, vec!["youtube.com/youtubei/".to_string()]);
+    }
+
+    #[test]
+    fn resolved_routing_user_patterns_dedup_against_default() {
+        // If a user pastes the default pattern verbatim (or with stray
+        // whitespace / scheme), dedup keeps a single entry.
+        let s = r#"{
+            "mode": "apps_script",
+            "auth_key": "secret-test-secret-test",
+            "script_id": "X",
+            "relay_url_patterns": [
+                "https://YouTube.com/YouTubei/",
+                "  example.com/api/  "
+            ]
+        }"#;
+        let cfg: crate::config::Config = serde_json::from_str(s).unwrap();
+        let r = ResolvedRouting::from_config(&cfg, Mode::AppsScript);
+        assert_eq!(
+            r.relay_url_patterns,
+            vec![
+                "youtube.com/youtubei/".to_string(),
+                "example.com/api/".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn force_mitm_pulls_only_configured_host_and_subdomains() {
+        // One-directional suffix match: an entry like
+        // `youtubei.googleapis.com` pulls itself and its subdomains, but
+        // does NOT pull the parent `googleapis.com` or sibling
+        // subdomains. Sibling traffic stays on SNI-rewrite. This is a
+        // regression guard against the original bidirectional-match
+        // implementation, which pulled parents and made
+        // `host_in_force_mitm_list` disagree with `matches_sni_rewrite`.
+        let hosts = std::collections::HashMap::new();
+        let force = vec!["youtubei.googleapis.com".to_string()];
+
+        // Exact force host: pulled.
+        assert!(!should_use_sni_rewrite(
+            &hosts,
+            "youtubei.googleapis.com",
+            443,
+            false,
+            &force,
+        ));
+        // Subdomain of the force host: pulled.
+        assert!(!should_use_sni_rewrite(
+            &hosts,
+            "v1.youtubei.googleapis.com",
+            443,
+            false,
+            &force,
+        ));
+        // Sibling subdomain of the parent: NOT pulled (stays on SNI-rewrite).
+        assert!(should_use_sni_rewrite(
+            &hosts,
+            "drive.googleapis.com",
+            443,
+            false,
+            &force,
+        ));
+    }
+
+    #[test]
+    fn force_mitm_subdomain_does_not_pull_parent_sni_suffix() {
+        // Direct test of the asymmetry that motivated dropping the
+        // bidirectional clause. force=`studio.youtube.com` must NOT
+        // make `www.youtube.com` or bare `youtube.com` pull out of
+        // SNI-rewrite — those should still take the SNI-rewrite tunnel
+        // (matched via the `youtube.com` entry in SNI_REWRITE_SUFFIXES).
+        // Otherwise the dispatch-side `host_in_force_mitm_list` would
+        // disagree (no recognition of the parent), and parent-host
+        // traffic would be force-MITM'd-then-blindly-relayed instead of
+        // taking the fast SNI tunnel.
+        let hosts = std::collections::HashMap::new();
+        let force = vec!["studio.youtube.com".to_string()];
+
+        // Configured host pulled.
+        assert!(!should_use_sni_rewrite(
+            &hosts,
+            "studio.youtube.com",
+            443,
+            false,
+            &force,
+        ));
+        // Parent NOT pulled — still SNI-rewrites.
+        assert!(should_use_sni_rewrite(
+            &hosts,
+            "youtube.com",
+            443,
+            false,
+            &force,
+        ));
+        assert!(should_use_sni_rewrite(
+            &hosts,
+            "www.youtube.com",
+            443,
+            false,
+            &force,
+        ));
+        // Matchers must agree on membership of the parent.
+        assert!(!host_in_force_mitm_list("youtube.com", &force));
+        assert!(!host_in_force_mitm_list("www.youtube.com", &force));
     }
 }

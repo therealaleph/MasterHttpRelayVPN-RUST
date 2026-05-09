@@ -1645,6 +1645,40 @@ impl DomainFronter {
             url
         };
 
+        // SABR quality-track strip for YouTube `/videoplayback` POST bodies.
+        // Has to run before the exit-node short-circuit so the exit-node
+        // path also benefits — same quota-relief reason as the relay path
+        // (Apps Script's UrlFetchApp + the exit node both cap at ~10 MB).
+        // Pure transform on body bytes; no-op on non-SABR payloads.
+        //
+        // Host-gated to YouTube's videoplayback hosts so an unrelated
+        // service that happens to expose a `/videoplayback` endpoint
+        // serving a protobuf-shaped POST body (with top-level fields 2
+        // and 3) doesn't get its field-3 entries silently rewritten.
+        // YouTube's videoplayback URLs live on either `*.googlevideo.com`
+        // (the chunk CDN) or `youtube.com` itself; both are gated.
+        let stripped_body;
+        let body: &[u8] = if method == "POST"
+            && !body.is_empty()
+            && url.contains("/videoplayback")
+            && url_host_is_youtube_video_endpoint(url)
+        {
+            let s = strip_sabr_quality_tracks(body);
+            if s.len() != body.len() {
+                tracing::debug!(
+                    "SABR strip: removed {} quality-track bytes from {}",
+                    body.len() - s.len(),
+                    url.split('?').next().unwrap_or(url),
+                );
+                stripped_body = s;
+                stripped_body.as_slice()
+            } else {
+                body
+            }
+        } else {
+            body
+        };
+
         // Exit-node short-circuit: route through the configured second-hop
         // relay (Deno Deploy / fly.io / etc.) for hosts that need a
         // non-Google exit IP. The cache + coalesce layer below is bypassed
@@ -3472,6 +3506,213 @@ fn status_reason(status: u16) -> &'static str {
         504 => "Gateway Timeout",
         _ => "Status",
     }
+}
+
+/// True if `url`'s host is one of YouTube's `/videoplayback` endpoints.
+/// Gates `strip_sabr_quality_tracks` so an unrelated service that
+/// happens to expose `/videoplayback` and serves a protobuf-shaped body
+/// with top-level fields 2 and 3 doesn't get its field-3 entries
+/// silently rewritten.
+///
+/// Two host families serve `/videoplayback`:
+///
+/// * `*.googlevideo.com` — the YouTube chunk CDN. Most segment-fetch
+///   POSTs land here on subdomains like `rrx---sn-xxx.googlevideo.com`.
+/// * `youtube.com` (and subdomains) — direct same-origin endpoints
+///   used by the YouTube web client in some client variants.
+///
+/// Match is case-insensitive and trailing-dot tolerant. Anything else
+/// returns false; the strip is a no-op.
+fn url_host_is_youtube_video_endpoint(url: &str) -> bool {
+    let host = match extract_host(url) {
+        Some(h) => h,
+        None => return false,
+    };
+    let h = host.trim_end_matches('.');
+    if h.is_empty() {
+        return false;
+    }
+    const YT_VIDEOPLAYBACK_SUFFIXES: &[&str] = &[
+        "googlevideo.com",
+        "youtube.com",
+    ];
+    YT_VIDEOPLAYBACK_SUFFIXES
+        .iter()
+        .any(|s| h == *s || h.ends_with(&format!(".{}", s)))
+}
+
+/// Strip top-level field-3 (quality-track selection) entries from a SABR
+/// segment-fetch protobuf body.
+///
+/// YouTube's SABR (Server-Adaptive Bitrate) `videoplayback` POST bodies
+/// come in two distinct message shapes:
+///
+/// * **Segment-fetch** — carries field-2 (tag `0x12`) byte-range entries
+///   for video/audio segments. Field-3 (tag `0x1a`) entries here are
+///   quality-track selectors that ask googlevideo to bundle multiple
+///   simultaneous quality tracks into one response, easily exceeding
+///   Apps Script `UrlFetchApp`'s ~10 MB response buffer → 502. Stripping
+///   them forces a single-track response that fits.
+///
+/// * **Session-init** — carries field-5 (tag `0x2a`) entries and *no*
+///   field-2 entries. Field-3 here is essential session metadata
+///   (language, viewer state, ...). Stripping it corrupts the init
+///   handshake → CDN returns 403.
+///
+/// Heuristic: only strip field-3 when at least one field-2 entry is also
+/// present at the top level (segment-fetch shape). Otherwise return the
+/// body unchanged.
+///
+/// Only top-level fields are inspected; nested messages are left intact.
+/// On a malformed body (truncated tag, unknown wire type) the unparsed
+/// tail is appended verbatim so a corrupt request is never silently
+/// truncated. Ported from upstream `_strip_sabr_quality_tracks`
+/// (commits 9b6d03e + 33db28a).
+pub(crate) fn strip_sabr_quality_tracks(body: &[u8]) -> Vec<u8> {
+    // Phase 1: single pass — collect (field_number, start, end) for every
+    // top-level field. We need to know whether field 2 exists before deciding
+    // to strip, but a two-pass walk would be wasteful.
+    let mut segments: Vec<(u32, usize, usize)> = Vec::new();
+    let mut has_field2 = false;
+    let mut has_field3 = false;
+    let mut i = 0usize;
+    let n = body.len();
+    let mut tail_start = n;
+
+    'outer: while i < n {
+        let seg_start = i;
+
+        // Decode varint tag.
+        let mut tag: u64 = 0;
+        let mut shift: u32 = 0;
+        let mut tag_complete = false;
+        while i < n {
+            let b = body[i];
+            i += 1;
+            tag |= ((b & 0x7F) as u64) << shift;
+            if b & 0x80 == 0 {
+                tag_complete = true;
+                break;
+            }
+            shift += 7;
+            if shift >= 64 {
+                // Pathologically long varint — bail.
+                tail_start = seg_start;
+                break 'outer;
+            }
+        }
+        if !tag_complete {
+            tail_start = seg_start;
+            break;
+        }
+
+        let field_number = (tag >> 3) as u32;
+        let wire_type = (tag & 0x07) as u8;
+
+        // Each branch advances `i` past the field's payload. Truncation
+        // (running off the end before the payload is whole) bails out
+        // with `tail_start = seg_start` so the malformed segment and
+        // everything after it is preserved verbatim — never silently
+        // dropped, never half-stripped.
+        match wire_type {
+            0 => {
+                // varint payload: bytes with high bit set are
+                // continuation; first byte with high bit clear is the
+                // terminator. EOF before terminator = truncated.
+                let mut term = false;
+                while i < n {
+                    let b = body[i];
+                    i += 1;
+                    if b & 0x80 == 0 {
+                        term = true;
+                        break;
+                    }
+                }
+                if !term {
+                    tail_start = seg_start;
+                    break;
+                }
+            }
+            1 => {
+                // 64-bit fixed
+                if n - i < 8 {
+                    tail_start = seg_start;
+                    break;
+                }
+                i += 8;
+            }
+            2 => {
+                // length-delimited: varint length, then `val_len` bytes.
+                let mut val_len: u64 = 0;
+                let mut shift: u32 = 0;
+                let mut len_complete = false;
+                while i < n {
+                    let b = body[i];
+                    i += 1;
+                    val_len |= ((b & 0x7F) as u64) << shift;
+                    if b & 0x80 == 0 {
+                        len_complete = true;
+                        break;
+                    }
+                    shift += 7;
+                    if shift >= 64 {
+                        tail_start = seg_start;
+                        break 'outer;
+                    }
+                }
+                if !len_complete {
+                    tail_start = seg_start;
+                    break;
+                }
+                // Payload truncated: declared length runs past buffer end.
+                // Bail BEFORE recording the segment so a half-present
+                // field-3 isn't accidentally stripped from the output.
+                let val_len = val_len as usize;
+                if val_len > n - i {
+                    tail_start = seg_start;
+                    break;
+                }
+                i += val_len;
+            }
+            5 => {
+                // 32-bit fixed
+                if n - i < 4 {
+                    tail_start = seg_start;
+                    break;
+                }
+                i += 4;
+            }
+            _ => {
+                // Unknown wire type — bail, tail copied verbatim.
+                tail_start = seg_start;
+                break;
+            }
+        }
+
+        if field_number == 2 {
+            has_field2 = true;
+        } else if field_number == 3 {
+            has_field3 = true;
+        }
+        segments.push((field_number, seg_start, i));
+    }
+
+    // Phase 2: only strip when this is a segment-fetch body (has field 2)
+    // AND there's at least one field-3 entry to strip.
+    if !has_field2 || !has_field3 {
+        return body.to_vec();
+    }
+
+    let mut out = Vec::with_capacity(body.len());
+    for (field_number, seg_start, seg_end) in segments {
+        if field_number != 3 {
+            out.extend_from_slice(&body[seg_start..seg_end]);
+        }
+    }
+    if tail_start < n {
+        out.extend_from_slice(&body[tail_start..]);
+    }
+    out
 }
 
 fn extract_host(url: &str) -> Option<String> {
@@ -5685,5 +5926,259 @@ hello";
             Ok(_) => panic!("expected AlpnRefused, got Ok"),
         }
         server.await.unwrap();
+    }
+
+    // ── SABR quality-track strip (commits 9b6d03e + 33db28a) ─────────────
+
+    /// Encode a single varint at the front of a buffer.
+    fn enc_varint(out: &mut Vec<u8>, mut v: u64) {
+        while v >= 0x80 {
+            out.push((v as u8) | 0x80);
+            v >>= 7;
+        }
+        out.push(v as u8);
+    }
+
+    /// Encode a single length-delimited (wire-type 2) field.
+    fn enc_length_delim(out: &mut Vec<u8>, field: u32, payload: &[u8]) {
+        enc_varint(out, ((field as u64) << 3) | 2);
+        enc_varint(out, payload.len() as u64);
+        out.extend_from_slice(payload);
+    }
+
+    /// Encode a single varint (wire-type 0) field.
+    fn enc_varint_field(out: &mut Vec<u8>, field: u32, value: u64) {
+        // Wire-type 0 is the zero bits; explicit `| 0` would be clippy
+        // `identity_op`. The shift is the entire encoding.
+        enc_varint(out, (field as u64) << 3);
+        enc_varint(out, value);
+    }
+
+    #[test]
+    fn sabr_strip_segment_fetch_drops_field3() {
+        // Segment-fetch shape: has both field-2 (range descriptor) and
+        // field-3 (quality-track selector). Strip should remove only the
+        // field-3 entries, leaving everything else intact.
+        let mut body: Vec<u8> = Vec::new();
+        enc_length_delim(&mut body, 2, b"range-descriptor-1");
+        enc_length_delim(&mut body, 3, b"quality-track-selector-1");
+        enc_length_delim(&mut body, 2, b"range-descriptor-2");
+        enc_length_delim(&mut body, 3, b"quality-track-selector-2");
+        enc_varint_field(&mut body, 4, 12345); // some other field
+
+        let mut expected: Vec<u8> = Vec::new();
+        enc_length_delim(&mut expected, 2, b"range-descriptor-1");
+        enc_length_delim(&mut expected, 2, b"range-descriptor-2");
+        enc_varint_field(&mut expected, 4, 12345);
+
+        assert_eq!(strip_sabr_quality_tracks(&body), expected);
+    }
+
+    #[test]
+    fn sabr_strip_session_init_leaves_field3_alone() {
+        // Session-init shape: has field-5 entries and field-3, but NO
+        // field-2. Field-3 here is essential session metadata —
+        // stripping it would corrupt the handshake → CDN 403. Heuristic:
+        // require field-2 presence before stripping field-3.
+        let mut body: Vec<u8> = Vec::new();
+        enc_length_delim(&mut body, 5, b"session-context");
+        enc_length_delim(&mut body, 3, b"language-and-state-metadata");
+        enc_varint_field(&mut body, 7, 1);
+
+        let original = body.clone();
+        // Untouched.
+        assert_eq!(strip_sabr_quality_tracks(&body), original);
+    }
+
+    #[test]
+    fn sabr_strip_no_field3_is_noop() {
+        // Plain segment-fetch with only field-2 entries — nothing to strip.
+        let mut body: Vec<u8> = Vec::new();
+        enc_length_delim(&mut body, 2, b"only-range-descriptors");
+        enc_length_delim(&mut body, 2, b"more-range-descriptors");
+
+        let original = body.clone();
+        assert_eq!(strip_sabr_quality_tracks(&body), original);
+    }
+
+    #[test]
+    fn sabr_strip_empty_body_is_noop() {
+        assert_eq!(strip_sabr_quality_tracks(b""), b"");
+    }
+
+    #[test]
+    fn sabr_strip_truncated_tag_preserves_remainder_verbatim() {
+        // A field-2 entry followed by a truncated varint tag (high bit
+        // set, no continuation byte). Strip should bail at the truncated
+        // tag, copying the remaining bytes verbatim — never silently
+        // dropping the tail.
+        let mut body: Vec<u8> = Vec::new();
+        enc_length_delim(&mut body, 2, b"first-entry");
+        // Truncated: high bit set, then EOF.
+        body.push(0x80);
+
+        let result = strip_sabr_quality_tracks(&body);
+        // Body had no field-3 to strip → entire input returned.
+        assert_eq!(result, body);
+    }
+
+    #[test]
+    fn sabr_strip_truncated_tag_after_field3_preserves_tail() {
+        // field-2, field-3, then truncated. Strip should remove the
+        // field-3 entry (segment-fetch shape) and copy the truncated
+        // tail verbatim.
+        let mut body: Vec<u8> = Vec::new();
+        enc_length_delim(&mut body, 2, b"range-desc");
+        enc_length_delim(&mut body, 3, b"quality-track");
+        // truncated tag
+        body.push(0x80);
+
+        let mut expected: Vec<u8> = Vec::new();
+        enc_length_delim(&mut expected, 2, b"range-desc");
+        expected.push(0x80);
+
+        assert_eq!(strip_sabr_quality_tracks(&body), expected);
+    }
+
+    #[test]
+    fn sabr_strip_unknown_wire_type_preserves_remainder() {
+        // Wire type 6 (unused / reserved) — the strip should bail at
+        // the unknown wire type and copy the rest verbatim. Build it
+        // manually so we control the wire-type bits.
+        let mut body: Vec<u8> = Vec::new();
+        enc_length_delim(&mut body, 2, b"first-range");
+        // tag = (field 9 << 3) | wire 6 = 0x4E
+        body.push(0x4E);
+        body.extend_from_slice(b"\x01\x02\x03"); // some bytes after
+
+        // No field-3 ever seen → nothing to strip → full body returned.
+        assert_eq!(strip_sabr_quality_tracks(&body), body);
+    }
+
+    #[test]
+    fn sabr_strip_truncated_field3_payload_preserves_segment_verbatim() {
+        // field-2 (legitimate range descriptor) followed by a TRUNCATED
+        // field-3 entry: the length varint says 100 bytes but only 5 are
+        // present. The original `i.saturating_add(val_len).min(n)` would
+        // have clamped to EOF and let the segment be stripped, silently
+        // dropping the partial bytes. Correct behaviour: bail at the
+        // truncated payload and emit everything from there to EOF
+        // verbatim, untouched.
+        let mut body: Vec<u8> = Vec::new();
+        enc_length_delim(&mut body, 2, b"good-range");
+        // Manually emit a truncated field-3 length-delimited header:
+        // tag = (field 3 << 3) | 2 = 0x1A, len = 100, then only 5 bytes.
+        body.push(0x1A);
+        body.push(100); // declares 100-byte payload
+        body.extend_from_slice(b"short");
+
+        let mut expected: Vec<u8> = Vec::new();
+        enc_length_delim(&mut expected, 2, b"good-range");
+        // Truncated tail copied verbatim from where field-3 starts.
+        expected.push(0x1A);
+        expected.push(100);
+        expected.extend_from_slice(b"short");
+
+        assert_eq!(strip_sabr_quality_tracks(&body), expected);
+    }
+
+    #[test]
+    fn sabr_strip_truncated_field2_payload_preserves_segment_verbatim() {
+        // Even segment-fetch detection must not over-eagerly believe a
+        // truncated field-2 is real — the segment-fetch heuristic only
+        // fires on COMPLETE field-2 entries. Here field-2 is truncated;
+        // the parser bails at it and the malformed tail is preserved.
+        let mut body: Vec<u8> = Vec::new();
+        // Tag = field 2, wire 2 = 0x12, declared len = 50, only 3 bytes.
+        body.push(0x12);
+        body.push(50);
+        body.extend_from_slice(b"abc");
+
+        // No prior field-2 OR field-3 captured → strip is a no-op
+        // and returns the buffer unchanged.
+        assert_eq!(strip_sabr_quality_tracks(&body), body);
+    }
+
+    #[test]
+    fn sabr_strip_truncated_fixed_width_preserves_segment_verbatim() {
+        // 64-bit fixed (wire type 1) — only 3 of 8 bytes present.
+        // Without a length-check this used to clamp via .min(n) and
+        // declare the field "complete." Now bails at the segment.
+        let mut body: Vec<u8> = Vec::new();
+        enc_length_delim(&mut body, 2, b"r");
+        enc_length_delim(&mut body, 3, b"q");
+        // Tag = field 4, wire 1 = 0x21, then only 3 bytes follow.
+        body.push(0x21);
+        body.extend_from_slice(b"\x01\x02\x03");
+
+        // The malformed tail starts at the truncated fixed-width tag,
+        // so the field-2 / field-3 we did parse get emitted (segment-
+        // fetch shape, field-3 stripped), then the tail verbatim.
+        let mut expected: Vec<u8> = Vec::new();
+        enc_length_delim(&mut expected, 2, b"r");
+        // field-3 stripped here
+        expected.push(0x21);
+        expected.extend_from_slice(b"\x01\x02\x03");
+        assert_eq!(strip_sabr_quality_tracks(&body), expected);
+    }
+
+    // ── SABR host gate (defense against unrelated /videoplayback) ────────
+
+    #[test]
+    fn sabr_host_gate_recognises_youtube_video_endpoints() {
+        // YouTube chunk CDN and yt itself.
+        assert!(url_host_is_youtube_video_endpoint(
+            "https://rrx---sn-xxx.googlevideo.com/videoplayback?...&itag=18"
+        ));
+        assert!(url_host_is_youtube_video_endpoint(
+            "https://googlevideo.com/videoplayback"
+        ));
+        assert!(url_host_is_youtube_video_endpoint(
+            "https://www.youtube.com/videoplayback"
+        ));
+        // Case-insensitive + trailing dot.
+        assert!(url_host_is_youtube_video_endpoint(
+            "https://GoogleVideo.com/videoplayback"
+        ));
+        assert!(url_host_is_youtube_video_endpoint(
+            "https://googlevideo.com./videoplayback"
+        ));
+    }
+
+    #[test]
+    fn sabr_host_gate_rejects_unrelated_hosts_with_videoplayback_path() {
+        // Any service that incidentally has `/videoplayback` must not
+        // be treated as YouTube SABR.
+        assert!(!url_host_is_youtube_video_endpoint(
+            "https://api.example.com/videoplayback"
+        ));
+        assert!(!url_host_is_youtube_video_endpoint(
+            "https://my-company.internal/videoplayback?id=42"
+        ));
+        // Suffix-attack: non-googlevideo hosts ending in similar bytes.
+        assert!(!url_host_is_youtube_video_endpoint(
+            "https://evilgooglevideo.com/videoplayback"
+        ));
+        assert!(!url_host_is_youtube_video_endpoint(
+            "https://notyoutube.com/videoplayback"
+        ));
+    }
+
+    #[test]
+    fn sabr_strip_truncated_varint_payload_preserves_segment_verbatim() {
+        // Wire type 0 (varint) with a continuation byte and no terminator.
+        let mut body: Vec<u8> = Vec::new();
+        enc_length_delim(&mut body, 2, b"r");
+        enc_length_delim(&mut body, 3, b"q");
+        // Tag = field 5, wire 0 = 0x28, then a continuation byte that
+        // never terminates.
+        body.push(0x28);
+        body.push(0x80); // continuation, then EOF
+
+        let mut expected: Vec<u8> = Vec::new();
+        enc_length_delim(&mut expected, 2, b"r");
+        expected.push(0x28);
+        expected.push(0x80);
+        assert_eq!(strip_sabr_quality_tracks(&body), expected);
     }
 }
