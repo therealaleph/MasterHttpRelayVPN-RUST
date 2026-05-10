@@ -41,7 +41,43 @@ on that edge through the same tunnel without burning Apps Script quota.
 `vercel.com` covers both `vercel.com` and `*.vercel.com`. First group
 in the list whose member matches wins.
 
-A working example is shipped at `config.fronting-groups.example.json`.
+A working example is shipped at `config.fronting-groups.example.json`. It
+mirrors the same coverage as the curated bundle below.
+
+## Curated bundle (no-typing path)
+
+The binary ships [`assets/fronting-groups/curated.json`](../assets/fronting-groups/curated.json)
+with five groups derived from the
+[`patterniha/MITM-DomainFronting`](https://github.com/patterniha/MITM-DomainFronting)
+Xray config — the same set of (sni, edge IP, member-domain) tuples that
+project's author has tested in the field:
+
+| Group | SNI | Covers |
+| --- | --- | --- |
+| `github-direct` | `github.com` | `gist.github.com` |
+| `github-content-direct` | `central.github.com` | `objects-origin.githubusercontent.com` |
+| `vercel` | `react.dev` | `vercel.com`, `vercel.app`, `nextjs.org`, `cursor.com`, `zeit.co`, … (29 domains) |
+| `fastly` | `pypi.org` | `reddit.com`, `cnn.com`, `pinterest.com`, `buzzfeed.com`, `githubusercontent.com`, `pypi.org`, … (40 domains) |
+| `cloudfront` | `kubernetes.io` | `netlify.app`, `netlify.com` |
+
+The two GitHub-direct groups appear before `fastly` in the list so that
+first-match-wins routes `objects-origin.githubusercontent.com` away from
+the broader `githubusercontent.com` suffix in `fastly`.
+
+**Desktop UI** — open the *Advanced* section and click **Load curated
+fronting groups**. The button appends groups whose `name` isn't already
+in your config; hand-edited entries are never overwritten. Then press
+**Save config** to persist.
+
+**Android UI** — same flow under *Advanced*, **Load curated fronting
+groups**. (Android did not round-trip the `fronting_groups` field at all
+before this — earlier Android builds silently dropped the field on
+Save. If you previously hand-edited groups into `config.json` on a
+phone, re-add them or load the curated bundle.)
+
+**CLI / config-file users** — copy `config.fronting-groups.example.json`
+into place, or splice the `fronting_groups` array from
+`assets/fronting-groups/curated.json` into your existing `config.json`.
 
 ## Picking the (ip, sni) pair
 

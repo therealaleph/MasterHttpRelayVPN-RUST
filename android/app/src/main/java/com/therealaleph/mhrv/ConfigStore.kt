@@ -77,6 +77,21 @@ enum class UiLang { AUTO, FA, EN }
  */
 enum class Mode { APPS_SCRIPT, DIRECT, FULL }
 
+/**
+ * One multi-edge fronting group. Mirrors the Rust `FrontingGroup`
+ * struct in `src/config.rs` and the desktop UI's round-tripped form.
+ *
+ * `domains` matches case-insensitively, exact OR dot-anchored suffix
+ * (`vercel.com` covers `*.vercel.com`). First group whose member
+ * matches wins, so put more-specific groups earlier in the list.
+ */
+data class FrontingGroup(
+    val name: String,
+    val ip: String,
+    val sni: String,
+    val domains: List<String>,
+)
+
 data class MhrvConfig(
     val mode: Mode = Mode.APPS_SCRIPT,
 
@@ -161,6 +176,16 @@ data class MhrvConfig(
 
     /** UI language toggle. Non-Rust; honoured only by the Android wrapper. */
     val uiLang: UiLang = UiLang.AUTO,
+
+    /**
+     * Multi-edge fronting groups (Vercel, Fastly, AWS CloudFront, …).
+     * Until v1.9.x the Android Save path silently dropped this field
+     * because it wasn't modelled here; round-tripping fixes that and
+     * unlocks the curated bundle loader. There's no in-app editor for
+     * the entries — users either load the curated bundle or import a
+     * config that contains them. See `assets/fronting-groups/curated.json`.
+     */
+    val frontingGroups: List<FrontingGroup> = emptyList(),
 ) {
     /**
      * Extract just the deployment ID from either a full
@@ -279,6 +304,19 @@ data class MhrvConfig(
                 UiLang.FA -> "fa"
                 UiLang.EN -> "en"
             })
+
+            if (frontingGroups.isNotEmpty()) {
+                put("fronting_groups", JSONArray().apply {
+                    for (g in frontingGroups) {
+                        put(JSONObject().apply {
+                            put("name", g.name)
+                            put("ip", g.ip)
+                            put("sni", g.sni)
+                            put("domains", JSONArray().apply { g.domains.forEach { put(it) } })
+                        })
+                    }
+                })
+            }
         }
         return obj.toString(2)
     }
@@ -356,6 +394,18 @@ object ConfigStore {
         if (cleanBypassDohHosts.isNotEmpty()) {
             obj.put("bypass_doh_hosts", JSONArray().apply { cleanBypassDohHosts.forEach { put(it) } })
         }
+        if (cfg.frontingGroups.isNotEmpty()) {
+            obj.put("fronting_groups", JSONArray().apply {
+                for (g in cfg.frontingGroups) {
+                    put(JSONObject().apply {
+                        put("name", g.name)
+                        put("ip", g.ip)
+                        put("sni", g.sni)
+                        put("domains", JSONArray().apply { g.domains.forEach { put(it) } })
+                    })
+                }
+            })
+        }
 
         // Compress with DEFLATE then base64.
         val jsonBytes = obj.toString().toByteArray(Charsets.UTF_8)
@@ -415,8 +465,13 @@ object ConfigStore {
         return false
     }
 
-    /** Parse config from a JSON object — shared by load() and decode(). */
-    private fun loadFromJson(obj: JSONObject): MhrvConfig {
+    /**
+     * Parse config from a JSON object — shared by [load] and [decode].
+     * `internal` rather than `private` so the JVM unit tests in
+     * `src/test/` can drive a JSON-only round-trip without going
+     * through the disk path.
+     */
+    internal fun loadFromJson(obj: JSONObject): MhrvConfig {
         val ids = obj.optJSONArray("script_ids")?.let { arr ->
             buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }
         }?.filter { it.isNotBlank() }.orEmpty()
@@ -476,6 +531,29 @@ object ConfigStore {
                 "en" -> UiLang.EN
                 else -> UiLang.AUTO
             },
+            frontingGroups = obj.optJSONArray("fronting_groups")?.let { arr ->
+                buildList {
+                    for (i in 0 until arr.length()) {
+                        val g = arr.optJSONObject(i) ?: continue
+                        val name = g.optString("name").trim()
+                        val ip = g.optString("ip").trim()
+                        val sni = g.optString("sni").trim()
+                        val domArr = g.optJSONArray("domains")
+                        val domains = if (domArr != null) {
+                            buildList {
+                                for (j in 0 until domArr.length()) {
+                                    val d = domArr.optString(j).trim()
+                                    if (d.isNotEmpty()) add(d)
+                                }
+                            }
+                        } else emptyList()
+                        // Skip half-empty entries — same shape as the
+                        // Rust validator in src/config.rs would reject.
+                        if (name.isEmpty() || ip.isEmpty() || sni.isEmpty() || domains.isEmpty()) continue
+                        add(FrontingGroup(name, ip, sni, domains))
+                    }
+                }
+            }.orEmpty(),
         )
     }
 }

@@ -75,6 +75,13 @@
     <string name="adv_upstream_socks5">upstream_socks5 (optional)</string>
     <string name="adv_upstream_socks5_help">If set, route upstream via this SOCKS5. Leave blank for direct.</string>
 
+    <!-- Curated fronting groups -->
+    <string name="adv_fronting_groups_count">Fronting groups: %1$d</string>
+    <string name="adv_fronting_groups_help">Curated bundle covers vercel, fastly (reddit/cnn/python), AWS CloudFront (netlify), and direct GitHub paths. Edit IPs in config.json if a group stops working.</string>
+    <string name="btn_load_curated_groups">Load curated fronting groups</string>
+    <string name="toast_curated_loaded">Loaded curated groups: %1$d added, %2$d already present.</string>
+    <string name="toast_curated_load_failed">Could not read curated fronting groups asset.</string>
+
     <!-- Live logs -->
     <string name="logs_lines_count">%1$d lines</string>
 

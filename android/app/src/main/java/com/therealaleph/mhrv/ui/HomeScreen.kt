@@ -35,6 +35,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.therealaleph.mhrv.CaInstall
 import com.therealaleph.mhrv.ConfigStore
+import com.therealaleph.mhrv.CuratedGroups
 import com.therealaleph.mhrv.DEFAULT_SNI_POOL
 import com.therealaleph.mhrv.MhrvConfig
 import com.therealaleph.mhrv.Mode
@@ -1369,6 +1370,52 @@ private fun AdvancedSettings(
                 Text(stringResource(R.string.adv_upstream_socks5_help))
             },
         )
+
+        // Curated fronting-group loader. The bundle ships at
+        // assets/fronting-groups/curated.json (synced from the Rust
+        // crate's canonical copy by Gradle's syncFrontingGroupsAssets
+        // task). Mirrors the desktop UI's Advanced-section button.
+        // No in-app editor for the entries — this is the no-typing
+        // path. Existing groups with the same `name` are preserved.
+        val ctx = LocalContext.current
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(
+                stringResource(R.string.adv_fronting_groups_count, cfg.frontingGroups.size),
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Text(
+                stringResource(R.string.adv_fronting_groups_help),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            FilledTonalButton(
+                onClick = {
+                    val curated = CuratedGroups.loadCurated(ctx)
+                    if (curated == null) {
+                        Toast.makeText(
+                            ctx,
+                            ctx.getString(R.string.toast_curated_load_failed),
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    } else {
+                        val (merged, report) = CuratedGroups.mergeInto(cfg.frontingGroups, curated)
+                        onChange(cfg.copy(frontingGroups = merged))
+                        Toast.makeText(
+                            ctx,
+                            ctx.getString(
+                                R.string.toast_curated_loaded,
+                                report.added,
+                                report.skipped,
+                            ),
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
+                },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(stringResource(R.string.btn_load_curated_groups))
+            }
+        }
     }
 }
 

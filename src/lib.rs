@@ -3,6 +3,7 @@
 pub mod cache;
 pub mod cert_installer;
 pub mod config;
+pub mod curated_groups;
 pub mod data_dir;
 pub mod domain_fronter;
 pub mod lan_utils;

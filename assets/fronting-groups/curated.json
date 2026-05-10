@@ -1,13 +1,21 @@
 {
-  "_comment": "Domain coverage mirrors assets/fronting-groups/curated.json (the bundle the UI's 'Load curated fronting groups' button installs). Edit IPs in-place if a group stops working — re-resolve `sni` with `nslookup`/`dig` and replace.",
-  "mode": "direct",
-  "google_ip": "216.239.38.120",
-  "front_domain": "www.google.com",
-  "listen_host": "127.0.0.1",
-  "listen_port": 8085,
-  "socks5_port": 8086,
-  "log_level": "info",
-  "verify_ssl": true,
+  "_comment": [
+    "Curated fronting groups derived from patterniha/MITM-DomainFronting",
+    "(https://github.com/patterniha/MITM-DomainFronting). The Xray config",
+    "in that project ships a tested set of (sni, edge, member-domain)",
+    "tuples for Vercel, Fastly, AWS CloudFront, and direct-to-GitHub paths.",
+    "This file is the same data, restructured for mhrv-rs's `fronting_groups`",
+    "config shape. See docs/fronting-groups.md.",
+    "",
+    "Edge IPs rotate. If a group stops working, re-resolve `sni`",
+    "(`nslookup <sni>` or `dig +short <sni>`) and replace the IP in-place.",
+    "Order matters — first group whose `domains` list matches wins, so the",
+    "more-specific GitHub-direct groups appear before fastly (which would",
+    "otherwise eat `*.githubusercontent.com` via suffix match).",
+    "",
+    "The `_comment` key is ignored by the deserializer (Config doesn't use",
+    "`deny_unknown_fields`)."
+  ],
   "fronting_groups": [
     {
       "name": "github-direct",

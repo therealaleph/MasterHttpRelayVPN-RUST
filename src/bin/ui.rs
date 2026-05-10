@@ -1274,6 +1274,51 @@ impl eframe::App for App {
                                  Issue #213, #793.",
                             );
                     });
+
+                    // Curated fronting-group loader. The full list shipped
+                    // in `assets/fronting-groups/curated.json` covers
+                    // Vercel, Fastly (reddit/cnn/python/github-content),
+                    // AWS CloudFront (netlify), and direct-to-GitHub for
+                    // gist + objects-origin. There's no editor for the
+                    // groups in the UI yet — this button is the no-typing
+                    // path to install the full set; hand-edited entries
+                    // are preserved (collision is by group `name`).
+                    ui.horizontal(|ui| {
+                        ui.add_space(120.0 + 8.0);
+                        let count = self.form.fronting_groups.len();
+                        let label = format!(
+                            "Load curated fronting groups (vercel, fastly, …)  ·  current: {}",
+                            count
+                        );
+                        if ui.button(label)
+                            .on_hover_text(
+                                "Append the bundled curated fronting groups to your config. \
+                                 Existing groups are preserved — entries with the same `name` \
+                                 are skipped, never overwritten. Press Save config afterwards \
+                                 to persist. Edge IPs may need refresh; see docs/fronting-groups.md."
+                            )
+                            .clicked()
+                        {
+                            match mhrv_rs::curated_groups::merge_into(&mut self.form.fronting_groups) {
+                                Ok(report) => {
+                                    self.toast = Some((
+                                        format!(
+                                            "Loaded curated groups: {} added, {} already present. \
+                                             Press Save config to persist.",
+                                            report.added, report.skipped,
+                                        ),
+                                        Instant::now(),
+                                    ));
+                                }
+                                Err(e) => {
+                                    self.toast = Some((
+                                        format!("Could not load curated groups: {}", e),
+                                        Instant::now(),
+                                    ));
+                                }
+                            }
+                        }
+                    });
                 });
             });
 

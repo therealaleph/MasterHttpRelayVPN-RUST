@@ -75,6 +75,13 @@
     <string name="adv_upstream_socks5">upstream_socks5 (اختیاری)</string>
     <string name="adv_upstream_socks5_help">اگر تنظیم شود، ترافیک خروجی از این SOCKS5 رد می‌شود. خالی بگذارید برای اتصال مستقیم.</string>
 
+    <!-- Curated fronting groups -->
+    <string name="adv_fronting_groups_count">گروه‌های فرانتینگ: %1$d</string>
+    <string name="adv_fronting_groups_help">بستهٔ آماده شامل Vercel، Fastly (reddit/cnn/python)، AWS CloudFront (netlify) و مسیرهای مستقیم به GitHub است. اگر یک گروه از کار افتاد، آی‌پی را در config.json ویرایش کنید.</string>
+    <string name="btn_load_curated_groups">بارگذاری گروه‌های فرانتینگ آماده</string>
+    <string name="toast_curated_loaded">گروه‌های آماده بارگذاری شد: %1$d مورد افزوده شد، %2$d مورد از قبل وجود داشت.</string>
+    <string name="toast_curated_load_failed">خواندن فایل گروه‌های فرانتینگ آماده ممکن نشد.</string>
+
     <!-- Live logs -->
     <string name="logs_lines_count">%1$d خط</string>
 

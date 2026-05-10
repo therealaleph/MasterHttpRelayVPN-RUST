@@ -107,6 +107,16 @@ android {
     // that before each assembleDebug / assembleRelease.
     sourceSets["main"].jniLibs.srcDirs("src/main/jniLibs")
 
+    // assets/fronting-groups/curated.json is generated into build/ by
+    // the syncFrontingGroupsAssets task (defined further down). Keeping
+    // generated output under build/ rather than src/ means stale copies
+    // can't outlive the canonical file in the source tree, and the
+    // standard build/ gitignore covers it without a carve-out under
+    // src/main/assets/.
+    sourceSets["main"].assets.srcDir(
+        layout.buildDirectory.dir("generated/curatedAssets")
+    )
+
     packaging {
         resources.excludes += setOf(
             "META-INF/AL2.0",
@@ -142,6 +152,15 @@ dependencies {
 
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
+
+    // Local JVM unit tests (`gradlew :app:test`). JUnit 4 plus the real
+    // org.json:json classes — by default android.jar's stubbed
+    // JSONObject methods all return null in unit tests, which makes
+    // ConfigStore round-trip tests untestable. The org.json artifact
+    // overrides those stubs in the test classpath without affecting
+    // the device runtime.
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }
 
 // --------------------------------------------------------------------------
@@ -220,5 +239,36 @@ tasks.configureEach {
     when (name) {
         "mergeDebugJniLibFolders" -> dependsOn("cargoBuildDebug")
         "mergeReleaseJniLibFolders" -> dependsOn("cargoBuildRelease")
+    }
+}
+
+// --------------------------------------------------------------------------
+// Bundle assets/fronting-groups/curated.json into the APK so the Android
+// UI's "Load curated fronting groups" button can read it without a network
+// hop. The Rust crate is the single source of truth; we copy into a
+// build/generated/ directory that is wired into sourceSets.main.assets
+// above, so stale outputs can't survive the canonical file being deleted
+// or renamed (a fresh `gradlew clean` wipes them) and we don't need a
+// gitignore carve-out under src/main/assets/.
+// --------------------------------------------------------------------------
+val syncFrontingGroupsAssets =
+    tasks.register<Copy>("syncFrontingGroupsAssets") {
+        from(rustCrateDir.resolve("assets/fronting-groups"))
+        include("curated.json")
+        // Sub-folder so the asset opens at "fronting-groups/curated.json"
+        // (matches CuratedGroups.ASSET_PATH); without the sub-dir Android
+        // would expose it at the asset namespace root.
+        into(layout.buildDirectory.dir("generated/curatedAssets/fronting-groups"))
+    }
+
+tasks.configureEach {
+    when (name) {
+        // Asset merge runs before resource processing — depending on
+        // mergeDebugAssets / mergeReleaseAssets is the most precise
+        // hook, but preBuild also covers the lint/compile paths that
+        // need the file present (lintDebug, etc.).
+        "preBuild" -> dependsOn(syncFrontingGroupsAssets)
+        "mergeDebugAssets",
+        "mergeReleaseAssets" -> dependsOn(syncFrontingGroupsAssets)
     }
 }
