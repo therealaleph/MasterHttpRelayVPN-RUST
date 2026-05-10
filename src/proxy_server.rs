@@ -3189,7 +3189,13 @@ where
         && host_in_force_mitm_list(host, &rewrite_ctx.force_mitm_hosts)
         && !url_matches_relay_pattern(&url, &rewrite_ctx.relay_url_patterns)
     {
-        tracing::info!("sni-rewrite forward {} {}", method, url);
+        // All forwarder log lines use `target = "yt_forwarder"` so users
+        // diagnosing #977-style reports can `RUST_LOG=yt_forwarder=info`
+        // (or =debug) and see exactly which requests took the fast path,
+        // their sizes, and their latencies — without grepping the
+        // general-relay info-spam.
+        tracing::info!(target: "yt_forwarder", "dispatch {} {}", method, url);
+        let t0 = std::time::Instant::now();
         match forward_via_sni_rewrite_http(
             &method,
             host,
@@ -3202,6 +3208,21 @@ where
         .await
         {
             Ok(response_bytes) => {
+                let response_len = response_bytes.len();
+                let elapsed_ms = t0.elapsed().as_millis();
+                tracing::info!(
+                    target: "yt_forwarder",
+                    "ok {} {} bytes={} latency_ms={}",
+                    method, url, response_len, elapsed_ms,
+                );
+                // Record BEFORE the downstream write: we want
+                // `forwarder_calls` to reflect "the path filter
+                // produced an upstream response," not "the browser
+                // received it." A client disconnect during write would
+                // otherwise leave the metric understating fast-path
+                // utilisation — we'd see only relay-path traffic in
+                // stats while the forwarder was actually doing work.
+                fronter.record_forwarder_call(response_len as u64);
                 stream.write_all(&response_bytes).await?;
                 stream.flush().await?;
                 // The forwarder always sets `Connection: close` on the
@@ -3213,10 +3234,18 @@ where
             }
             Err(e) => {
                 tracing::warn!(
-                    "sni-rewrite forward failed for {}: {} — falling back to relay",
-                    url,
-                    e
+                    target: "yt_forwarder",
+                    "error {} {}: {} (latency_ms={}) — falling back to relay",
+                    method, url, e, t0.elapsed().as_millis(),
                 );
+                // `record_forwarder_error` only describes what just
+                // happened to the fast path. Whether the relay-path
+                // fallback below recovers the request is reflected in
+                // `relay_calls` / `relay_failures`; combining those
+                // with `forwarder_errors` lets diagnostics tell apart
+                // "fast path missed but request served" from "request
+                // failed end-to-end."
+                fronter.record_forwarder_error();
                 // fall through
             }
         }

@@ -311,6 +311,28 @@ pub struct DomainFronter {
     /// h2_fallbacks)` ratio indicates an unhealthy h2 conn or a flaky
     /// middlebox eating h2 frames; consider `force_http1: true`.
     h2_fallbacks: AtomicU64,
+    /// Successful SNI-rewrite HTTP forwarder calls (the b3b9220 path —
+    /// non-`/youtubei/` paths on `force_mitm_hosts` taking the direct
+    /// SNI-rewrite TLS path instead of burning Apps Script quota).
+    /// Counts upstream-fetch success: incremented as soon as the
+    /// forwarder has the response bytes in hand, BEFORE writing to the
+    /// browser. A client-disconnect during the downstream write still
+    /// counts — the path filter did upstream work, that's the metric.
+    /// Useful for diagnosing reports like #977: a high
+    /// `forwarder_calls / (forwarder_calls + relay_calls)` ratio means
+    /// the path filter is doing its job; a near-zero ratio means it's
+    /// inert (and any reported regression isn't from the forwarder).
+    forwarder_calls: AtomicU64,
+    /// Response bytes successfully fetched by the forwarder from the
+    /// upstream (Google edge). Same upstream-fetch-success semantic as
+    /// `forwarder_calls`.
+    forwarder_bytes: AtomicU64,
+    /// Forwarder dispatch errors — connect failure, TLS error, read
+    /// timeout, response cap exceeded, or upstream EOF before any
+    /// bytes. Counts the forwarder fast-path miss; says nothing about
+    /// whether the subsequent relay-path fallback recovered the
+    /// request. Use `relay_failures` for request-failure counting.
+    forwarder_errors: AtomicU64,
     /// Per-host breakdown of traffic going through this fronter. Keyed by
     /// the host of the URL (e.g. "api.x.com"). Read-mostly; only touched
     /// on the slow path (once per relayed request), so a plain Mutex is
@@ -542,6 +564,9 @@ impl DomainFronter {
             bytes_relayed: AtomicU64::new(0),
             h2_calls: AtomicU64::new(0),
             h2_fallbacks: AtomicU64::new(0),
+            forwarder_calls: AtomicU64::new(0),
+            forwarder_bytes: AtomicU64::new(0),
+            forwarder_errors: AtomicU64::new(0),
             per_site: Arc::new(std::sync::Mutex::new(HashMap::new())),
             today_calls: AtomicU64::new(0),
             today_bytes: AtomicU64::new(0),
@@ -611,6 +636,27 @@ impl DomainFronter {
     /// change. Clamped to `[5s, 300s]` at construction.
     pub(crate) fn batch_timeout(&self) -> Duration {
         self.batch_timeout
+    }
+
+    /// Record a successful upstream fetch by the SNI-rewrite forwarder.
+    /// `bytes` is the response size received from the Google edge.
+    /// Counted at the point of upstream success, BEFORE the proxy
+    /// writes the bytes to the browser — a client disconnect mid-write
+    /// still leaves the metric accurate (the path filter did its
+    /// work). Called by `proxy_server::handle_mitm_request`.
+    pub(crate) fn record_forwarder_call(&self, bytes: u64) {
+        self.forwarder_calls.fetch_add(1, Ordering::Relaxed);
+        self.forwarder_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Record a forwarder dispatch error (connect failure, TLS error,
+    /// read timeout, cap exceeded, ...). Says nothing about whether
+    /// the subsequent relay-path fallback recovered the request — use
+    /// `relay_failures` for that. The two metrics together let
+    /// diagnostics distinguish "fast path missed but request still
+    /// served" from "request failed end-to-end."
+    pub(crate) fn record_forwarder_error(&self) {
+        self.forwarder_errors.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Return `Some(stripped_body)` when the SABR quality-track strip
@@ -745,6 +791,9 @@ impl DomainFronter {
             h2_calls: self.h2_calls.load(Ordering::Relaxed),
             h2_fallbacks: self.h2_fallbacks.load(Ordering::Relaxed),
             h2_disabled: self.h2_disabled.load(Ordering::Relaxed),
+            forwarder_calls: self.forwarder_calls.load(Ordering::Relaxed),
+            forwarder_bytes: self.forwarder_bytes.load(Ordering::Relaxed),
+            forwarder_errors: self.forwarder_errors.load(Ordering::Relaxed),
         }
     }
 
@@ -4420,6 +4469,27 @@ pub struct StatsSnapshot {
     /// switch set, or peer refused h2 during ALPN). All traffic on the
     /// h1 path.
     pub h2_disabled: bool,
+    /// Successful upstream fetches by the SNI-rewrite forwarder
+    /// (b3b9220 fast path — non-`/youtubei/` paths on
+    /// `force_mitm_hosts`). Counted at upstream success, before the
+    /// downstream write to the browser, so a client-disconnect during
+    /// write still counts as "the path filter did upstream work."
+    /// Useful for diagnosing whether the path filter is firing as
+    /// expected; a near-zero ratio against `relay_calls` means the
+    /// forwarder is inert and any reported regression is elsewhere.
+    pub forwarder_calls: u64,
+    /// Response bytes successfully fetched by the forwarder from the
+    /// upstream. Same upstream-fetch-success semantic as
+    /// `forwarder_calls`.
+    pub forwarder_bytes: u64,
+    /// Forwarder dispatch errors (connect failure, TLS error, read
+    /// timeout, cap exceeded). Distinct from `relay_failures` —
+    /// `relay_failures` counts request-level failures, this counts
+    /// fast-path-only misses regardless of whether the relay-fallback
+    /// then recovered the request. Combine the two to distinguish
+    /// "fast path missed but request served" from "request failed
+    /// end-to-end".
+    pub forwarder_errors: u64,
 }
 
 impl StatsSnapshot {
@@ -4452,8 +4522,24 @@ impl StatsSnapshot {
                 )
             }
         };
+        // Forwarder segment is only emitted when the path filter has
+        // actually fired — keeps the line clean for the typical
+        // (non-AppsScript / no-pattern-hit) case. `err` is the
+        // fast-path miss count (regardless of whether relay-fallback
+        // recovered the request); `relay_failures` covers actual
+        // end-to-end request failures.
+        let fwd_seg = if self.forwarder_calls + self.forwarder_errors == 0 {
+            String::new()
+        } else {
+            format!(
+                " fwd={} ({}KB) err={}",
+                self.forwarder_calls,
+                self.forwarder_bytes / 1024,
+                self.forwarder_errors,
+            )
+        };
         format!(
-            "stats: relay={} ({}KB) failures={} coalesced={} cache={}/{} ({:.0}% hit, {}KB) scripts={}/{} active{}",
+            "stats: relay={} ({}KB) failures={} coalesced={} cache={}/{} ({:.0}% hit, {}KB) scripts={}/{} active{}{}",
             self.relay_calls,
             self.bytes_relayed / 1024,
             self.relay_failures,
@@ -4465,6 +4551,7 @@ impl StatsSnapshot {
             self.total_scripts - self.blacklisted_scripts,
             self.total_scripts,
             h2_seg,
+            fwd_seg,
         )
     }
 
@@ -4477,7 +4564,7 @@ impl StatsSnapshot {
             s.replace('\\', "\\\\").replace('"', "\\\"")
         }
         format!(
-            r#"{{"relay_calls":{},"relay_failures":{},"coalesced":{},"bytes_relayed":{},"cache_hits":{},"cache_misses":{},"cache_bytes":{},"blacklisted_scripts":{},"total_scripts":{},"today_calls":{},"today_bytes":{},"today_key":"{}","today_reset_secs":{},"h2_calls":{},"h2_fallbacks":{},"h2_disabled":{}}}"#,
+            r#"{{"relay_calls":{},"relay_failures":{},"coalesced":{},"bytes_relayed":{},"cache_hits":{},"cache_misses":{},"cache_bytes":{},"blacklisted_scripts":{},"total_scripts":{},"today_calls":{},"today_bytes":{},"today_key":"{}","today_reset_secs":{},"h2_calls":{},"h2_fallbacks":{},"h2_disabled":{},"forwarder_calls":{},"forwarder_bytes":{},"forwarder_errors":{}}}"#,
             self.relay_calls,
             self.relay_failures,
             self.coalesced,
@@ -4494,6 +4581,9 @@ impl StatsSnapshot {
             self.h2_calls,
             self.h2_fallbacks,
             self.h2_disabled,
+            self.forwarder_calls,
+            self.forwarder_bytes,
+            self.forwarder_errors,
         )
     }
 }
@@ -6347,5 +6437,139 @@ hello";
         expected.push(0x28);
         expected.push(0x80);
         assert_eq!(strip_sabr_quality_tracks(&body), expected);
+    }
+
+    // ── StatsSnapshot::fmt_line + to_json (forwarder fields) ────────────
+
+    /// Build a `StatsSnapshot` fixture for serialization tests.
+    /// All non-forwarder fields take fixed sentinels; the three
+    /// forwarder fields are caller-supplied so each test can target
+    /// the zero / non-zero branches.
+    fn snapshot_with_forwarder(
+        forwarder_calls: u64,
+        forwarder_bytes: u64,
+        forwarder_errors: u64,
+    ) -> StatsSnapshot {
+        StatsSnapshot {
+            relay_calls: 100,
+            relay_failures: 2,
+            coalesced: 5,
+            bytes_relayed: 4096,
+            cache_hits: 30,
+            cache_misses: 70,
+            cache_bytes: 8192,
+            blacklisted_scripts: 0,
+            total_scripts: 1,
+            today_calls: 100,
+            today_bytes: 4096,
+            today_key: "2026-05-10".into(),
+            today_reset_secs: 3600,
+            h2_calls: 80,
+            h2_fallbacks: 4,
+            h2_disabled: false,
+            forwarder_calls,
+            forwarder_bytes,
+            forwarder_errors,
+        }
+    }
+
+    #[test]
+    fn fmt_line_omits_forwarder_segment_when_zero() {
+        // Path filter never fired → forwarder values all zero. The
+        // CLI line must NOT carry an `fwd=0 err=0` segment, otherwise
+        // every non-AppsScript / no-pattern-hit user sees a confusing
+        // always-zero pair.
+        let s = snapshot_with_forwarder(0, 0, 0);
+        let line = s.fmt_line();
+        assert!(
+            !line.contains("fwd="),
+            "fmt_line must omit forwarder segment when all-zero: {}",
+            line
+        );
+        assert!(
+            !line.contains("err="),
+            "fmt_line must omit forwarder error count when all-zero: {}",
+            line
+        );
+    }
+
+    #[test]
+    fn fmt_line_includes_forwarder_segment_when_nonzero() {
+        // Once the path filter has fired (any of calls / errors > 0),
+        // the diagnostic segment shows up. Bytes are converted to KB
+        // (mirrors `bytes_relayed`).
+        let s = snapshot_with_forwarder(42, 1_048_576, 3);
+        let line = s.fmt_line();
+        assert!(line.contains("fwd=42"), "fmt_line missing fwd=42: {}", line);
+        // 1_048_576 / 1024 = 1024 KB
+        assert!(
+            line.contains("(1024KB)"),
+            "fmt_line missing bytes segment: {}",
+            line
+        );
+        assert!(line.contains("err=3"), "fmt_line missing err=3: {}", line);
+    }
+
+    #[test]
+    fn fmt_line_includes_forwarder_segment_when_only_errors_nonzero() {
+        // Edge: forwarder consistently failed → calls=0, errors > 0.
+        // Segment must still appear so users see the failure rate;
+        // otherwise a fully-broken fast path looks identical to one
+        // that's never been triggered.
+        let s = snapshot_with_forwarder(0, 0, 5);
+        let line = s.fmt_line();
+        assert!(line.contains("fwd=0"), "fmt_line missing fwd=0: {}", line);
+        assert!(line.contains("err=5"), "fmt_line missing err=5: {}", line);
+    }
+
+    #[test]
+    fn to_json_emits_forwarder_fields_with_zero_values() {
+        // Hand-rolled to_json must include the new fields even when
+        // zero — Android JNI consumers expect a stable schema and
+        // shouldn't have to handle "missing field" branches per
+        // version. Parse the output as JSON to also validate the
+        // hand-rolled format string is syntactically correct.
+        let s = snapshot_with_forwarder(0, 0, 0);
+        let json = s.to_json();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("to_json must produce valid JSON");
+        assert_eq!(parsed["forwarder_calls"], 0);
+        assert_eq!(parsed["forwarder_bytes"], 0);
+        assert_eq!(parsed["forwarder_errors"], 0);
+        // No `forwarder_fallbacks` key — that was the pre-rename name
+        // and shipping it would confuse JNI consumers parsing both.
+        assert!(
+            parsed.get("forwarder_fallbacks").is_none(),
+            "stale field name must not appear: {}",
+            json
+        );
+    }
+
+    #[test]
+    fn to_json_emits_forwarder_fields_with_nonzero_values() {
+        let s = snapshot_with_forwarder(42, 1_048_576, 3);
+        let json = s.to_json();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("to_json must produce valid JSON");
+        assert_eq!(parsed["forwarder_calls"], 42);
+        assert_eq!(parsed["forwarder_bytes"], 1_048_576);
+        assert_eq!(parsed["forwarder_errors"], 3);
+    }
+
+    #[test]
+    fn to_json_round_trips_existing_fields_alongside_new_ones() {
+        // Regression guard for the hand-rolled format string: adding
+        // the new forwarder fields must not have broken any of the
+        // preexisting fields. Pick a sample of each to confirm.
+        let s = snapshot_with_forwarder(7, 1024, 0);
+        let json = s.to_json();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("to_json must produce valid JSON");
+        assert_eq!(parsed["relay_calls"], 100);
+        assert_eq!(parsed["bytes_relayed"], 4096);
+        assert_eq!(parsed["h2_calls"], 80);
+        assert_eq!(parsed["h2_disabled"], false);
+        assert_eq!(parsed["today_key"], "2026-05-10");
+        assert_eq!(parsed["forwarder_calls"], 7);
     }
 }

@@ -1338,7 +1338,7 @@ impl eframe::App for App {
                 if let Some(s) = &stats {
                     // Compact two-column layout so 7 metrics fit in ~4 rows
                     // instead of a tall vertical strip.
-                    let rows: Vec<(&str, String)> = vec![
+                    let mut rows: Vec<(&str, String)> = vec![
                         ("relay calls", s.relay_calls.to_string()),
                         ("failures", s.relay_failures.to_string()),
                         ("coalesced", s.coalesced.to_string()),
@@ -1362,6 +1362,22 @@ impl eframe::App for App {
                             ),
                         ),
                     ];
+                    // Forwarder rows only appear once the path filter
+                    // has fired at least once — otherwise the typical
+                    // (no-pattern-hit / non-AppsScript) user sees an
+                    // empty pair of "0" rows that adds noise without
+                    // signal. `err` is fast-path-miss count; combine
+                    // with `relay_failures` to gauge end-to-end health.
+                    if s.forwarder_calls + s.forwarder_errors > 0 {
+                        rows.push((
+                            "fwd calls",
+                            format!(
+                                "{} (err {})",
+                                s.forwarder_calls, s.forwarder_errors
+                            ),
+                        ));
+                        rows.push(("fwd bytes", fmt_bytes(s.forwarder_bytes)));
+                    }
                     egui::Grid::new("stats")
                         .num_columns(4)
                         .spacing([16.0, 4.0])
