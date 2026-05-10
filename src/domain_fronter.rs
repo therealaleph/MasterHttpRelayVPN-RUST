@@ -880,28 +880,35 @@ impl DomainFronter {
     /// Open outbound TLS connections eagerly so the first relay request
     /// doesn't pay a cold handshake.
     ///
-    /// When h2 is enabled, attempts to open the multiplexed h2 cell
-    /// first. Success there means one TCP/TLS handshake serves all
-    /// future requests, so we only need a tiny fallback h1 pool
-    /// (clamped to 2) instead of the full `n` requested. On h2 failure
-    /// (ALPN refusal, network error), falls back to the legacy
-    /// behavior: warm the full `n` h1 sockets.
+    /// h2 and h1 prewarm run in parallel: a request that arrives while
+    /// the h2 handshake is still in flight (or has just hit its 8 s
+    /// timeout) needs a warm h1 socket waiting for it, otherwise the
+    /// h1 fallback path pays a cold handshake on the same slow network
+    /// and the 30 s outer batch budget elapses (#924). v1.9.14 warmed
+    /// h1 unconditionally; v1.9.15 (PR #799) accidentally gated the h1
+    /// prewarm behind `ensure_h2()` so the h1 pool stayed empty during
+    /// the h2 init window.
     ///
     /// Staggered 500 ms apart so we don't burst N TLS handshakes at the
     /// Google edge simultaneously, and each connection gets an 8 s
     /// expiry offset so they roll off gradually instead of all hitting
-    /// POOL_TTL_SECS at once.
+    /// POOL_TTL_SECS at once. If h2 ends up the active fast path,
+    /// `run_pool_refill` trims the pool back down to
+    /// `POOL_MIN_H2_FALLBACK` on the next tick — the extra warm h1
+    /// sockets just age out naturally instead of being kept alive.
     pub async fn warm(self: &Arc<Self>, n: usize) {
-        // Try to bring up the h2 fast path first. If that succeeds,
-        // shrink the h1 pool warm count to the fallback minimum — the
-        // multiplexed h2 conn handles all real traffic, so the h1 pool
-        // only needs to cover the rare case where h2 dies mid-session.
-        let h2_alive = !self.h2_disabled.load(Ordering::Relaxed)
-            && self.ensure_h2().await.is_some();
-        let h1_target = if h2_alive { 2.min(n) } else { n };
+        // Spawn the h2 prewarm in parallel so the h1 prewarm loop
+        // below isn't blocked on it. Capturing the join handle lets
+        // us still log "h2 fast path active" / "h1 fallback only"
+        // accurately at the end.
+        let h2_self = self.clone();
+        let h2_handle = tokio::spawn(async move {
+            !h2_self.h2_disabled.load(Ordering::Relaxed)
+                && h2_self.ensure_h2().await.is_some()
+        });
 
         let mut warmed = 0usize;
-        for i in 0..h1_target {
+        for i in 0..n {
             if i > 0 {
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
@@ -922,6 +929,11 @@ impl DomainFronter {
                 }
             }
         }
+        // Join the h2 prewarm here only to log whether it landed; the
+        // h1 pool above is already populated either way. JoinError
+        // collapses to "h2 not alive" — same as if ensure_h2 returned
+        // None — so we still log a useful line.
+        let h2_alive = h2_handle.await.unwrap_or(false);
         if h2_alive {
             tracing::info!(
                 "h2 fast path active; h1 fallback pool pre-warmed with {} connection(s)",
