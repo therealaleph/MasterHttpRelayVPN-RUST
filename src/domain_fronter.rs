@@ -983,16 +983,13 @@ impl DomainFronter {
         }
     }
 
-    /// Background loop that keeps the h1 fallback pool warm.
+    /// Background loop that keeps the h1 pool warm.
     ///
-    /// Target depends on whether the h2 fast path is active:
-    /// - h2 disabled (or peer refused ALPN h2): keep `POOL_MIN` (8)
-    ///   sockets so the per-request acquire never pays a cold handshake
-    ///   — the pre-h2 default behavior.
-    /// - h2 active: keep just `POOL_MIN_H2_FALLBACK` (2). All real
-    ///   traffic rides the multiplexed h2 connection; the h1 pool only
-    ///   exists to cover the case where h2 dies and we need to fall
-    ///   back instantly without a cold handshake.
+    /// Always maintains `POOL_MIN` (8) connections. Full-tunnel mode
+    /// uses the h1 pool for all batch traffic (h2 is skipped for
+    /// tunnel batches), so the pool must stay at full capacity
+    /// regardless of h2 status. Relay mode also benefits from a warm
+    /// pool as h1 fallback.
     ///
     /// A connection only counts toward the minimum if it has at least
     /// 20 s of TTL remaining — nearly-expired entries don't help.
@@ -1000,7 +997,6 @@ impl DomainFronter {
     /// and opens replacements one at a time so there's no burst.
     pub async fn run_pool_refill(self: Arc<Self>) {
         const MIN_REMAINING_SECS: u64 = 20;
-        const POOL_MIN_H2_FALLBACK: usize = 2;
         loop {
             tokio::time::sleep(Duration::from_secs(POOL_REFILL_INTERVAL_SECS)).await;
 
@@ -1010,24 +1006,7 @@ impl DomainFronter {
                 pool.retain(|e| e.created.elapsed().as_secs() < POOL_TTL_SECS);
             }
 
-            // Decide target. We treat "h2 active right now" as having a
-            // fresh, non-poisoned cell. h2_disabled is the sticky flag
-            // (peer never agreed to h2); a transient cell-poison after
-            // h2 success briefly drops back to the larger target until
-            // ensure_h2 reopens.
-            let target = if self.h2_disabled.load(Ordering::Relaxed) {
-                POOL_MIN
-            } else {
-                let cell = self.h2_cell.lock().await;
-                let h2_alive = cell
-                    .as_ref()
-                    .map(|c| {
-                        c.created.elapsed().as_secs() < H2_CONN_TTL_SECS
-                            && !c.dead.load(Ordering::Relaxed)
-                    })
-                    .unwrap_or(false);
-                if h2_alive { POOL_MIN_H2_FALLBACK } else { POOL_MIN }
-            };
+            let target = POOL_MIN;
 
             // Count only connections with enough life left.
             // Refill one at a time to avoid bursting TLS handshakes.
@@ -2876,44 +2855,11 @@ impl DomainFronter {
 
         let path = format!("/macros/s/{}/exec", script_id);
 
-        // h2 fast path. A batch carries N stateful tunnel ops — each
-        // `data`/`udp_data`/`connect` may have already executed
-        // upstream when the response framing failed. Replaying the
-        // whole batch on h1 risks duplicating every op in it. Only
-        // fall back when h2 definitely never sent. Honors
-        // user-configured batch_timeout so a slow but legitimate
-        // batch isn't cut off at an arbitrary fixed cap.
-        match self
-            .h2_relay_request(&path, payload.clone(), self.batch_timeout)
-            .await
-        {
-            Ok((status, _hdrs, _resp_body)) if is_h2_fronting_refusal_status(status) => {
-                // Edge rejected the batch before forwarding. Safe to
-                // fall back: no batched op reached Apps Script, so
-                // replaying via h1 won't double-fire any of them.
-                self.sticky_disable_h2_for_fronting_refusal(status, "tunnel batch")
-                    .await;
-                // fall through to h1
-            }
-            Ok((status, _hdrs, resp_body)) => {
-                return self.finalize_batch_response(script_id, status, resp_body);
-            }
-            Err((e, RequestSent::No)) => {
-                tracing::debug!(
-                    "h2 batch request pre-send failure: {} — falling back to h1",
-                    e
-                );
-            }
-            Err((e, RequestSent::Maybe)) => {
-                tracing::warn!(
-                    "h2 batch request post-send failure: {} — \
-                     not replaying on h1 to avoid duplicating batched ops",
-                    e
-                );
-                return Err(e);
-            }
-        }
-
+        // Skip h2 for tunnel batches. Batched ops are already coalesced
+        // into one HTTP request so h2 multiplexing adds no benefit.
+        // The h1 pool path is simpler and avoids h2-specific overhead
+        // (ready timeout, NonRetryable errors, concurrent stream
+        // contention with long-poll batches).
         let mut entry = self.acquire().await?;
 
         let req_head = format!(
