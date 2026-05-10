@@ -433,7 +433,7 @@ fn load_form() -> (FormState, Option<String>) {
             normalize_x_graphql: false,
             youtube_via_relay: false,
             relay_url_patterns: Vec::new(),
-            sabr_strip: true,
+            sabr_strip: false,
             passthrough_hosts: Vec::new(),
             block_quic: true,
             disable_padding: false,
@@ -684,9 +684,10 @@ struct ConfigWire<'a> {
     /// the proxy-applied default isn't echoed into config.json.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     relay_url_patterns: &'a Vec<String>,
-    /// See `config::Config::sabr_strip`. Default `true`; emitted only
-    /// when explicitly disabled so unchanged configs stay clean.
-    #[serde(skip_serializing_if = "is_true")]
+    /// See `config::Config::sabr_strip`. Default `false` (opt-in
+    /// after #977); emitted only when explicitly enabled so unchanged
+    /// configs stay clean.
+    #[serde(skip_serializing_if = "is_false")]
     sabr_strip: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     passthrough_hosts: &'a Vec<String>,

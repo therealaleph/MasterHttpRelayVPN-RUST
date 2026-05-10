@@ -212,29 +212,35 @@ pub struct Config {
 
     /// Strip surplus SABR quality-track entries (top-level field-3 of
     /// the segment-fetch protobuf) from `/videoplayback` POST bodies on
-    /// `*.googlevideo.com` / `*.youtube.com`. Default `true` — fixes
-    /// "Response too large" 502s on multi-track segment fetches that
-    /// exceed Apps Script `UrlFetchApp`'s ~10 MB cap (commits 9b6d03e
-    /// + 33db28a from upstream Python).
+    /// `*.googlevideo.com` / `*.youtube.com`. **Default `false` —
+    /// opt-in.** The original use case was fixing "Response too large"
+    /// 502s on multi-track segment fetches that exceed Apps Script
+    /// `UrlFetchApp`'s ~10 MB cap (commits 9b6d03e + 33db28a from
+    /// upstream Python).
     ///
-    /// **Heuristic** (diverges from upstream's "strip all field-3"):
-    /// the first field-3 entry is always kept; only the 2nd and
-    /// subsequent ones are stripped, and only when at least one
-    /// field-2 byte-range entry is present (segment-fetch shape, not
-    /// session-init). Single-track requests pass through unchanged so
-    /// googlevideo always has a track selected. This was added in
-    /// response to #977 testing (unacoder, May 2026): the original
-    /// strip-all rule turned single-track requests into "zero tracks
-    /// selected" requests, which googlevideo answered with empty
-    /// bodies — buffer never advanced, player retried with `rn=`
-    /// incrementing.
+    /// **Why off by default** (#977 testing, unacoder, May 2026):
+    /// stripping field-3 entries broke video playback in the field
+    /// across two iterations of the heuristic. The strip-all variant
+    /// produced empty googlevideo responses on single-track requests
+    /// (player retried indefinitely with `rn=` incrementing); the
+    /// keep-first refinement still broke playback even on single-track
+    /// 1080p60 default-config tests. The most plausible explanation is
+    /// that field-3 entries aren't homogeneous quality-track selectors
+    /// — they likely encode multiple request facets (audio/video
+    /// tracks, init-segment refs) and stripping any of them produces
+    /// responses the player can't splice into its buffer. Without a
+    /// captured `/videoplayback` request body and proto reflection we
+    /// can't design a correct heuristic, so default-off ships safe
+    /// behaviour for the unbroken-playback common case.
     ///
-    /// **When to flip to `false`**: if you still see buffering issues
-    /// on long-form video playback after the keep-first refinement,
-    /// turn the strip off entirely to revert to the pre-port behaviour
-    /// (occasional 502s on multi-track segments → player falls back
-    /// to a lower quality). The pre-port behaviour was tolerable for
-    /// most users; the strip is an opt-in quality-of-life fix.
+    /// **When to flip on**: if you specifically hit "Response too
+    /// large" 502s on long-form videos at high quality (1080p+ on
+    /// long playlists is the usual case). The opt-in behaviour uses
+    /// the keep-first heuristic — strictly less aggressive than
+    /// upstream's strip-all, so it's the safer of the two flavours.
+    /// Accept that some videos may still not play correctly with the
+    /// strip on; you're trading "occasional 502s" for "occasional
+    /// broken segments." Most users should leave this off.
     #[serde(default = "default_sabr_strip")]
     pub sabr_strip: bool,
 
@@ -604,11 +610,16 @@ fn default_auto_blacklist_cooldown_secs() -> u64 { 120 }
 /// hard-coded `BATCH_TIMEOUT` and Apps Script's typical response cliff.
 fn default_request_timeout_secs() -> u64 { 30 }
 
-/// Default for `sabr_strip`: `true`. Matches upstream-parity behaviour
-/// and the headline "no more 10 MB UrlFetchApp 502s on multi-track
-/// segment fetches" win. Users hitting the speed-up-playback buffering
-/// regression (#977) can opt out with `sabr_strip: false`.
-fn default_sabr_strip() -> bool { true }
+/// Default for `sabr_strip`: `false`. Flipped from `true` after #977
+/// testing — both strip-all and keep-first variants of the heuristic
+/// broke video playback in the field, including on single-track
+/// default-config tests at 1080p60. Without proto reflection on a
+/// captured `/videoplayback` body we can't design a correct heuristic,
+/// so default-off ships the unbroken-playback common case. Users who
+/// specifically hit "Response too large" 502s on long-form 1080p+
+/// videos can opt in with `sabr_strip: true` (uses the keep-first
+/// flavour, less aggressive than upstream's strip-all).
+fn default_sabr_strip() -> bool { false }
 
 fn default_google_ip() -> String {
     "216.239.38.120".into()
@@ -1168,23 +1179,45 @@ mod tests {
     }
 
     #[test]
-    fn sabr_strip_defaults_to_true_when_omitted() {
-        // Existing configs from before the kill-switch landed don't
-        // have the field. `serde(default = "default_sabr_strip")` must
-        // resolve to true so the upstream-parity behaviour is what
-        // unchanged users get.
+    fn sabr_strip_defaults_to_false_when_omitted() {
+        // After the #977 flip: `serde(default = "default_sabr_strip")`
+        // must resolve to false so configs without the field get the
+        // safe (unbroken-playback) common case. Existing configs that
+        // never had the field continue to work — they just don't get
+        // the strip applied.
         let s = r#"{
             "mode": "apps_script",
             "auth_key": "secret-test-secret-test",
             "script_id": "X"
         }"#;
         let cfg: Config = serde_json::from_str(s).unwrap();
-        assert!(cfg.sabr_strip, "default must be true (strip enabled)");
+        assert!(
+            !cfg.sabr_strip,
+            "default must be false (strip opt-in, default off)"
+        );
     }
 
     #[test]
-    fn sabr_strip_round_trips_explicit_false() {
-        // Users hitting the #977 buffering regression flip this to false.
+    fn sabr_strip_round_trips_explicit_true_for_opt_in() {
+        // Users specifically hitting "Response too large" 502s on
+        // long-form high-quality videos can opt in with sabr_strip:
+        // true. The keep-first heuristic kicks in only on multi-track
+        // bodies — single-track requests pass through untouched.
+        let s = r#"{
+            "mode": "apps_script",
+            "auth_key": "secret-test-secret-test",
+            "script_id": "X",
+            "sabr_strip": true
+        }"#;
+        let cfg: Config = serde_json::from_str(s).unwrap();
+        assert!(cfg.sabr_strip, "explicit true must round-trip for opt-in users");
+    }
+
+    #[test]
+    fn sabr_strip_round_trips_explicit_false_explicitly() {
+        // Round-trip the explicit-false case too — `false` is the
+        // default but a user might write it out for clarity, and we
+        // shouldn't lose information either way.
         let s = r#"{
             "mode": "apps_script",
             "auth_key": "secret-test-secret-test",
@@ -1192,7 +1225,7 @@ mod tests {
             "sabr_strip": false
         }"#;
         let cfg: Config = serde_json::from_str(s).unwrap();
-        assert!(!cfg.sabr_strip, "explicit false must round-trip");
+        assert!(!cfg.sabr_strip);
     }
 
     #[test]

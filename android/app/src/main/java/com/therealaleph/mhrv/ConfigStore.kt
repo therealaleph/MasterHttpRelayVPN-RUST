@@ -160,11 +160,12 @@ data class MhrvConfig(
     val youtubeViaRelay: Boolean = false,
 
     /**
-     * SABR quality-track strip kill-switch (Rust `sabr_strip`).
-     * Default true. See `src/config.rs` `sabr_strip` for the trade-off
-     * and when to flip — Android-side is just round-trip plumbing.
+     * SABR quality-track strip — opt-in (Rust `sabr_strip`, default
+     * false after #977 testing). See `src/config.rs` `sabr_strip` for
+     * the full reasoning and when to flip on. Android-side is just
+     * round-trip plumbing.
      */
-    val sabrStrip: Boolean = true,
+    val sabrStrip: Boolean = false,
 
     /**
      * Path-pinned relay routing (Rust `relay_url_patterns`).
@@ -256,10 +257,10 @@ data class MhrvConfig(
             put("tunnel_doh", tunnelDoh)
             put("block_doh", blockDoh)
             if (youtubeViaRelay) put("youtube_via_relay", true)
-            // sabr_strip default is true on the Rust side; emit only
-            // when the user has explicitly disabled it so unchanged
-            // configs stay clean. #977 kill-switch.
-            if (!sabrStrip) put("sabr_strip", false)
+            // sabr_strip default is false on the Rust side (opt-in
+            // after #977); emit only when the user has explicitly
+            // enabled it so unchanged configs stay clean.
+            if (sabrStrip) put("sabr_strip", true)
             // Trim/drop-empty/dedupe before serializing — same pattern
             // as bypass_doh_hosts. Skip the key entirely when the user
             // hasn't added any extras so we don't leak an empty array
@@ -495,7 +496,7 @@ object ConfigStore {
             tunnelDoh = obj.optBoolean("tunnel_doh", true),
             blockDoh = obj.optBoolean("block_doh", true),
             youtubeViaRelay = obj.optBoolean("youtube_via_relay", false),
-            sabrStrip = obj.optBoolean("sabr_strip", true),
+            sabrStrip = obj.optBoolean("sabr_strip", false),
             bypassDohHosts = obj.optJSONArray("bypass_doh_hosts")?.let { arr ->
                 buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }
             }?.filter { it.isNotBlank() }.orEmpty(),
