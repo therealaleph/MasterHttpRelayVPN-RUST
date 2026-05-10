@@ -251,9 +251,12 @@ struct FormState {
     google_ip_validation: bool,
     normalize_x_graphql: bool,
     youtube_via_relay: bool,
-    /// Round-tripped from config.json. No UI control yet — power-user
-    /// edit. See config.rs `relay_url_patterns` (b3b9220).
+    /// See `config::Config::relay_url_patterns` for semantics + defaults.
+    /// No UI control; round-tripped so a hand-edited list survives Save.
     relay_url_patterns: Vec<String>,
+    /// See `config::Config::sabr_strip` for trade-off + when to flip.
+    /// No UI control; round-tripped so a hand-edited `false` survives Save.
+    sabr_strip: bool,
     passthrough_hosts: Vec<String>,
     /// Round-tripped from config.json so the UI's save path doesn't
     /// drop the user's setting. Not currently exposed as a UI control;
@@ -389,6 +392,7 @@ fn load_form() -> (FormState, Option<String>) {
             normalize_x_graphql: c.normalize_x_graphql,
             youtube_via_relay: c.youtube_via_relay,
             relay_url_patterns: c.relay_url_patterns.clone(),
+            sabr_strip: c.sabr_strip,
             passthrough_hosts: c.passthrough_hosts.clone(),
             block_quic: c.block_quic,
             disable_padding: c.disable_padding,
@@ -429,6 +433,7 @@ fn load_form() -> (FormState, Option<String>) {
             normalize_x_graphql: false,
             youtube_via_relay: false,
             relay_url_patterns: Vec::new(),
+            sabr_strip: true,
             passthrough_hosts: Vec::new(),
             block_quic: true,
             disable_padding: false,
@@ -585,11 +590,10 @@ impl FormState {
             // config-only flag for now. Passed through from the loaded
             // config if set, otherwise defaults to false.
             youtube_via_relay: self.youtube_via_relay,
-            // relay_url_patterns is config-only too (b3b9220). No UI
-            // editor yet — the default `youtube.com/youtubei/` ships
-            // automatically; round-trip preserves any extras the user
-            // added by hand.
+            // Config-only round-trips. Source of truth for both fields
+            // is `config::Config` (defaults, gating, trade-offs).
             relay_url_patterns: self.relay_url_patterns.clone(),
+            sabr_strip: self.sabr_strip,
             // Similarly config-only for now; round-trips through the
             // file so the UI doesn't drop the user's entries on save.
             passthrough_hosts: self.passthrough_hosts.clone(),
@@ -676,12 +680,14 @@ struct ConfigWire<'a> {
     normalize_x_graphql: bool,
     #[serde(skip_serializing_if = "is_false")]
     youtube_via_relay: bool,
-    /// Path-prefix relay routing (b3b9220). Default is empty — the
-    /// built-in `youtube.com/youtubei/` is added at proxy startup, not
-    /// written into config.json — so configs stay clean unless the user
-    /// added their own extras.
+    /// See `config::Config::relay_url_patterns`. Skipped when empty so
+    /// the proxy-applied default isn't echoed into config.json.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     relay_url_patterns: &'a Vec<String>,
+    /// See `config::Config::sabr_strip`. Default `true`; emitted only
+    /// when explicitly disabled so unchanged configs stay clean.
+    #[serde(skip_serializing_if = "is_true")]
+    sabr_strip: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     passthrough_hosts: &'a Vec<String>,
     // IP-scan knobs. These used to be missing from the wire struct, so
@@ -790,6 +796,7 @@ impl<'a> From<&'a Config> for ConfigWire<'a> {
             normalize_x_graphql: c.normalize_x_graphql,
             youtube_via_relay: c.youtube_via_relay,
             relay_url_patterns: &c.relay_url_patterns,
+            sabr_strip: c.sabr_strip,
             passthrough_hosts: &c.passthrough_hosts,
             fetch_ips_from_api: c.fetch_ips_from_api,
             max_ips_to_scan: c.max_ips_to_scan,

@@ -359,6 +359,12 @@ pub struct DomainFronter {
     /// Pre-normalized (lowercased, leading-dot stripped) host list for
     /// fast O(N) match in `exit_node_matches`.
     exit_node_hosts: Vec<String>,
+    /// Strip SABR quality-track entries from `/videoplayback` POST
+    /// bodies. Mirrors `Config::sabr_strip`. Default `true`. Kill-switch
+    /// for users who hit the speed-up-playback buffering regression
+    /// reported in #977. See config.rs `sabr_strip` for the full
+    /// trade-off.
+    sabr_strip: bool,
 }
 
 /// Aggregated stats for one remote host.
@@ -571,6 +577,7 @@ impl DomainFronter {
                 .map(|h| h.trim().trim_start_matches('.').to_ascii_lowercase())
                 .filter(|h| !h.is_empty())
                 .collect(),
+            sabr_strip: config.sabr_strip,
         })
     }
 
@@ -604,6 +611,57 @@ impl DomainFronter {
     /// change. Clamped to `[5s, 300s]` at construction.
     pub(crate) fn batch_timeout(&self) -> Duration {
         self.batch_timeout
+    }
+
+    /// Return `Some(stripped_body)` when the SABR quality-track strip
+    /// applies to this request and actually removed bytes; `None` when
+    /// the original body should pass through untouched.
+    ///
+    /// Six gates, all of which must pass for the strip to fire:
+    ///   1. `Config::sabr_strip` is on (kill-switch from #977 testing —
+    ///      see `src/config.rs` for the full trade-off).
+    ///   2. POST method (segment fetches are POSTs in YouTube's SABR
+    ///      protocol; GETs and other methods don't carry the protobuf).
+    ///   3. Non-empty body (no body to walk → nothing to strip).
+    ///   4. URL path contains `/videoplayback` (the SABR endpoint).
+    ///   5. URL host is in `url_host_is_youtube_video_endpoint`'s set
+    ///      (`*.googlevideo.com` or `*.youtube.com`) — defends against
+    ///      an unrelated service that happens to expose the same path
+    ///      shape with a protobuf-like body.
+    ///   6. The strip itself actually removed at least one byte —
+    ///      session-init bodies (no field-2) and bodies without any
+    ///      field-3 entries return unchanged from
+    ///      `strip_sabr_quality_tracks` and we report `None` so the
+    ///      caller skips the allocation churn.
+    ///
+    /// Pulled out of `relay()` so the gate can be exercised by unit
+    /// tests without standing up a live Apps Script connection — see
+    /// `sabr_strip_off_keeps_body_unchanged` /
+    /// `sabr_strip_on_strips_segment_fetch_body`.
+    pub(crate) fn maybe_strip_sabr_body(
+        &self,
+        method: &str,
+        url: &str,
+        body: &[u8],
+    ) -> Option<Vec<u8>> {
+        if !self.sabr_strip
+            || method != "POST"
+            || body.is_empty()
+            || !url.contains("/videoplayback")
+            || !url_host_is_youtube_video_endpoint(url)
+        {
+            return None;
+        }
+        let stripped = strip_sabr_quality_tracks(body);
+        if stripped.len() == body.len() {
+            return None;
+        }
+        tracing::debug!(
+            "SABR strip: removed {} quality-track bytes from {}",
+            body.len() - stripped.len(),
+            url.split('?').next().unwrap_or(url),
+        );
+        Some(stripped)
     }
 
     /// Record one relay call toward the daily budget. Called once per
@@ -1645,38 +1703,17 @@ impl DomainFronter {
             url
         };
 
-        // SABR quality-track strip for YouTube `/videoplayback` POST bodies.
-        // Has to run before the exit-node short-circuit so the exit-node
-        // path also benefits — same quota-relief reason as the relay path
-        // (Apps Script's UrlFetchApp + the exit node both cap at ~10 MB).
-        // Pure transform on body bytes; no-op on non-SABR payloads.
-        //
-        // Host-gated to YouTube's videoplayback hosts so an unrelated
-        // service that happens to expose a `/videoplayback` endpoint
-        // serving a protobuf-shaped POST body (with top-level fields 2
-        // and 3) doesn't get its field-3 entries silently rewritten.
-        // YouTube's videoplayback URLs live on either `*.googlevideo.com`
-        // (the chunk CDN) or `youtube.com` itself; both are gated.
+        // SABR quality-track strip — applied before the exit-node
+        // short-circuit so both paths benefit. The full decision +
+        // trade-off is in `maybe_strip_sabr_body` so the gate can be
+        // unit-tested without invoking the network-coupled relay path.
         let stripped_body;
-        let body: &[u8] = if method == "POST"
-            && !body.is_empty()
-            && url.contains("/videoplayback")
-            && url_host_is_youtube_video_endpoint(url)
-        {
-            let s = strip_sabr_quality_tracks(body);
-            if s.len() != body.len() {
-                tracing::debug!(
-                    "SABR strip: removed {} quality-track bytes from {}",
-                    body.len() - s.len(),
-                    url.split('?').next().unwrap_or(url),
-                );
-                stripped_body = s;
+        let body: &[u8] = match self.maybe_strip_sabr_body(method, url, body) {
+            None => body,
+            Some(stripped) => {
+                stripped_body = stripped;
                 stripped_body.as_slice()
-            } else {
-                body
             }
-        } else {
-            body
         };
 
         // Exit-node short-circuit: route through the configured second-hop
@@ -5284,6 +5321,14 @@ hello";
     /// `verify_ssl=true` and a placeholder `google_ip` are fine because
     /// `DomainFronter::new` doesn't touch the network.
     fn fronter_for_test(force_http1: bool) -> DomainFronter {
+        fronter_for_test_with(force_http1, true)
+    }
+
+    /// `fronter_for_test` plus a `sabr_strip` knob for the SABR
+    /// kill-switch gate tests. Lets the tests prove the runtime
+    /// behaviour at the `relay()` strip-decision branch — not just
+    /// the config-default round-trip.
+    fn fronter_for_test_with(force_http1: bool, sabr_strip: bool) -> DomainFronter {
         let json = format!(
             r#"{{
                 "mode": "apps_script",
@@ -5295,9 +5340,10 @@ hello";
                 "listen_port": 8085,
                 "log_level": "info",
                 "verify_ssl": true,
-                "force_http1": {}
+                "force_http1": {},
+                "sabr_strip": {}
             }}"#,
-            force_http1
+            force_http1, sabr_strip
         );
         let cfg: Config = serde_json::from_str(&json).unwrap();
         DomainFronter::new(&cfg).expect("test fronter must construct")
@@ -6123,6 +6169,127 @@ hello";
     }
 
     // ── SABR host gate (defense against unrelated /videoplayback) ────────
+
+    // ── SABR kill-switch runtime gate (#977) ─────────────────────────────
+
+    /// Build a known segment-fetch body (field-2 + field-3) that the
+    /// strip would actually shrink — used to prove the gate at runtime
+    /// rather than just the config-default round-trip.
+    fn segment_fetch_body() -> Vec<u8> {
+        let mut body: Vec<u8> = Vec::new();
+        enc_length_delim(&mut body, 2, b"range-descriptor");
+        enc_length_delim(&mut body, 3, b"quality-track-selector");
+        body
+    }
+
+    #[test]
+    fn sabr_strip_on_strips_segment_fetch_body_via_relay_gate() {
+        // sabr_strip = true (default): segment-fetch POST to a real
+        // googlevideo URL is stripped. This protects the main behaviour
+        // the kill-switch gates — if a future refactor accidentally
+        // drops the `self.sabr_strip` check from `relay()`, the strip
+        // would still apply on `true` and the test would pass; if the
+        // refactor accidentally INVERTS the check, this test fails
+        // because no bytes are removed.
+        let fronter = fronter_for_test_with(false, true);
+        let body = segment_fetch_body();
+        let result = fronter.maybe_strip_sabr_body(
+            "POST",
+            "https://rrx---sn-xxx.googlevideo.com/videoplayback?id=42",
+            &body,
+        );
+        let stripped = result.expect("sabr_strip=true must strip a segment-fetch body");
+        assert!(
+            stripped.len() < body.len(),
+            "strip must remove at least one byte ({} -> {})",
+            body.len(),
+            stripped.len(),
+        );
+        // And the field-3 entry specifically is what was removed.
+        assert!(
+            !stripped.windows(b"quality-track-selector".len())
+                .any(|w| w == b"quality-track-selector"),
+            "field-3 payload must be gone from stripped body",
+        );
+    }
+
+    #[test]
+    fn sabr_strip_off_keeps_body_unchanged_via_relay_gate() {
+        // sabr_strip = false: same body, same URL, gate must report
+        // None so `relay()` passes the body through verbatim. This is
+        // the regression test for the #977 kill-switch — if someone
+        // removes the `self.sabr_strip` check, this test fails.
+        let fronter = fronter_for_test_with(false, false);
+        let body = segment_fetch_body();
+        let result = fronter.maybe_strip_sabr_body(
+            "POST",
+            "https://rrx---sn-xxx.googlevideo.com/videoplayback?id=42",
+            &body,
+        );
+        assert!(
+            result.is_none(),
+            "sabr_strip=false must report None (no transformation): got {:?}",
+            result,
+        );
+    }
+
+    #[test]
+    fn sabr_strip_gate_respects_method_and_url_even_when_flag_is_on() {
+        // Other gates: only POST + /videoplayback + YT-host triggers.
+        // This protects the host-gate / method-gate / path-gate work
+        // from a refactor that conflates the kill-switch with the rest.
+        let fronter = fronter_for_test_with(false, true);
+        let body = segment_fetch_body();
+
+        // GET on the right URL: gate off (not POST).
+        assert!(fronter
+            .maybe_strip_sabr_body(
+                "GET",
+                "https://rrx---sn-xxx.googlevideo.com/videoplayback",
+                &body,
+            )
+            .is_none());
+
+        // POST on a non-YT host: gate off (host gate).
+        assert!(fronter
+            .maybe_strip_sabr_body(
+                "POST",
+                "https://api.example.com/videoplayback",
+                &body,
+            )
+            .is_none());
+
+        // POST on YT host without /videoplayback path: gate off.
+        assert!(fronter
+            .maybe_strip_sabr_body(
+                "POST",
+                "https://www.youtube.com/youtubei/v1/player",
+                &body,
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn sabr_strip_gate_returns_none_when_strip_is_a_no_op() {
+        // Body without field-3 (or without field-2) survives
+        // `strip_sabr_quality_tracks` unchanged. The gate then reports
+        // None so the caller doesn't pay for a redundant clone of an
+        // unmodified buffer.
+        let fronter = fronter_for_test_with(false, true);
+        let mut session_init: Vec<u8> = Vec::new();
+        // field-5 + field-3, no field-2 → strip is a no-op.
+        enc_length_delim(&mut session_init, 5, b"session-context");
+        enc_length_delim(&mut session_init, 3, b"essential-metadata");
+        let result = fronter.maybe_strip_sabr_body(
+            "POST",
+            "https://rrx---sn-xxx.googlevideo.com/videoplayback",
+            &session_init,
+        );
+        assert!(
+            result.is_none(),
+            "no-op strip must report None to avoid redundant alloc"
+        );
+    }
 
     #[test]
     fn sabr_host_gate_recognises_youtube_video_endpoints() {

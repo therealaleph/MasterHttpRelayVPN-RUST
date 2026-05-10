@@ -160,27 +160,18 @@ data class MhrvConfig(
     val youtubeViaRelay: Boolean = false,
 
     /**
-     * Path-pinned relay routing (Rust `relay_url_patterns`, upstream
-     * commit b3b9220). Each entry is a `host/path-prefix` (no scheme,
-     * lowercase) — paths matching go through the Apps Script relay,
-     * non-matching paths on the same host fall through to a direct
-     * SNI-rewrite HTTP forward (saving Apps Script quota).
-     *
-     * The Rust side prepends the default `youtube.com/youtubei/`
-     * pattern at startup, with two suppression gates:
-     *   - `youtubeViaRelay = true` (full YT through relay → filter is
-     *     redundant)
-     *   - exit-node "full" mode (every URL must route through the
-     *     second-hop exit node → filter would bypass it)
-     * Plus, when either gate is active, user-supplied patterns whose
-     * host overlaps `YOUTUBE_RELAY_HOSTS` (youtube.com, youtu.be,
-     * youtube-nocookie.com, youtubei.googleapis.com) are dropped at
-     * startup with a warning, since they would partially defeat the
-     * full-relay contract.
-     *
-     * This Android-side field is for *additional* user entries only —
-     * round-tripped through config.json so a hand-edited extension
-     * survives a save. No UI editor (power-user knob).
+     * SABR quality-track strip kill-switch (Rust `sabr_strip`).
+     * Default true. See `src/config.rs` `sabr_strip` for the trade-off
+     * and when to flip — Android-side is just round-trip plumbing.
+     */
+    val sabrStrip: Boolean = true,
+
+    /**
+     * Path-pinned relay routing (Rust `relay_url_patterns`).
+     * See `src/config.rs` `relay_url_patterns` for the full semantics —
+     * suppression gates, default pattern, host-overlap rules. This
+     * Android-side field is for *additional* user entries only,
+     * round-tripped so a hand-edited list survives Save.
      */
     val relayUrlPatterns: List<String> = emptyList(),
 
@@ -265,6 +256,10 @@ data class MhrvConfig(
             put("tunnel_doh", tunnelDoh)
             put("block_doh", blockDoh)
             if (youtubeViaRelay) put("youtube_via_relay", true)
+            // sabr_strip default is true on the Rust side; emit only
+            // when the user has explicitly disabled it so unchanged
+            // configs stay clean. #977 kill-switch.
+            if (!sabrStrip) put("sabr_strip", false)
             // Trim/drop-empty/dedupe before serializing — same pattern
             // as bypass_doh_hosts. Skip the key entirely when the user
             // hasn't added any extras so we don't leak an empty array
@@ -385,6 +380,7 @@ object ConfigStore {
         if (cfg.tunnelDoh != defaults.tunnelDoh) obj.put("tunnel_doh", cfg.tunnelDoh)
         if (cfg.blockDoh != defaults.blockDoh) obj.put("block_doh", cfg.blockDoh)
         if (cfg.youtubeViaRelay != defaults.youtubeViaRelay) obj.put("youtube_via_relay", cfg.youtubeViaRelay)
+        if (cfg.sabrStrip != defaults.sabrStrip) obj.put("sabr_strip", cfg.sabrStrip)
         val cleanBypassDohHosts = cfg.bypassDohHosts
             .map { it.trim() }
             .filter { it.isNotEmpty() }
@@ -499,6 +495,7 @@ object ConfigStore {
             tunnelDoh = obj.optBoolean("tunnel_doh", true),
             blockDoh = obj.optBoolean("block_doh", true),
             youtubeViaRelay = obj.optBoolean("youtube_via_relay", false),
+            sabrStrip = obj.optBoolean("sabr_strip", true),
             bypassDohHosts = obj.optJSONArray("bypass_doh_hosts")?.let { arr ->
                 buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }
             }?.filter { it.isNotBlank() }.orEmpty(),

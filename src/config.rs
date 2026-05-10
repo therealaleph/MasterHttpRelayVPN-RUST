@@ -57,7 +57,18 @@ impl ScriptId {
     }
 }
 
+/// Top-level config schema. Marked `#[non_exhaustive]` so adding a new
+/// field (which the YouTube + DPI work has done several times in the
+/// last few releases) isn't a breaking change for downstream Rust
+/// consumers depending on `mhrv_rs` as a library — they'll be forced
+/// to use functional-update or `serde_json::from_str` rather than a
+/// full struct literal, which means a new field added later doesn't
+/// fail their build until they choose to surface it.
+///
+/// In-crate code can still construct via struct literal as usual;
+/// `#[non_exhaustive]` only restricts cross-crate construction.
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct Config {
     pub mode: String,
     #[serde(default = "default_google_ip")]
@@ -198,6 +209,32 @@ pub struct Config {
     /// `relay_url_patterns` (commit b3b9220).
     #[serde(default)]
     pub relay_url_patterns: Vec<String>,
+
+    /// Strip SABR quality-track entries (top-level field-3 of the
+    /// segment-fetch protobuf) from `/videoplayback` POST bodies on
+    /// `*.googlevideo.com` / `*.youtube.com`. Default `true` — this is
+    /// the upstream-parity behaviour and the fix for "Response too
+    /// large" 502s on multi-track segment fetches that exceed Apps
+    /// Script `UrlFetchApp`'s ~10 MB cap (commits 9b6d03e + 33db28a
+    /// from upstream Python).
+    ///
+    /// **Why this kill-switch exists** (#977 testing report from
+    /// `unacoder`, May 2026): under `apps_script` mode with
+    /// `youtube_via_relay = false`, forcing single-quality-track
+    /// responses can interact poorly with playback at faster-than-1×
+    /// speeds (1.7×–2×). Each chunk represents less buffer-ahead
+    /// duration than a multi-track bundle would, and at speed-up the
+    /// player drains the buffer faster than the next chunk arrives —
+    /// reported as "only one videoplayback request is buffered."
+    ///
+    /// Flip to `false` if you hit that regression. The trade-off is
+    /// that long-form videos may then 502 on segments where Google
+    /// would have bundled multiple quality tracks; the player handles
+    /// that by falling back to a lower quality. The pre-port behaviour
+    /// (no SABR strip) was tolerable for most users — the strip is a
+    /// quality-of-life fix for the specific bundling-blowup case.
+    #[serde(default = "default_sabr_strip")]
+    pub sabr_strip: bool,
 
     /// User-configurable passthrough list. Any host whose name matches
     /// one of these entries bypasses the Apps Script relay entirely and
@@ -430,7 +467,13 @@ pub struct Config {
 }
 
 /// Configuration for the optional second-hop exit node.
+///
+/// Same `#[non_exhaustive]` rationale as `Config` — the exit-node
+/// feature is still maturing (host lists, mode strings, retry knobs are
+/// all places future fields are likely to land), so cross-crate
+/// consumers should round-trip through serde rather than struct literal.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[non_exhaustive]
 pub struct ExitNodeConfig {
     /// Master switch. Default false. Even with `relay_url` and `psk`
     /// set, nothing routes through the exit node unless this is true.
@@ -558,6 +601,12 @@ fn default_auto_blacklist_cooldown_secs() -> u64 { 120 }
 /// Default for `request_timeout_secs`: 30s, matching the historical
 /// hard-coded `BATCH_TIMEOUT` and Apps Script's typical response cliff.
 fn default_request_timeout_secs() -> u64 { 30 }
+
+/// Default for `sabr_strip`: `true`. Matches upstream-parity behaviour
+/// and the headline "no more 10 MB UrlFetchApp 502s on multi-track
+/// segment fetches" win. Users hitting the speed-up-playback buffering
+/// regression (#977) can opt out with `sabr_strip: false`.
+fn default_sabr_strip() -> bool { true }
 
 fn default_google_ip() -> String {
     "216.239.38.120".into()
@@ -1114,6 +1163,34 @@ mod tests {
             "error must echo the offending pattern: {}",
             msg
         );
+    }
+
+    #[test]
+    fn sabr_strip_defaults_to_true_when_omitted() {
+        // Existing configs from before the kill-switch landed don't
+        // have the field. `serde(default = "default_sabr_strip")` must
+        // resolve to true so the upstream-parity behaviour is what
+        // unchanged users get.
+        let s = r#"{
+            "mode": "apps_script",
+            "auth_key": "secret-test-secret-test",
+            "script_id": "X"
+        }"#;
+        let cfg: Config = serde_json::from_str(s).unwrap();
+        assert!(cfg.sabr_strip, "default must be true (strip enabled)");
+    }
+
+    #[test]
+    fn sabr_strip_round_trips_explicit_false() {
+        // Users hitting the #977 buffering regression flip this to false.
+        let s = r#"{
+            "mode": "apps_script",
+            "auth_key": "secret-test-secret-test",
+            "script_id": "X",
+            "sabr_strip": false
+        }"#;
+        let cfg: Config = serde_json::from_str(s).unwrap();
+        assert!(!cfg.sabr_strip, "explicit false must round-trip");
     }
 
     #[test]
