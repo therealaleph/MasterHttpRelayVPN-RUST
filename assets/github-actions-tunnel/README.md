@@ -31,25 +31,47 @@ its own guide with step-by-step instructions.
 | # | Method | Guide | Account Required | URL Behavior | Iran ISP friendly? |
 |---|---|---|---|---|---|
 | 1 | cloudflared Quick Tunnel | [cloudflared-quick.md][quick] | None | New URL each session | ⚠️ See note below |
-| 2 | ngrok Tunnel | [ngrok.md][ngrok] | ngrok (free) | New URL each session | ✅ Works |
+| 2 | ngrok Tunnel | [ngrok.md][ngrok] | ngrok (free) | **Permanent URL** | ⚠️ `.dev` TLD blocked on some ISPs |
 | 3 | cloudflared Named Tunnel | [cloudflared-named.md][named] | Cloudflare + domain | **Permanent URL** | ⚠️ See note below |
 
-> **⚠️ Important — cloudflared methods may not work from Iran ISP.** Apps Script
-> outbound runs from Google datacenter IPs, which Cloudflare's anti-bot system
-> flags as bots and serves a 403 / Persian Google Docs error page (#849). This
-> blocks the Apps Script → trycloudflare.com / your-domain step. **If you're on
-> Iran ISP, start with Method 2 (ngrok) instead** — ngrok's edge IPs are not
-> on Cloudflare's flagged list. cloudflared Methods 1 and 3 may still work for
-> users on networks where Cloudflare's anti-bot heuristics aren't firing
-> against Apps Script's outbound, so they're documented for completeness.
+> **⚠️ ngrok `*.ngrok-free.dev` block (early 2026).** Free-tier ngrok now
+> auto-assigns `*.ngrok-free.dev` domains exclusively for new accounts (the
+> older `*.ngrok-free.app` is grandfathered for existing accounts only and
+> cannot be claimed). Some Iran ISPs (TCI, Irancell, IRMCI confirmed via
+> #924) block `*.ngrok-free.dev` at DNS or TCP. Symptom: `curl` from your
+> network to your ngrok URL times out, but works from a non-Iran machine.
+> Workarounds: try **Method 1 (cloudflared Quick)** as a different TLD, or
+> pay $10/mo for ngrok Personal plan to get `*.ngrok.app` instead.
+>
+> **⚠️ cloudflared methods may not work from Iran ISP.** Apps Script
+> outbound runs from Google datacenter IPs, which Cloudflare's anti-bot
+> system sometimes flags as bots and serves a 403 / Persian Google Docs
+> error page (#849). cloudflared Methods 1 and 3 may still work for users
+> on networks where Cloudflare's anti-bot heuristics aren't firing against
+> Apps Script's outbound — try them and check.
 
-**New to Full tunnel mode?** If you're on Iran ISP, start with [Method 2 (ngrok)][ngrok]
-— it's the most reliable. If you're on a network where CF anti-bot doesn't
-fire against Google datacenter IPs, [Method 1 (cloudflared Quick)][quick] is
-the simplest (no third-party signup).
+**New to Full tunnel mode?** Try [Method 2 (ngrok)][ngrok] first — it's the
+fastest setup and gives a permanent URL on the free tier. If `*.ngrok-free.dev`
+is blocked on your ISP (curl times out), switch to [Method 1 (cloudflared
+Quick)][quick] — different TLD, sometimes passes where ngrok's `.dev`
+doesn't. If both fail, see the **Alternative hosts** section below.
 
-**Need a stable URL that survives restarts?** Use [Method 3][named] — requires
-a one-time Cloudflare CLI setup but the URL never changes.
+**Need a stable URL on a CF-friendly domain?** Use [Method 3][named] — requires
+a one-time Cloudflare CLI setup with your own domain.
+
+## Alternative hosts (when GitHub Actions tunnels don't work)
+
+If both ngrok and cloudflared paths are blocked on your network, run
+`mhrv-tunnel-node` somewhere that doesn't rely on a third-party tunnel:
+
+- **HuggingFace Spaces (Docker SDK)**: free, permanent `*.hf.space` URL,
+  no tunnel layer needed. Create a Space → pick Docker SDK → small
+  Dockerfile that runs `ghcr.io/therealaleph/mhrv-tunnel-node:latest`.
+  16 GB storage, 2 vCPU. Most Iran-friendly option in 2026.
+- **Replit (Deno repl)**: signup with email, free tier. Run
+  `mhrv-tunnel-node` and the Repl exposes a public URL.
+- **Your own VPS**: Hetzner / Vultr / DigitalOcean / ArvanCloud. ~$3-5/mo.
+  See [tunnel-node README](../../tunnel-node/README.md) for Docker setup.
 
 ## Shared Requirements
 
