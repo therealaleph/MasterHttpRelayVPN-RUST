@@ -210,29 +210,31 @@ pub struct Config {
     #[serde(default)]
     pub relay_url_patterns: Vec<String>,
 
-    /// Strip SABR quality-track entries (top-level field-3 of the
-    /// segment-fetch protobuf) from `/videoplayback` POST bodies on
-    /// `*.googlevideo.com` / `*.youtube.com`. Default `true` — this is
-    /// the upstream-parity behaviour and the fix for "Response too
-    /// large" 502s on multi-track segment fetches that exceed Apps
-    /// Script `UrlFetchApp`'s ~10 MB cap (commits 9b6d03e + 33db28a
-    /// from upstream Python).
+    /// Strip surplus SABR quality-track entries (top-level field-3 of
+    /// the segment-fetch protobuf) from `/videoplayback` POST bodies on
+    /// `*.googlevideo.com` / `*.youtube.com`. Default `true` — fixes
+    /// "Response too large" 502s on multi-track segment fetches that
+    /// exceed Apps Script `UrlFetchApp`'s ~10 MB cap (commits 9b6d03e
+    /// + 33db28a from upstream Python).
     ///
-    /// **Why this kill-switch exists** (#977 testing report from
-    /// `unacoder`, May 2026): under `apps_script` mode with
-    /// `youtube_via_relay = false`, forcing single-quality-track
-    /// responses can interact poorly with playback at faster-than-1×
-    /// speeds (1.7×–2×). Each chunk represents less buffer-ahead
-    /// duration than a multi-track bundle would, and at speed-up the
-    /// player drains the buffer faster than the next chunk arrives —
-    /// reported as "only one videoplayback request is buffered."
+    /// **Heuristic** (diverges from upstream's "strip all field-3"):
+    /// the first field-3 entry is always kept; only the 2nd and
+    /// subsequent ones are stripped, and only when at least one
+    /// field-2 byte-range entry is present (segment-fetch shape, not
+    /// session-init). Single-track requests pass through unchanged so
+    /// googlevideo always has a track selected. This was added in
+    /// response to #977 testing (unacoder, May 2026): the original
+    /// strip-all rule turned single-track requests into "zero tracks
+    /// selected" requests, which googlevideo answered with empty
+    /// bodies — buffer never advanced, player retried with `rn=`
+    /// incrementing.
     ///
-    /// Flip to `false` if you hit that regression. The trade-off is
-    /// that long-form videos may then 502 on segments where Google
-    /// would have bundled multiple quality tracks; the player handles
-    /// that by falling back to a lower quality. The pre-port behaviour
-    /// (no SABR strip) was tolerable for most users — the strip is a
-    /// quality-of-life fix for the specific bundling-blowup case.
+    /// **When to flip to `false`**: if you still see buffering issues
+    /// on long-form video playback after the keep-first refinement,
+    /// turn the strip off entirely to revert to the pre-port behaviour
+    /// (occasional 502s on multi-track segments → player falls back
+    /// to a lower quality). The pre-port behaviour was tolerable for
+    /// most users; the strip is an opt-in quality-of-life fix.
     #[serde(default = "default_sabr_strip")]
     pub sabr_strip: bool,
 

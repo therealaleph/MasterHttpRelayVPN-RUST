@@ -3627,40 +3627,58 @@ fn url_host_is_youtube_video_endpoint(url: &str) -> bool {
         .any(|s| h == *s || h.ends_with(&format!(".{}", s)))
 }
 
-/// Strip top-level field-3 (quality-track selection) entries from a SABR
-/// segment-fetch protobuf body.
+/// Strip surplus field-3 (quality-track selection) entries from a SABR
+/// segment-fetch protobuf body, keeping the first one intact.
 ///
 /// YouTube's SABR (Server-Adaptive Bitrate) `videoplayback` POST bodies
 /// come in two distinct message shapes:
 ///
 /// * **Segment-fetch** — carries field-2 (tag `0x12`) byte-range entries
 ///   for video/audio segments. Field-3 (tag `0x1a`) entries here are
-///   quality-track selectors that ask googlevideo to bundle multiple
-///   simultaneous quality tracks into one response, easily exceeding
-///   Apps Script `UrlFetchApp`'s ~10 MB response buffer → 502. Stripping
-///   them forces a single-track response that fits.
+///   quality-track selectors that ask googlevideo to return a particular
+///   quality track. When the player asks for *multiple* tracks at once
+///   (multi-track bundling), googlevideo concatenates them into a single
+///   response — easily exceeding Apps Script `UrlFetchApp`'s ~10 MB cap
+///   → 502.
 ///
 /// * **Session-init** — carries field-5 (tag `0x2a`) entries and *no*
 ///   field-2 entries. Field-3 here is essential session metadata
 ///   (language, viewer state, ...). Stripping it corrupts the init
 ///   handshake → CDN returns 403.
 ///
-/// Heuristic: only strip field-3 when at least one field-2 entry is also
-/// present at the top level (segment-fetch shape). Otherwise return the
-/// body unchanged.
+/// **Heuristic**:
+///
+/// 1. Body must be segment-fetch shape (≥ 1 field-2 entry). Otherwise
+///    no-op — session-init bodies must not be touched.
+/// 2. Body must carry **2 or more** field-3 entries before stripping
+///    fires. The first field-3 is always kept; only the 2nd, 3rd, ...
+///    are removed.
+///
+/// **Why keep the first field-3** (#977, unacoder testing, May 2026):
+/// the original "strip all field-3" rule produced empty googlevideo
+/// responses on single-track requests — the player asks for ONE track
+/// via a sole field-3, we strip it, and the CDN answers a request with
+/// zero tracks selected by sending nothing. The player retries
+/// indefinitely with the `rn=` retry counter incrementing, never
+/// advancing its buffer. Keeping the first field-3 means single-track
+/// requests pass through unchanged (no regression at low quality)
+/// while multi-track requests still get capped to one track (the
+/// 10 MB-blowup fix is preserved).
 ///
 /// Only top-level fields are inspected; nested messages are left intact.
 /// On a malformed body (truncated tag, unknown wire type) the unparsed
 /// tail is appended verbatim so a corrupt request is never silently
-/// truncated. Ported from upstream `_strip_sabr_quality_tracks`
-/// (commits 9b6d03e + 33db28a).
+/// truncated. Originally ported from upstream
+/// `_strip_sabr_quality_tracks` (commits 9b6d03e + 33db28a); the
+/// keep-first refinement diverges from upstream based on local testing.
 pub(crate) fn strip_sabr_quality_tracks(body: &[u8]) -> Vec<u8> {
     // Phase 1: single pass — collect (field_number, start, end) for every
-    // top-level field. We need to know whether field 2 exists before deciding
-    // to strip, but a two-pass walk would be wasteful.
+    // top-level field. We need both the segment-fetch detection (field-2
+    // present) AND the field-3 count (≥ 2 to fire) before deciding,
+    // and a two-pass walk would be wasteful.
     let mut segments: Vec<(u32, usize, usize)> = Vec::new();
     let mut has_field2 = false;
-    let mut has_field3 = false;
+    let mut field3_count: usize = 0;
     let mut i = 0usize;
     let n = body.len();
     let mut tail_start = n;
@@ -3778,20 +3796,32 @@ pub(crate) fn strip_sabr_quality_tracks(body: &[u8]) -> Vec<u8> {
         if field_number == 2 {
             has_field2 = true;
         } else if field_number == 3 {
-            has_field3 = true;
+            field3_count += 1;
         }
         segments.push((field_number, seg_start, i));
     }
 
-    // Phase 2: only strip when this is a segment-fetch body (has field 2)
-    // AND there's at least one field-3 entry to strip.
-    if !has_field2 || !has_field3 {
+    // Phase 2: only strip when this is a segment-fetch body (has field
+    // 2) AND there are at least 2 field-3 entries — i.e. real multi-
+    // track bundling. Single-track requests (one field-3) flow through
+    // unchanged so googlevideo still has a track selected.
+    if !has_field2 || field3_count < 2 {
         return body.to_vec();
     }
 
+    // Keep the first field-3 entry, strip the rest. `field3_kept`
+    // flips to `true` after the first encounter so subsequent ones
+    // fall through the strip branch.
     let mut out = Vec::with_capacity(body.len());
+    let mut field3_kept = false;
     for (field_number, seg_start, seg_end) in segments {
-        if field_number != 3 {
+        if field_number == 3 {
+            if !field3_kept {
+                field3_kept = true;
+                out.extend_from_slice(&body[seg_start..seg_end]);
+            }
+            // else: strip
+        } else {
             out.extend_from_slice(&body[seg_start..seg_end]);
         }
     }
@@ -6091,10 +6121,32 @@ hello";
     }
 
     #[test]
-    fn sabr_strip_segment_fetch_drops_field3() {
-        // Segment-fetch shape: has both field-2 (range descriptor) and
-        // field-3 (quality-track selector). Strip should remove only the
-        // field-3 entries, leaving everything else intact.
+    fn sabr_strip_keeps_sole_field3_unchanged() {
+        // The #977 regression case from unacoder's testing: a
+        // segment-fetch body with exactly ONE field-3 entry (the
+        // single-track request the player sends at low/medium quality).
+        // The original "strip all field-3" rule turned this into a
+        // request with zero tracks selected, which googlevideo answered
+        // with an empty body — buffer never advanced, player retried
+        // 11+ times with `rn=` incrementing. Keep-first heuristic
+        // returns the body unchanged so the player gets a valid
+        // single-track response.
+        let mut body: Vec<u8> = Vec::new();
+        enc_length_delim(&mut body, 2, b"range-descriptor");
+        enc_length_delim(&mut body, 3, b"sole-quality-track");
+        enc_varint_field(&mut body, 4, 12345);
+
+        // No transform: 1 field-3 < 2-entry threshold.
+        assert_eq!(strip_sabr_quality_tracks(&body), body);
+    }
+
+    #[test]
+    fn sabr_strip_segment_fetch_keeps_first_field3_strips_rest() {
+        // Segment-fetch shape with TWO field-3 entries (multi-track
+        // bundling). The first field-3 is kept (preserves a single
+        // track on the wire so googlevideo has something to send); the
+        // second is stripped (caps the response under 10 MB). Other
+        // fields pass through unchanged.
         let mut body: Vec<u8> = Vec::new();
         enc_length_delim(&mut body, 2, b"range-descriptor-1");
         enc_length_delim(&mut body, 3, b"quality-track-selector-1");
@@ -6104,7 +6156,9 @@ hello";
 
         let mut expected: Vec<u8> = Vec::new();
         enc_length_delim(&mut expected, 2, b"range-descriptor-1");
+        enc_length_delim(&mut expected, 3, b"quality-track-selector-1"); // KEPT
         enc_length_delim(&mut expected, 2, b"range-descriptor-2");
+        // quality-track-selector-2: STRIPPED
         enc_varint_field(&mut expected, 4, 12345);
 
         assert_eq!(strip_sabr_quality_tracks(&body), expected);
@@ -6159,21 +6213,20 @@ hello";
     }
 
     #[test]
-    fn sabr_strip_truncated_tag_after_field3_preserves_tail() {
-        // field-2, field-3, then truncated. Strip should remove the
-        // field-3 entry (segment-fetch shape) and copy the truncated
-        // tail verbatim.
+    fn sabr_strip_truncated_tag_after_single_field3_is_noop() {
+        // field-2 + ONE field-3 (single-track request) + truncated tag.
+        // Under the keep-first heuristic, single field-3 is preserved
+        // → strip is a no-op → body returned verbatim (truncated tail
+        // included). The original behaviour was to strip the sole
+        // field-3 here, but that's exactly the regression #977
+        // identified.
         let mut body: Vec<u8> = Vec::new();
         enc_length_delim(&mut body, 2, b"range-desc");
         enc_length_delim(&mut body, 3, b"quality-track");
-        // truncated tag
-        body.push(0x80);
+        body.push(0x80); // truncated tag
 
-        let mut expected: Vec<u8> = Vec::new();
-        enc_length_delim(&mut expected, 2, b"range-desc");
-        expected.push(0x80);
-
-        assert_eq!(strip_sabr_quality_tracks(&body), expected);
+        // No transform — single field-3 < 2-entry threshold.
+        assert_eq!(strip_sabr_quality_tracks(&body), body);
     }
 
     #[test]
@@ -6236,23 +6289,36 @@ hello";
     }
 
     #[test]
-    fn sabr_strip_truncated_fixed_width_preserves_segment_verbatim() {
-        // 64-bit fixed (wire type 1) — only 3 of 8 bytes present.
-        // Without a length-check this used to clamp via .min(n) and
-        // declare the field "complete." Now bails at the segment.
+    fn sabr_strip_truncated_fixed_width_with_single_field3_is_noop() {
+        // 64-bit fixed (wire type 1) — only 3 of 8 bytes present. The
+        // bail-on-truncated-payload behaviour is unchanged; what's
+        // different from the older "strip all field-3" version is
+        // that a SOLE field-3 is now kept (keep-first heuristic),
+        // so the body comes back unchanged.
         let mut body: Vec<u8> = Vec::new();
         enc_length_delim(&mut body, 2, b"r");
-        enc_length_delim(&mut body, 3, b"q");
-        // Tag = field 4, wire 1 = 0x21, then only 3 bytes follow.
+        enc_length_delim(&mut body, 3, b"q"); // sole field-3 → kept
         body.push(0x21);
         body.extend_from_slice(b"\x01\x02\x03");
 
-        // The malformed tail starts at the truncated fixed-width tag,
-        // so the field-2 / field-3 we did parse get emitted (segment-
-        // fetch shape, field-3 stripped), then the tail verbatim.
+        assert_eq!(strip_sabr_quality_tracks(&body), body);
+    }
+
+    #[test]
+    fn sabr_strip_truncated_fixed_width_with_two_field3_strips_extras() {
+        // Same fixed-width-truncation shape, but with TWO field-3
+        // entries. Keep-first rule fires: first field-3 kept, second
+        // stripped, malformed tail verbatim.
+        let mut body: Vec<u8> = Vec::new();
+        enc_length_delim(&mut body, 2, b"r");
+        enc_length_delim(&mut body, 3, b"q1");
+        enc_length_delim(&mut body, 3, b"q2"); // stripped
+        body.push(0x21);
+        body.extend_from_slice(b"\x01\x02\x03");
+
         let mut expected: Vec<u8> = Vec::new();
         enc_length_delim(&mut expected, 2, b"r");
-        // field-3 stripped here
+        enc_length_delim(&mut expected, 3, b"q1"); // kept
         expected.push(0x21);
         expected.extend_from_slice(b"\x01\x02\x03");
         assert_eq!(strip_sabr_quality_tracks(&body), expected);
@@ -6262,25 +6328,30 @@ hello";
 
     // ── SABR kill-switch runtime gate (#977) ─────────────────────────────
 
-    /// Build a known segment-fetch body (field-2 + field-3) that the
-    /// strip would actually shrink — used to prove the gate at runtime
-    /// rather than just the config-default round-trip.
+    /// Build a known segment-fetch body that the strip would actually
+    /// shrink — multi-track shape (field-2 + 2× field-3) so the
+    /// keep-first heuristic fires and removes the second field-3.
+    /// Used to prove the gate at runtime rather than just the
+    /// config-default round-trip.
     fn segment_fetch_body() -> Vec<u8> {
         let mut body: Vec<u8> = Vec::new();
         enc_length_delim(&mut body, 2, b"range-descriptor");
-        enc_length_delim(&mut body, 3, b"quality-track-selector");
+        enc_length_delim(&mut body, 3, b"quality-track-selector-1");
+        enc_length_delim(&mut body, 3, b"quality-track-selector-2");
         body
     }
 
     #[test]
-    fn sabr_strip_on_strips_segment_fetch_body_via_relay_gate() {
-        // sabr_strip = true (default): segment-fetch POST to a real
-        // googlevideo URL is stripped. This protects the main behaviour
-        // the kill-switch gates — if a future refactor accidentally
-        // drops the `self.sabr_strip` check from `relay()`, the strip
-        // would still apply on `true` and the test would pass; if the
-        // refactor accidentally INVERTS the check, this test fails
-        // because no bytes are removed.
+    fn sabr_strip_on_strips_extra_field3_entries_via_relay_gate() {
+        // sabr_strip = true (default), multi-track segment-fetch body
+        // (the keep-first heuristic threshold). The first field-3
+        // entry must survive (so the player still has a track selected
+        // — the #977 lesson); subsequent field-3 entries must be gone
+        // (the 10 MB-blowup fix). Protects the main behaviour the
+        // kill-switch gates: if a future refactor drops the
+        // `self.sabr_strip` check, the strip still applies on `true`
+        // and the test passes; if the refactor inverts the check, this
+        // fails because no bytes are removed.
         let fronter = fronter_for_test_with(false, true);
         let body = segment_fetch_body();
         let result = fronter.maybe_strip_sabr_body(
@@ -6288,18 +6359,25 @@ hello";
             "https://rrx---sn-xxx.googlevideo.com/videoplayback?id=42",
             &body,
         );
-        let stripped = result.expect("sabr_strip=true must strip a segment-fetch body");
+        let stripped = result.expect("sabr_strip=true must strip a multi-track body");
         assert!(
             stripped.len() < body.len(),
             "strip must remove at least one byte ({} -> {})",
             body.len(),
             stripped.len(),
         );
-        // And the field-3 entry specifically is what was removed.
+        // First field-3 kept (single-track preservation), second stripped.
         assert!(
-            !stripped.windows(b"quality-track-selector".len())
-                .any(|w| w == b"quality-track-selector"),
-            "field-3 payload must be gone from stripped body",
+            stripped
+                .windows(b"quality-track-selector-1".len())
+                .any(|w| w == b"quality-track-selector-1"),
+            "first field-3 payload (quality-track-selector-1) must SURVIVE the strip",
+        );
+        assert!(
+            !stripped
+                .windows(b"quality-track-selector-2".len())
+                .any(|w| w == b"quality-track-selector-2"),
+            "subsequent field-3 payload (quality-track-selector-2) must be STRIPPED",
         );
     }
 
@@ -6422,21 +6500,17 @@ hello";
     }
 
     #[test]
-    fn sabr_strip_truncated_varint_payload_preserves_segment_verbatim() {
-        // Wire type 0 (varint) with a continuation byte and no terminator.
+    fn sabr_strip_truncated_varint_payload_with_single_field3_is_noop() {
+        // Wire type 0 (varint) with a continuation byte and no
+        // terminator. Sole field-3 → kept under keep-first heuristic
+        // → body returned verbatim (truncated tail included).
         let mut body: Vec<u8> = Vec::new();
         enc_length_delim(&mut body, 2, b"r");
-        enc_length_delim(&mut body, 3, b"q");
-        // Tag = field 5, wire 0 = 0x28, then a continuation byte that
-        // never terminates.
+        enc_length_delim(&mut body, 3, b"q"); // sole field-3 → kept
         body.push(0x28);
         body.push(0x80); // continuation, then EOF
 
-        let mut expected: Vec<u8> = Vec::new();
-        enc_length_delim(&mut expected, 2, b"r");
-        expected.push(0x28);
-        expected.push(0x80);
-        assert_eq!(strip_sabr_quality_tracks(&body), expected);
+        assert_eq!(strip_sabr_quality_tracks(&body), body);
     }
 
     // ── StatsSnapshot::fmt_line + to_json (forwarder fields) ────────────
