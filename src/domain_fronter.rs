@@ -920,11 +920,13 @@ impl DomainFronter {
     /// prewarm behind `ensure_h2()` so the h1 pool stayed empty during
     /// the h2 init window.
     ///
-    /// Staggered 500 ms apart so we don't burst N TLS handshakes at the
-    /// Google edge simultaneously, and each connection gets an 8 s
-    /// expiry offset so they roll off gradually instead of all hitting
-    /// POOL_TTL_SECS at once. If h2 ends up the active fast path,
-    /// `run_pool_refill` trims the pool back down to
+    /// The spawned h2 handshake races h1[0] — boot fires two TLS
+    /// handshakes back-to-back. The 500 ms stagger only applies between
+    /// h1[i] and h1[i+1] for i ≥ 1, so we don't burst the remaining
+    /// h1[1..n] handshakes at the Google edge simultaneously. Each
+    /// connection gets an 8 s expiry offset so they roll off gradually
+    /// instead of all hitting POOL_TTL_SECS at once. If h2 ends up the
+    /// active fast path, `run_pool_refill` trims the pool back down to
     /// `POOL_MIN_H2_FALLBACK` on the next tick — the extra warm h1
     /// sockets just age out naturally instead of being kept alive.
     pub async fn warm(self: &Arc<Self>, n: usize) {
@@ -961,10 +963,16 @@ impl DomainFronter {
             }
         }
         // Join the h2 prewarm here only to log whether it landed; the
-        // h1 pool above is already populated either way. JoinError
-        // collapses to "h2 not alive" — same as if ensure_h2 returned
-        // None — so we still log a useful line.
-        let h2_alive = h2_handle.await.unwrap_or(false);
+        // h1 pool above is already populated either way. A panic in
+        // the spawned task surfaces as `JoinError` — log it explicitly
+        // so it isn't indistinguishable from a clean ALPN refusal.
+        let h2_alive = match h2_handle.await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("h2 prewarm task failed to join: {}", e);
+                false
+            }
+        };
         if h2_alive {
             tracing::info!(
                 "h2 fast path active; h1 fallback pool pre-warmed with {} connection(s)",
@@ -5231,15 +5239,13 @@ hello";
 
         // The fast path normally returns Some(send, gen) when the cell
         // is within TTL. With dead=true it must NOT return the stale
-        // SendRequest. We can't drive the open machinery here (no real
-        // Google edge), so the test asserts "doesn't return the stale
-        // cell" rather than "successfully reopens".
-        //
-        // ensure_h2 will fall through to the open path which will
-        // eventually try to TCP-connect to `connect_host:443`. That's
-        // a fake address in `fronter_for_test`, so the open will fail
-        // — and ensure_h2 returns None. The point is: the stale gen=1
-        // SendRequest was NOT served.
+        // SendRequest. Pre-set the failure-backoff timestamp so
+        // ensure_h2 short-circuits at the backoff check (no network
+        // I/O) regardless of whatever's bound on 127.0.0.1:443 on the
+        // dev/CI host. This isolates the assertion to the new
+        // dead-flag check.
+        *fronter.h2_open_failed_at.lock().await = Some(Instant::now());
+
         let result = fronter.ensure_h2().await;
         assert!(
             result.is_none(),
