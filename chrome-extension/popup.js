@@ -78,12 +78,22 @@ function setAuthKey(key) {
 
 async function loadTemplate() {
   try {
-    const response = await fetch(chrome.runtime.getURL(CODE_FILE));
+    const response = await fetch(CODE_FILE_URL);
+    if (!response.ok) throw new Error('Failed to fetch Code.gs');
     codeTemplate = await response.text();
     renderScript();
+    showMessage('Code.gs loaded from repository.');
   } catch (err) {
-    showMessage('Failed to load Code.gs from the extension package.', true);
+    showMessage('Failed to load Code.gs from repository. Using local fallback.', true);
     console.error(err);
+    // Fallback to local if fetch fails
+    try {
+      const localResponse = await fetch(chrome.runtime.getURL('Code.gs'));
+      codeTemplate = await localResponse.text();
+      renderScript();
+    } catch (localErr) {
+      showMessage('Could not load Code.gs at all.', true);
+    }
   }
 }
 
