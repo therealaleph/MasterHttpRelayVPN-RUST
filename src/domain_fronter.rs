@@ -2687,50 +2687,9 @@ impl DomainFronter {
         let script_id = self.next_script_id();
         let path = format!("/macros/s/{}/exec", script_id);
 
-        // h2 fast path. Tunnel ops are stateful — a `connect` may
-        // have opened an upstream socket; a `data` op may have
-        // forwarded bytes. Replaying on h1 after the op reached
-        // Apps Script can corrupt the tunnel session. Only fall back
-        // when h2 definitely never sent.
-        // Use the user-configured batch_timeout so Full-mode tuning
-        // (`request_timeout_secs`) is honored — a fixed cap would let
-        // legitimately slow batches incorrectly trip strike counters
-        // on healthy deployments at tunnel_client::fire_batch.
-        match self
-            .h2_relay_request(&path, payload.clone(), self.batch_timeout)
-            .await
-        {
-            Ok((status, _hdrs, _resp_body)) if is_h2_fronting_refusal_status(status) => {
-                // Edge rejected the fronted h2 request. Safe to fall
-                // back to h1 — the tunnel op never executed because
-                // Apps Script never received the request.
-                self.sticky_disable_h2_for_fronting_refusal(
-                    status,
-                    &format!("tunnel op {}", op),
-                )
-                .await;
-                // fall through to h1
-            }
-            Ok((status, _hdrs, resp_body)) => {
-                return self.finalize_tunnel_response(&script_id, status, resp_body);
-            }
-            Err((e, RequestSent::No)) => {
-                tracing::debug!(
-                    "h2 tunnel request pre-send failure: {} — falling back to h1",
-                    e
-                );
-            }
-            Err((e, RequestSent::Maybe)) => {
-                tracing::warn!(
-                    "h2 tunnel request post-send failure (op={}): {} — \
-                     not replaying on h1 to avoid corrupting the tunnel session",
-                    op,
-                    e
-                );
-                return Err(e);
-            }
-        }
-
+        // Skip h2 for tunnel ops — same rationale as tunnel_batch_request_to
+        // (PR #1040): tunnel ops are already single HTTP requests, h2
+        // multiplexing adds no benefit and causes 16-17s long-poll stalls.
         let mut entry = self.acquire().await?;
 
         let req_head = format!(
