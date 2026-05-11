@@ -74,6 +74,8 @@ ISPs can't read inside encrypted HTTPS. They only see the address — `www.googl
 11. Google shows a **Deployment ID** (a long random string). **Copy it** — you'll need it in Step 3.
 
 > **Tip:** if you ever update `Code.gs` later, don't make a new deployment. Edit the code, then go to **Deploy → Manage deployments → ✏️ → Version: New version → Deploy**. The Deployment ID stays the same.
+>
+> **Optional:** use `chrome-extension/README.md` for a browser helper that generates `Code.gs` and local config automatically.
 
 ### Step 2 — Download mhrv-rs
 

@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "mhrv-rs Apps Script Helper",
+  "description": "Generate Google Apps Script deployment code and configuration for mhrv-rs.",
+  "version": "0.1.0",
+  "action": {
+    "default_title": "mhrv-rs Apps Script Helper",
+    "default_popup": "popup.html"
+  },
+  "permissions": ["storage", "clipboardWrite"],
+  "host_permissions": ["https://script.google.com/*"]
+}

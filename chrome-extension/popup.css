@@ -1,0 +1,120 @@
+:root {
+  color-scheme: light;
+  font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  font-size: 13px;
+  color: #111;
+  background: #f7fafc;
+}
+
+body {
+  margin: 0;
+  min-width: 360px;
+}
+
+.container {
+  padding: 16px;
+}
+
+header h1 {
+  margin: 0 0 4px;
+  font-size: 1rem;
+}
+
+header p {
+  margin: 0 0 16px;
+  color: #475569;
+  font-size: 0.95rem;
+}
+
+.step {
+  margin-bottom: 18px;
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 14px;
+  padding: 14px;
+}
+
+.step h2 {
+  margin: 0 0 8px;
+  font-size: 0.95rem;
+}
+
+.step p {
+  margin: 0 0 12px;
+  line-height: 1.5;
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.row.small {
+  gap: 4px;
+}
+
+button {
+  border: none;
+  border-radius: 10px;
+  padding: 10px 14px;
+  font-size: 0.92rem;
+  cursor: pointer;
+  background: #0f172a;
+  color: #fff;
+  transition: transform 0.1s ease, background 0.2s ease;
+}
+
+button.secondary {
+  background: #e2e8f0;
+  color: #111827;
+}
+
+button:hover {
+  transform: translateY(-1px);
+}
+
+label {
+  display: block;
+  margin-bottom: 10px;
+  color: #334155;
+}
+
+input,
+textarea {
+  width: 100%;
+  border: 1px solid #cbd5e1;
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-family: inherit;
+  font-size: 0.95rem;
+  background: #f8fafc;
+  color: #0f172a;
+  resize: vertical;
+}
+
+textarea {
+  min-height: 88px;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.notice {
+  background: #f8fafc;
+  border-left: 4px solid #60a5fa;
+  padding: 10px 12px;
+  color: #334155;
+  font-size: 0.92rem;
+  border-radius: 0 0 10px 10px;
+}
+
+footer {
+  margin-top: 0;
+  padding-top: 4px;
+}
+
+#message {
+  color: #0f172a;
+  font-size: 0.9rem;
+}

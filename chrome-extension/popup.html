@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>mhrv-rs Apps Script Helper</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>mhrv-rs Apps Script Helper</h1>
+      <p>Generate Google Apps Script code and config for mhrv-rs.</p>
+    </header>
+
+    <section class="step">
+      <h2>Step 1: Generate a strong auth key</h2>
+      <p>This secret is used by the Apps Script and your local config.</p>
+      <div class="row">
+        <button id="generate-key">Generate auth key</button>
+        <button id="copy-key" class="secondary">Copy key</button>
+      </div>
+      <textarea id="auth-key" readonly aria-label="Generated auth key"></textarea>
+    </section>
+
+    <section class="step">
+      <h2>Step 2: Build your Apps Script</h2>
+      <p>Open Apps Script, paste the generated code, and deploy as a Web app.</p>
+      <div class="row">
+        <button id="copy-script">Copy Code.gs</button>
+        <button id="download-script" class="secondary">Download Code.gs</button>
+        <button id="open-script" class="secondary">Open Apps Script</button>
+      </div>
+      <div class="notice">The script is loaded from the extension package and includes the same relay protocol used by mhrv-rs.</div>
+    </section>
+
+    <section class="step">
+      <h2>Step 3: Create config</h2>
+      <p>Paste your Deployment ID and the auth key into your local config.</p>
+      <label>
+        Deployment ID
+        <input id="deployment-id" type="text" placeholder="YOUR_APPS_SCRIPT_DEPLOYMENT_ID" />
+      </label>
+      <div class="row">
+        <button id="copy-config">Copy config snippet</button>
+      </div>
+      <textarea id="config-json" readonly aria-label="Generated config snippet"></textarea>
+    </section>
+
+    <section class="step note">
+      <h2>Quick links</h2>
+      <div class="row small">
+        <button id="open-readme">View app docs</button>
+        <button id="open-guide" class="secondary">Open setup guide</button>
+      </div>
+      <p>Use a local browser proxy such as Proxy SwitchyOmega for Chrome/Edge.</p>
+    </section>
+
+    <footer>
+      <span id="message" aria-live="polite"></span>
+    </footer>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>
