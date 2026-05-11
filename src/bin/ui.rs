@@ -15,6 +15,7 @@ use mhrv_rs::data_dir;
 use mhrv_rs::domain_fronter::{DomainFronter, DEFAULT_GOOGLE_SNI_POOL};
 use mhrv_rs::lan_utils::{detect_lan_ip, is_share_on_lan};
 use mhrv_rs::mitm::{MitmCertManager, CA_CERT_FILE};
+use mhrv_rs::profiles::{self, ProfilesFile};
 use mhrv_rs::proxy_server::ProxyServer;
 use mhrv_rs::{scan_ips, scan_sni, test_cmd};
 
@@ -91,6 +92,65 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
+    // Load the profile store. Three outcomes:
+    //   - Ok → load_ok = true.
+    //   - CorruptOnDisk + backup-rename succeeded → load_ok = true
+    //     (the corrupt file is now backed up; we own the live file).
+    //   - CorruptOnDisk + backup-rename FAILED → load_ok = false. We
+    //     start empty in memory but refuse to save, because saving
+    //     would clobber the corrupt-but-recoverable bytes on disk
+    //     that may be the user's only copy.
+    //   - I/O read error (permission denied, locked file, etc.) →
+    //     load_ok = false. The file probably still exists on disk;
+    //     overwriting it with an empty store would risk losing the
+    //     user's data. Surface a toast and refuse writes until the
+    //     next restart.
+    let (profiles, profiles_load_ok, profile_toast) = match ProfilesFile::load() {
+        Ok(pf) => (pf, true, None),
+        Err(mhrv_rs::profiles::ProfileError::CorruptOnDisk(msg)) => {
+            let path = profiles::profiles_path();
+            let backup = pick_corrupt_backup_path(&path);
+            let renamed = std::fs::rename(&path, &backup);
+            let (load_ok, detail) = match renamed {
+                Ok(()) => (
+                    true,
+                    format!(
+                        "profiles.json was unreadable ({}); backed up to {}",
+                        msg,
+                        backup.display()
+                    ),
+                ),
+                Err(re) => (
+                    false,
+                    format!(
+                        "profiles.json was unreadable ({}) and backup also failed ({}). \
+                         Profile saves are disabled until you move the file aside manually.",
+                        msg, re
+                    ),
+                ),
+            };
+            tracing::warn!("profiles: {}", detail);
+            (ProfilesFile::default(), load_ok, Some(detail))
+        }
+        Err(e) => {
+            // Read / I/O / permissions failure on a file that exists.
+            // Treat the same as CorruptOnDisk-but-can't-back-up: the
+            // bytes on disk are still there, we just can't read them
+            // right now, and writing an empty store would clobber
+            // them. Refuse writes until the user investigates.
+            let detail = format!(
+                "profiles.json could not be loaded ({}). Profile saves are \
+                 disabled to avoid clobbering the on-disk file.",
+                e
+            );
+            tracing::warn!("profiles: {}", detail);
+            (ProfilesFile::default(), false, Some(detail))
+        }
+    };
+    // If we already had a config-load toast, prefer that; otherwise
+    // surface the profile-load detail on first paint.
+    let initial_toast = initial_toast.or_else(|| profile_toast.map(|m| (m, Instant::now())));
+
     eframe::run_native(
         "mhrv-rs",
         options,
@@ -102,9 +162,37 @@ fn main() -> eframe::Result<()> {
                 form,
                 last_poll: Instant::now(),
                 toast: initial_toast,
+                profiles,
+                profiles_load_ok,
+                save_as_dialog: None,
+                manage_dialog: None,
             }))
         }),
     )
+}
+
+/// Pick a non-colliding "json.corrupt-…" backup filename for a path
+/// we couldn't parse at startup. Uses unix nanoseconds for entropy
+/// AND a create-new probe loop, so a quick restart (or repeated
+/// corrupt loads in the same nanosecond, hypothetically) doesn't
+/// silently overwrite a previous backup that may itself be the
+/// user's only copy of recoverable data.
+fn pick_corrupt_backup_path(original: &std::path::Path) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut candidate = original.with_extension(format!("json.corrupt-{}", nanos));
+    // If we somehow land on an existing backup, append a counter
+    // until we find a fresh name. Cap iterations as a sanity belt;
+    // hitting the cap would mean something pathological with the
+    // filesystem, in which case we fall back to the last candidate.
+    let mut n = 1u32;
+    while candidate.exists() && n < 1000 {
+        candidate = original.with_extension(format!("json.corrupt-{}-{}", nanos, n));
+        n += 1;
+    }
+    candidate
 }
 
 #[derive(Default)]
@@ -213,6 +301,49 @@ struct App {
     form: FormState,
     last_poll: Instant,
     toast: Option<(String, Instant)>,
+    /// Profile bookkeeping for the multi-profile selector. Loaded from
+    /// `profiles.json` at startup and kept in memory; mutations write
+    /// through to disk immediately. See `src/profiles.rs`.
+    profiles: ProfilesFile,
+    /// True iff `profiles.json` either didn't exist OR loaded cleanly
+    /// at startup. False means the file was corrupt AND the backup
+    /// rename failed (so the corrupt file is still on disk). In that
+    /// state we MUST NOT save — the current empty in-memory state
+    /// would clobber the corrupt-but-recoverable bytes that may be
+    /// the user's only copy of their data.
+    profiles_load_ok: bool,
+    /// Modal state for the "Save as new profile" dialog.
+    save_as_dialog: Option<SaveAsState>,
+    /// Modal state for the "Manage profiles" window.
+    manage_dialog: Option<ManageState>,
+}
+
+#[derive(Default)]
+struct SaveAsState {
+    /// Free-form name typed by the user.
+    name: String,
+    /// Inline error message rendered under the text field (e.g. "name
+    /// already exists"). Cleared on the next keystroke.
+    error: Option<String>,
+}
+
+#[derive(Default)]
+struct ManageState {
+    /// Per-profile rename buffer keyed by current profile name. Lazily
+    /// populated when the user clicks "Rename" on a row.
+    rename_buf: HashMap<String, String>,
+    /// Currently-being-renamed profile name (only one at a time). `None`
+    /// when no rename is in progress.
+    renaming: Option<String>,
+    /// Inline error message at the top of the window (rename collision,
+    /// duplicate-target collision, etc.).
+    error: Option<String>,
+    /// Profile name pending delete confirmation. Set when the user
+    /// clicks "Delete"; cleared when they confirm or cancel. While
+    /// set we render an inline "Confirm delete?" row instead of the
+    /// usual action buttons, so an accidental click can't blow
+    /// away the user's only saved copy of a config.
+    pending_delete: Option<String>,
 }
 
 #[derive(Clone)]
@@ -294,6 +425,32 @@ struct FormState {
     /// claude.ai / grok.com / x.com). Config-only — no UI editor yet.
     /// See `assets/exit_node/` for the generic exit-node handler.
     exit_node: mhrv_rs::config::ExitNodeConfig,
+    /// Verbatim passthrough buffer for any config.json key this build
+    /// doesn't model. Captured at load time from `Config::extras` and
+    /// re-emitted by [`to_config`] / `ConfigWire` so Save-config and
+    /// Save-as-profile preserve future / hand-edited fields — same
+    /// contract as Android's `MhrvConfig.extrasJson`.
+    extras: std::collections::BTreeMap<String, serde_json::Value>,
+
+    // ── Carried-but-not-exposed modeled fields ──────────────────────
+    // These are real fields in `Config` (so serde-deserialised at
+    // load), but the desktop UI doesn't surface editors for them yet.
+    // We round-trip them through FormState so Save-config and
+    // Save-as-profile don't silently drop user-edited values from
+    // hand-edited config.json files. ConfigWire was previously
+    // missing serialize entries for some of these, which made the
+    // "round-trip" comments aspirational rather than true.
+    /// Hostname → IP override map. Hand-edited config field; preserve
+    /// across saves so a user-defined override survives a UI save.
+    hosts_passthrough: std::collections::HashMap<String, String>,
+    /// Legacy batch toggle (rarely set today). Pure passthrough.
+    enable_batching: bool,
+    /// PR #448 — adaptive coalesce window. Android exposes sliders;
+    /// desktop currently passes the compiled defaults (0/0) but a
+    /// user who hand-edits config.json to non-zero values should
+    /// keep them across UI saves.
+    coalesce_step_ms: u16,
+    coalesce_max_ms: u16,
 }
 
 #[derive(Clone, Debug)]
@@ -398,6 +555,11 @@ fn load_form() -> (FormState, Option<String>) {
             auto_blacklist_cooldown_secs: c.auto_blacklist_cooldown_secs,
             request_timeout_secs: c.request_timeout_secs,
             exit_node: c.exit_node.clone(),
+            extras: c.extras.clone(),
+            hosts_passthrough: c.hosts.clone(),
+            enable_batching: c.enable_batching,
+            coalesce_step_ms: c.coalesce_step_ms,
+            coalesce_max_ms: c.coalesce_max_ms,
         }
     } else {
         FormState {
@@ -439,6 +601,11 @@ fn load_form() -> (FormState, Option<String>) {
             auto_blacklist_cooldown_secs: 120,
             request_timeout_secs: 30,
             exit_node: mhrv_rs::config::ExitNodeConfig::default(),
+            extras: std::collections::BTreeMap::new(),
+            hosts_passthrough: std::collections::HashMap::new(),
+            enable_batching: false,
+            coalesce_step_ms: 0,
+            coalesce_max_ms: 0,
         }
     };
     (form, load_err)
@@ -542,8 +709,10 @@ impl FormState {
             socks5_port,
             log_level: self.log_level.trim().to_string(),
             verify_ssl: self.verify_ssl,
-            hosts: std::collections::HashMap::new(),
-            enable_batching: false,
+            // Round-tripped fields — preserve whatever was on disk
+            // (or the user's hand-edits) instead of wiping to defaults.
+            hosts: self.hosts_passthrough.clone(),
+            enable_batching: self.enable_batching,
             upstream_socks5: {
                 let v = self.upstream_socks5.trim();
                 if v.is_empty() {
@@ -608,12 +777,13 @@ impl FormState {
             // round-tripped through the UI so Save doesn't drop them.
             fronting_groups: self.fronting_groups.clone(),
             // PR #448 (Android): adaptive coalesce window. Desktop UI
-            // doesn't expose sliders for these yet (Android does), so
-            // we pass 0 to keep the compiled defaults (40ms step,
-            // 1000ms max). Round-trip planned for the v1.8.x desktop UI
-            // batch alongside the system-proxy toggle (#432).
-            coalesce_step_ms: 0,
-            coalesce_max_ms: 0,
+            // doesn't expose sliders for these yet, so for fresh
+            // installs they stay at the compiled defaults (0/0 → the
+            // crate's built-in 10ms / 1000ms). But if a user hand-edits
+            // config.json to set non-zero values, we round-trip them
+            // through FormState rather than wiping on every UI save.
+            coalesce_step_ms: self.coalesce_step_ms,
+            coalesce_max_ms: self.coalesce_max_ms,
             // Auto-blacklist + batch timeout: config-only knobs (#391,
             // #444, #430). Round-trip through FormState so Save doesn't
             // drop hand-edited values. UI editor planned alongside the
@@ -626,17 +796,23 @@ impl FormState {
             // / grok.com / x.com). Round-trip through FormState — config-only
             // editing for now, UI editor planned for v1.9.x desktop UI batch.
             exit_node: self.exit_node.clone(),
+            // Unknown / future config.json keys captured at load time.
+            // Cloned through so Save-config and Save-as-profile preserve
+            // every field, even those not modelled by this build.
+            extras: self.extras.clone(),
         })
     }
 }
 
 fn save_config(cfg: &Config) -> Result<PathBuf, String> {
     let path = data_dir::config_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let json = serde_json::to_string_pretty(&ConfigWire::from(cfg)).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| e.to_string())?;
+    // Round-trip through serde_json::Value so we can hand the bytes
+    // to the same atomic write helper the profile paths use. The
+    // helper writes to a `.tmp` and atomic-renames into place — no
+    // pre-delete window where the user could lose their previous
+    // config.json to a failed write.
+    let value = serde_json::to_value(ConfigWire::from(cfg)).map_err(|e| e.to_string())?;
+    mhrv_rs::profiles::write_config_json_to(&path, &value).map_err(|e| e.to_string())?;
     Ok(path)
 }
 
@@ -707,6 +883,27 @@ struct ConfigWire<'a> {
     /// unchanged configs stay clean.
     #[serde(skip_serializing_if = "is_false")]
     force_http1: bool,
+    /// Block QUIC (UDP/443). Default true. Skip when matching default
+    /// so unchanged configs stay clean — emit when user has turned
+    /// the block off. Previously missing from ConfigWire, which made
+    /// `Save config` silently drop a user-set `block_quic: false`.
+    #[serde(skip_serializing_if = "is_true")]
+    block_quic: bool,
+    /// Anti-fingerprint random padding kill switch. Default false
+    /// (padding active). Emit when user disabled padding.
+    #[serde(skip_serializing_if = "is_false")]
+    disable_padding: bool,
+    /// Legacy batch toggle. Default false. Emit when explicitly set.
+    #[serde(skip_serializing_if = "is_false")]
+    enable_batching: bool,
+    /// PR #448 adaptive coalesce window. Defaults are 0/0 (= "use
+    /// the crate's compiled defaults"). Emit when the user has
+    /// hand-edited non-zero values into config.json so they survive
+    /// a UI save.
+    #[serde(skip_serializing_if = "is_zero_u16")]
+    coalesce_step_ms: u16,
+    #[serde(skip_serializing_if = "is_zero_u16")]
+    coalesce_max_ms: u16,
     /// Exit-node config (CF-anti-bot bypass for chatgpt.com / claude.ai /
     /// grok.com / x.com via exit-node second-hop relay). Skip when fully
     /// default (disabled with no URL/PSK/hosts) so configs without
@@ -714,6 +911,14 @@ struct ConfigWire<'a> {
     /// Save preserves user-edited values.
     #[serde(skip_serializing_if = "is_default_exit_node")]
     exit_node: &'a mhrv_rs::config::ExitNodeConfig,
+
+    /// Verbatim passthrough of unknown / future config.json keys
+    /// captured at load time. Re-emitted via `#[serde(flatten)]`
+    /// so a Save-config or Save-as-profile round-trip preserves
+    /// every field — matching the Android `extrasJson` semantics.
+    /// Skip when empty so unchanged configs stay clean.
+    #[serde(flatten, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    extras: &'a std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 fn is_default_strikes(v: &u32) -> bool { *v == 3 }
@@ -737,6 +942,10 @@ fn is_true(b: &bool) -> bool {
 }
 
 fn is_zero_u8(v: &u8) -> bool {
+    *v == 0
+}
+
+fn is_zero_u16(v: &u16) -> bool {
     *v == 0
 }
 
@@ -788,6 +997,12 @@ impl<'a> From<&'a Config> for ConfigWire<'a> {
             request_timeout_secs: c.request_timeout_secs,
             force_http1: c.force_http1,
             exit_node: &c.exit_node,
+            extras: &c.extras,
+            block_quic: c.block_quic,
+            disable_padding: c.disable_padding,
+            enable_batching: c.enable_batching,
+            coalesce_step_ms: c.coalesce_step_ms,
+            coalesce_max_ms: c.coalesce_max_ms,
         }
     }
 }
@@ -923,6 +1138,13 @@ impl eframe::App for App {
             });
 
             ui.add_space(2.0);
+
+            // ── Profile bar ──────────────────────────────────────────────
+            // Lets the user keep several configs (e.g. one Apps Script setup
+            // and one Full tunnel setup) side by side and switch between
+            // them without re-typing deployment IDs / auth keys / tuning
+            // knobs. See `src/profiles.rs` for the storage model.
+            self.show_profile_bar(ui);
 
             // ── Section: Mode ─────────────────────────────────────────────
             // Surfacing the mode at the top of the form because it changes
@@ -1286,7 +1508,48 @@ impl eframe::App for App {
                             // Apply the new log level live so users don't have to
                             // restart for the combobox to take effect (#401).
                             apply_log_level(&self.form.log_level);
-                            self.toast = Some((format!("Saved to {}", p.display()), Instant::now()));
+                            // Invariant 2: `active = "name"` means the
+                            // named profile's snapshot equals
+                            // config.json. A regular Save config writes
+                            // user-edited bytes that almost certainly
+                            // diverge from any saved profile, so clear
+                            // active. The user can re-bind via "Save as
+                            // profile" if they want the live config
+                            // tracked under a name again.
+                            let mut pointer_warning: Option<String> = None;
+                            if !self.profiles.active.is_empty() && self.profiles_load_ok {
+                                let mut next = self.profiles.clone();
+                                next.active = String::new();
+                                match next.save() {
+                                    Ok(()) => {
+                                        self.profiles = next;
+                                    }
+                                    Err(e) => {
+                                        // The config write succeeded but
+                                        // we couldn't clear the stale
+                                        // active marker. Surface that to
+                                        // the user — the dropdown will
+                                        // still claim the previous
+                                        // profile matches the live
+                                        // config when it no longer does.
+                                        tracing::warn!(
+                                            "profiles: clearing active on Save config failed: {}",
+                                            e
+                                        );
+                                        pointer_warning = Some(format!("{}", e));
+                                    }
+                                }
+                            }
+                            self.toast = Some((
+                                match pointer_warning {
+                                    Some(w) => format!(
+                                        "Saved to {}, but the active profile marker still points at '{}' (clearing it failed: {}). The dropdown will misclaim until you switch profiles or restart.",
+                                        p.display(), self.profiles.active, w
+                                    ),
+                                    None => format!("Saved to {}", p.display()),
+                                },
+                                Instant::now(),
+                            ));
                         }
                         Err(e) => self.toast = Some((format!("Save failed: {}", e), Instant::now())),
                     }
@@ -1298,6 +1561,9 @@ impl eframe::App for App {
             // Floating SNI editor window. Rendered here so it's inside the
             // same egui context but visually pops out with its own title bar.
             self.show_sni_editor(ctx);
+            // Profile dialogs (Save as / Manage). Same pop-out treatment.
+            self.show_save_as_dialog(ctx);
+            self.show_manage_dialog(ctx);
 
             ui.add_space(8.0);
 
@@ -1873,6 +2139,528 @@ impl App {
             }
         }
         mhrv_rs::update_check::Route::Direct
+    }
+
+    /// Top-of-form profile bar: dropdown selector + "Save as profile" +
+    /// "Manage" buttons. Switching a profile writes its stored config
+    /// snapshot to `config.json` and reloads the form from there, so the
+    /// runtime path (read `config.json`) stays unchanged.
+    fn show_profile_bar(&mut self, ui: &mut egui::Ui) {
+        let active = self.profiles.active.clone();
+        let names = self.profiles.names();
+        // Disable profile switching AND Save-as while the proxy is
+        // running. The running ProxyServer task holds a Config that
+        // was cloned at Cmd::Start time and won't pick up a new
+        // config.json, so any write here would create a UI/runtime
+        // drift. Save-as currently rewrites config.json (so the
+        // active marker can truthfully claim "matches live config"),
+        // which means it has the same drift problem as switching.
+        // Manage stays enabled — rename / duplicate / delete don't
+        // touch config.json.
+        let running = self.shared.state.lock().unwrap().running;
+
+        // Declared outside the horizontal closure so we can read it back
+        // after the click handlers have run and the borrow on `ui` is
+        // released — switching profile mutates self, which collides with
+        // any borrow held inside the closure.
+        let mut chosen: Option<String> = None;
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Profile")
+                    .size(12.0)
+                    .color(egui::Color32::from_gray(180))
+                    .strong(),
+            );
+            let selected_label = if active.is_empty() {
+                "(none)".to_string()
+            } else {
+                active.clone()
+            };
+            let combo = egui::ComboBox::from_id_source("profile_picker")
+                .selected_text(selected_label);
+            ui.add_enabled_ui(!running, |ui| {
+                let resp = combo.show_ui(ui, |ui| {
+                    if names.is_empty() {
+                        ui.label(
+                            egui::RichText::new("no profiles saved yet")
+                                .color(egui::Color32::from_gray(140))
+                                .italics(),
+                        );
+                    } else {
+                        for name in &names {
+                            if ui
+                                .selectable_label(active == *name, name.clone())
+                                .clicked()
+                            {
+                                chosen = Some(name.clone());
+                            }
+                        }
+                    }
+                });
+                if running {
+                    resp.response.on_hover_text(
+                        "Stop the proxy first — profile switching takes effect on \
+                         the next Start, and swapping the live config underneath \
+                         a running proxy would only confuse things.",
+                    );
+                }
+            });
+
+            // Gate Save-as on (a) profiles.json being loadable AND
+            // (b) the proxy not running. The corrupt-on-disk case
+            // would clobber the recoverable bytes; the running case
+            // would put config.json out of sync with the cloned
+            // Config inside the running ProxyServer task.
+            let save_as_enabled = self.profiles_load_ok && !running;
+            ui.add_enabled_ui(save_as_enabled, |ui| {
+                let resp = ui
+                    .button("Save as profile…")
+                    .on_hover_text(
+                        "Capture the current form (deployment IDs, mode, auth key, \
+                         and all tuning knobs) under a name so you can switch back \
+                         to it later.",
+                    );
+                if resp.clicked() {
+                    self.save_as_dialog = Some(SaveAsState::default());
+                }
+                if !self.profiles_load_ok {
+                    resp.on_hover_text(
+                        "Profiles disabled: profiles.json on disk is unreadable. \
+                         Move it aside manually, then restart.",
+                    );
+                } else if running {
+                    resp.on_hover_text(
+                        "Stop the proxy first — Save as profile rewrites config.json \
+                         to make the active marker truthful, which would put the live \
+                         config out of sync with the running proxy's cloned config.",
+                    );
+                }
+            });
+
+            ui.add_enabled_ui(self.profiles_load_ok && !names.is_empty(), |ui| {
+                if ui
+                    .button("Manage…")
+                    .on_hover_text("Rename, duplicate, or delete saved profiles.")
+                    .clicked()
+                {
+                    self.manage_dialog = Some(ManageState::default());
+                }
+            });
+        });
+
+        if let Some(name) = chosen {
+            self.switch_to_profile(&name);
+        }
+    }
+
+    /// Switch the live config to a stored profile: write the profile's
+    /// snapshot to `config.json`, reload the form from disk, update the
+    /// profiles file's active pointer. Toasts on either outcome.
+    ///
+    /// The snapshot is applied RAW (invariant 1 in `src/profiles.rs`) —
+    /// any config fields this build doesn't model still survive in the
+    /// live config.
+    fn switch_to_profile(&mut self, name: &str) {
+        // Three distinct outcomes from apply_profile:
+        //   - Err — nothing changed on disk. Toast the error verbatim.
+        //   - Ok(ApplyOutcome::Ok) — both writes succeeded.
+        //   - Ok(ApplyOutcome::PartialConfigOnly(e)) — config.json IS
+        //     the new profile but the active pointer didn't save.
+        //     Treat as "switched" for the form reload, but surface the
+        //     carried error so the user knows the dropdown's marker is
+        //     stale.
+        let pointer_warning = match profiles::apply_profile(name) {
+            Err(e) => {
+                self.toast = Some((format!("Switch failed: {}", e), Instant::now()));
+                return;
+            }
+            Ok(profiles::ApplyOutcome::Ok) => None,
+            Ok(profiles::ApplyOutcome::PartialConfigOnly(e)) => Some(format!("{}", e)),
+        };
+        // Reload the profile store so the active pointer reflects the
+        // switch (apply_profile updated it on disk — unless we got
+        // PartialConfigOnly, in which case the on-disk pointer is
+        // stale; we still reload so any other concurrent changes show
+        // up correctly).
+        match ProfilesFile::load() {
+            Ok(pf) => self.profiles = pf,
+            Err(e) => {
+                tracing::warn!("profiles: reload after switch failed: {}", e);
+            }
+        }
+        // Reload the form from the new config.json. A warning load_err is
+        // surfaced as a toast — the user notices but doesn't get stuck.
+        let (new_form, load_err) = load_form();
+        self.form = new_form;
+        apply_log_level(&self.form.log_level);
+        let msg = match (pointer_warning, load_err) {
+            (Some(ptr), Some(le)) => format!(
+                "Switched to '{}' (live config updated) but pointer save failed: {}; also: {}",
+                name, ptr, le
+            ),
+            (Some(ptr), None) => format!(
+                "Switched to '{}' (live config updated) but profile pointer save failed: {}",
+                name, ptr
+            ),
+            (None, Some(le)) => format!("Switched to '{}' but: {}", name, le),
+            (None, None) => format!("Switched to profile '{}'", name),
+        };
+        self.toast = Some((msg, Instant::now()));
+    }
+
+    /// Modal: "Save as new profile" name prompt. Validates non-empty and
+    /// non-duplicate (offers an "overwrite existing" path when the name
+    /// already exists).
+    fn show_save_as_dialog(&mut self, ctx: &egui::Context) {
+        let mut close = false;
+        let Some(state) = self.save_as_dialog.as_mut() else {
+            return;
+        };
+        // Snapshot what we need so we can mutate self after the window closes.
+        let mut commit: Option<(String, bool)> = None; // (name, overwrite)
+        egui::Window::new("Save as profile")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(360.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
+            .show(ctx, |ui| {
+                ui.label(
+                    "Profile name:",
+                );
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut state.name)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("e.g. Apps Script (home) or Full tunnel (work)"),
+                );
+                if resp.changed() {
+                    state.error = None;
+                }
+                if let Some(err) = &state.error {
+                    ui.colored_label(ERR_RED, err);
+                }
+                let trimmed = state.name.trim().to_string();
+                let exists = !trimmed.is_empty()
+                    && self.profiles.find(&trimmed).is_some();
+                if exists {
+                    ui.small(
+                        egui::RichText::new(format!(
+                            "A profile named '{}' already exists.",
+                            trimmed
+                        ))
+                        .color(egui::Color32::from_rgb(220, 180, 100)),
+                    );
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let save_label = if exists { "Overwrite" } else { "Save" };
+                    let save_enabled = !trimmed.is_empty();
+                    if ui
+                        .add_enabled(save_enabled, egui::Button::new(save_label))
+                        .clicked()
+                    {
+                        commit = Some((trimmed.clone(), exists));
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+            });
+
+        if let Some((name, overwrite)) = commit {
+            match self.save_form_as_profile(&name, overwrite) {
+                Ok(()) => {
+                    self.toast = Some((
+                        format!("Saved profile '{}'", name),
+                        Instant::now(),
+                    ));
+                    close = true;
+                }
+                Err(msg) => {
+                    if let Some(state) = self.save_as_dialog.as_mut() {
+                        state.error = Some(msg);
+                    }
+                }
+            }
+        }
+
+        if close {
+            self.save_as_dialog = None;
+        }
+    }
+
+    /// Save the current form as a named profile.
+    ///
+    /// Write order: **`config.json` FIRST, then `profiles.json`**.
+    /// This is the safe order because:
+    ///   - If `config.json` fails, neither file changes; nothing to
+    ///     roll back (invariant 3).
+    ///   - If `profiles.json` fails after `config.json` succeeded, the
+    ///     live config now reflects the form — equivalent to the user
+    ///     having clicked Save config — but no profile entry was
+    ///     added/updated. Invariant 2 holds: we never wrote an
+    ///     `active` claim we couldn't back up.
+    ///
+    /// The previous order (profiles.json first) had a corruption bug:
+    /// on overwrite, the profile's snapshot was already replaced
+    /// before we knew whether config.json would land, so a failed
+    /// config write left profile "name" pointing at bytes that
+    /// nothing on disk matched.
+    fn save_form_as_profile(&mut self, name: &str, overwrite: bool) -> Result<(), String> {
+        if !self.profiles_load_ok {
+            return Err(
+                "profiles.json on disk is unreadable; refusing to overwrite. \
+                 Move it aside manually, then restart."
+                    .into(),
+            );
+        }
+        let cfg = self
+            .form
+            .to_config()
+            .map_err(|e| format!("Form is invalid: {}", e))?;
+        let wire = ConfigWire::from(&cfg);
+        let value = serde_json::to_value(&wire)
+            .map_err(|e| format!("serialize failed: {}", e))?;
+
+        // Pre-validate the profile mutation would succeed (collision /
+        // empty-name checks) BEFORE touching config.json, so we don't
+        // commit the live config and then discover the profile
+        // operation is rejected.
+        let mut next = self.profiles.clone();
+        if overwrite {
+            next.upsert(name, value.clone()).map_err(|e| format!("{}", e))?;
+        } else {
+            next.insert_new(name, value.clone()).map_err(|e| format!("{}", e))?;
+        }
+
+        // Step 1: write the snapshot to config.json. On failure,
+        // neither file has changed.
+        profiles::write_config_json(&value)
+            .map_err(|e| format!("write config.json failed: {}", e))?;
+
+        // Step 2: write profiles.json with the new entry + active=name.
+        // On failure here, config.json is already the new bytes but no
+        // profile entry exists. We surface this as "PartialConfigOnly"
+        // text so the user understands the live config DID change but
+        // the profile didn't save.
+        match next.save() {
+            Ok(()) => {
+                self.profiles = next;
+                let (new_form, _) = load_form();
+                self.form = new_form;
+                apply_log_level(&self.form.log_level);
+                Ok(())
+            }
+            Err(e) => {
+                // config.json IS the new bytes — refresh the form so
+                // the UI reflects that — but report the profile save
+                // failure honestly.
+                let (new_form, _) = load_form();
+                self.form = new_form;
+                apply_log_level(&self.form.log_level);
+                Err(format!(
+                    "Live config saved, but writing the profile entry failed: {}. \
+                     Retry to save the profile.",
+                    e
+                ))
+            }
+        }
+    }
+
+    /// Modal: "Manage profiles". Lists every saved profile with rename,
+    /// duplicate, and delete actions. All mutations write through to disk
+    /// immediately.
+    fn show_manage_dialog(&mut self, ctx: &egui::Context) {
+        if self.manage_dialog.is_none() {
+            return;
+        }
+        // Use a local "close" sentinel and only mutate self.manage_dialog
+        // at the very end — egui's Window::open borrow conflicts with
+        // mid-frame mutations.
+        let mut close = false;
+        let names = self.profiles.names();
+        let active = self.profiles.active.clone();
+        // Collected actions to apply after the closure (mutating
+        // self.profiles inside would tangle with the &mut borrow on
+        // self.manage_dialog).
+        enum Action {
+            CommitRename { from: String, to: String },
+            Duplicate(String),
+            Delete(String),
+        }
+        let mut pending: Option<Action> = None;
+
+        egui::Window::new("Manage profiles")
+            .collapsible(false)
+            .resizable(true)
+            .default_size(egui::vec2(460.0, 360.0))
+            .show(ctx, |ui| {
+                let state = self.manage_dialog.as_mut().unwrap();
+                if let Some(err) = &state.error {
+                    ui.colored_label(ERR_RED, err);
+                    ui.add_space(4.0);
+                }
+                if names.is_empty() {
+                    ui.label(
+                        egui::RichText::new("No profiles saved yet.")
+                            .italics()
+                            .color(egui::Color32::from_gray(160)),
+                    );
+                }
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| {
+                        for name in &names {
+                            ui.horizontal(|ui| {
+                                let is_active = *name == active;
+                                if is_active {
+                                    ui.label(
+                                        egui::RichText::new("●")
+                                            .color(OK_GREEN)
+                                            .strong(),
+                                    )
+                                    .on_hover_text("Active profile");
+                                } else {
+                                    ui.label("  ");
+                                }
+                                if state.renaming.as_deref() == Some(name.as_str()) {
+                                    let buf = state
+                                        .rename_buf
+                                        .entry(name.clone())
+                                        .or_insert_with(|| name.clone());
+                                    ui.add(
+                                        egui::TextEdit::singleline(buf)
+                                            .desired_width(180.0),
+                                    );
+                                    if ui.button("OK").clicked() {
+                                        let to = buf.clone();
+                                        pending = Some(Action::CommitRename {
+                                            from: name.clone(),
+                                            to,
+                                        });
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        state.renaming = None;
+                                        state.rename_buf.remove(name);
+                                        state.error = None;
+                                    }
+                                } else if state.pending_delete.as_deref()
+                                    == Some(name.as_str())
+                                {
+                                    // Confirm-delete row: replaces the
+                                    // usual action buttons with an
+                                    // explicit "Confirm delete?" prompt.
+                                    // Profile data may be the user's
+                                    // only copy, so we don't want a
+                                    // single accidental click to take
+                                    // it out.
+                                    ui.label(
+                                        egui::RichText::new(format!("Delete '{}'?", name))
+                                            .color(ERR_RED)
+                                            .strong(),
+                                    );
+                                    let confirm = egui::Button::new(
+                                        egui::RichText::new("Confirm delete")
+                                            .color(egui::Color32::WHITE),
+                                    )
+                                    .fill(ERR_RED)
+                                    .rounding(4.0);
+                                    if ui.add(confirm).clicked() {
+                                        pending = Some(Action::Delete(name.clone()));
+                                    }
+                                    if ui.small_button("Cancel").clicked() {
+                                        state.pending_delete = None;
+                                        state.error = None;
+                                    }
+                                } else {
+                                    ui.label(
+                                        egui::RichText::new(name.clone())
+                                            .monospace(),
+                                    );
+                                    if ui.small_button("Rename").clicked() {
+                                        state.renaming = Some(name.clone());
+                                        state.error = None;
+                                    }
+                                    if ui.small_button("Duplicate").clicked() {
+                                        pending = Some(Action::Duplicate(name.clone()));
+                                    }
+                                    if ui.small_button("Delete").clicked() {
+                                        state.pending_delete = Some(name.clone());
+                                        state.error = None;
+                                    }
+                                }
+                            });
+                            ui.add_space(2.0);
+                        }
+                    });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Close").clicked() {
+                        close = true;
+                    }
+                });
+            });
+
+        if let Some(action) = pending {
+            if !self.profiles_load_ok {
+                let state = self.manage_dialog.as_mut().unwrap();
+                state.error = Some(
+                    "profiles.json on disk is unreadable; refusing to overwrite. \
+                     Move it aside manually, then restart."
+                        .into(),
+                );
+                if close {
+                    self.manage_dialog = None;
+                }
+                return;
+            }
+            // Transactional: mutate a clone, save, only assign back on
+            // success. A failed disk write thus leaves both the
+            // in-memory state and the on-disk file unchanged
+            // (invariant 3 in src/profiles.rs).
+            let mut next = self.profiles.clone();
+            let outcome: Result<(), String> = match &action {
+                Action::CommitRename { from, to } => next
+                    .rename(from, to)
+                    .map_err(|e| format!("{}", e)),
+                Action::Duplicate(name) => {
+                    // Pick a unique copy name: "name (copy)", "name (copy 2)", …
+                    let mut candidate = format!("{} (copy)", name);
+                    let mut n = 2;
+                    while next.find(&candidate).is_some() {
+                        candidate = format!("{} (copy {})", name, n);
+                        n += 1;
+                    }
+                    next.duplicate(name, &candidate)
+                        .map_err(|e| format!("{}", e))
+                }
+                Action::Delete(name) => {
+                    next.delete(name).map_err(|e| format!("{}", e))
+                }
+            };
+            let state = self.manage_dialog.as_mut().unwrap();
+            match outcome.and_then(|_| next.save().map_err(|e| format!("save failed: {}", e))) {
+                Ok(()) => {
+                    // Disk write succeeded — now commit the new state.
+                    self.profiles = next;
+                    state.error = None;
+                    match &action {
+                        Action::CommitRename { from, .. } => {
+                            state.renaming = None;
+                            state.rename_buf.remove(from);
+                        }
+                        Action::Delete(_) => {
+                            state.pending_delete = None;
+                        }
+                        Action::Duplicate(_) => {}
+                    }
+                }
+                Err(e) => state.error = Some(e),
+            }
+        }
+
+        if close {
+            self.manage_dialog = None;
+        }
     }
 
     /// Floating editor window for the SNI rotation pool. Opens from the
@@ -2712,5 +3500,101 @@ fn push_log(shared: &Shared, msg: &str) {
     s.log.push_back(line);
     while s.log.len() > LOG_MAX {
         s.log.pop_front();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mhrv_rs::config::Config;
+
+    /// Regression for the desktop write-side extras passthrough.
+    /// `config.rs::unknown_fields_captured_into_extras` proves the
+    /// LOAD side stashes unknown keys into `Config::extras`. This
+    /// test pins the WRITE side: building a `ConfigWire` from a
+    /// `Config` with extras must re-emit those keys verbatim in the
+    /// serialized JSON. Otherwise Save-config and Save-as-profile
+    /// would still silently drop future / hand-edited fields even
+    /// though `Config` carried them through.
+    #[test]
+    fn config_wire_serializes_extras() {
+        let json = r#"{
+            "mode": "apps_script",
+            "auth_key": "MY_REAL_SECRET",
+            "script_id": "X",
+            "future_field_xyz": [1, 2, 3],
+            "another_future_field": {"nested": true, "n": 42}
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        // Sanity check on the load side.
+        assert!(cfg.extras.contains_key("future_field_xyz"));
+
+        // The write path: build a ConfigWire and serialize.
+        let wire = ConfigWire::from(&cfg);
+        let out = serde_json::to_value(&wire).expect("ConfigWire serialize");
+
+        // Unknown keys must appear in the output, with their values
+        // preserved exactly.
+        assert_eq!(
+            out.get("future_field_xyz"),
+            Some(&serde_json::json!([1, 2, 3])),
+            "ConfigWire must re-emit unknown scalar/array fields verbatim"
+        );
+        assert_eq!(
+            out.get("another_future_field"),
+            Some(&serde_json::json!({"nested": true, "n": 42})),
+            "ConfigWire must re-emit unknown object fields verbatim"
+        );
+        // Modelled fields must NOT be duplicated by the extras flatten
+        // (would happen if Config also stuck them in `extras`).
+        assert_eq!(out.get("mode"), Some(&serde_json::json!("apps_script")));
+        assert_eq!(out.get("auth_key"), Some(&serde_json::json!("MY_REAL_SECRET")));
+    }
+
+    /// Carry-through of `block_quic` / `disable_padding` / `enable_batching`
+    /// / `coalesce_*` through ConfigWire. These were the modelled fields
+    /// that the previous ConfigWire was silently dropping.
+    #[test]
+    fn config_wire_serializes_previously_dropped_modeled_fields() {
+        let json = r#"{
+            "mode": "direct",
+            "block_quic": false,
+            "disable_padding": true,
+            "enable_batching": true,
+            "coalesce_step_ms": 25,
+            "coalesce_max_ms": 750
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        let wire = ConfigWire::from(&cfg);
+        let out = serde_json::to_value(&wire).unwrap();
+        // block_quic: default true → emit when false.
+        assert_eq!(out.get("block_quic"), Some(&serde_json::json!(false)));
+        // disable_padding: default false → emit when true.
+        assert_eq!(out.get("disable_padding"), Some(&serde_json::json!(true)));
+        // enable_batching: default false → emit when true.
+        assert_eq!(out.get("enable_batching"), Some(&serde_json::json!(true)));
+        // coalesce_*: default 0 → emit when non-zero.
+        assert_eq!(out.get("coalesce_step_ms"), Some(&serde_json::json!(25)));
+        assert_eq!(out.get("coalesce_max_ms"), Some(&serde_json::json!(750)));
+    }
+
+    /// Defaults must NOT be emitted, so unchanged configs stay clean
+    /// on disk — symmetric to the round-trip test above. This catches
+    /// the failure mode where `skip_serializing_if` is wired to the
+    /// wrong predicate (e.g. `is_false` instead of `is_true`).
+    #[test]
+    fn config_wire_omits_default_values() {
+        let json = r#"{
+            "mode": "direct"
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        let wire = ConfigWire::from(&cfg);
+        let out = serde_json::to_value(&wire).unwrap();
+        // block_quic defaults true → should NOT appear in output.
+        assert!(out.get("block_quic").is_none(), "default block_quic must be omitted");
+        assert!(out.get("disable_padding").is_none());
+        assert!(out.get("enable_batching").is_none());
+        assert!(out.get("coalesce_step_ms").is_none());
+        assert!(out.get("coalesce_max_ms").is_none());
     }
 }

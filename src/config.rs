@@ -370,6 +370,26 @@ pub struct Config {
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
 
+    /// Verbatim JSON for any config.json key this build doesn't model
+    /// (e.g. fields shipped by a newer build of the desktop UI, or
+    /// keys hand-edited by the user that haven't graduated to a real
+    /// field yet). Captured here via `#[serde(flatten)]` so unknown
+    /// fields round-trip cleanly through load → UI form → save
+    /// instead of being silently dropped.
+    ///
+    /// The profile-storage layer in `src/profiles.rs` promises raw
+    /// snapshot preservation; the on-disk snapshot is the same
+    /// `config.json` contents, so any field that makes it through
+    /// this map will also survive a Save-as-profile / Switch round
+    /// trip.
+    ///
+    /// Order matters: `#[serde(flatten)]` must come BEFORE
+    /// `exit_node` so unknown keys collect into the map rather than
+    /// being claimed by it. (`flatten` on a HashMap absorbs every
+    /// not-already-named field.)
+    #[serde(flatten, default)]
+    pub extras: std::collections::BTreeMap<String, serde_json::Value>,
+
     /// Optional second-hop exit node, for sites that block traffic
     /// from Google datacenter IPs (Apps Script's outbound IP space).
     /// Most visibly: Cloudflare-fronted services that flag the GCP IP
@@ -549,7 +569,7 @@ impl Config {
         Ok(cfg)
     }
 
-    fn validate(&self) -> Result<(), ConfigError> {
+    pub fn validate(&self) -> Result<(), ConfigError> {
         let mode = self.mode_kind()?;
         if mode == Mode::AppsScript || mode == Mode::Full {
             if self.auth_key.trim().is_empty() || self.auth_key == "CHANGE_ME_TO_A_STRONG_SECRET" {
@@ -921,6 +941,41 @@ mod rt_tests {
 }"#;
         let cfg: Config = serde_json::from_str(json).unwrap();
         assert!(cfg.force_http1, "force_http1=true must round-trip");
+    }
+
+    /// Unknown / future config.json keys captured into `extras` round-trip
+    /// through serde load. Sibling tests on the write side
+    /// (`config_wire_serializes_extras` /
+    /// `config_wire_serializes_previously_dropped_modeled_fields` /
+    /// `config_wire_omits_default_values`) live in `src/bin/ui.rs`
+    /// since `ConfigWire` is defined there.
+    #[test]
+    fn unknown_fields_captured_into_extras() {
+        let json = r#"{
+            "mode": "apps_script",
+            "auth_key": "secretkey123",
+            "script_id": "X",
+            "future_field_xyz": [1, 2, 3],
+            "another_future_field": {"nested": true}
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert!(
+            cfg.extras.contains_key("future_field_xyz"),
+            "extras must capture unknown scalar/array fields"
+        );
+        assert!(
+            cfg.extras.contains_key("another_future_field"),
+            "extras must capture unknown object fields"
+        );
+        assert_eq!(
+            cfg.extras.get("future_field_xyz").unwrap(),
+            &serde_json::json!([1, 2, 3])
+        );
+        // Modelled fields must NOT end up in extras (otherwise we'd
+        // double-emit them on save).
+        assert!(!cfg.extras.contains_key("mode"));
+        assert!(!cfg.extras.contains_key("auth_key"));
+        assert!(!cfg.extras.contains_key("script_id"));
     }
 
     #[test]

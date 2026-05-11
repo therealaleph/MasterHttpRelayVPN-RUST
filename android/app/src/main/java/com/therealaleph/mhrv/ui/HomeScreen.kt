@@ -39,6 +39,7 @@ import com.therealaleph.mhrv.DEFAULT_SNI_POOL
 import com.therealaleph.mhrv.MhrvConfig
 import com.therealaleph.mhrv.Mode
 import com.therealaleph.mhrv.Native
+import com.therealaleph.mhrv.ProfileStore
 import com.therealaleph.mhrv.ConnectionMode
 import com.therealaleph.mhrv.NetworkDetect
 import com.therealaleph.mhrv.R
@@ -99,8 +100,32 @@ fun HomeScreen(
     // cheap at this write rate, avoids "I tapped Start before saving" bugs.
     var cfg by remember { mutableStateOf(ConfigStore.load(ctx)) }
     fun persist(new: MhrvConfig) {
+        // In-memory state goes through unconditionally so the form
+        // doesn't snap back to old bytes mid-edit. Disk state is
+        // gated on the write succeeding — if config.json didn't
+        // change, the active profile marker also stays put
+        // (invariant 2: clearing active claims the live config
+        // diverged from the marker, which is only true once the
+        // write lands).
         cfg = new
-        ConfigStore.save(ctx, new)
+        val saved = ConfigStore.save(ctx, new)
+        if (!saved) {
+            // Surface the failure; the next snackbar slot will show
+            // it. The in-memory cfg reflects the user's edit, but
+            // config.json on disk does not.
+            scope.launch {
+                snackbar.showSnackbar(
+                    ctx.getString(R.string.snack_config_save_failed),
+                    withDismissAction = true,
+                )
+            }
+            return
+        }
+        // Only after a successful write do we touch the profile
+        // pointer. A failed save would have left config.json with
+        // the OLD bytes (which may still match the active profile),
+        // so clearing active in that case would be a false claim.
+        ProfileStore.clearActiveIfAny(ctx)
     }
 
     // CA install dialog visibility.
@@ -254,6 +279,20 @@ fun HomeScreen(
             ConfigSharingBar(
                 cfg = cfg,
                 onImport = { persist(it) },
+                onSnackbar = { snackbar.showSnackbar(it) },
+            )
+
+            // Multi-profile bar — switch between saved configs without
+            // re-typing deployment IDs / auth keys (e.g. one Apps Script
+            // profile, one Full tunnel profile). Writes through to the
+            // same `config.json` the Rust runtime reads. When a profile
+            // carries a different `ui_lang`, we route through the same
+            // onLangChange path as the top-bar toggle so the activity
+            // recreates with the right locale + RTL/LTR direction.
+            ProfileBar(
+                cfg = cfg,
+                onConfigChange = { cfg = it },
+                onLangChange = onLangChange,
                 onSnackbar = { snackbar.showSnackbar(it) },
             )
 

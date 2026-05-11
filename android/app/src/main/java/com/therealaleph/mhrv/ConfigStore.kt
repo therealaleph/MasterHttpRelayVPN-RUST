@@ -161,6 +161,29 @@ data class MhrvConfig(
 
     /** UI language toggle. Non-Rust; honoured only by the Android wrapper. */
     val uiLang: UiLang = UiLang.AUTO,
+
+    /**
+     * Verbatim JSON for any config.json key this build doesn't model
+     * (e.g. desktop-only `fronting_groups`, `exit_node`,
+     * `request_timeout_secs`, `disable_padding`, `auto_blacklist_*`,
+     * `hosts`, `normalize_x_graphql`, and any future Rust-side field
+     * added before Android catches up).
+     *
+     * Captured by [ConfigStore.loadFromJson] and re-emitted by
+     * [toJson] so a Rust-shaped or future-shaped config survives a
+     * round-trip through the Android UI **without losing fields the
+     * native runtime still needs**. The whole point of the Profile
+     * "raw snapshot preservation" invariant is that the Rust side
+     * sees those fields — and the Rust side reads `config.json`,
+     * which is what we write here.
+     *
+     * Stored as a JSON object string (not Map) so we can splice it
+     * back in via [JSONObject.put] without retyping every key.
+     * Default empty = no passthrough fields.
+     *
+     * Excluded from [toJson]'s output when blank.
+     */
+    val extrasJson: String = "",
 ) {
     /**
      * Extract just the deployment ID from either a full
@@ -279,6 +302,27 @@ data class MhrvConfig(
                 UiLang.FA -> "fa"
                 UiLang.EN -> "en"
             })
+
+            // Splice back any keys this build doesn't model (so they
+            // survive a load → edit → save round-trip and reach the
+            // native runtime, which IS the source of truth for them).
+            // We deliberately don't overwrite our modelled keys — if a
+            // future build models a field that's currently in extras,
+            // the new modelled value wins on the next save.
+            if (extrasJson.isNotBlank()) {
+                try {
+                    val ex = JSONObject(extrasJson)
+                    val it = ex.keys()
+                    while (it.hasNext()) {
+                        val k = it.next()
+                        if (!has(k)) put(k, ex.get(k))
+                    }
+                } catch (_: Throwable) {
+                    // Malformed extras — drop. Captured-at-parse-time
+                    // extras should never be malformed; this guard is
+                    // for the synthetic-cfg path (decode()).
+                }
+            }
         }
         return obj.toString(2)
     }
@@ -301,9 +345,24 @@ object ConfigStore {
         }
     }
 
-    fun save(ctx: Context, cfg: MhrvConfig) {
+    /**
+     * Persist [cfg] to `config.json`. Returns true on success.
+     *
+     * Atomicity: writes to `config.json.tmp` and replaces via the same
+     * NIO/backup pattern as [ProfileStore.save] — never deletes the
+     * existing file without a backup. On failure the previous
+     * `config.json` is preserved untouched (or restored from `.bak`).
+     */
+    fun save(ctx: Context, cfg: MhrvConfig): Boolean {
         val f = File(ctx.filesDir, FILE)
-        f.writeText(cfg.toJson())
+        val tmp = File(ctx.filesDir, "$FILE.tmp")
+        return try {
+            tmp.writeText(cfg.toJson())
+            ProfileStore.atomicReplacePublic(tmp, f)
+        } catch (_: Throwable) {
+            tmp.delete()
+            false
+        }
     }
 
     /** Prefix for encoded config strings so we can detect them in clipboard. */
@@ -387,8 +446,7 @@ object ConfigStore {
         if (trimmed.startsWith("{")) {
             return try {
                 val obj = JSONObject(trimmed)
-                if (!obj.has("mode") && !obj.has("script_ids") && !obj.has("auth_key")) null
-                else loadFromJson(obj)
+                if (!hasConfigShape(obj)) null else loadFromJson(obj)
             } catch (_: Throwable) { null }
         }
         // Try mhrv:// base64 encoded (possibly DEFLATE-compressed).
@@ -397,7 +455,7 @@ object ConfigStore {
             val raw = android.util.Base64.decode(payload, android.util.Base64.NO_WRAP or android.util.Base64.URL_SAFE)
             val text = inflateOrRaw(raw)
             val obj = JSONObject(text)
-            if (!obj.has("mode") && !obj.has("script_ids") && !obj.has("auth_key")) return null
+            if (!hasConfigShape(obj)) return null
             loadFromJson(obj)
         } catch (_: Throwable) {
             null
@@ -408,22 +466,88 @@ object ConfigStore {
     fun looksLikeConfig(text: String): Boolean {
         val t = text.trim()
         if (t.startsWith(HASH_PREFIX)) return true
-        // Also accept raw JSON with a "mode" field.
         if (t.startsWith("{")) {
-            return try { JSONObject(t).has("mode") } catch (_: Throwable) { false }
+            return try { hasConfigShape(JSONObject(t)) } catch (_: Throwable) { false }
         }
         return false
     }
 
+    /**
+     * Acceptance gate for "is this JSON shaped like an mhrv config?".
+     * Accepts any of `mode`, `auth_key`, `script_id` (Rust output),
+     * or `script_ids` (legacy Android output). `script_id` was added
+     * after the parser was taught to read both shapes — without it,
+     * a Rust-shaped config with only `script_id` would be rejected
+     * here even though [loadFromJson] could read it fine.
+     */
+    private fun hasConfigShape(obj: JSONObject): Boolean =
+        obj.has("mode") ||
+            obj.has("auth_key") ||
+            obj.has("script_id") ||
+            obj.has("script_ids")
+
+    /**
+     * Keys this build models. Anything outside this set is captured
+     * into [MhrvConfig.extrasJson] at parse time and re-emitted by
+     * [MhrvConfig.toJson] so the native runtime keeps seeing
+     * desktop-only / future Rust-side fields (`fronting_groups`,
+     * `exit_node`, `request_timeout_secs`, `disable_padding`,
+     * `auto_blacklist_*`, `hosts`, `normalize_x_graphql`,
+     * `google_ip_validation`, `scan_batch_size`, etc.).
+     *
+     * Updating this set is a deliberate act — add a key here only
+     * when [MhrvConfig] gains a real field for it.
+     */
+    private val MODELLED_KEYS: Set<String> = setOf(
+        "mode",
+        "listen_host", "listen_port", "socks5_port",
+        // Both script_id (Rust output) and script_ids (legacy Android
+        // output) are read by us, so both belong in the "modelled" set
+        // — otherwise a Rust-shaped config would have its IDs end up
+        // in extras AND in the parsed appsScriptUrls, getting written
+        // out twice (once as the unmodelled passthrough, once as
+        // script_ids).
+        "script_id", "script_ids",
+        "auth_key",
+        "front_domain", "sni_hosts", "google_ip",
+        "verify_ssl", "log_level", "parallel_relay",
+        "force_http1",
+        "coalesce_step_ms", "coalesce_max_ms",
+        "block_quic", "upstream_socks5",
+        "passthrough_hosts",
+        "tunnel_doh", "bypass_doh_hosts", "block_doh",
+        "youtube_via_relay",
+        "connection_mode", "split_mode", "split_apps", "ui_lang",
+        // Phone-scoped scan defaults toJson() emits. Modelled so they
+        // don't round-trip into extras then collide with toJson's
+        // explicit puts.
+        "fetch_ips_from_api", "max_ips_to_scan",
+    )
+
     /** Parse config from a JSON object — shared by load() and decode(). */
     private fun loadFromJson(obj: JSONObject): MhrvConfig {
-        val ids = obj.optJSONArray("script_ids")?.let { arr ->
-            buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }
-        }?.filter { it.isNotBlank() }.orEmpty()
+        // Read deployment IDs from both `script_id` (Rust output) and
+        // `script_ids` (legacy Android output). Each can be a scalar
+        // string OR an array of strings.
+        val ids = buildList<String> {
+            addAll(readScriptIdList(obj, "script_id"))
+            addAll(readScriptIdList(obj, "script_ids"))
+        }.filter { it.isNotBlank() }.distinct()
         val urls = ids.map { "https://script.google.com/macros/s/$it/exec" }
         val sni = obj.optJSONArray("sni_hosts")?.let { arr ->
             buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }
         }?.filter { it.isNotBlank() }.orEmpty()
+
+        // Capture anything we don't model into extras for passthrough
+        // (raw-snapshot preservation invariant — the native runtime
+        // reads config.json directly and needs every field).
+        val extras = JSONObject()
+        val keys = obj.keys()
+        while (keys.hasNext()) {
+            val k = keys.next()
+            if (k !in MODELLED_KEYS) extras.put(k, obj.get(k))
+        }
+        val extrasStr = if (extras.length() > 0) extras.toString() else ""
 
         return MhrvConfig(
             mode = when (obj.optString("mode", "apps_script")) {
@@ -476,7 +600,33 @@ object ConfigStore {
                 "en" -> UiLang.EN
                 else -> UiLang.AUTO
             },
+            extrasJson = extrasStr,
         )
+    }
+
+    /**
+     * Read a list of deployment IDs from `key`. Accepts:
+     *   - a JSON string scalar ("abc")
+     *   - a JSON array of strings (["abc","def"])
+     *
+     * Mirrors the Rust [ScriptId] enum's `untagged` deserialize so both
+     * shapes interop with desktop. Returns an empty list if the key
+     * is absent or shaped wrong.
+     */
+    private fun readScriptIdList(obj: JSONObject, key: String): List<String> {
+        if (!obj.has(key)) return emptyList()
+        // Array form first.
+        obj.optJSONArray(key)?.let { arr ->
+            return buildList {
+                for (i in 0 until arr.length()) {
+                    val s = arr.optString(i, "")
+                    if (s.isNotBlank()) add(s)
+                }
+            }
+        }
+        // Scalar form.
+        val s = obj.optString(key, "")
+        return if (s.isNotBlank()) listOf(s) else emptyList()
     }
 }
 
