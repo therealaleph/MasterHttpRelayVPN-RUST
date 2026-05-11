@@ -15,6 +15,8 @@ const elements = {
   copyConfig: document.getElementById('copy-config'),
   openReadme: document.getElementById('open-readme'),
   openGuide: document.getElementById('open-guide'),
+  downloadRust: document.getElementById('download-rust'),
+  openReleases: document.getElementById('open-releases'),
 };
 
 function randomHex(length = 32) {
@@ -107,6 +109,35 @@ function copyText(text, label) {
   );
 }
 
+async function downloadLatestRust() {
+  try {
+    const response = await fetch('https://api.github.com/repos/therealaleph/MasterHttpRelayVPN-RUST/releases/latest');
+    if (!response.ok) throw new Error('Failed to fetch releases');
+    const release = await response.json();
+    const assets = release.assets;
+    // Detect platform
+    const platform = navigator.platform.toLowerCase();
+    let assetName;
+    if (platform.includes('win')) {
+      assetName = assets.find(a => a.name.includes('windows') && a.name.endsWith('.exe'));
+    } else if (platform.includes('mac')) {
+      assetName = assets.find(a => a.name.includes('macos') || a.name.includes('darwin'));
+    } else {
+      assetName = assets.find(a => a.name.includes('linux'));
+    }
+    if (!assetName) {
+      showMessage('No suitable binary found for your platform.', true);
+      return;
+    }
+    window.open(assetName.browser_download_url, '_blank');
+    showMessage('Opening download page for latest mhrv-rs binary.');
+  } catch (err) {
+    console.error(err);
+    showMessage('Failed to fetch latest release. Opening releases page.', true);
+    window.open('https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases', '_blank');
+  }
+}
+
 function initListeners() {
   elements.generateKey.addEventListener('click', () => {
     setAuthKey(randomHex(32));
@@ -170,6 +201,9 @@ function initListeners() {
   elements.openGuide.addEventListener('click', () => {
     window.open('https://github.com/therealaleph/MasterHttpRelayVPN-RUST/blob/main/README.md', '_blank');
   });
+
+  elements.downloadRust.addEventListener('click', () => downloadLatestRust());
+  elements.openReleases.addEventListener('click', () => window.open('https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases', '_blank'));
 
   elements.deploymentId.addEventListener('input', renderConfig);
 }

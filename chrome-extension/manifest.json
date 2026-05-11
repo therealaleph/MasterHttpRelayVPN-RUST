@@ -8,5 +8,5 @@
     "default_popup": "popup.html"
   },
   "permissions": ["storage", "clipboardWrite"],
-  "host_permissions": ["https://script.google.com/*", "https://raw.githubusercontent.com/*"]
+  "host_permissions": ["https://script.google.com/*", "https://raw.githubusercontent.com/*", "https://api.github.com/*"]
 }

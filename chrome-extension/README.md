@@ -4,6 +4,7 @@ This Chrome extension is a lightweight helper for the `MasterHttpRelayVPN-RUST` 
 
 ## What it does
 
+- Downloads the latest `mhrv-rs` binary for your platform
 - Generates a strong random `AUTH_KEY`
 - Fetches the latest `Code.gs` from the GitHub repository (with local fallback)
 - Creates a ready-to-deploy `Code.gs` file with the same relay protocol used by the repo
@@ -22,15 +23,16 @@ This Chrome extension is a lightweight helper for the `MasterHttpRelayVPN-RUST` 
 ## Usage
 
 1. Click the extension icon.
-2. Tap **Generate auth key**.
-3. The extension will fetch the latest `Code.gs` from GitHub.
-4. Tap **Copy Code.gs** or **Download Code.gs**.
-5. In `https://script.google.com`, create a new Apps Script project and paste the generated contents.
-6. Deploy as a Web App with:
+2. Tap **Download mhrv-rs** to get the latest binary for your platform.
+3. Tap **Generate auth key**.
+4. The extension will fetch the latest `Code.gs` from GitHub.
+5. Tap **Copy Code.gs** or **Download Code.gs**.
+6. In `https://script.google.com`, create a new Apps Script project and paste the generated contents.
+7. Deploy as a Web App with:
    - **Execute as:** Me
    - **Who has access:** Anyone
-7. Copy the deployment ID and paste it into the Deployment ID field in the extension.
-8. Tap **Copy config snippet** and paste the result into your local `config.json`.
+8. Copy the deployment ID and paste it into the Deployment ID field in the extension.
+9. Tap **Copy config snippet** and paste the result into your local `config.json`.
 
 ## Automation Level
 
