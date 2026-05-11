@@ -1651,13 +1651,36 @@ async fn tunnel_loop(
 }
 
 /// Maximum number of `data` ops a pipelined session keeps in flight
-/// at any one time. Two parallel batches per session is enough to
-/// overlap one Apps Script round-trip with the next on a single TCP
-/// stream — that's the throughput win. Higher depths run into
-/// diminishing returns (server-side seq enforcement serializes the
-/// drains anyway) and burn more Apps Script quota on speculative
-/// polls when a session goes idle.
-const PIPELINE_DEPTH: usize = 2;
+/// at any one time. Matches the TLS connection-pool minimum so a
+/// single active session can fill every warm connection's transit
+/// window when client→Apps Script is the dominant leg (the censored-
+/// network case this project is built for).
+///
+/// Server-side processing stays serial via the per-session seq lock,
+/// so this depth doesn't translate to parallel upstream writes — but
+/// it does parallelize the slow client↔AS leg's RTT. With depth=8 the
+/// slow leg is used for ~8 ops simultaneously instead of one at a
+/// time, which is the actual bottleneck in throttled networks.
+///
+/// Costs that grow with depth:
+///   * Client-side reorder-buffer memory: one oneshot receiver per
+///     in-flight op, bounded by depth. With 64 KB chunks the per-
+///     session worst case is `depth × 64 KB` of payload sitting in
+///     the mux pipeline.
+///   * Per-deployment semaphore pressure: a single session can
+///     occupy up to `depth` of a deployment's 30 concurrent slots
+///     (or spread across deployments via `next_script_id`
+///     round-robin). With many active pipelined sessions this can
+///     contend with new connects.
+///   * Seq-loss cascade: if seq=N is permanently lost (rare —
+///     requires the carrying batch to never reach the server), all
+///     subsequent in-flight seqs wait `SEQ_WAIT_TIMEOUT` for it
+///     before failing.
+///
+/// Idle sessions stay at depth=1 regardless of this constant — see
+/// `target_depth` in `tunnel_loop_pipelined` — so the quota cost of
+/// raising this only applies to actively-streaming sessions.
+const PIPELINE_DEPTH: usize = 8;
 
 /// Pipelined variant of `tunnel_loop`: keeps up to `PIPELINE_DEPTH`
 /// `data` ops in flight per session, each tagged with a per-session
@@ -2547,8 +2570,8 @@ mod tests {
         });
 
         // Receive both ops back-to-back. Loop sends them before
-        // entering the receive phase because PIPELINE_DEPTH=2 and
-        // both reads succeed in the send phase.
+        // entering the receive phase: target_depth ≥ 2 (PIPELINE_DEPTH)
+        // and both reads succeed in the send phase.
         let msg0 = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
             .expect("first op not emitted")
