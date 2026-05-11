@@ -100,26 +100,29 @@ The tunnel shuts down after 6 hours. To start a new session:
 1. Go to the **Actions** tab
 2. Select **Full Tunnel (ngrok)**
 3. Click **Run workflow > Run workflow**
-4. Check the tunnel URL in the logs:
-   - **Free tier with a static domain assigned** (default for new ngrok accounts):
-     the URL is the same across runs — no `CodeFull.gs` update needed.
-   - **Free tier without a static domain** (older ngrok accounts, or after
-     `ngrok config delete-domain`): the URL is a fresh random
-     `*.ngrok-free.app` each time. Copy it and update `TUNNEL_SERVER_URL`
-     in `CodeFull.gs`, then redeploy.
+4. Check the tunnel URL in the logs. Each ngrok free account gets one
+   auto-assigned **dev domain** that's permanent across runs — the URL is the
+   same every time you re-run the workflow, so no `CodeFull.gs` update is
+   needed after the initial setup.
 
 ## Limitations
 
 - Requires an ngrok account (free tier: 1 online tunnel, limited connections
-  per minute)
-- ngrok's free tier now includes one **static domain** per account, so the
-  `*.ngrok-free.app` URL stays the same across workflow runs once assigned.
-  Older accounts that opted out, or accounts that explicitly deleted the
-  domain, get a fresh URL on every run and must redeploy `CodeFull.gs` each
-  session.
-- 6-hour maximum per session (GitHub Actions limit)
+  per minute).
+- **ngrok TLD note**: ngrok handed out `*.ngrok-free.app` domains until early
+  2026; new free-tier accounts now get `*.ngrok-free.dev` instead, with no
+  way to switch back. **Some Iran ISPs block `*.ngrok-free.dev` at the DNS
+  layer.** If your tunnel works on a non-Iran network but `curl` from your
+  Iran network times out at TCP, the `.dev` block is why. Workarounds:
+  - Switch to **cloudflared Quick** (Method 1) — different TLD, often passes
+    where ngrok's `.dev` doesn't.
+  - Switch to **HuggingFace Spaces (Docker)** — run tunnel-node directly on
+    a Space, get a permanent `*.hf.space` URL with no tunnel layer.
+  - Pay for ngrok's $10/mo Personal plan to get a `*.ngrok.app` domain
+    (the older, more widely allowlisted TLD).
+- 6-hour maximum per session (GitHub Actions limit).
 - Slightly higher latency than cloudflared methods (extra hop through ngrok's
-  relay servers)
+  relay servers).
 
 ## Troubleshooting
 

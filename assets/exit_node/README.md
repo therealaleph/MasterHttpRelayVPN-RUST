@@ -94,7 +94,7 @@ sign up for and trust:
 |---|---|
 | **Deno Deploy** ([deno.com/deploy](https://deno.com/deploy)) | Free tier covers personal use. Deploy via `deployctl deploy --prod exit_node.ts` or via GitHub Actions. Same web-standard API as the script expects. |
 | **fly.io** | Free tier with limits. Wrap the handler in a thin server (`Deno.serve(handler)` for Deno or an Express wrapper for Node) + add a Dockerfile. Persistent IPs, picks geographic region. |
-| **Your own VPS** | Run `deno run --allow-net wrapper.ts` where `wrapper.ts` does `Deno.serve({ port: 8443 }, handler)`. Most control, ~$3-5/mo. |
+| **Your own VPS** | Use the included [`wrapper.ts`](wrapper.ts): `deno run --allow-net --allow-env --allow-read wrapper.ts`. Auto-detects Deno / Bun / Node 22+. Most control, ~$3-5/mo. |
 | **Cloudflare Workers** | **Doesn't help.** CF Workers exit through CF's own IP space, which CF anti-bot still flags as worker-internal traffic. |
 
 For most users running locally, Deno Deploy is the fastest setup. For

@@ -94,7 +94,7 @@ config مثال کامل در
 |---|---|
 | **Deno Deploy** ([deno.com/deploy](https://deno.com/deploy)) | free tier برای personal use کافی است. با `deployctl deploy --prod exit_node.ts` یا GitHub Actions deploy کنید. همان web-standard API. |
 | **fly.io** | free tier با محدودیت. handler رو در یک server thin بسته‌بندی کنید (`Deno.serve(handler)` برای Deno یا یک Express wrapper برای Node) + Dockerfile اضافه کنید. IP دائم، region جغرافیایی قابل انتخاب. |
-| **VPS شخصی خودت** | `deno run --allow-net wrapper.ts` که `wrapper.ts` کارش `Deno.serve({ port: 8443 }, handler)` است. حداکثر کنترل، ~۳-۵ دلار در ماه. |
+| **VPS شخصی خودت** | از فایل آماده [`wrapper.ts`](wrapper.ts) استفاده کن: `deno run --allow-net --allow-env --allow-read wrapper.ts`. خودکار Deno / Bun / Node 22+ تشخیص می‌ده. حداکثر کنترل، ~۳-۵ دلار در ماه. |
 | **Cloudflare Workers** | **کمک نمی‌کنه.** CF Workers از IP space خود CF خروج می‌کنن، که CF anti-bot هنوز به‌عنوان worker-internal flag می‌کنه. |
 
 برای اکثر کاربرانی که مسیر local رو اجرا می‌کنن، Deno Deploy

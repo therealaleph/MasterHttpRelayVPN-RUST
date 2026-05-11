@@ -836,17 +836,18 @@ fn form_row(
     ui: &mut egui::Ui,
     label: &str,
     hover: Option<&str>,
-    widget: impl FnOnce(&mut egui::Ui),
+    widget: impl FnOnce(&mut egui::Ui, egui::Id),
 ) {
     ui.horizontal(|ui| {
         let resp = ui.add_sized(
             [120.0, 20.0],
             egui::Label::new(egui::RichText::new(label).color(egui::Color32::from_gray(200))),
         );
+        let label_id = resp.id;
         if let Some(h) = hover {
             resp.on_hover_text(h);
         }
-        widget(ui);
+        widget(ui, label_id);
     });
 }
 
@@ -935,7 +936,7 @@ impl eframe::App for App {
                     "apps_script: DPI bypass via Apps Script relay (needs cert).\n\
                      full: tunnel ALL traffic through Apps Script + tunnel node (no cert needed).\n\
                      direct: SNI-rewrite tunnel only — no relay (Google edge + any fronting_groups)."
-                ), |ui| {
+                ), |ui, _label_id| {
                     egui::ComboBox::from_id_source("mode")
                         .selected_text(match self.form.mode.as_str() {
                             "direct" | "google_only" => "Direct (no relay)",
@@ -988,11 +989,12 @@ impl eframe::App for App {
                     form_row(ui, "Deployment IDs", Some(
                         "One deployment ID per line. Proxy round-robins between them and sidelines \
                          any ID that hits its daily quota for 10 minutes before retrying."
-                    ), |ui| {
+                    ), |ui, label_id| {
                         ui.add(egui::TextEdit::multiline(&mut self.form.script_id)
                             .hint_text("one deployment ID per line")
                             .desired_width(f32::INFINITY)
-                            .desired_rows(3));
+                            .desired_rows(3))
+                        .labelled_by(label_id);
                     });
 
                     let id_count = self.form.script_id
@@ -1014,19 +1016,21 @@ impl eframe::App for App {
 
                     form_row(ui, "Auth key", Some(
                         "Same value as AUTH_KEY inside your Code.gs."
-                    ), |ui| {
+                    ), |ui, label_id| {
                         ui.add(egui::TextEdit::singleline(&mut self.form.auth_key)
                             .password(!self.form.show_auth_key)
-                            .desired_width(f32::INFINITY));
+                            .desired_width(f32::INFINITY))
+                        .labelled_by(label_id);
                     });
                 });
             });
 
             // ── Section: Network ──────────────────────────────────────────
             section(ui, "Network", |ui| {
-                form_row(ui, "Google IP", None, |ui| {
+                form_row(ui, "Google IP", None, |ui, label_id| {
                     ui.add(egui::TextEdit::singleline(&mut self.form.google_ip)
-                        .desired_width(f32::INFINITY));
+                        .desired_width(f32::INFINITY))
+                    .labelled_by(label_id);
                 });
                 ui.horizontal(|ui| {
                     ui.add_space(120.0 + 8.0);
@@ -1064,9 +1068,10 @@ impl eframe::App for App {
                     }
                 });
 
-                form_row(ui, "Front domain", None, |ui| {
+                form_row(ui, "Front domain", None, |ui, label_id| {
                     ui.add(egui::TextEdit::singleline(&mut self.form.front_domain)
-                        .desired_width(f32::INFINITY));
+                        .desired_width(f32::INFINITY))
+                    .labelled_by(label_id);
                 });
 
                 // Network sharing: phones, tablets, other laptops on the
@@ -1102,7 +1107,7 @@ impl eframe::App for App {
                      other devices then point their HTTP / SOCKS5 proxy at the \
                      LAN IP shown below. Make sure your firewall lets in the proxy \
                      port — macOS pops up a Firewall prompt the first time."
-                ), |ui| {
+                ), |ui, _label_id| {
                     if is_custom_bind {
                         // The user manually wrote a specific bind IP —
                         // don't let the checkbox stomp on it. Show what
@@ -1168,11 +1173,15 @@ impl eframe::App for App {
                         egui::Label::new(egui::RichText::new("Ports")
                             .color(egui::Color32::from_gray(200))),
                     );
-                    ui.label(egui::RichText::new("HTTP").small());
-                    ui.add(egui::TextEdit::singleline(&mut self.form.listen_port).desired_width(70.0));
+                    let http_label = ui.label(egui::RichText::new("HTTP").small());
+                    ui.add(egui::TextEdit::singleline(&mut self.form.listen_port)
+                        .desired_width(70.0))
+                    .labelled_by(http_label.id);
                     ui.add_space(10.0);
-                    ui.label(egui::RichText::new("SOCKS5").small());
-                    ui.add(egui::TextEdit::singleline(&mut self.form.socks5_port).desired_width(70.0));
+                    let socks_label = ui.label(egui::RichText::new("SOCKS5").small());
+                    ui.add(egui::TextEdit::singleline(&mut self.form.socks5_port)
+                        .desired_width(70.0))
+                    .labelled_by(socks_label.id);
                 });
             });
 
@@ -1197,23 +1206,24 @@ impl eframe::App for App {
                          When set, non-HTTP / raw-TCP traffic (Telegram MTProto, IMAP, SSH, …) \
                          is chained through it instead of direct. HTTP/HTTPS still go through \
                          the Apps Script relay."
-                    ), |ui| {
+                    ), |ui, label_id| {
                         ui.add(egui::TextEdit::singleline(&mut self.form.upstream_socks5)
                             .hint_text("empty = direct; 127.0.0.1:50529 for local xray")
-                            .desired_width(f32::INFINITY));
+                            .desired_width(f32::INFINITY))
+                        .labelled_by(label_id);
                     });
 
                     form_row(ui, "Parallel dispatch", Some(
                         "Fire N Apps Script IDs in parallel per request and take the first \
                          response. 0/1 = off. 2-3 kills long-tail latency at N× quota cost. \
                          Only effective with multiple IDs configured."
-                    ), |ui| {
+                    ), |ui, _label_id| {
                         ui.add(egui::DragValue::new(&mut self.form.parallel_relay)
                             .speed(1)
                             .range(0..=8));
                     });
 
-                    form_row(ui, "Log level", None, |ui| {
+                    form_row(ui, "Log level", None, |ui, _label_id| {
                         egui::ComboBox::from_id_source("loglevel")
                             .selected_text(&self.form.log_level)
                             .show_ui(ui, |ui| {
@@ -1965,11 +1975,19 @@ impl App {
                         for (i, row) in self.form.sni_pool.iter_mut().enumerate() {
                             ui.horizontal(|ui| {
                                 ui.checkbox(&mut row.enabled, "");
+                                let sni_label = ui.add_sized(
+                                    [0.0, 0.0],
+                                    egui::Label::new(
+                                        egui::RichText::new(format!("SNI name {}", i))
+                                            .color(egui::Color32::TRANSPARENT),
+                                    ),
+                                );
                                 ui.add(
                                     egui::TextEdit::singleline(&mut row.name)
                                         .desired_width(NAME_W)
                                         .font(egui::TextStyle::Monospace),
-                                );
+                                )
+                                .labelled_by(sni_label.id);
                                 let status_txt = match probe_map.get(&row.name) {
                                     Some(SniProbeState::Ok(ms)) => {
                                         egui::RichText::new(format!("ok  {} ms", ms))
@@ -2024,11 +2042,19 @@ impl App {
 
                 ui.separator();
                 ui.horizontal(|ui| {
+                    let custom_label = ui.add_sized(
+                        [0.0, 0.0],
+                        egui::Label::new(
+                            egui::RichText::new("Custom SNI")
+                                .color(egui::Color32::TRANSPARENT),
+                        ),
+                    );
                     ui.add(
                         egui::TextEdit::singleline(&mut self.form.sni_custom_input)
                             .hint_text("add a custom SNI (e.g. translate.google.com)")
                             .desired_width(280.0),
-                    );
+                    )
+                    .labelled_by(custom_label.id);
                     let add_clicked = ui.button("+ Add").clicked();
                     if add_clicked {
                         let new_name = self.form.sni_custom_input.trim().to_string();
