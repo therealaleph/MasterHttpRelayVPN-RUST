@@ -2495,22 +2495,6 @@ where
 
     tracing::info!("relay {} {}", method, url);
 
-    // For GETs without a body, take the range-parallel path — probes
-    // with `Range: bytes=0-<chunk>`, and if the origin supports ranges,
-    // fetches the rest in parallel 256 KB chunks. This is what lets
-    // YouTube video streaming / gvt1.com Chrome-updates / big static
-    // files not stall waiting on one ~2s Apps Script call per MB.
-    // Anything with a body (POST/PUT/PATCH) goes through the normal
-    // relay path — range semantics on mutating requests are undefined
-    // and would break form submissions.
-    let response = if method.eq_ignore_ascii_case("GET") && body.is_empty() {
-        fronter
-            .relay_parallel_range(&method, &url, &headers, &body)
-            .await
-    } else {
-        fronter.relay(&method, &url, &headers, &body).await
-    };
-
     // CORS response-header injection. The preflight short-circuit
     // above handles `OPTIONS`, but the *actual* fetch that follows
     // also needs CORS-compliant headers on the way back, or the
@@ -2529,13 +2513,39 @@ where
     // the headers and adding them would be noise. The relay response
     // is otherwise byte-identical, so this never affects non-browser
     // clients (curl, wget, app-level HTTP clients).
-    let response = if let Some(origin) = header_value(&headers, "origin") {
-        inject_cors_response_headers(&response, origin)
-    } else {
-        response
+    let cors_origin = header_value(&headers, "origin").map(|s| s.to_string());
+    let transform_head = |head: &[u8]| -> Vec<u8> {
+        match cors_origin.as_deref() {
+            Some(origin) => inject_cors_into_head(head, origin).unwrap_or_else(|| head.to_vec()),
+            None => head.to_vec(),
+        }
     };
 
-    stream.write_all(&response).await?;
+    // For GETs without a body, take the range-parallel path — probes
+    // with `Range: bytes=0-<chunk>`, and if the origin supports ranges,
+    // fetches the rest in parallel 256 KB chunks. This is what lets
+    // YouTube video streaming / gvt1.com Chrome-updates / big static
+    // files not stall waiting on one ~2s Apps Script call per MB.
+    // Anything with a body (POST/PUT/PATCH) goes through the normal
+    // relay path — range semantics on mutating requests are undefined
+    // and would break form submissions.
+    //
+    // The range-parallel call writes directly to the stream so files
+    // above Apps Script's single-GET ceiling (~40 MiB) can stream
+    // through chunk-by-chunk instead of being buffered into one giant
+    // `Vec<u8>` (which previously failed for 100 MiB+ downloads — #1042).
+    if method.eq_ignore_ascii_case("GET") && body.is_empty() {
+        fronter
+            .relay_parallel_range_to(stream, &method, &url, &headers, &body, transform_head)
+            .await?;
+    } else {
+        let response = fronter.relay(&method, &url, &headers, &body).await;
+        let response = match cors_origin.as_deref() {
+            Some(origin) => inject_cors_response_headers(&response, origin),
+            None => response,
+        };
+        stream.write_all(&response).await?;
+    }
     stream.flush().await?;
 
     // Keep-alive unless the client asked to close.
@@ -2614,22 +2624,43 @@ fn inject_cors_response_headers(response: &[u8], origin: &str) -> Vec<u8> {
     else {
         return response.to_vec();
     };
-    let head = &response[..idx];
+    let head_with_terminator = &response[..idx + sep.len()];
     let body = &response[idx + sep.len()..];
 
-    // Rebuild the header block, dropping any pre-existing
-    // `Access-Control-*` lines so the destination's value can't
-    // conflict with ours.
-    let head_str = match std::str::from_utf8(head) {
-        Ok(s) => s,
-        Err(_) => return response.to_vec(),
+    let Some(mut buf) = inject_cors_into_head(head_with_terminator, origin) else {
+        return response.to_vec();
     };
+    buf.extend_from_slice(body);
+    buf
+}
+
+/// Head-only variant of `inject_cors_response_headers`. Takes the head
+/// block of an HTTP/1.x response *including* the trailing `\r\n\r\n`
+/// separator and returns a rewritten head block, again including the
+/// `\r\n\r\n` terminator. Returns `None` if the head block isn't valid
+/// UTF-8 — the caller should pass the original bytes through unchanged
+/// in that case.
+///
+/// Split out so the range-parallel streaming path can apply CORS
+/// rewrites to the response head before the body has been assembled
+/// (where the buffered path could just rewrite the finished
+/// head+body blob).
+pub(crate) fn inject_cors_into_head(head_with_terminator: &[u8], origin: &str) -> Option<Vec<u8>> {
+    let sep = b"\r\n\r\n";
+    let head = head_with_terminator
+        .strip_suffix(sep)
+        .unwrap_or(head_with_terminator);
+    let head_str = std::str::from_utf8(head).ok()?;
+
     let mut out = String::with_capacity(head.len() + 256);
     let mut lines = head_str.split("\r\n");
     if let Some(status) = lines.next() {
         out.push_str(status);
         out.push_str("\r\n");
     }
+    // Rebuild the header block, dropping any pre-existing
+    // `Access-Control-*` lines so the destination's value can't
+    // conflict with ours.
     for line in lines {
         let lower = line.to_ascii_lowercase();
         if lower.starts_with("access-control-") {
@@ -2651,9 +2682,7 @@ fn inject_cors_response_headers(response: &[u8], origin: &str) -> Vec<u8> {
     out.push_str("Vary: Origin\r\n");
     out.push_str("\r\n");
 
-    let mut buf = out.into_bytes();
-    buf.extend_from_slice(body);
-    buf
+    Some(out.into_bytes())
 }
 
 fn expects_100_continue(headers: &[(String, String)]) -> bool {
@@ -2851,15 +2880,24 @@ async fn do_plain_http(
     // Plain HTTP proxy path — same range-parallel strategy as the
     // MITM-HTTPS path above. Large downloads on port 80 (package
     // mirrors, video poster streams, etc.) need the same acceleration
-    // or the relay stalls per-chunk.
-    let response = if method.eq_ignore_ascii_case("GET") && body.is_empty() {
+    // or the relay stalls per-chunk. No CORS injection on this path —
+    // plain-http proxy traffic isn't a browser-MITM flow, so the
+    // origin's response headers go through unchanged.
+    if method.eq_ignore_ascii_case("GET") && body.is_empty() {
         fronter
-            .relay_parallel_range(&method, &url, &headers, &body)
-            .await
+            .relay_parallel_range_to(
+                &mut sock,
+                &method,
+                &url,
+                &headers,
+                &body,
+                |head: &[u8]| head.to_vec(),
+            )
+            .await?;
     } else {
-        fronter.relay(&method, &url, &headers, &body).await
-    };
-    sock.write_all(&response).await?;
+        let response = fronter.relay(&method, &url, &headers, &body).await;
+        sock.write_all(&response).await?;
+    }
     sock.flush().await?;
     Ok(())
 }
