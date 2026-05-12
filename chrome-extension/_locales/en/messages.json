@@ -1,0 +1,8 @@
+{
+  "extName": {
+    "message": "mhrv-rs Apps Script Helper"
+  },
+  "extDescription": {
+    "message": "Generate Google Apps Script deployment code and configuration for mhrv-rs."
+  }
+}

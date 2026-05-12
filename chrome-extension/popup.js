@@ -1,5 +1,6 @@
 const AUTH_KEY_PLACEHOLDER = 'CHANGE_ME_TO_A_STRONG_SECRET';
 const CODE_FILE = 'Code.gs';
+const CODE_FILE_URL = 'https://raw.githubusercontent.com/therealaleph/MasterHttpRelayVPN-RUST/main/assets/apps_script/Code.gs';
 let codeTemplate = '';
 let messages = {};
 
