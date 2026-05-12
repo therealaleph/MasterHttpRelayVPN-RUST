@@ -43,37 +43,35 @@ This Chrome extension is a lightweight helper for the `MasterHttpRelayVPN-RUST` 
 8. Copy the deployment ID and paste it into the Deployment ID field in the extension.
 9. Tap **Copy config snippet** and paste the result into your local `config.json`.
 
-## Automation Level
+## Testing the Extension
 
-The extension automates as much as possible within Chrome extension limitations:
+### Manual Testing
+1. Load the extension in Chrome as described in Installation
+2. Click the extension icon
+3. Test language switching (English ↔ Persian)
+4. Generate an auth key and verify it's 64 characters
+5. Test copying functionality (key, script, config)
+6. Test download buttons (should open new tabs)
+7. Verify RTL layout works in Persian mode
 
-- ✅ Generates secure keys
-- ✅ Fetches latest script code from repo
-- ✅ Prepares deployment-ready code
-- ✅ Generates config snippets
-- ❌ Cannot automatically deploy to Google Apps Script (requires manual paste and deploy due to OAuth/security restrictions)
+### Automated Testing
+Open `test.html` in a browser to test the UI without Chrome extension restrictions:
+```bash
+# In chrome-extension folder
+python3 -m http.server 8000
+# Then open http://localhost:8000/test.html
+```
 
-Full automation of Apps Script deployment would require:
-- Google OAuth integration
-- Apps Script API access
-- Publishing as a verified Chrome extension
-- User consent for Google account access
+### Validation Checks
+```bash
+# Check JSON syntax
+python3 -m json.tool manifest.json
+python3 -m json.tool messages.json
 
-This is beyond the scope of a simple helper extension.
+# Check JavaScript syntax
+node -c popup.js
 
-## Notes
-
-- The extension fetches `Code.gs` from GitHub on load, ensuring you always get the latest version.
-- If GitHub is blocked, it falls back to the bundled local copy.
-- The extension does not store secret values persistently in Chrome storage.
-- If your network does not allow `script.google.com`, use the project in `direct` mode first and then follow the guide.
-
-## Recommended workflow
-
-- Use the extension to avoid manual editing mistakes.
-- Keep the generated `AUTH_KEY` secret.
-- If you need full tunnel mode later, use the repo docs to deploy `CodeFull.gs` or `Code.cfw.gs`.
-
-## Limitations
-
-This helper is intentionally minimal and does not perform OAuth on behalf of your Google account. It simplifies the code generation and setup flow but still requires a manual Apps Script deployment step inside Google.
+# Verify file structure
+ls -la
+# Should show: Code.gs, manifest.json, messages.json, popup.css, popup.html, popup.js, README.md, test.html
+```
