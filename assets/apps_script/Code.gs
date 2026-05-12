@@ -189,13 +189,27 @@ function _doSingle(req) {
   }
 
   // ── Normal relay (cache disabled or unavailable) ────────
-  var opts = _buildOpts(req);
-  var resp = UrlFetchApp.fetch(req.u, opts);
-  return _json({
-    s: resp.getResponseCode(),
-    h: _respHeaders(resp),
-    b: Utilities.base64Encode(resp.getContent()),
-  });
+  // Wrap the fetch + body encode in try/catch so any failure surfaces as
+  // a JSON error envelope the Rust client can parse. Without this, throws
+  // from UrlFetchApp.fetch (URL too long, payload too large, quota
+  // exhausted, 6-minute execution timeout) or from base64Encode (response
+  // body near Apps Script's ~50 MB ceiling can blow the V8 heap during
+  // encode) propagate unhandled, and Apps Script serves its default
+  // `<title>Web App</title>` HTML error page — which the client then
+  // reports as "Relay failed: bad response: no json in: <title>Web App>..."
+  // and the user has no signal as to the actual cause. Mirrors the
+  // per-item try/catch in _doBatch below.
+  try {
+    var opts = _buildOpts(req);
+    var resp = UrlFetchApp.fetch(req.u, opts);
+    return _json({
+      s: resp.getResponseCode(),
+      h: _respHeaders(resp),
+      b: Utilities.base64Encode(resp.getContent()),
+    });
+  } catch (err) {
+    return _json({ e: "fetch failed: " + String(err) });
+  }
 }
 
 // ── Batch Request ──────────────────────────────────────────
