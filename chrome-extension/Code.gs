@@ -46,7 +46,7 @@ const AUTH_KEY = "CHANGE_ME_TO_A_STRONG_SECRET";
 // (Inspired by #365 Section 3, mhrv-rs v1.8.0+.)
 const DIAGNOSTIC_MODE = false;
 
-// ── Optional Spreadsheet Cache ────────────────────────────────
+// ── Optional Spreadsheet Cache ──────────────────────────────
 // Set to a valid Spreadsheet ID to enable response caching.
 // Leave as-is to disable caching entirely (zero overhead).
 const CACHE_SPREADSHEET_ID = "CHANGE_ME_TO_CACHE_SPREADSHEET_ID";
@@ -91,12 +91,10 @@ const VARY_KEY_HEADERS = ["accept-encoding", "accept-language"];
 // `masterking32/MasterHttpRelayVPN@3094288`.
 const SKIP_HEADERS = {
   host: 1, connection: 1, "content-length": 1,
-  "transfer-encoding": 1, "proxy-connection": 1,
-  "proxy-authorization": 1,
+  "transfer-encoding": 1, "proxy-connection": 1, "proxy-authorization": 1,
   "priority": 1, te: 1,
-  "x-forwarded-for": 1, "x-forwarded-host": 1,
-  "x-forwarded-proto": 1, "x-forwarded-port": 1,
-  "x-real-ip": 1, "forwarded": 1, "via": 1,
+  "x-forwarded-for": 1, "x-forwarded-host": 1, "x-forwarded-proto": 1,
+  "x-forwarded-port": 1, "x-real-ip": 1, "forwarded": 1, "via": 1,
 };
 
 // Methods we consider safe to replay if `UrlFetchApp.fetchAll()` raises.
@@ -119,7 +117,7 @@ const DECOY_HTML =
   '<body><p>The script completed but did not return anything.</p>' +
   '</body></html>';
 
-// ── Request Handlers ─────────────────────────────────────────
+// ── Request Handlers ────────────────────────────────────────
 
 function _decoyOrError(jsonBody) {
   if (DIAGNOSTIC_MODE) return _json(jsonBody);
@@ -191,13 +189,27 @@ function _doSingle(req) {
   }
 
   // ── Normal relay (cache disabled or unavailable) ────────
-  var opts = _buildOpts(req);
-  var resp = UrlFetchApp.fetch(req.u, opts);
-  return _json({
-    s: resp.getResponseCode(),
-    h: _respHeaders(resp),
-    b: Utilities.base64Encode(resp.getContent()),
-  });
+  // Wrap the fetch + body encode in try/catch so any failure surfaces as
+  // a JSON error envelope the Rust client can parse. Without this, throws
+  // from UrlFetchApp.fetch (URL too long, payload too large, quota
+  // exhausted, 6-minute execution timeout) or from base64Encode (response
+  // body near Apps Script's ~50 MB ceiling can blow the V8 heap during
+  // encode) propagate unhandled, and Apps Script serves its default
+  // `<title>Web App</title>` HTML error page — which the client then
+  // reports as "Relay failed: bad response: no json in: <title>Web App>..."
+  // and the user has no signal as to the actual cause. Mirrors the
+  // per-item try/catch in _doBatch below.
+  try {
+    var opts = _buildOpts(req);
+    var resp = UrlFetchApp.fetch(req.u, opts);
+    return _json({
+      s: resp.getResponseCode(),
+      h: _respHeaders(resp),
+      b: Utilities.base64Encode(resp.getContent()),
+    });
+  } catch (err) {
+    return _json({ e: "fetch failed: " + String(err) });
+  }
 }
 
 // ── Batch Request ──────────────────────────────────────────
@@ -332,7 +344,7 @@ function _json(obj) {
 
 // ═══════════════════════════════════════════════════════════
 //  SPREADSHEET CACHE — SHEET MANAGEMENT
-// ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
 
 function _initCacheSheet() {
   if (CACHE_SPREADSHEET_ID === "CHANGE_ME_TO_CACHE_SPREADSHEET_ID") {
@@ -430,8 +442,10 @@ function _getHeaderCaseInsensitive(headers, targetKey) {
  * headers that are known to cause response variation. This handles
  * Vary: Accept-Encoding and Vary: Accept-Language without ever
  * inspecting the response.
+ *
  * Values are lowercased and whitespace-stripped so semantically
  * identical requests from different clients produce the same hash.
+ * Missing and empty headers both map to "<none>" (same semantic).
  */
 function _getCacheKey(url, reqHeaders) {
   var parts = [url];

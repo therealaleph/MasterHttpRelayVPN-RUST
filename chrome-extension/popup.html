@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" dir="ltr">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -8,56 +8,66 @@
 </head>
 <body>
   <div class="container">
+    <header>
+      <div class="header-row">
+        <h1>mhrv-rs Apps Script Helper</h1>
+        <select id="language-select">
+          <option value="en">English</option>
+          <option value="fa">فارسی</option>
+        </select>
+      </div>
+      <p>Generate Google Apps Script deployment code and configuration for mhrv-rs.</p>
+    </header>
+
     <section class="step">
-      <h2>Step 0: Download mhrv-rs</h2>
-      <p>Get the latest Rust binary for your platform.</p>
+      <h2 data-i18n="step0Title">Step 0: Download mhrv-rs</h2>
+      <p data-i18n="step0Desc">Get the latest Rust binary for your platform.</p>
       <div class="row">
-        <button id="download-rust">Download mhrv-rs</button>
-        <button id="open-releases" class="secondary">View all releases</button>
+        <button id="download-rust" data-i18n="downloadRust">Download mhrv-rs</button>
+        <button id="open-releases" class="secondary" data-i18n="viewReleases">View all releases</button>
       </div>
     </section>
 
     <section class="step">
-      <h2>Step 1: Generate a strong auth key</h2>
-      <p>This secret is used by the Apps Script and your local config.</p>
+      <h2 data-i18n="step1Title">Step 1: Generate a strong auth key</h2>
+      <p data-i18n="step1Desc">This secret is used by the Apps Script and your local config.</p>
       <div class="row">
-        <button id="generate-key">Generate auth key</button>
-        <button id="copy-key" class="secondary">Copy key</button>
+        <button id="generate-key" data-i18n="generateKey">Generate auth key</button>
+        <button id="copy-key" class="secondary" data-i18n="copyKey">Copy key</button>
       </div>
       <textarea id="auth-key" readonly aria-label="Generated auth key"></textarea>
     </section>
 
     <section class="step">
-      <h2>Step 2: Build your Apps Script</h2>
-      <p>Open Apps Script, paste the generated code, and deploy as a Web app.</p>
+      <h2 data-i18n="step2Title">Step 2: Build your Apps Script</h2>
+      <p data-i18n="step2Desc">Open Apps Script, paste the generated code, and deploy as a Web app.</p>
       <div class="row">
-        <button id="copy-script">Copy Code.gs</button>
-        <button id="download-script" class="secondary">Download Code.gs</button>
-        <button id="open-script" class="secondary">Open Apps Script</button>
+        <button id="copy-script" data-i18n="copyScript">Copy Code.gs</button>
+        <button id="download-script" class="secondary" data-i18n="downloadScript">Download Code.gs</button>
+        <button id="open-script" class="secondary" data-i18n="openScript">Open Apps Script</button>
       </div>
-      <div class="notice">The script is loaded from the extension package and includes the same relay protocol used by mhrv-rs.</div>
+      <div class="progress" id="script-progress"></div>
+      <div class="notice" data-i18n="scriptNotice">The script is loaded from the extension package and includes the same relay protocol used by mhrv-rs.</div>
     </section>
 
     <section class="step">
-      <h2>Step 3: Create config</h2>
-      <p>Paste your Deployment ID and the auth key into your local config.</p>
-      <label>
-        Deployment ID
-        <input id="deployment-id" type="text" placeholder="YOUR_APPS_SCRIPT_DEPLOYMENT_ID" />
-      </label>
+      <h2 data-i18n="step3Title">Step 3: Create config</h2>
+      <p data-i18n="step3Desc">Paste your Deployment ID and the auth key into your local config.</p>
+      <label data-i18n="deploymentIdLabel">Deployment ID</label>
+      <input id="deployment-id" type="text" data-i18n-placeholder="deploymentIdPlaceholder" placeholder="YOUR_APPS_SCRIPT_DEPLOYMENT_ID" />
       <div class="row">
-        <button id="copy-config">Copy config snippet</button>
+        <button id="copy-config" data-i18n="copyConfig">Copy config snippet</button>
       </div>
       <textarea id="config-json" readonly aria-label="Generated config snippet"></textarea>
     </section>
 
     <section class="step note">
-      <h2>Quick links</h2>
+      <h2 data-i18n="linksTitle">Quick links</h2>
       <div class="row small">
-        <button id="open-readme">View app docs</button>
-        <button id="open-guide" class="secondary">Open setup guide</button>
+        <button id="open-readme" data-i18n="viewDocs">View app docs</button>
+        <button id="open-guide" class="secondary" data-i18n="setupGuide">Open setup guide</button>
       </div>
-      <p>Use a local browser proxy such as Proxy SwitchyOmega for Chrome/Edge.</p>
+      <p data-i18n="proxyNote">Use a local browser proxy such as Proxy SwitchyOmega for Chrome/Edge.</p>
     </section>
 
     <footer>

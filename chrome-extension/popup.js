@@ -1,8 +1,10 @@
 const AUTH_KEY_PLACEHOLDER = 'CHANGE_ME_TO_A_STRONG_SECRET';
 const CODE_FILE = 'Code.gs';
 let codeTemplate = '';
+let messages = {};
 
 const elements = {
+  languageSelect: document.getElementById('language-select'),
   authKey: document.getElementById('auth-key'),
   deploymentId: document.getElementById('deployment-id'),
   configJson: document.getElementById('config-json'),
@@ -17,7 +19,69 @@ const elements = {
   openGuide: document.getElementById('open-guide'),
   downloadRust: document.getElementById('download-rust'),
   openReleases: document.getElementById('open-releases'),
+  scriptProgress: document.getElementById('script-progress'),
 };
+
+async function loadMessages() {
+  try {
+    const response = await fetch(chrome.runtime.getURL('messages.json'));
+    messages = await response.json();
+  } catch (err) {
+    console.error('Failed to load messages:', err);
+    // Fallback messages
+    messages = {
+      en: {
+        keyGenerated: "Auth key generated. Paste it into Apps Script and config.",
+        copied: "Copied {item}.",
+        scriptDownloaded: "Downloaded Code.gs for Apps Script deployment.",
+        codeLoaded: "Code.gs loaded from repository.",
+        codeLoadedFallback: "Failed to load Code.gs from repository. Using local fallback.",
+        downloadError: "Failed to fetch latest release. Opening releases page.",
+        downloadSuccess: "Opening download page for latest mhrv-rs binary.",
+        scriptNotLoaded: "Script template not loaded yet.",
+        generateKeyFirst: "Generate an auth key first.",
+        copyError: "Could not copy {item}.",
+        fetchError: "Failed to load Code.gs at all."
+      }
+    };
+  }
+}
+
+function getMessage(key, params = {}) {
+  const lang = elements.languageSelect.value;
+  let message = messages[lang]?.[key] || messages.en?.[key] || key;
+  
+  // Replace placeholders
+  Object.keys(params).forEach(param => {
+    message = message.replace(`{${param}}`, params[param]);
+  });
+  
+  return message;
+}
+
+function updateUILanguage() {
+  const lang = elements.languageSelect.value;
+  document.documentElement.lang = lang;
+  document.documentElement.dir = lang === 'fa' ? 'rtl' : 'ltr';
+  
+  // Update all elements with data-i18n attributes
+  document.querySelectorAll('[data-i18n]').forEach(el => {
+    const key = el.getAttribute('data-i18n');
+    el.textContent = getMessage(key);
+  });
+  
+  // Update placeholders
+  document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
+    const key = el.getAttribute('data-i18n-placeholder');
+    el.placeholder = getMessage(key);
+  });
+  
+  // Update title
+  document.title = getMessage('appName');
+  
+  // Re-render config to update any language-specific text
+  renderConfig();
+}
 
 function randomHex(length = 32) {
   const array = new Uint8Array(length);
@@ -29,7 +93,7 @@ function randomHex(length = 32) {
 
 function showMessage(text, isError = false) {
   elements.message.textContent = text;
-  elements.message.style.color = isError ? '#b91c1c' : '#0f172a';
+  elements.message.className = isError ? 'error' : '';
 }
 
 function renderConfig() {
@@ -79,14 +143,15 @@ function setAuthKey(key) {
 }
 
 async function loadTemplate() {
+  elements.scriptProgress.style.display = 'block';
   try {
     const response = await fetch(CODE_FILE_URL);
     if (!response.ok) throw new Error('Failed to fetch Code.gs');
     codeTemplate = await response.text();
     renderScript();
-    showMessage('Code.gs loaded from repository.');
+    showMessage(getMessage('codeLoaded'));
   } catch (err) {
-    showMessage('Failed to load Code.gs from repository. Using local fallback.', true);
+    showMessage(getMessage('codeLoadedFallback'), true);
     console.error(err);
     // Fallback to local if fetch fails
     try {
@@ -94,17 +159,19 @@ async function loadTemplate() {
       codeTemplate = await localResponse.text();
       renderScript();
     } catch (localErr) {
-      showMessage('Could not load Code.gs at all.', true);
+      showMessage(getMessage('fetchError'), true);
     }
+  } finally {
+    elements.scriptProgress.style.display = 'none';
   }
 }
 
 function copyText(text, label) {
   return navigator.clipboard.writeText(text).then(
-    () => showMessage(`Copied ${label}.`),
+    () => showMessage(getMessage('copied', { item: label })),
     (err) => {
       console.error(err);
-      showMessage(`Could not copy ${label}.`, true);
+      showMessage(getMessage('copyError', { item: label }), true);
     }
   );
 }
@@ -130,24 +197,26 @@ async function downloadLatestRust() {
       return;
     }
     window.open(assetName.browser_download_url, '_blank');
-    showMessage('Opening download page for latest mhrv-rs binary.');
+    showMessage(getMessage('downloadSuccess'));
   } catch (err) {
     console.error(err);
-    showMessage('Failed to fetch latest release. Opening releases page.', true);
+    showMessage(getMessage('downloadError'), true);
     window.open('https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases', '_blank');
   }
 }
 
 function initListeners() {
+  elements.languageSelect.addEventListener('change', updateUILanguage);
+  
   elements.generateKey.addEventListener('click', () => {
     setAuthKey(randomHex(32));
-    showMessage('Auth key generated. Paste it into Apps Script and config.');
+    showMessage(getMessage('keyGenerated'));
   });
 
   elements.copyKey.addEventListener('click', () => {
     const key = elements.authKey.value.trim();
     if (!key) {
-      showMessage('Generate an auth key first.', true);
+      showMessage(getMessage('generateKeyFirst'), true);
       return;
     }
     copyText(key, 'auth key');
@@ -155,7 +224,7 @@ function initListeners() {
 
   elements.copyScript.addEventListener('click', () => {
     if (!codeTemplate) {
-      showMessage('Script template not loaded yet.', true);
+      showMessage(getMessage('scriptNotLoaded'), true);
       return;
     }
     const authKey = elements.authKey.value.trim() || AUTH_KEY_PLACEHOLDER;
@@ -168,7 +237,7 @@ function initListeners() {
 
   elements.downloadScript.addEventListener('click', () => {
     if (!codeTemplate) {
-      showMessage('Script template not loaded yet.', true);
+      showMessage(getMessage('scriptNotLoaded'), true);
       return;
     }
     const authKey = elements.authKey.value.trim() || AUTH_KEY_PLACEHOLDER;
@@ -183,7 +252,7 @@ function initListeners() {
     anchor.download = 'Code.gs';
     anchor.click();
     URL.revokeObjectURL(url);
-    showMessage('Downloaded Code.gs for Apps Script deployment.');
+    showMessage(getMessage('scriptDownloaded'));
   });
 
   elements.openScript.addEventListener('click', () => {
@@ -195,11 +264,11 @@ function initListeners() {
   });
 
   elements.openReadme.addEventListener('click', () => {
-    window.open('https://github.com/therealaleph/MasterHttpRelayVPN-RUST/blob/main/assets/apps_script/README.md', '_blank');
+    window.open('https://github.com/therealaleph/MasterHttpRelayVPN-RUST/blob/main/README.md', '_blank');
   });
 
   elements.openGuide.addEventListener('click', () => {
-    window.open('https://github.com/therealaleph/MasterHttpRelayVPN-RUST/blob/main/README.md', '_blank');
+    window.open('https://github.com/therealaleph/MasterHttpRelayVPN-RUST/blob/main/docs/guide.md', '_blank');
   });
 
   elements.downloadRust.addEventListener('click', () => downloadLatestRust());
@@ -208,10 +277,12 @@ function initListeners() {
   elements.deploymentId.addEventListener('input', renderConfig);
 }
 
-function init() {
+async function init() {
+  await loadMessages();
   loadTemplate();
   initListeners();
   renderConfig();
+  updateUILanguage();
 }
 
 init();

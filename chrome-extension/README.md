@@ -2,6 +2,14 @@
 
 This Chrome extension is a lightweight helper for the `MasterHttpRelayVPN-RUST` project. It automates the first-time Apps Script setup by generating a strong `AUTH_KEY`, fetching the latest `Code.gs` source from the repository, and producing a local config snippet.
 
+## ✨ New Features (v0.2.0)
+- 🌐 **Multilingual Support**: English and Persian (فارسی) interface
+- 🎨 **Modern UI**: Improved design with icons, animations, and better UX
+- 📱 **RTL Support**: Proper right-to-left layout for Persian
+- 🔄 **Loading Indicators**: Visual feedback during script fetching
+- 📦 **Auto-Updates**: Always fetches latest Code.gs from repository
+- 🏗️ **Better Architecture**: Modular code with i18n support
+
 ## What it does
 
 - Downloads the latest `mhrv-rs` binary for your platform
@@ -23,11 +31,12 @@ This Chrome extension is a lightweight helper for the `MasterHttpRelayVPN-RUST` 
 ## Usage
 
 1. Click the extension icon.
-2. Tap **Download mhrv-rs** to get the latest binary for your platform.
-3. Tap **Generate auth key**.
-4. The extension will fetch the latest `Code.gs` from GitHub.
-5. Tap **Copy Code.gs** or **Download Code.gs**.
-6. In `https://script.google.com`, create a new Apps Script project and paste the generated contents.
+2. Select your preferred language (English/Persian) from the dropdown.
+3. Tap **Download mhrv-rs** to get the latest binary for your platform.
+4. Tap **Generate auth key**.
+5. The extension will fetch the latest `Code.gs` from GitHub (shows loading indicator).
+6. Tap **Copy Code.gs** or **Download Code.gs**.
+7. In `https://script.google.com`, create a new Apps Script project and paste the generated contents.
 7. Deploy as a Web App with:
    - **Execute as:** Me
    - **Who has access:** Anyone
