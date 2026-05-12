@@ -178,6 +178,16 @@ const APPS_SCRIPT_BODY_MAX_BYTES: u64 = 40 * 1024 * 1024;
 /// through.
 const MAX_STREAMED_RANGE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
+/// Byte interval between `range-parallel-stream` progress log lines.
+/// Large downloads through the streaming branch otherwise look stuck
+/// in the logs (one "starting N chunks" line at the top, nothing
+/// until completion or failure). At 16 MiB intervals the operator sees
+/// ~6 lines per 100 MiB and ~64 lines per 1 GiB — useful pace at the
+/// ~1.4 MB/s typical through-relay throughput, and quiet enough that
+/// even a 16 GiB file won't drown the log (~1024 progress lines over
+/// the multi-hour download). Per user feedback on PR #1085.
+const STREAM_PROGRESS_LOG_INTERVAL_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Hard ceiling on the buffered stitch buffer's `Vec::with_capacity(total)`
 /// allocation. Two roles:
 ///
@@ -3582,6 +3592,7 @@ async fn stream_chunks_to_writer<W, S>(
     writer: &mut W,
     head: &[u8],
     probe_body: &[u8],
+    total: u64,
     fetches: S,
     url_for_log: &str,
 ) -> std::io::Result<()>
@@ -3609,9 +3620,44 @@ where
     writer.flush().await?;
     futures_util::pin_mut!(fetches);
 
+    // Progress accounting: bytes emitted as wire body so far (the
+    // probe body, plus every successfully-written chunk). The head
+    // doesn't count — it's protocol framing, not body progress.
+    // `next_progress_log_at` is the next body-byte threshold at
+    // which we emit a progress line, advanced past the current
+    // count each time so a single large chunk crossing multiple
+    // intervals only logs once.
+    let mut body_bytes_emitted: u64 = probe_body.len() as u64;
+    let mut next_progress_log_at: u64 = STREAM_PROGRESS_LOG_INTERVAL_BYTES;
+
     while let Some((s, e, chunk_result)) = fetches.next().await {
         match chunk_result {
-            Ok(c) => writer.write_all(&c).await?,
+            Ok(c) => {
+                writer.write_all(&c).await?;
+                body_bytes_emitted = body_bytes_emitted.saturating_add(c.len() as u64);
+                if body_bytes_emitted >= next_progress_log_at {
+                    // Percentage is well-defined here: streaming
+                    // branch is only reached for total >
+                    // APPS_SCRIPT_BODY_MAX_BYTES (≥ 40 MiB), so the
+                    // divisor is never zero.
+                    let pct = (body_bytes_emitted * 100) / total;
+                    tracing::info!(
+                        "range-parallel-stream: {}/{} MiB ({}%) emitted for {}",
+                        body_bytes_emitted / (1024 * 1024),
+                        total / (1024 * 1024),
+                        pct,
+                        url_for_log,
+                    );
+                    // Advance to the next interval past the current
+                    // count — a chunk much larger than the interval
+                    // (shouldn't happen at 256 KiB chunks, but defend
+                    // against future tuning) skips intermediate
+                    // thresholds rather than firing N log lines back
+                    // to back.
+                    next_progress_log_at = body_bytes_emitted
+                        .saturating_add(STREAM_PROGRESS_LOG_INTERVAL_BYTES);
+                }
+            }
             Err(reason) => {
                 tracing::warn!(
                     "range-parallel-stream: invalid chunk {}-{} for {} ({}); truncating response",
@@ -3664,7 +3710,7 @@ where
 {
     let head = assemble_200_head(probe_resp_headers, total);
     let head = transform_head(&head);
-    stream_chunks_to_writer(writer, &head, probe_body, chunks_stream, url_for_log).await
+    stream_chunks_to_writer(writer, &head, probe_body, total, chunks_stream, url_for_log).await
 }
 
 /// Tiny adapter that lets `relay_parallel_range_to` write into a
@@ -5498,6 +5544,7 @@ hello";
             &mut VecAsyncWriter(&mut buf),
             head,
             probe,
+            10,
             fetches.map(|x| x),
             "https://example.test/file",
         )
@@ -5726,6 +5773,7 @@ hello";
             &mut writer,
             head,
             probe,
+            12,
             fetches.map(|x| x),
             "https://example.test/file",
         )
@@ -5744,6 +5792,109 @@ hello";
             "flush() must run after committed prefix is written; flushed_at={:?}, expected at byte {}",
             writer.flushed_at,
             expected_committed,
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_chunks_to_writer_emits_progress_log_at_each_16mib_boundary() {
+        // User feedback on PR #1085: large streamed downloads went
+        // silent in the logs between "starting N chunks" and
+        // completion, with no progress signal. This test locks in
+        // the periodic progress lines by capturing the tracing
+        // output of a synthetic 40 MiB stream and counting how many
+        // `range-parallel-stream:` lines mention "MiB" (the progress
+        // lines do; the start-up summary phrases it differently).
+        //
+        // At 40 MiB total and 16 MiB intervals we expect two
+        // crossings — at 16 MiB and 32 MiB. Strictly *not* one at
+        // 0 MiB (the threshold must be reached, not just initialised)
+        // and *not* one at 40 MiB (40 < next_progress_log_at=48 once
+        // we've crossed 32 MiB).
+        use futures_util::stream;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone, Default)]
+        struct LogCapture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for LogCapture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for LogCapture {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .with_target(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // 40 MiB total. Probe is one 256 KiB chunk; the rest of the
+        // file is 159 same-sized chunks fed as a synthetic stream.
+        let chunk_size: u64 = 256 * 1024;
+        let total: u64 = 40 * 1024 * 1024;
+        let probe_body = vec![0u8; chunk_size as usize];
+        let mut chunks_data: Vec<(u64, u64, Result<Vec<u8>, &'static str>)> = Vec::new();
+        let mut start = chunk_size;
+        while start < total {
+            let end = (start + chunk_size - 1).min(total - 1);
+            let len = (end - start + 1) as usize;
+            chunks_data.push((start, end, Ok(vec![0u8; len])));
+            start = end + 1;
+        }
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", total).into_bytes();
+
+        let mut buf: Vec<u8> = Vec::new();
+        stream_chunks_to_writer(
+            &mut VecAsyncWriter(&mut buf),
+            &head,
+            &probe_body,
+            total,
+            stream::iter(chunks_data),
+            "https://example.test/big",
+        )
+        .await
+        .unwrap();
+        // Wire output sanity: head + 40 MiB body, exactly.
+        assert_eq!(buf.len() as u64, head.len() as u64 + total);
+
+        // Inspect the captured log. The two progress lines should
+        // mention `16/40` and `32/40` (MiB emitted / MiB total).
+        // Drop the subscriber guard so any inadvertent log lines
+        // from drop-handlers don't race with our read.
+        drop(_guard);
+        let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        let progress_lines: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains("range-parallel-stream:") && l.contains(" MiB ("))
+            .collect();
+        assert_eq!(
+            progress_lines.len(),
+            2,
+            "expected 2 progress lines at the 16 / 32 MiB crossings; full log:\n{}",
+            log,
+        );
+        assert!(
+            progress_lines[0].contains("16/40 MiB (40%)"),
+            "first progress line should read 16/40 MiB (40%); got: {}",
+            progress_lines[0],
+        );
+        assert!(
+            progress_lines[1].contains("32/40 MiB (80%)"),
+            "second progress line should read 32/40 MiB (80%); got: {}",
+            progress_lines[1],
         );
     }
 
@@ -5771,6 +5922,7 @@ hello";
             &mut writer,
             head,
             probe,
+            14,
             fetches.map(|x| x),
             "https://example.test/file",
         )
@@ -6000,6 +6152,7 @@ hello";
             &mut VecAsyncWriter(&mut buf),
             head,
             probe,
+            12,
             fetches.map(|x| x),
             "https://example.test/file",
         )
