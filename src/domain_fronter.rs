@@ -3125,8 +3125,16 @@ impl DomainFronter {
         entry.stream.write_all(&payload).await?;
         entry.stream.flush().await?;
 
+        // Use the configured `request_timeout_secs` for the header read,
+        // not the hardcoded 10 s default. With Apps Script cold starts
+        // routinely landing in the 8–12 s range, the 10 s cliff was
+        // firing as a false-positive batch timeout (issue #1088), killing
+        // every in-flight tunnel session under it. The outer
+        // `tokio::time::timeout(batch_timeout, ...)` in `fire_batch`
+        // remains the authoritative bound on total batch round-trip time.
+        let batch_timeout = self.batch_timeout();
         let (mut status, mut resp_headers, mut resp_body) =
-            read_http_response(&mut entry.stream).await?;
+            read_http_response_with_header_timeout(&mut entry.stream, batch_timeout).await?;
 
         // Follow redirect chain
         for _ in 0..5 {
@@ -3139,7 +3147,8 @@ impl DomainFronter {
             );
             entry.stream.write_all(req.as_bytes()).await?;
             entry.stream.flush().await?;
-            let (s, h, b) = read_http_response(&mut entry.stream).await?;
+            let (s, h, b) =
+                read_http_response_with_header_timeout(&mut entry.stream, batch_timeout).await?;
             status = s; resp_headers = h; resp_body = b;
         }
 
@@ -4242,14 +4251,50 @@ fn parse_redirect(location: &str) -> (String, Option<String>) {
 
 /// Read a single HTTP/1.1 response from the stream. Keep-alive safe: respects
 /// Content-Length or chunked transfer-encoding.
+///
+/// Uses a 10 s *total* header-read deadline — the historical 10 s value
+/// preserved for most callers (relay path, exit-node, etc.). Note the
+/// semantics changed in this patch: the underlying loop now treats this
+/// as an absolute deadline across all header reads, not a per-read budget
+/// that would silently extend on drip-feed. The tunnel batch path overrides
+/// the 10 s value via `read_http_response_with_header_timeout`, since the
+/// configurable `request_timeout_secs` (default 30 s) is the authoritative
+/// cliff there.
 async fn read_http_response<S>(stream: &mut S) -> Result<(u16, Vec<(String, String)>, Vec<u8>), FronterError>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    read_http_response_with_header_timeout(stream, Duration::from_secs(10)).await
+}
+
+/// `read_http_response` with a caller-supplied header-read timeout. The
+/// timeout applies only to the *initial* header-block read; the body-read
+/// timeouts in this function are deliberately left at their fixed values
+/// because once the response has started flowing, per-chunk stalls are a
+/// separate signal from "Apps Script hasn't started writing yet."
+///
+/// The tunnel batch path passes `DomainFronter::batch_timeout()` so that
+/// `Config::request_timeout_secs` is the *only* knob controlling how long
+/// we wait for an Apps Script edge to start responding — the hardcoded 10 s
+/// inner cliff was firing well before the outer `batch_timeout` in
+/// `tunnel_client::fire_batch` could, masquerading as a 10 s "batch
+/// timeout" in user logs (issue #1088).
+async fn read_http_response_with_header_timeout<S>(
+    stream: &mut S,
+    header_read_timeout: Duration,
+) -> Result<(u16, Vec<(String, String)>, Vec<u8>), FronterError>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
     let mut buf = Vec::with_capacity(8192);
     let mut tmp = [0u8; 8192];
+    // One deadline for the whole header read, not per-iteration. Otherwise
+    // a slow peer drip-feeding one byte just under `header_read_timeout`
+    // keeps this loop alive forever and defeats the outer `batch_timeout`
+    // wiring (the entire point of #1088's fix).
+    let deadline = tokio::time::Instant::now() + header_read_timeout;
     let header_end = loop {
-        let n = timeout(Duration::from_secs(10), stream.read(&mut tmp)).await
+        let n = tokio::time::timeout_at(deadline, stream.read(&mut tmp)).await
             .map_err(|_| FronterError::Timeout)??;
         if n == 0 {
             return Err(FronterError::BadResponse("connection closed before headers".into()));
@@ -5011,6 +5056,80 @@ mod tests {
             read_http_response(&mut stream).await.expect("must succeed despite UnexpectedEof");
         assert_eq!(status, 200);
         assert_eq!(got_body, body);
+    }
+
+    /// Issue #1088. The tunnel batch path passes `batch_timeout` (default
+    /// 30 s, configurable up to 300 s) to `read_http_response_with_header_timeout`
+    /// so Apps Script cold starts in the 8-12 s range no longer trip a
+    /// hardcoded 10 s cliff. A regression that re-introduces the old 10 s
+    /// inner timeout — or that ignores the parameter entirely — would let
+    /// cold-start batches fail in the field while passing every existing
+    /// test. This locks the parameter down: headers arriving at virtual
+    /// T=15 s must succeed when the caller asked for a 30 s budget.
+    #[tokio::test(start_paused = true)]
+    async fn read_http_response_respects_configured_header_timeout() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client_side, mut server_side) = tokio::io::duplex(8192);
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+
+        tokio::spawn(async move {
+            // Slow Apps Script edge: response doesn't start streaming
+            // for 15 s. Under a 10 s budget this would be Timeout; under
+            // the 30 s budget the caller passed it must succeed.
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            server_side.write_all(response).await.unwrap();
+        });
+
+        let (status, _, body) = read_http_response_with_header_timeout(
+            &mut client_side,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("15 s response must succeed under 30 s header-read budget");
+        assert_eq!(status, 200);
+        assert!(body.is_empty());
+    }
+
+    /// The header-read deadline must be *total*, not reset on every read.
+    /// Without this, a peer that drip-feeds one byte just under the
+    /// per-read timeout keeps the loop alive forever and defeats the
+    /// outer `batch_timeout` wiring — defeating the whole point of
+    /// #1088's fix. This is the regression that would survive a naive
+    /// revert to `timeout(d, stream.read(...))` inside the loop, because
+    /// every individual read completes well under `d`. With the
+    /// `timeout_at(deadline, ...)` form, total elapsed exceeds the
+    /// deadline and we get `FronterError::Timeout`.
+    #[tokio::test(start_paused = true)]
+    async fn read_http_response_header_deadline_is_total_not_per_read() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client_side, mut server_side) = tokio::io::duplex(8192);
+        // Header block is 38 bytes; drip-feeding at 3 s/byte takes 114 s
+        // total. Each individual read returns within 3 s — well under
+        // the 10 s budget — so per-read semantics would NOT detect the
+        // stall.
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec();
+
+        tokio::spawn(async move {
+            for byte in response {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                server_side.write_all(&[byte]).await.unwrap();
+                server_side.flush().await.unwrap();
+            }
+        });
+
+        let result = read_http_response_with_header_timeout(
+            &mut client_side,
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(FronterError::Timeout)),
+            "drip-feed slower than the total deadline must time out — \
+             got {:?}",
+            result.map(|(s, _, _)| s)
+        );
     }
 
     #[tokio::test]

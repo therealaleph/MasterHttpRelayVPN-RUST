@@ -45,11 +45,12 @@ const MAX_BATCH_OPS: usize = 50;
 // Script's typical response cliff — lives in `default_request_timeout_secs`
 // in `config.rs`.
 
-/// Timeout for a session waiting for its batch reply. If the batch task
-/// is slow (e.g. one op in the batch has a dead target on the tunnel-node
-/// side), the session gives up and retries on the next tick rather than
-/// blocking indefinitely.
-const REPLY_TIMEOUT: Duration = Duration::from_secs(35);
+/// Slack added to the reply-timeout budget on top of `batch_timeout`.
+/// Covers spawn/encode overhead and a small margin for clock skew, so
+/// the session-side `reply_rx` doesn't fire just before `fire_batch`'s
+/// HTTP round-trip would have completed. No retry budget here — each
+/// batch makes exactly one attempt (see `fire_batch` docs).
+const REPLY_TIMEOUT_SLACK: Duration = Duration::from_secs(5);
 
 /// How long we'll briefly hold the client socket after the local
 /// CONNECT/SOCKS5 handshake, waiting for the client's first bytes (the
@@ -280,6 +281,14 @@ pub struct TunnelMux {
     /// `(host, port)`, value is the expiry instant. Plain Mutex<HashMap> is
     /// fine: it's touched once per CONNECT (cheap) and once per failure.
     unreachable_cache: Mutex<HashMap<(String, u16), Instant>>,
+    /// How long a session waits for its batch reply before giving up and
+    /// retry-polling on the next tick. Computed at construction from
+    /// `fronter.batch_timeout() + REPLY_TIMEOUT_SLACK` so the session-
+    /// side `reply_rx` always outlives `fire_batch`'s single HTTP
+    /// round-trip. Without runtime derivation, an operator who raises
+    /// `request_timeout_secs` would see sessions abandon replies just
+    /// before the batch would have completed.
+    reply_timeout: Duration,
 }
 
 impl TunnelMux {
@@ -311,6 +320,14 @@ impl TunnelMux {
         let step = if coalesce_step_ms > 0 { coalesce_step_ms } else { DEFAULT_COALESCE_STEP_MS };
         let max = if coalesce_max_ms > 0 { coalesce_max_ms } else { DEFAULT_COALESCE_MAX_MS };
         tracing::info!("batch coalesce: step={}ms max={}ms", step, max);
+        // Reply timeout co-varies with `request_timeout_secs` so an
+        // operator who raises the batch budget doesn't have sessions
+        // abandoning replies just before the HTTP round-trip would
+        // have completed. See the `reply_timeout` field comment for
+        // the invariant.
+        let reply_timeout = fronter
+            .batch_timeout()
+            .saturating_add(REPLY_TIMEOUT_SLACK);
         let (tx, rx) = mpsc::channel(512);
         tokio::spawn(mux_loop(rx, fronter, step, max));
         Arc::new(Self {
@@ -326,7 +343,15 @@ impl TunnelMux {
             preread_win_total_us: AtomicU64::new(0),
             preread_total_events: AtomicU64::new(0),
             unreachable_cache: Mutex::new(HashMap::new()),
+            reply_timeout,
         })
+    }
+
+    /// How long a session waits for its batch reply before retry-polling.
+    /// Co-varies with `Config::request_timeout_secs` so `fire_batch`'s
+    /// single HTTP round-trip is always covered.
+    pub fn reply_timeout(&self) -> Duration {
+        self.reply_timeout
     }
 
     async fn send(&self, msg: MuxMsg) {
@@ -849,9 +874,16 @@ fn encode_pending(p: PendingOp) -> BatchOp {
 /// Pick a deployment, acquire its per-account concurrency slot, and spawn
 /// a batch request task.
 ///
-/// The batch HTTP round-trip is bounded by `BATCH_TIMEOUT` so a slow or
-/// dead tunnel-node target cannot hold a pipeline slot (and block waiting
-/// sessions) forever.
+/// The batch HTTP round-trip is bounded by `DomainFronter::batch_timeout()`
+/// so a slow or dead tunnel-node target cannot hold a pipeline slot (and
+/// block waiting sessions) forever. Each batch makes a single attempt —
+/// no client-side retry against a different deployment, because
+/// tunnel-node's `drain_now` mutates the per-session buffer when building
+/// a response, so a lost response means lost bytes (silent gap on the
+/// client side). Without server-side ack / sequence support a replay
+/// would either duplicate writes (payload ops) or silently skip bytes
+/// (empty polls). Sessions whose batch times out re-poll on the next
+/// tick — same recovery surface as pre-#1088.
 async fn fire_batch(
     sems: &Arc<HashMap<String, Arc<Semaphore>>>,
     fronter: &Arc<DomainFronter>,
@@ -879,17 +911,18 @@ async fn fire_batch(
 
         // Bounded-wait: if the batch takes longer than the configured
         // batch timeout (Config::request_timeout_secs), all sessions in
-        // this batch get an error and can retry.
+        // this batch get an error and can retry-poll on the next tick.
         let batch_timeout = f.batch_timeout();
         let result = tokio::time::timeout(
             batch_timeout,
             f.tunnel_batch_request_to(&script_id, &data_ops),
         )
         .await;
+        let sid_short = &script_id[..script_id.len().min(8)];
         tracing::info!(
             "batch: {} ops → {}, rtt={:?}",
             n_ops,
-            &script_id[..script_id.len().min(8)],
+            sid_short,
             t0.elapsed()
         );
 
@@ -925,7 +958,6 @@ async fn fire_batch(
                     })
                     .sum();
                 f.record_today(response_bytes);
-                let sid_short = &script_id[..script_id.len().min(8)];
                 for (idx, reply) in data_replies {
                     if let Some(resp) = batch_resp.r.get(idx) {
                         let _ = reply.send(Ok((resp.clone(), script_id.clone())));
@@ -948,25 +980,12 @@ async fn fire_batch(
                     f.record_timeout_strike(&script_id);
                 }
                 let err_msg = format!("{}", e);
-                let sid_short = &script_id[..script_id.len().min(8)];
-                // Detect the body string we ship as the v1.8.0 bad-auth
-                // decoy. v1.8.1 asserted "AUTH_KEY mismatch" outright, but
-                // #404 (w0l4i) found the same body comes back from Apps
-                // Script in 3 other unrelated cases too:
-                //
-                //   1. AUTH_KEY mismatch                 — our intentional decoy
-                //   2. Apps Script execution timeout/    — runtime hit 6-min
-                //      mid-call quota tear                 cap or per-100s quota
-                //   3. Apps Script internal hiccup       — Google-side flake,
-                //                                          serves placeholder
-                //   4. ISP-side response truncation      — #313 pattern, the
-                //                                          response was assembled
-                //                                          but ate an RST mid-flight
-                //
-                // So we surface all four candidates instead of asserting #1.
-                // Users can flip DIAGNOSTIC_MODE=true in Code.gs to disambiguate:
-                // only #1 still returns the decoy in diagnostic mode; the
-                // others return real JSON or different errors.
+                // Decoy / Apps-Script-flake detection. This body string can
+                // mean any of 4 unrelated things (AUTH_KEY mismatch, Apps
+                // Script execution timeout, Google-side flake, ISP-side
+                // truncation #313), so surface all candidates rather than
+                // asserting one. Operators can flip DIAGNOSTIC_MODE in
+                // Code.gs to disambiguate (#404).
                 if err_msg.contains("The script completed but did not return anything") {
                     tracing::error!(
                         "batch failed (script {}): got the v1.8.0 decoy/placeholder body — \
@@ -993,7 +1012,6 @@ async fn fire_batch(
                 // per-read timeout — count it the same way so a truly-stuck
                 // deployment exits round-robin fast.
                 f.record_timeout_strike(&script_id);
-                let sid_short = &script_id[..script_id.len().min(8)];
                 tracing::warn!(
                     "batch timed out after {:?} (script {}, {} ops)",
                     batch_timeout,
@@ -1368,7 +1386,7 @@ async fn tunnel_loop(
         // Bounded-wait on reply: if the batch this op landed in is slow
         // (dead target on the tunnel-node side), don't block this session
         // forever — timeout and let it retry on the next tick.
-        let (resp, script_id) = match tokio::time::timeout(REPLY_TIMEOUT, reply_rx).await {
+        let (resp, script_id) = match tokio::time::timeout(mux.reply_timeout(), reply_rx).await {
             Ok(Ok(Ok((r, sid_used)))) => (r, sid_used),
             Ok(Ok(Err(e))) => {
                 tracing::debug!("tunnel data error: {}", e);
@@ -1719,8 +1737,53 @@ mod tests {
             preread_win_total_us: AtomicU64::new(0),
             preread_total_events: AtomicU64::new(0),
             unreachable_cache: Mutex::new(HashMap::new()),
+            // Tests that exercise the reply-timeout path expect a
+            // generous fixed value here; production derives this from
+            // `fronter.batch_timeout()` (see `TunnelMux::start`).
+            reply_timeout: Duration::from_secs(35),
         });
         (mux, rx)
+    }
+
+    /// `TunnelMux::reply_timeout` must co-vary with the configured
+    /// `request_timeout_secs` plus `REPLY_TIMEOUT_SLACK`. Without this
+    /// runtime derivation, operators who raise `request_timeout_secs`
+    /// see sessions abandon `reply_rx` just before `fire_batch`'s
+    /// HTTP round-trip would have completed — silently orphaning
+    /// in-flight responses. The test muxes hardcode a value for
+    /// convenience, so a regression in `TunnelMux::start`'s formula
+    /// could ship unnoticed unless we exercise the real construction
+    /// path.
+    #[tokio::test]
+    async fn mux_reply_timeout_tracks_batch_timeout_plus_slack() {
+        use crate::config::Config;
+
+        // Pick a non-default `request_timeout_secs` so the assertion
+        // would fail under any hardcoded value (35 s in tests, 75 s in
+        // the previous patch).
+        let cfg: Config = serde_json::from_str(
+            r#"{
+                "mode": "apps_script",
+                "google_ip": "127.0.0.1",
+                "front_domain": "www.google.com",
+                "script_id": "TEST",
+                "auth_key": "test_auth_key",
+                "listen_host": "127.0.0.1",
+                "listen_port": 8085,
+                "log_level": "info",
+                "verify_ssl": true,
+                "request_timeout_secs": 60
+            }"#,
+        )
+        .unwrap();
+        let fronter = Arc::new(DomainFronter::new(&cfg).expect("test fronter must construct"));
+        let mux = TunnelMux::start(fronter, 0, 0);
+
+        assert_eq!(
+            mux.reply_timeout(),
+            Duration::from_secs(60) + REPLY_TIMEOUT_SLACK,
+            "reply_timeout must equal batch_timeout + REPLY_TIMEOUT_SLACK"
+        );
     }
 
     /// The buffered ClientHello from the pre-read window must reach the
