@@ -1,0 +1,56 @@
+name: FreeBSD Rust Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  freebsd:
+    name: FreeBSD ${{ matrix.freebsd-version }} / ${{ matrix.target }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - freebsd-version: "14.2"
+            target: x86_64-unknown-freebsd
+          - freebsd-version: "15.0"
+            target: x86_64-unknown-freebsd
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build on FreeBSD ${{ matrix.freebsd-version }}
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: ${{ matrix.freebsd-version }}
+          usesh: true
+          prepare: |
+            pkg install -y curl git bash gmake pkgconf
+            curl https://sh.rustup.rs -sSf | sh -s -- -y
+          run: |
+            set -e
+            . "$HOME/.cargo/env"
+
+            rustup default stable
+            rustc --version
+            cargo --version
+
+            cargo build --release
+
+            mkdir -p dist
+            BIN_NAME="your-binary-name"
+
+            cp "target/release/$BIN_NAME" "dist/${BIN_NAME}-freebsd-${{ matrix.freebsd-version }}-x86_64"
+            tar -C dist -czf "dist/${BIN_NAME}-freebsd-${{ matrix.freebsd-version }}-x86_64.tar.gz" "${BIN_NAME}-freebsd-${{ matrix.freebsd-version }}-x86_64"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: freebsd-${{ matrix.freebsd-version }}-x86_64
+          path: dist/*.tar.gz
