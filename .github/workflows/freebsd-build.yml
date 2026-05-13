@@ -34,7 +34,8 @@ jobs:
             rustc --version
             cargo --version
 
-            cargo build --release --bin mhrv-rs --bin mhrv-rs-ui
+            cargo build --release --bin mhrv-rs
+            cargo build --release --features ui --bin mhrv-rs-ui
 
             mkdir -p dist/freebsd-x86_64
 
