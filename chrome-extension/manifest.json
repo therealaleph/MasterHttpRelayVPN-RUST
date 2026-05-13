@@ -8,6 +8,9 @@
     "default_title": "__MSG_extName__",
     "default_popup": "popup.html"
   },
+  "background": {
+    "service_worker": "background.js"
+  },
   "permissions": ["storage", "clipboardWrite"],
   "host_permissions": ["https://script.google.com/*", "https://raw.githubusercontent.com/*", "https://api.github.com/*"]
 }

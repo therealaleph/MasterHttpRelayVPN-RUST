@@ -46,7 +46,23 @@ permissions:
 # and more importantly keeps target/ warm via the rust-cache action.
 
 jobs:
+  verify-chrome-extension-codegs-sync:
+    name: verify chrome-extension Code.gs sync
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Compare Apps Script source with extension fallback
+        run: |
+          if ! cmp -s assets/apps_script/Code.gs chrome-extension/Code.gs; then
+            echo "::error file=chrome-extension/Code.gs::chrome-extension/Code.gs must match assets/apps_script/Code.gs. Update the bundled fallback whenever the canonical Apps Script changes."
+            diff -u assets/apps_script/Code.gs chrome-extension/Code.gs || true
+            exit 1
+          fi
+
   build:
+    needs: verify-chrome-extension-codegs-sync
     strategy:
       fail-fast: false
       matrix:

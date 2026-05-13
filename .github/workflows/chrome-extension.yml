@@ -1,0 +1,61 @@
+name: chrome-extension
+
+on:
+  pull_request:
+    paths:
+      - 'assets/apps_script/Code.gs'
+      - 'chrome-extension/**'
+      - '.github/workflows/chrome-extension.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'assets/apps_script/Code.gs'
+      - 'chrome-extension/**'
+      - '.github/workflows/chrome-extension.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  bundled-code-sync:
+    name: bundled Code.gs stays in sync
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Compare Apps Script source with extension fallback
+        run: |
+          if ! cmp -s assets/apps_script/Code.gs chrome-extension/Code.gs; then
+            echo "::error file=chrome-extension/Code.gs::chrome-extension/Code.gs must match assets/apps_script/Code.gs. Update the bundled fallback whenever the canonical Apps Script changes."
+            diff -u assets/apps_script/Code.gs chrome-extension/Code.gs || true
+            exit 1
+          fi
+
+  auth-key-smoke-test:
+    name: auth key smoke test
+    runs-on: ubuntu-latest
+    needs: bundled-code-sync
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install test dependencies
+        working-directory: chrome-extension
+        run: npm install
+
+      - name: Install Playwright browser
+        working-directory: chrome-extension
+        run: npx playwright install --with-deps chromium
+
+      - name: Run extension smoke tests
+        working-directory: chrome-extension
+        run: xvfb-run npm run test:smoke

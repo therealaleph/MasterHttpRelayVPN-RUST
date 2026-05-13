@@ -16,6 +16,7 @@
     "downloadScript": "Download Code.gs",
     "openScript": "Open Apps Script",
     "scriptNotice": "The script is loaded from the extension package and includes the same relay protocol used by mhrv-rs.",
+    "checkScriptVersion": "Check latest Code.gs",
     "step3Title": "Step 3: Create config",
     "step3Desc": "Paste your Deployment ID and the auth key into your local config.",
     "deploymentIdLabel": "Deployment ID",
@@ -36,6 +37,11 @@
     "generateKeyFirst": "Generate an auth key first.",
     "copyError": "Could not copy {item}.",
     "fetchError": "Failed to load Code.gs at all."
+    ,
+    "scriptUpToDate": "Your bundled Code.gs matches the latest upstream version.",
+    "scriptOutdated": "Update available: your bundled Code.gs differs from upstream.",
+    "scriptCheckFailed": "Could not verify Code.gs version.",
+    "scriptCheckNetworkBlocked": "Could not reach upstream to check Code.gs (network blocked/offline)."
   },
   "fa": {
     "appName": "کمک‌کننده اسکریپت اپس mhrv-rs",
@@ -54,6 +60,7 @@
     "downloadScript": "دانلود Code.gs",
     "openScript": "باز کردن Apps Script",
     "scriptNotice": "اسکریپت از بسته افزونه بارگذاری می‌شود و شامل همان پروتکل رله استفاده شده توسط mhrv-rs است.",
+    "checkScriptVersion": "بررسی آخرین نسخه Code.gs",
     "step3Title": "مرحله ۳: ایجاد پیکربندی",
     "step3Desc": "شناسه استقرار و کلید احراز هویت را در پیکربندی محلی خود جای‌گذاری کنید.",
     "deploymentIdLabel": "شناسه استقرار",
@@ -74,5 +81,10 @@
     "generateKeyFirst": "ابتدا یک کلید احراز هویت تولید کنید.",
     "copyError": "کپی {item} امکان‌پذیر نبود.",
     "fetchError": "بارگذاری Code.gs به طور کامل ناموفق بود."
+    ,
+    "scriptUpToDate": "Code.gs داخلی افزونه با آخرین نسخه upstream یکسان است.",
+    "scriptOutdated": "به‌روزرسانی موجود است: Code.gs داخلی افزونه با upstream متفاوت است.",
+    "scriptCheckFailed": "امکان بررسی نسخه Code.gs وجود ندارد.",
+    "scriptCheckNetworkBlocked": "امکان دسترسی به upstream برای بررسی Code.gs نبود (اینترنت/شبکه مسدود یا آفلاین)."
   }
 }

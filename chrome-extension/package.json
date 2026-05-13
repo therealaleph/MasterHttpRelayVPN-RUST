@@ -1,0 +1,10 @@
+{
+  "name": "mhrv-helper-extension-tests",
+  "private": true,
+  "scripts": {
+    "test:smoke": "playwright test --config=playwright.config.js"
+  },
+  "devDependencies": {
+    "@playwright/test": "latest"
+  }
+}

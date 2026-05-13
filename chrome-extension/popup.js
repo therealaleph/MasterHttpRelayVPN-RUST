@@ -14,6 +14,7 @@ const elements = {
   copyKey: document.getElementById('copy-key'),
   copyScript: document.getElementById('copy-script'),
   downloadScript: document.getElementById('download-script'),
+  checkScriptVersion: document.getElementById('check-script-version'),
   openScript: document.getElementById('open-script'),
   copyConfig: document.getElementById('copy-config'),
   openReadme: document.getElementById('open-readme'),
@@ -22,6 +23,18 @@ const elements = {
   openReleases: document.getElementById('open-releases'),
   scriptProgress: document.getElementById('script-progress'),
 };
+
+function toHex(bytes) {
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+async function sha256(text) {
+  const data = new TextEncoder().encode(text);
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  return toHex(new Uint8Array(digest));
+}
 
 async function loadMessages() {
   try {
@@ -177,6 +190,45 @@ function copyText(text, label) {
   );
 }
 
+async function checkScriptVersion() {
+  elements.scriptProgress.style.display = 'block';
+  try {
+    const [remoteResp, localResp] = await Promise.all([
+      fetch(CODE_FILE_URL, { cache: 'no-store' }),
+      fetch(chrome.runtime.getURL(CODE_FILE)),
+    ]);
+
+    if (!localResp.ok) {
+      showMessage(getMessage('scriptCheckFailed'), true);
+      return;
+    }
+
+    const localText = await localResp.text();
+    const localHash = await sha256(localText);
+
+    if (!remoteResp.ok) {
+      // Network / censorship realities: just report we couldn't check.
+      showMessage(getMessage('scriptCheckNetworkBlocked'), true);
+      return;
+    }
+
+    const remoteText = await remoteResp.text();
+    const remoteHash = await sha256(remoteText);
+
+    if (remoteHash === localHash) {
+      showMessage(getMessage('scriptUpToDate'));
+      return;
+    }
+
+    showMessage(getMessage('scriptOutdated'), true);
+  } catch (err) {
+    console.error(err);
+    showMessage(getMessage('scriptCheckFailed'), true);
+  } finally {
+    elements.scriptProgress.style.display = 'none';
+  }
+}
+
 async function downloadLatestRust() {
   try {
     const response = await fetch('https://api.github.com/repos/therealaleph/MasterHttpRelayVPN-RUST/releases/latest');
@@ -271,6 +323,8 @@ function initListeners() {
   elements.openGuide.addEventListener('click', () => {
     window.open('https://github.com/therealaleph/MasterHttpRelayVPN-RUST/blob/main/docs/guide.md', '_blank');
   });
+
+  elements.checkScriptVersion.addEventListener('click', () => checkScriptVersion());
 
   elements.downloadRust.addEventListener('click', () => downloadLatestRust());
   elements.openReleases.addEventListener('click', () => window.open('https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases', '_blank'));
