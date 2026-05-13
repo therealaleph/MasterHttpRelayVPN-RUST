@@ -9,7 +9,7 @@ on:
 
 jobs:
   freebsd:
-    name: FreeBSD x86_64
+    name: FreeBSD amd64
     runs-on: ubuntu-latest
 
     steps:
@@ -37,17 +37,17 @@ jobs:
             cargo build --release --bin mhrv-rs
             cargo build --release --features ui --bin mhrv-rs-ui
 
-            mkdir -p dist/freebsd-x86_64
+            mkdir -p dist
 
-            cp target/release/mhrv-rs dist/freebsd-x86_64/
-            cp target/release/mhrv-rs-ui dist/freebsd-x86_64/
+            cp target/release/mhrv-rs dist/mhrv-rs
+            cp target/release/mhrv-rs-ui dist/mhrv-rs-ui
 
             tar -C dist \
-              -czf mhrv-rs-freebsd-x86_64.tar.gz \
-              freebsd-x86_64
+              -czf dist/mhrv-rs-freebsd-amd64.tar.gz \
+              mhrv-rs mhrv-rs-ui
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mhrv-rs-freebsd-x86_64
-          path: mhrv-rs-freebsd-x86_64.tar.gz
+          name: mhrv-rs-freebsd-amd64
+          path: dist/mhrv-rs-freebsd-amd64.tar.gz
