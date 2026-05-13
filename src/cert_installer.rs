@@ -54,7 +54,7 @@ impl RemovalOutcome {
 /// When running as root via `sudo`, the process's `HOME` / `USER`
 /// environment reflects **root**, not the user who invoked the command.
 /// That breaks every user-scoped cert path this module touches —
-/// `data_dir()` resolves to root's config dir, `firefox_profile_dirs()`
+/// `data_dir()` resolves to root's config dir, `mozilla_family_profile_dirs()`
 /// scans root's profiles, macOS `login.keychain-db` is root's. The
 /// removal then operates on paths that probably don't exist, reports
 /// success, and leaves the real user's CA trusted.
@@ -840,10 +840,10 @@ fn remove_windows() {
     }
 }
 
-// ---------- NSS (Firefox + Chrome/Chromium on Linux) ----------
+// ---------- NSS (Firefox + LibreWolf + Chrome/Chromium on Linux) ----------
 
 /// Best-effort install of the CA into all discovered NSS stores:
-///   1. Every Firefox profile (each has its own cert9.db).
+///   1. Every Firefox/LibreWolf profile (each has its own cert9.db).
 ///   2. On Linux, the shared Chrome/Chromium NSS DB at ~/.pki/nssdb —
 ///      this is the one update-ca-certificates does NOT populate, and
 ///      missing it was the real blocker for Chrome users who'd installed
@@ -851,18 +851,19 @@ fn remove_windows() {
 /// Silently no-ops if `certutil` (from libnss3-tools) isn't on PATH.
 /// Browsers must be closed during install for changes to take effect.
 fn install_nss_stores(cert_path: &str) {
-    // First, try to make Firefox pick up the OS-level CA automatically by
-    // flipping the `security.enterprise_roots.enabled` pref in user.js of
-    // every Firefox profile we find. This is the cleanest cross-platform
-    // fix because it doesn't depend on whether NSS certutil is installed
-    // — Firefox just starts trusting whatever the OS trusts. Especially
-    // important on Windows where NSS certutil isn't on PATH.
-    enable_firefox_enterprise_roots();
+    // First, try to make Firefox/LibreWolf pick up the OS-level CA
+    // automatically by flipping the `security.enterprise_roots.enabled`
+    // pref in user.js of every Mozilla-family profile we find. This is
+    // the cleanest cross-platform fix because it doesn't depend on
+    // whether NSS certutil is installed — the browser just starts
+    // trusting whatever the OS trusts. Especially important on Windows
+    // where NSS certutil isn't on PATH.
+    enable_mozilla_enterprise_roots();
 
     if !has_nss_certutil() {
         tracing::debug!(
-            "NSS certutil not found — Firefox will still trust the CA via the \
-             `security.enterprise_roots.enabled` user.js pref (flipped above). \
+            "NSS certutil not found — Firefox/LibreWolf will still trust the CA via \
+             the `security.enterprise_roots.enabled` user.js pref (flipped above). \
              For Chrome/Chromium on Linux, install `libnss3-tools` (Debian/Ubuntu) \
              or `nss-tools` (Fedora/RHEL), or import ca.crt manually via \
              chrome://settings/certificates → Authorities."
@@ -873,8 +874,8 @@ fn install_nss_stores(cert_path: &str) {
     let mut ok = 0;
     let mut tried = 0;
 
-    // 1. Firefox profiles.
-    for p in firefox_profile_dirs() {
+    // 1. Firefox/LibreWolf profiles.
+    for p in mozilla_family_profile_dirs() {
         tried += 1;
         if install_nss_in_profile(&p, cert_path) {
             ok += 1;
@@ -910,36 +911,36 @@ fn install_nss_stores(cert_path: &str) {
         tracing::info!("CA installed in {}/{} NSS store(s).", ok, tried);
     } else if tried > 0 {
         tracing::warn!(
-            "NSS install: 0/{} stores updated. If Firefox/Chrome was running, close \
-             them and retry. Otherwise, import ca.crt manually via browser settings.",
+            "NSS install: 0/{} stores updated. If Firefox/LibreWolf/Chrome was running, \
+             close them and retry. Otherwise, import ca.crt manually via browser settings.",
             tried
         );
     }
 }
 
 /// Write `user_pref("security.enterprise_roots.enabled", true);` to every
-/// discovered Firefox profile's user.js. This makes Firefox trust the OS
-/// trust store on next startup — so our already-successful system-level
-/// CA install automatically propagates. Critical on Windows where Firefox
-/// keeps its own NSS DB independent of Windows cert store, and NSS
-/// certutil isn't typically installed so the certutil-based path doesn't
-/// fire there.
+/// discovered Firefox/LibreWolf profile's user.js. This makes the browser
+/// trust the OS trust store on next startup — so our already-successful
+/// system-level CA install automatically propagates. Critical on Windows
+/// where the browser keeps its own NSS DB independent of the Windows
+/// cert store, and NSS certutil isn't typically installed so the
+/// certutil-based path doesn't fire there.
 ///
 /// We tag the block we write with a sentinel marker comment on the line
 /// above the pref, so uninstall can prove ownership before removing it —
 /// the user may have had `security.enterprise_roots.enabled = true`
 /// before this app existed, and we must not silently revoke their
 /// setting. Idempotent.
-fn enable_firefox_enterprise_roots() {
+fn enable_mozilla_enterprise_roots() {
     let mut touched = 0;
-    for profile in firefox_profile_dirs() {
+    for profile in mozilla_family_profile_dirs() {
         let user_js = profile.join("user.js");
         let existing = std::fs::read_to_string(&user_js).unwrap_or_default();
         match add_enterprise_roots_block(&existing) {
             EnterpriseRootsEdit::AddedBlock(new) => {
                 if let Err(e) = std::fs::write(&user_js, new) {
                     tracing::debug!(
-                        "firefox profile {}: user.js write failed: {}",
+                        "mozilla profile {}: user.js write failed: {}",
                         profile.display(),
                         e
                     );
@@ -950,7 +951,7 @@ fn enable_firefox_enterprise_roots() {
             EnterpriseRootsEdit::AlreadyOurs => {}
             EnterpriseRootsEdit::UserOwned => {
                 tracing::debug!(
-                    "firefox profile {} already has a user-owned enterprise_roots pref; leaving alone",
+                    "mozilla profile {} already has a user-owned enterprise_roots pref; leaving alone",
                     profile.display()
                 );
             }
@@ -958,7 +959,7 @@ fn enable_firefox_enterprise_roots() {
     }
     if touched > 0 {
         tracing::info!(
-            "enabled Firefox enterprise_roots in {} profile(s) — restart Firefox for it to take effect",
+            "enabled enterprise_roots in {} Firefox/LibreWolf profile(s) — restart the browser for it to take effect",
             touched
         );
     }
@@ -1054,7 +1055,7 @@ fn contains_our_block(existing: &str) -> bool {
 /// True iff `existing` has our exact pref line but NOT inside our
 /// marker+pref block — i.e. an orphan `security.enterprise_roots.enabled
 /// = true` whose provenance we can't prove. Used by
-/// `disable_firefox_enterprise_roots` to surface a one-line hint on
+/// `disable_mozilla_enterprise_roots` to surface a one-line hint on
 /// uninstall so users upgrading from pre-v1.2.13 installs know their
 /// Firefox user.js still has a cosmetic orphan pref from the old app
 /// (not broken, just left in place because we can't distinguish it
@@ -1173,13 +1174,13 @@ impl NssReport {
 }
 
 fn remove_nss_stores() -> NssReport {
-    disable_firefox_enterprise_roots();
+    disable_mozilla_enterprise_roots();
 
     if !has_nss_certutil() {
         // Only warn if there's actually an NSS store we can see — if the
         // user never ran Firefox/Chrome on this machine there's nothing
         // to clean up either way.
-        let profiles = firefox_profile_dirs();
+        let profiles = mozilla_family_profile_dirs();
         let chrome_present: bool;
         #[cfg(target_os = "linux")]
         {
@@ -1195,9 +1196,9 @@ fn remove_nss_stores() -> NssReport {
         if stores_present {
             tracing::warn!(
                 "NSS certutil not found — cannot automatically remove CA from \
-                 Firefox/Chrome NSS stores. Remove `MasterHttpRelayVPN` manually \
-                 via each browser's certificate settings, or install NSS tools \
-                 (`libnss3-tools` on Debian/Ubuntu, `nss-tools` on Fedora/RHEL) \
+                 Firefox/LibreWolf/Chrome NSS stores. Remove `MasterHttpRelayVPN` \
+                 manually via each browser's certificate settings, or install NSS \
+                 tools (`libnss3-tools` on Debian/Ubuntu, `nss-tools` on Fedora/RHEL) \
                  and re-run --remove-cert."
             );
         }
@@ -1210,7 +1211,7 @@ fn remove_nss_stores() -> NssReport {
 
     let mut report = NssReport::default();
 
-    for p in firefox_profile_dirs() {
+    for p in mozilla_family_profile_dirs() {
         report.tried += 1;
         if remove_nss_in_profile(&p) {
             report.ok += 1;
@@ -1239,7 +1240,7 @@ fn remove_nss_stores() -> NssReport {
             tracing::info!("Removed CA from {} NSS store(s).", report.ok);
         } else {
             tracing::warn!(
-                "NSS cleanup partial: {}/{} stores updated. If Firefox/Chrome \
+                "NSS cleanup partial: {}/{} stores updated. If Firefox/LibreWolf/Chrome \
                  was running, close it and re-run --remove-cert. Otherwise \
                  remove `MasterHttpRelayVPN` manually via each browser's cert \
                  settings.",
@@ -1329,12 +1330,12 @@ fn remove_nss_in_profile(profile: &Path) -> bool {
     remove_nss_in_dir(&dir_arg)
 }
 
-/// Undo `enable_firefox_enterprise_roots`: for each profile, strip the
+/// Undo `enable_mozilla_enterprise_roots`: for each profile, strip the
 /// marker+pref block if (and only if) we wrote it. If the user owns
 /// their own `enterprise_roots` pref — indicated by the absence of our
 /// marker line — leave user.js alone entirely.
-fn disable_firefox_enterprise_roots() {
-    for profile in firefox_profile_dirs() {
+fn disable_mozilla_enterprise_roots() {
+    for profile in mozilla_family_profile_dirs() {
         let user_js = profile.join("user.js");
         let Ok(existing) = std::fs::read_to_string(&user_js) else {
             continue;
@@ -1351,10 +1352,10 @@ fn disable_firefox_enterprise_roots() {
         // leftovers feel like half-done removals.
         if has_bare_enterprise_roots(&existing) {
             tracing::info!(
-                "Firefox profile {}: `security.enterprise_roots.enabled` pref \
+                "Mozilla profile {}: `security.enterprise_roots.enabled` pref \
                  present without our marker — left in place. If it was written \
-                 by a pre-v1.2.13 install it's a cosmetic orphan (harmless, \
-                 Firefox falls back to its built-in root store); remove it \
+                 by a pre-v1.2.13 install it's a cosmetic orphan (harmless, the \
+                 browser falls back to its built-in root store); remove it \
                  manually from user.js if it bothers you. If you set it \
                  yourself, leave it.",
                 profile.display()
@@ -1363,14 +1364,44 @@ fn disable_firefox_enterprise_roots() {
     }
 }
 
-fn firefox_profile_dirs() -> Vec<std::path::PathBuf> {
-    use std::path::PathBuf;
+/// Candidate root directories under which Mozilla-family browser profile
+/// directories (each containing cert9.db / cert8.db) live. Pure helper —
+/// OS / HOME / APPDATA / XDG_CONFIG_HOME come in as args so the
+/// per-platform layout can be asserted in unit tests without touching
+/// env or the filesystem.
+///
+/// LibreWolf (issue #1145) is a Firefox fork with strict privacy
+/// defaults that shares Firefox's NSS DB layout and respects the same
+/// `security.enterprise_roots.enabled` pref, but stores its profile tree
+/// under its own app dir — so the original Firefox-only scan missed it
+/// and the MITM CA never reached LibreWolf's trust store. HSTS-protected
+/// sites (bing.com, youtube.com, …) then failed with
+/// MOZILLA_PKIX_ERROR_MITM_DETECTED with no add-exception path the user
+/// could take.
+///
+/// On Linux we have to scan four candidate layouts because LibreWolf
+/// migrated mid-project:
+///   * `~/.librewolf` — legacy Firefox-style layout (pre-migration installs).
+///   * `${XDG_CONFIG_HOME:-~/.config}/librewolf/librewolf` — current XDG layout.
+///   * Both of the above again under `~/.var/app/io.gitlab.librewolf-community/`
+///     for the Flatpak sandbox, which redirects HOME inside the container.
+/// Non-existent roots silently no-op via `read_dir` failure, so listing
+/// all four costs nothing on installs that only have one.
+fn mozilla_family_profile_roots(
+    os: &str,
+    home: &str,
+    appdata: Option<&str>,
+    xdg_config_home: Option<&str>,
+) -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
-    let home = std::env::var("HOME").unwrap_or_default();
-    match std::env::consts::OS {
+    match os {
         "macos" => {
             roots.push(PathBuf::from(format!(
                 "{}/Library/Application Support/Firefox/Profiles",
+                home
+            )));
+            roots.push(PathBuf::from(format!(
+                "{}/Library/Application Support/LibreWolf/Profiles",
                 home
             )));
         }
@@ -1380,20 +1411,47 @@ fn firefox_profile_dirs() -> Vec<std::path::PathBuf> {
                 "{}/snap/firefox/common/.mozilla/firefox",
                 home
             )));
+            // Legacy LibreWolf layout (still present on older installs).
+            roots.push(PathBuf::from(format!("{}/.librewolf", home)));
+            // Current XDG layout. Empty XDG_CONFIG_HOME is treated as
+            // unset per XDG Base Directory spec.
+            let xdg = xdg_config_home
+                .filter(|v| !v.is_empty())
+                .map(String::from)
+                .unwrap_or_else(|| format!("{}/.config", home));
+            roots.push(PathBuf::from(format!("{}/librewolf/librewolf", xdg)));
+            // Flatpak sandbox: $HOME inside the container is
+            // ~/.var/app/<flatpak-id>/. Cover both legacy and XDG layouts
+            // since LibreWolf's migration mirrors the host inside the
+            // sandbox.
+            let flatpak_home = format!("{}/.var/app/io.gitlab.librewolf-community", home);
+            roots.push(PathBuf::from(format!("{}/.librewolf", flatpak_home)));
+            roots.push(PathBuf::from(format!(
+                "{}/.config/librewolf/librewolf",
+                flatpak_home
+            )));
         }
         "windows" => {
-            if let Ok(appdata) = std::env::var("APPDATA") {
+            if let Some(appdata) = appdata {
                 roots.push(PathBuf::from(format!(
                     "{}\\Mozilla\\Firefox\\Profiles",
                     appdata
                 )));
+                roots.push(PathBuf::from(format!("{}\\LibreWolf\\Profiles", appdata)));
             }
         }
         _ => {}
     }
+    roots
+}
 
+/// Walk each candidate root and return every immediate child that looks
+/// like a Mozilla NSS profile (has cert9.db or cert8.db). Pure given the
+/// roots — no env access — so tempdir tests can pin the filter without
+/// stubbing HOME/APPDATA. Missing roots silently skip.
+fn discover_profile_dirs(roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
-    for root in &roots {
+    for root in roots {
         let Ok(entries) = std::fs::read_dir(root) else {
             continue;
         };
@@ -1402,13 +1460,26 @@ fn firefox_profile_dirs() -> Vec<std::path::PathBuf> {
             if !p.is_dir() {
                 continue;
             }
-            // A profile has cert9.db or cert8.db.
+            // A profile has cert9.db (NSS sql:) or cert8.db (legacy dbm:).
             if p.join("cert9.db").exists() || p.join("cert8.db").exists() {
                 out.push(p);
             }
         }
     }
     out
+}
+
+fn mozilla_family_profile_dirs() -> Vec<std::path::PathBuf> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let appdata = std::env::var("APPDATA").ok();
+    let xdg = std::env::var("XDG_CONFIG_HOME").ok();
+    let roots = mozilla_family_profile_roots(
+        std::env::consts::OS,
+        &home,
+        appdata.as_deref(),
+        xdg.as_deref(),
+    );
+    discover_profile_dirs(&roots)
 }
 
 #[cfg(test)]
@@ -1799,5 +1870,157 @@ ID_LIKE=debian
         // An empty stderr with a non-zero exit is ambiguous — safer
         // to classify as "not found is NOT proven", i.e. failure.
         assert!(!is_nss_not_found(""));
+    }
+
+    // ── mozilla_family_profile_roots ──
+    //
+    // Regression guard for issue #1145: LibreWolf users hit
+    // MOZILLA_PKIX_ERROR_MITM_DETECTED on HSTS sites (bing.com,
+    // youtube.com) because the installer only scanned Firefox profile
+    // roots, never reaching LibreWolf's NSS DB. LibreWolf on Linux
+    // additionally migrated from `~/.librewolf` to XDG
+    // (`~/.config/librewolf/librewolf`) mid-project, and Flatpak
+    // installs redirect HOME inside the sandbox — both classes of
+    // install were silently missed by a first-pass legacy-only fix.
+    // These tests pin every layout so regressions can't sneak back.
+
+    #[test]
+    fn mozilla_roots_linux_covers_firefox_legacy_xdg_and_flatpak() {
+        let roots = mozilla_family_profile_roots("linux", "/home/u", None, None);
+        let s: Vec<String> = roots.iter().map(|p| p.display().to_string()).collect();
+        assert!(s.iter().any(|p| p == "/home/u/.mozilla/firefox"));
+        assert!(s
+            .iter()
+            .any(|p| p == "/home/u/snap/firefox/common/.mozilla/firefox"));
+        // LibreWolf legacy.
+        assert!(s.iter().any(|p| p == "/home/u/.librewolf"));
+        // LibreWolf XDG default (XDG_CONFIG_HOME unset → ~/.config).
+        assert!(s.iter().any(|p| p == "/home/u/.config/librewolf/librewolf"));
+        // LibreWolf Flatpak — both legacy and XDG layouts inside the sandbox.
+        assert!(s
+            .iter()
+            .any(|p| p == "/home/u/.var/app/io.gitlab.librewolf-community/.librewolf"));
+        assert!(s
+            .iter()
+            .any(|p| p
+                == "/home/u/.var/app/io.gitlab.librewolf-community/.config/librewolf/librewolf"));
+    }
+
+    #[test]
+    fn mozilla_roots_linux_honors_xdg_config_home_override() {
+        // When XDG_CONFIG_HOME is set we must use it verbatim, not
+        // ~/.config. Pinned because a refactor that always defaulted
+        // would silently miss profiles for users who relocate their
+        // XDG config dir.
+        let roots = mozilla_family_profile_roots("linux", "/home/u", None, Some("/srv/xdg"));
+        let s: Vec<String> = roots.iter().map(|p| p.display().to_string()).collect();
+        assert!(s.iter().any(|p| p == "/srv/xdg/librewolf/librewolf"));
+        // Default-derived path must NOT also be emitted when override
+        // is present — otherwise we double-scan a path that no longer
+        // exists for this user.
+        assert!(!s.iter().any(|p| p == "/home/u/.config/librewolf/librewolf"));
+    }
+
+    #[test]
+    fn mozilla_roots_linux_treats_empty_xdg_config_home_as_unset() {
+        // Per the XDG Base Directory spec, an empty value means
+        // "fall back to the default" — same as if the variable were
+        // unset entirely.
+        let roots = mozilla_family_profile_roots("linux", "/home/u", None, Some(""));
+        let s: Vec<String> = roots.iter().map(|p| p.display().to_string()).collect();
+        assert!(s.iter().any(|p| p == "/home/u/.config/librewolf/librewolf"));
+    }
+
+    #[test]
+    fn mozilla_roots_macos_covers_firefox_and_librewolf() {
+        let roots = mozilla_family_profile_roots("macos", "/Users/u", None, None);
+        let s: Vec<String> = roots.iter().map(|p| p.display().to_string()).collect();
+        assert!(s
+            .iter()
+            .any(|p| p == "/Users/u/Library/Application Support/Firefox/Profiles"));
+        assert!(s
+            .iter()
+            .any(|p| p == "/Users/u/Library/Application Support/LibreWolf/Profiles"));
+    }
+
+    #[test]
+    fn mozilla_roots_windows_covers_firefox_and_librewolf() {
+        let roots = mozilla_family_profile_roots(
+            "windows",
+            "ignored",
+            Some("C:\\Users\\u\\AppData\\Roaming"),
+            None,
+        );
+        let s: Vec<String> = roots.iter().map(|p| p.display().to_string()).collect();
+        assert!(s
+            .iter()
+            .any(|p| p == "C:\\Users\\u\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles"));
+        assert!(s
+            .iter()
+            .any(|p| p == "C:\\Users\\u\\AppData\\Roaming\\LibreWolf\\Profiles"));
+    }
+
+    #[test]
+    fn mozilla_roots_windows_without_appdata_yields_nothing() {
+        // %APPDATA% can be missing in stripped CI / service contexts.
+        // Existing behaviour was to no-op; LibreWolf addition must not
+        // panic or fabricate a path from an empty string either.
+        let roots = mozilla_family_profile_roots("windows", "ignored", None, None);
+        assert!(roots.is_empty());
+    }
+
+    #[test]
+    fn mozilla_roots_unknown_os_is_empty() {
+        let roots = mozilla_family_profile_roots("freebsd", "/home/u", None, None);
+        assert!(roots.is_empty());
+    }
+
+    // ── discover_profile_dirs (cert-db filter) ──
+
+    fn touch(path: &Path) {
+        std::fs::write(path, b"").expect("write");
+    }
+
+    #[test]
+    fn discover_profile_dirs_picks_profiles_with_cert9_or_cert8() {
+        // Build a tempdir that mimics the real Mozilla profile layout
+        // and assert the filter accepts cert9.db (NSS sql:) and
+        // cert8.db (legacy dbm:) profiles, skips siblings that have
+        // neither, ignores plain files, and tolerates missing roots.
+        let tmp = std::env::temp_dir().join(format!(
+            "mhrv-discover-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+
+        let with_cert9 = tmp.join("abc.default");
+        let with_cert8 = tmp.join("legacy.profile");
+        let without_db = tmp.join("not-a-profile");
+        let stray_file = tmp.join("profiles.ini");
+        std::fs::create_dir_all(&with_cert9).unwrap();
+        std::fs::create_dir_all(&with_cert8).unwrap();
+        std::fs::create_dir_all(&without_db).unwrap();
+        touch(&with_cert9.join("cert9.db"));
+        touch(&with_cert8.join("cert8.db"));
+        touch(&stray_file);
+
+        let missing_root = tmp.join("does-not-exist");
+        let got = discover_profile_dirs(&[tmp.clone(), missing_root]);
+
+        let names: std::collections::HashSet<_> = got
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains("abc.default"));
+        assert!(names.contains("legacy.profile"));
+        assert!(!names.contains("not-a-profile"));
+        assert!(!names.contains("profiles.ini"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
