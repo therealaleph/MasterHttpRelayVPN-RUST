@@ -1379,14 +1379,21 @@ fn disable_mozilla_enterprise_roots() {
 /// MOZILLA_PKIX_ERROR_MITM_DETECTED with no add-exception path the user
 /// could take.
 ///
-/// On Linux we have to scan four candidate layouts because LibreWolf
-/// migrated mid-project:
-///   * `~/.librewolf` — legacy Firefox-style layout (pre-migration installs).
-///   * `${XDG_CONFIG_HOME:-~/.config}/librewolf/librewolf` — current XDG layout.
-///   * Both of the above again under `~/.var/app/io.gitlab.librewolf-community/`
-///     for the Flatpak sandbox, which redirects HOME inside the container.
+/// On Linux we have to scan five candidate Mozilla-fork layouts:
+///   * `~/.librewolf` — LibreWolf legacy Firefox-style layout (still
+///     present on pre-migration installs).
+///   * `${XDG_CONFIG_HOME:-~/.config}/librewolf/librewolf` — LibreWolf
+///     current XDG layout.
+///   * Both LibreWolf paths again under
+///     `~/.var/app/io.gitlab.librewolf-community/` for the Flatpak
+///     sandbox, which redirects HOME inside the container.
+///   * `~/.mozilla/icecat` — GNU IceCat (Firefox fork shipped by
+///     Trisquel / Parabola / Guix / Debian). Same NSS DB format and
+///     `security.enterprise_roots.enabled` semantics as Firefox; only
+///     the binary's branded profile dir differs. Windows/macOS builds
+///     are not officially distributed, so we don't list paths there.
 /// Non-existent roots silently no-op via `read_dir` failure, so listing
-/// all four costs nothing on installs that only have one.
+/// all of them costs nothing on installs that only have one.
 fn mozilla_family_profile_roots(
     os: &str,
     home: &str,
@@ -1430,6 +1437,11 @@ fn mozilla_family_profile_roots(
                 "{}/.config/librewolf/librewolf",
                 flatpak_home
             )));
+            // GNU IceCat: Firefox fork shipped by Trisquel / Parabola /
+            // Guix / Debian, primarily a GNU/Linux distribution target.
+            // Mirrors Firefox's `~/.mozilla/firefox` layout under
+            // `~/.mozilla/icecat`.
+            roots.push(PathBuf::from(format!("{}/.mozilla/icecat", home)));
         }
         "windows" => {
             if let Some(appdata) = appdata {
@@ -1885,7 +1897,7 @@ ID_LIKE=debian
     // These tests pin every layout so regressions can't sneak back.
 
     #[test]
-    fn mozilla_roots_linux_covers_firefox_legacy_xdg_and_flatpak() {
+    fn mozilla_roots_linux_covers_firefox_librewolf_flatpak_and_icecat() {
         let roots = mozilla_family_profile_roots("linux", "/home/u", None, None);
         let s: Vec<String> = roots.iter().map(|p| p.display().to_string()).collect();
         assert!(s.iter().any(|p| p == "/home/u/.mozilla/firefox"));
@@ -1904,6 +1916,8 @@ ID_LIKE=debian
             .iter()
             .any(|p| p
                 == "/home/u/.var/app/io.gitlab.librewolf-community/.config/librewolf/librewolf"));
+        // GNU IceCat (Trisquel / Parabola / Guix / Debian).
+        assert!(s.iter().any(|p| p == "/home/u/.mozilla/icecat"));
     }
 
     #[test]
