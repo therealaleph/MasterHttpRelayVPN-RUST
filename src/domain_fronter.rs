@@ -8,7 +8,10 @@
 //!
 //! Multiplexes over HTTP/2 when the relay edge agrees via ALPN; falls back
 //! to HTTP/1.1 keep-alive when h2 is refused or fails. Range-parallel
-//! downloads are implemented by `relay_parallel_range`.
+//! downloads are implemented by `relay_parallel_range_to` (writer-based,
+//! streams files larger than Apps Script's single-GET ceiling) with a
+//! buffered `relay_parallel_range` compatibility wrapper for callers that
+//! want a `Vec<u8>` back.
 
 use std::collections::HashMap;
 // AtomicU64 via portable-atomic: native on 64-bit / armv7, spinlock-
@@ -144,10 +147,65 @@ const H1_OPEN_TIMEOUT_SECS: u64 = 8;
 /// request to wake back up — most painful on YouTube / streaming where
 /// the first chunk after a quiet pause stalls the player.
 const H1_KEEPALIVE_INTERVAL_SECS: u64 = 240;
-// Keep synthetic range stitching bounded. Without this, a buggy or hostile
-// origin can advertise `Content-Range: bytes 0-1/<huge>` and make us build a
-// massive range plan or preallocate an enormous response buffer.
-const MAX_STITCHED_RANGE_BYTES: u64 = 64 * 1024 * 1024;
+/// Largest response body Apps Script's `UrlFetchApp` will deliver before
+/// the script gets killed mid-execution. The hard wire ceiling is ~50 MiB;
+/// after base64 / envelope overhead and edge variance, the practical raw
+/// ceiling for a single GET sits around 40 MiB. This bounds the
+/// **writer-based** API's streaming threshold: above this, the buffered
+/// stitch path's single-GET fallback wouldn't fit through Apps Script
+/// even if invoked, so streaming chunks straight to the wire (with
+/// truncate-on-failure semantics the client can resume via Range)
+/// strictly beats today's 25 s timeout + 504 "Apps Script
+/// unresponsive" (#1042).
+const APPS_SCRIPT_BODY_MAX_BYTES: u64 = 40 * 1024 * 1024;
+
+/// Hard ceiling on how many bytes the streaming side of the
+/// range-parallel path will fetch for a single response. A hostile
+/// origin can advertise an absurd `Content-Range` total
+/// (`bytes 0-262143/<huge>`), pass our probe-checks with a normally-
+/// sized 256 KiB first-chunk body, and then drive us to keep issuing
+/// chunk Apps Script calls until the client disconnects. Each chunk
+/// is one Apps Script invocation, counting against the account's
+/// daily quota (~20 k requests/day on the free tier), so an
+/// unattended hostile download can exhaust the quota and lock the
+/// user out of the relay entirely.
+///
+/// 16 GiB is well above any legitimate single-file download a user
+/// is likely to do through a relay VPN (game patches, OS images,
+/// video files all fit) but small enough to bound worst-case quota
+/// drain to ~65 k chunks per pwned URL. Above this cap the streaming
+/// branch refuses the response with a 502 instead of plowing
+/// through.
+const MAX_STREAMED_RANGE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+/// Byte interval between `range-parallel-stream` progress log lines.
+/// Large downloads through the streaming branch otherwise look stuck
+/// in the logs (one "starting N chunks" line at the top, nothing
+/// until completion or failure). At 16 MiB intervals the operator sees
+/// ~6 lines per 100 MiB and ~64 lines per 1 GiB — useful pace at the
+/// ~1.4 MB/s typical through-relay throughput, and quiet enough that
+/// even a 16 GiB file won't drown the log (~1024 progress lines over
+/// the multi-hour download). Per user feedback on PR #1085.
+const STREAM_PROGRESS_LOG_INTERVAL_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Hard ceiling on the buffered stitch buffer's `Vec::with_capacity(total)`
+/// allocation. Two roles:
+///
+///   1. Memory-safety cap. A hostile/buggy origin advertising
+///      `Content-Range: bytes 0-1/<huge>` could otherwise drive
+///      preallocation to enormous values; totals above this either
+///      stream (writer-based API) or fall back to a single GET
+///      (`Vec<u8>` compatibility wrapper, see
+///      [`DomainFronter::relay_parallel_range`]).
+///   2. Pre-1.9.23 compatibility floor for the `Vec<u8>` wrapper.
+///      Range-capable downloads in the 40-64 MiB band used to stitch
+///      successfully via the buffered path; collapsing this constant
+///      into [`APPS_SCRIPT_BODY_MAX_BYTES`] would have pushed those
+///      onto the single-GET fallback path, where Apps Script returns
+///      502/504 because they're above its 50 MiB response ceiling.
+///      Keeping the two cutoffs separate restores that band's
+///      working buffered behavior for wrapper callers.
+const BUFFERED_STITCH_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 struct PoolEntry {
     stream: PooledStream,
@@ -1819,7 +1877,7 @@ impl DomainFronter {
     ///      defined, and the user-sent-Range-header case is handled
     ///      by relay() already (we skip cache for it).
     ///   2. Probe with `Range: bytes=0-<chunk-1>`.
-    ///   3. 200 back (origin doesn't support ranges) → return as-is.
+    ///   3. 200 back (origin doesn't support ranges) → write as-is.
     ///   4. 206 back → parse Content-Range total. If Content-Range says
     ///      the entity fits in the first probe, rewrite the 206 to a 200
     ///      so the client — which never asked for a
@@ -1827,28 +1885,97 @@ impl DomainFronter {
     ///      and Cloudflare turnstile in particular reject unsolicited
     ///      206 on XHR/fetch.)
     ///   5. Else: compute the remaining ranges, fetch them with
-    ///      bounded concurrency, stitch, return as 200.
+    ///      bounded concurrency. Two output modes:
+    ///        * `total ≤ APPS_SCRIPT_BODY_MAX_BYTES` (buffered): stitch
+    ///          all chunks into one `Vec<u8>`, transform the response
+    ///          head, write to caller in one shot. On chunk failure,
+    ///          fall back to a single GET — Apps Script can deliver
+    ///          the file in one piece up to its ~40 MiB cap. Safety
+    ///          net intact.
+    ///        * `total > APPS_SCRIPT_BODY_MAX_BYTES` (streaming): write
+    ///          the response head with `Content-Length: total` and the
+    ///          probe body straight to the client, then stream each
+    ///          remaining chunk to the client as it arrives in order.
+    ///          No buffered fallback (we've already committed bytes on
+    ///          the wire), but single-GET fallback wouldn't fit through
+    ///          Apps Script for files this size anyway — streaming with
+    ///          truncation on hard chunk failure beats today's 25s
+    ///          timeout + 504 (#1042).
     ///
-    /// If any later chunk fails validation or fetch, we fall back to the
-    /// probe's single-chunk response as a graceful-degradation, but we do
-    /// not stitch unchecked bytes into a fake full-success response.
-    pub async fn relay_parallel_range(
+    /// `transform_head` lets the caller rewrite the response head block
+    /// (e.g. CORS injection) without coupling this module to the
+    /// caller's policy. The input is the head bytes from "HTTP/1.x …"
+    /// through the trailing `\r\n\r\n`; the output should be the same
+    /// shape. Pass an identity closure if no rewrite is needed.
+    pub async fn relay_parallel_range_to<W, F>(
         &self,
+        writer: &mut W,
         method: &str,
         url: &str,
         headers: &[(String, String)],
         body: &[u8],
-    ) -> Vec<u8> {
+        transform_head: F,
+    ) -> std::io::Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+        F: Fn(&[u8]) -> Vec<u8>,
+    {
+        self.do_relay_parallel_range_to(
+            writer,
+            method,
+            url,
+            headers,
+            body,
+            &transform_head,
+            /*streaming_allowed=*/ true,
+        )
+        .await
+    }
+
+    /// Shared dispatch for [`Self::relay_parallel_range_to`] (streaming
+    /// enabled) and [`Self::relay_parallel_range`] (the `Vec<u8>`
+    /// compatibility wrapper, streaming disabled).
+    ///
+    /// When `streaming_allowed=false`, the function refuses the
+    /// streaming branch even when the response is large enough to
+    /// warrant it — instead falling back to a plain `self.relay()`
+    /// single GET, matching the pre-1.9.23 wrapper contract that a
+    /// `Vec<u8>` return must never be a fake-200 with the
+    /// `Content-Length` of the full advertised total but only a
+    /// prefix of the body (Issue #162). The streaming branch can
+    /// commit head + partial body before discovering a chunk
+    /// failure; that's correct for a wire writer (download client
+    /// sees Content-Length mismatch, retries via Range from the
+    /// partial position) but a buffered `Vec<u8>` consumer has no
+    /// way to react to the truncation, so we keep them off that
+    /// path entirely.
+    #[allow(clippy::too_many_arguments)]
+    async fn do_relay_parallel_range_to<W, F>(
+        &self,
+        writer: &mut W,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+        transform_head: &F,
+        streaming_allowed: bool,
+    ) -> std::io::Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+        F: Fn(&[u8]) -> Vec<u8>,
+    {
         const MAX_PARALLEL: usize = 16;
         let chunk = RANGE_PARALLEL_CHUNK_BYTES;
 
         if method != "GET" || !body.is_empty() {
-            return self.relay(method, url, headers, body).await;
+            let raw = self.relay(method, url, headers, body).await;
+            return write_response_with_head_transform(writer, &raw, &transform_head).await;
         }
         // If the client already sent a Range header, honour it as-is —
         // don't second-guess a caller that knows what bytes they want.
         if headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("range")) {
-            return self.relay(method, url, headers, body).await;
+            let raw = self.relay(method, url, headers, body).await;
+            return write_response_with_head_transform(writer, &raw, &transform_head).await;
         }
 
         // Probe with the first chunk.
@@ -1858,13 +1985,15 @@ impl DomainFronter {
 
         let (status, resp_headers, resp_body) = match split_response(&first) {
             Some(v) => v,
-            None => return first,
+            None => {
+                return write_response_with_head_transform(writer, &first, &transform_head).await
+            }
         };
 
         if status != 206 {
             // Origin returned the whole thing (or an error). Either way,
             // pass through.
-            return first;
+            return write_response_with_head_transform(writer, &first, &transform_head).await;
         }
 
         let probe_range = match validate_probe_range(status, &resp_headers, resp_body, chunk - 1)
@@ -1875,64 +2004,127 @@ impl DomainFronter {
                     "range-parallel: probe returned invalid 206 for {}; falling back to single GET",
                     url,
                 );
-                return self.relay(method, url, headers, body).await;
+                let raw = self.relay(method, url, headers, body).await;
+                return write_response_with_head_transform(writer, &raw, &transform_head).await;
             }
         };
         let total = probe_range.total;
 
         if total <= chunk || (probe_range.end + 1) >= total {
-            return rewrite_206_to_200(&first);
+            let raw = rewrite_206_to_200(&first);
+            return write_response_with_head_transform(writer, &raw, &transform_head).await;
         }
 
-        let total_usize = match checked_stitched_range_capacity(total) {
-            Some(v) => v,
-            None => {
-                tracing::warn!(
-                    "range-parallel: Content-Range total {} for {} is too large; falling back to single GET",
-                    total,
-                    url,
-                );
-                return self.relay(method, url, headers, body).await;
-            }
-        };
+        // Range planning is lazy via `plan_remaining_ranges` — a hostile
+        // origin can advertise `Content-Range: bytes 0-262143/<huge>` and
+        // pass the probe checks (matching 256 KiB body, claimed total >
+        // probe end), so eagerly building a `Vec<(u64, u64)>` for the
+        // full plan would let it drive arbitrary allocations on the
+        // stream branch (a 100 TiB advertised total at 256 KiB chunks
+        // is ~400M tuples, ~6 GB). PR #151's original `MAX_STITCHED_…`
+        // guard prevented this on the buffered side; lazy iteration
+        // preserves that protection for streaming without imposing a
+        // hard ceiling on legitimate large downloads.
+        let probe_end = probe_range.end;
+        let expected_chunks = (total - probe_end - 1).div_ceil(chunk);
 
-        // Plan remaining ranges after what the probe already returned.
-        let mut ranges: Vec<(u64, u64)> = Vec::new();
-        let mut start = probe_range.end + 1;
-        while start < total {
-            let end = (start + chunk - 1).min(total - 1);
-            ranges.push((start, end));
-            start = end + 1;
+        // Branch: buffered stitch (fallback-safe) vs. streaming vs.
+        // single-GET fallback for the compat wrapper. See
+        // `dispatch_range_response` doc for the per-caller contract.
+        match dispatch_range_response(total, streaming_allowed) {
+            RangeDispatch::Stream => {
+                tracing::info!(
+                    "range-parallel-stream: {} bytes total, {} chunks after probe, up to {} in flight",
+                    total, expected_chunks, MAX_PARALLEL,
+                );
+                let fetches = self.fetch_chunks_stream(
+                    url,
+                    headers,
+                    plan_remaining_ranges(probe_end, total, chunk),
+                    total,
+                    MAX_PARALLEL,
+                );
+                return stream_range_response_to(
+                    writer,
+                    &resp_headers,
+                    resp_body,
+                    total,
+                    fetches,
+                    transform_head,
+                    url,
+                )
+                .await;
+            }
+            RangeDispatch::FallbackSingleGet => {
+                // `Vec<u8>` wrapper above 64 MiB: stream branch is
+                // off-limits (truncate-then-Err can't be reacted to),
+                // so we fall back to a single GET — same path the
+                // pre-1.9.23 wrapper took above its 64 MiB cap. Apps
+                // Script will typically return 502/504 because the
+                // response exceeds its delivery ceiling, but that's
+                // the contract: callers see Apps Script's error, not
+                // a half-written success.
+                tracing::info!(
+                    "range-parallel: {} bytes total > {} buffered cap and streaming disallowed; falling back to single GET",
+                    total, BUFFERED_STITCH_MAX_BYTES,
+                );
+                let raw = self.relay(method, url, headers, body).await;
+                return write_response_with_head_transform(writer, &raw, transform_head).await;
+            }
+            RangeDispatch::RejectTooLarge => {
+                // Quota-DoS guard: refuse the response. Streaming
+                // an advertised 16 GiB+ total would issue ~65 k
+                // chunk Apps Script calls (~daily quota on the free
+                // tier) per pwned URL — see `MAX_STREAMED_RANGE_BYTES`.
+                // 502 is the right status: this is upstream-induced
+                // refusal, not a client error.
+                tracing::warn!(
+                    "range-parallel: refusing {} bytes total for {} — exceeds {} streaming cap",
+                    total, url, MAX_STREAMED_RANGE_BYTES,
+                );
+                let raw = error_response(
+                    502,
+                    "Advertised Content-Range total exceeds relay's streaming \
+                     ceiling. The origin reported a size larger than the relay \
+                     is willing to fetch through Apps Script; refusing to spend \
+                     daily quota on a likely-hostile or buggy origin.",
+                );
+                return write_response_with_head_transform(writer, &raw, transform_head).await;
+            }
+            RangeDispatch::Buffered => {
+                // Fall through to the buffered stitch code below.
+            }
         }
 
         tracing::info!(
             "range-parallel: {} bytes total, {} chunks remaining after probe, up to {} in flight",
-            total, ranges.len(), MAX_PARALLEL,
+            total, expected_chunks, MAX_PARALLEL,
         );
+
+        // Buffered stitch. `total` is bounded above by
+        // `BUFFERED_STITCH_MAX_BYTES` (64 MiB) for the `Vec<u8>`
+        // wrapper path and by `APPS_SCRIPT_BODY_MAX_BYTES` (40 MiB)
+        // for the writer-based API — see `dispatch_range_response`.
+        // Either way, well inside `usize` even on 32-bit targets, and
+        // the lazy range iterator produces at most ~256 tuples for a
+        // 64 MiB total at 256 KiB chunks, so collecting results into
+        // `Vec<_>` for stitching is cheap.
+        let total_usize = total as usize;
 
         // Concurrent fetch with `buffered` — preserves input order
         // (important for stitching) and caps in-flight count. Each task
         // calls back into `relay()`, which already has retry + fan-out
         // wiring on single-request granularity; we don't duplicate
         // those here.
-        use futures_util::stream::{self, StreamExt};
-        let url_owned = url.to_string();
-        let base_headers = headers.to_vec();
-        let fetches = stream::iter(ranges.into_iter())
-            .map(|(s, e)| {
-                let url = url_owned.clone();
-                let mut h = base_headers.clone();
-                // Force a single Range header — if the caller's headers
-                // somehow already had one we wouldn't be here, but be
-                // defensive anyway.
-                h.retain(|(k, _)| !k.eq_ignore_ascii_case("range"));
-                h.push(("Range".into(), format!("bytes={}-{}", s, e)));
-                async move {
-                    let raw = self.relay("GET", &url, &h, &[]).await;
-                    (s, e, extract_exact_range_body(&raw, s, e, total))
-                }
-            })
-            .buffered(MAX_PARALLEL)
+        use futures_util::stream::StreamExt;
+        let fetches = self
+            .fetch_chunks_stream(
+                url,
+                headers,
+                plan_remaining_ranges(probe_end, total, chunk),
+                total,
+                MAX_PARALLEL,
+            )
             .collect::<Vec<_>>()
             .await;
 
@@ -1954,14 +2146,16 @@ impl DomainFronter {
                     // origin returning 200-instead-of-206 on later
                     // chunks, total mismatch across chunks. Correct
                     // recovery is a fresh single GET — Apps Script
-                    // fetches the full URL up to its 50 MiB cap. Slow
+                    // fetches the full URL up to its ~40 MiB cap. Slow
                     // for big files vs. the parallel path but produces
                     // a complete response, which is what matters.
                     tracing::warn!(
                         "range-parallel: invalid chunk {}-{} for {} ({}); falling back to single GET",
                         start, end, url, reason,
                     );
-                    return self.relay(method, url, headers, body).await;
+                    let raw = self.relay(method, url, headers, body).await;
+                    return write_response_with_head_transform(writer, &raw, &transform_head)
+                        .await;
                 }
             }
         }
@@ -1975,14 +2169,108 @@ impl DomainFronter {
                 "range-parallel: stitched {}/{} bytes for {}; falling back to single GET",
                 full.len(), total, url,
             );
-            return self.relay(method, url, headers, body).await;
+            let raw = self.relay(method, url, headers, body).await;
+            return write_response_with_head_transform(writer, &raw, &transform_head).await;
         }
 
         // Build a 200 OK with Content-Length = full body length. Drop
         // the Content-Range header (no longer applicable) and
         // Transfer-Encoding/Content-Encoding (origin already decoded
         // what we got; we ship plain bytes).
-        assemble_full_200(&resp_headers, &full)
+        let raw = assemble_full_200(&resp_headers, &full);
+        write_response_with_head_transform(writer, &raw, &transform_head).await
+    }
+
+    /// Backward-compatible wrapper around `relay_parallel_range_to`
+    /// that buffers the full response into a `Vec<u8>` before
+    /// returning. Retained so downstream callers (and external
+    /// consumers of `mhrv-rs` as a library) that depend on the pre-
+    /// 1.9.23 `-> Vec<u8>` signature keep working without code
+    /// changes. New code should prefer `relay_parallel_range_to`,
+    /// which streams large files chunk-by-chunk instead of buffering
+    /// the response in memory.
+    ///
+    /// **Pre-1.9.23 contract preservation:** for responses above the
+    /// buffered ceiling (`BUFFERED_STITCH_MAX_BYTES`, 64 MiB) the
+    /// wrapper deliberately falls back to a single `relay()` call
+    /// rather than taking the streaming branch. Streaming commits a
+    /// `200 OK` head with `Content-Length: <total>` plus a partial
+    /// body before discovering chunk failures — that's correct for a
+    /// wire writer (download client retries via Range) but exactly
+    /// the "fake-truncated-success" contract violation from Issue
+    /// #162 once the bytes are collected into a buffer the caller
+    /// can't react to. Wrapper callers therefore see the same upper
+    /// bound on response size and the same fallback semantics they
+    /// had before 1.9.23; only the failure surface changes (502/504
+    /// from Apps Script for the >40 MiB case, same as before).
+    pub async fn relay_parallel_range(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        let identity = |head: &[u8]| head.to_vec();
+        // Writing to a `Vec<u8>` through `VecAsyncWriter` never fails
+        // (no I/O), so the `io::Result` from the writer-based API is
+        // always `Ok` here — modulo the streaming branch's chunk-
+        // validation error path. Disabling streaming
+        // (`streaming_allowed=false`) keeps the wrapper off that
+        // path, so the only `Err` cases left are unreachable for
+        // `VecAsyncWriter`.
+        let _ = self
+            .do_relay_parallel_range_to(
+                &mut VecAsyncWriter(&mut buf),
+                method,
+                url,
+                headers,
+                body,
+                &identity,
+                /*streaming_allowed=*/ false,
+            )
+            .await;
+        buf
+    }
+
+    /// Build the concurrent fetch stream used by both the buffered and
+    /// streaming branches of `relay_parallel_range_to`. Each yielded
+    /// item is `(start, end, Result<chunk_body, validation_reason>)`
+    /// in input order (via `buffered`, which preserves order while
+    /// capping in-flight count). Splitting this out keeps the
+    /// branching at the call site small and lets tests for the
+    /// streaming writer use a synthetic `Stream` with no
+    /// `DomainFronter` dependency.
+    fn fetch_chunks_stream<'a, I>(
+        &'a self,
+        url: &str,
+        base_headers: &[(String, String)],
+        ranges: I,
+        total: u64,
+        max_parallel: usize,
+    ) -> impl futures_util::Stream<Item = (u64, u64, Result<Vec<u8>, &'static str>)> + 'a
+    where
+        I: IntoIterator<Item = (u64, u64)> + 'a,
+        I::IntoIter: 'a,
+    {
+        use futures_util::stream::{self, StreamExt};
+        let url_owned = url.to_string();
+        let base_h = base_headers.to_vec();
+        stream::iter(ranges)
+            .map(move |(s, e)| {
+                let url = url_owned.clone();
+                let mut h = base_h.clone();
+                // Force a single Range header — if the caller's headers
+                // somehow already had one we wouldn't be here, but be
+                // defensive anyway.
+                h.retain(|(k, _)| !k.eq_ignore_ascii_case("range"));
+                h.push(("Range".into(), format!("bytes={}-{}", s, e)));
+                async move {
+                    let raw = self.relay("GET", &url, &h, &[]).await;
+                    (s, e, extract_exact_range_body(&raw, s, e, total))
+                }
+            })
+            .buffered(max_parallel)
     }
 
     async fn relay_uncoalesced(
@@ -3068,13 +3356,6 @@ fn probe_range_covers_complete_entity(range: ContentRange, requested_end: u64) -
         && range.total <= requested_end.saturating_add(1)
 }
 
-fn checked_stitched_range_capacity(total: u64) -> Option<usize> {
-    if total > MAX_STITCHED_RANGE_BYTES {
-        return None;
-    }
-    usize::try_from(total).ok()
-}
-
 fn extract_exact_range_body(
     raw: &[u8],
     start: u64,
@@ -3115,6 +3396,19 @@ fn rewrite_206_to_200(raw: &[u8]) -> Vec<u8> {
 /// wire-level stuff) — we set Content-Length from the body we're
 /// actually shipping.
 fn assemble_full_200(src_headers: &[(String, String)], body: &[u8]) -> Vec<u8> {
+    let mut out = assemble_200_head(src_headers, body.len() as u64);
+    out.extend_from_slice(body);
+    out
+}
+
+/// Build only the `HTTP/1.1 200 OK` head block — status line, headers,
+/// and the `\r\n\r\n` terminator — with `Content-Length:
+/// declared_length`. Used by the streaming side of the range-parallel
+/// path, where the body hasn't been assembled yet but we know its
+/// total size from the probe's `Content-Range`. Matches
+/// `assemble_full_200`'s header-skip rules so the two paths produce
+/// identical headers for a given probe.
+fn assemble_200_head(src_headers: &[(String, String)], declared_length: u64) -> Vec<u8> {
     let skip = |k: &str| {
         matches!(
             k.to_ascii_lowercase().as_str(),
@@ -3136,9 +3430,320 @@ fn assemble_full_200(src_headers: &[(String, String)], body: &[u8]) -> Vec<u8> {
         out.extend_from_slice(v.as_bytes());
         out.extend_from_slice(b"\r\n");
     }
-    out.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
-    out.extend_from_slice(body);
+    out.extend_from_slice(format!("Content-Length: {}\r\n\r\n", declared_length).as_bytes());
     out
+}
+
+/// Apply `transform_head` to the head block of an HTTP/1.x response
+/// (everything up to and including the first `\r\n\r\n` terminator),
+/// then write the transformed head followed by the unchanged body to
+/// `writer`. If the response can't be parsed as HTTP/1.x (no header
+/// terminator), passes the bytes through unchanged. This is the
+/// buffered-path bridge to the writer-based API: callers see the
+/// same head-rewrite policy regardless of whether we took the
+/// streaming or buffered branch.
+async fn write_response_with_head_transform<W, F>(
+    writer: &mut W,
+    response: &[u8],
+    transform_head: &F,
+) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    F: Fn(&[u8]) -> Vec<u8>,
+{
+    use tokio::io::AsyncWriteExt;
+
+    let sep = b"\r\n\r\n";
+    let Some(idx) = response.windows(sep.len()).position(|w| w == sep) else {
+        writer.write_all(response).await?;
+        return Ok(());
+    };
+    let head_with_terminator = &response[..idx + sep.len()];
+    let body = &response[idx + sep.len()..];
+    let new_head = transform_head(head_with_terminator);
+    writer.write_all(&new_head).await?;
+    writer.write_all(body).await?;
+    Ok(())
+}
+
+/// Three-way dispatch for the range-parallel response delivery in
+/// `do_relay_parallel_range_to`. Extracted as a pure function so the
+/// branching contract is unit-testable without a live `DomainFronter`,
+/// and split into an enum so the writer-based and `Vec<u8>` APIs can
+/// pick different cutoffs (which is exactly the regression that
+/// motivated PR #1043's third-round review).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RangeDispatch {
+    /// Stitch all chunks into a single in-memory buffer, then deliver
+    /// the response to the writer in one shot. Chunk failure falls
+    /// back to a single GET — which actually recovers when the file
+    /// fits through Apps Script's response cap.
+    Buffered,
+    /// Write the response head + probe body to the wire, then stream
+    /// each remaining chunk in order. Chunk failure truncates the
+    /// response and surfaces as a Content-Length mismatch the
+    /// download client resumes via Range. Only reachable from the
+    /// writer-based API (`streaming_allowed=true`).
+    Stream,
+    /// Fall back to a plain `self.relay()` single GET. Used by the
+    /// `Vec<u8>` compatibility wrapper when the response would
+    /// exceed the buffered stitch buffer's memory cap and the wrapper
+    /// can't take the streaming branch (a `Vec<u8>` consumer can't
+    /// react to a truncated 200 OK — Issue #162).
+    FallbackSingleGet,
+    /// Refuse the response outright with a 502. Only reachable from
+    /// the writer-based API for advertised totals above
+    /// [`MAX_STREAMED_RANGE_BYTES`]. Prevents an absurd
+    /// `Content-Range` total from turning one GET into an unbounded
+    /// stream of chunk Apps Script calls (quota drain DoS — see the
+    /// constant's doc). The compat wrapper has the lower
+    /// [`BUFFERED_STITCH_MAX_BYTES`] cliff above it, so this variant
+    /// is not reachable via `streaming_allowed=false`.
+    RejectTooLarge,
+}
+
+/// Decide how to deliver a range-capable response of size `total`.
+///
+/// Two callers, two contracts:
+///   * Writer-based public API ([`DomainFronter::relay_parallel_range_to`])
+///     passes `streaming_allowed=true`. It streams above
+///     [`APPS_SCRIPT_BODY_MAX_BYTES`] (40 MiB) — that's where
+///     single-GET fallback would fail through Apps Script anyway,
+///     so streaming with truncate-and-resume beats a hard 504.
+///   * `Vec<u8>` compatibility wrapper
+///     ([`DomainFronter::relay_parallel_range`]) passes
+///     `streaming_allowed=false`. It buffers up to
+///     [`BUFFERED_STITCH_MAX_BYTES`] (64 MiB) and only falls back to
+///     single GET above that. The 40-64 MiB band still stitches
+///     successfully (the pre-1.9.23 behavior); above 64 MiB the
+///     wrapper returns whatever Apps Script's single-GET returns
+///     (typically 502/504), matching the pre-1.9.23 cliff exactly.
+fn dispatch_range_response(total: u64, streaming_allowed: bool) -> RangeDispatch {
+    if streaming_allowed && total > MAX_STREAMED_RANGE_BYTES {
+        // Quota-DoS guard for the writer API. The wrapper never
+        // hits this branch because its `streaming_allowed=false`
+        // path is gated by the lower `BUFFERED_STITCH_MAX_BYTES`
+        // (64 MiB) cliff above — Apps Script's single-GET refuses
+        // the response there, no chunk loop runs.
+        RangeDispatch::RejectTooLarge
+    } else if streaming_allowed && total > APPS_SCRIPT_BODY_MAX_BYTES {
+        RangeDispatch::Stream
+    } else if !streaming_allowed && total > BUFFERED_STITCH_MAX_BYTES {
+        RangeDispatch::FallbackSingleGet
+    } else {
+        RangeDispatch::Buffered
+    }
+}
+
+/// Lazy iterator over the byte ranges that need to be fetched after
+/// the probe. Yields `(start, end)` pairs of inclusive byte indices,
+/// each ≤ `chunk_size` long, covering `(probe_end, total - 1]`.
+///
+/// Crucially this is `O(1)` memory regardless of `total`. A hostile or
+/// buggy origin advertising `Content-Range: bytes 0-262143/<huge>`
+/// can pass the probe checks (matching 256 KiB body, valid total) but
+/// must not be allowed to drive an eager `Vec<(u64, u64)>` allocation
+/// — at 256 KiB chunks a claimed 100 TiB total is ~400M tuples
+/// (~6 GB resident). PR #151's original guard was a fixed
+/// `MAX_STITCHED_RANGE_BYTES` cap; the writer-based path replaces it
+/// with this lazy iterator so streaming downloads have no hard size
+/// ceiling but also no eager allocation.
+fn plan_remaining_ranges(
+    probe_end: u64,
+    total: u64,
+    chunk_size: u64,
+) -> impl Iterator<Item = (u64, u64)> {
+    let mut start = probe_end.saturating_add(1);
+    std::iter::from_fn(move || {
+        if start >= total {
+            return None;
+        }
+        let s = start;
+        let e = (s.saturating_add(chunk_size).saturating_sub(1)).min(total - 1);
+        start = e.saturating_add(1);
+        Some((s, e))
+    })
+}
+
+/// Streaming write loop for the range-parallel path. Writes `head`,
+/// then `probe_body`, then each chunk from `fetches` in input order
+/// (which is by-range-start since `fetch_chunks_stream` uses
+/// `buffered` to preserve order). On the first validation failure
+/// flushes the committed prefix and returns `Err`; the partial
+/// response surfaces to the download client as a truncated body
+/// (Content-Length mismatch), which most clients — curl `-C -`,
+/// browsers' built-in download manager, wget — treat as a resumable
+/// failure and reissue via Range from the partial byte count.
+///
+/// The pre-Err flush is load-bearing on TLS streams (and to a
+/// lesser extent on plain sockets with the kernel send buffer):
+/// `write_all` returns once the bytes are in the TLS writer's
+/// in-memory buffer, NOT once they've been encrypted and shipped
+/// down the socket. If we returned `Err` without flushing, the
+/// caller's `?` typically propagates the error and the connection
+/// is dropped — taking buffered ciphertext with it. The client then
+/// sees a clean connection close before any body bytes, instead of
+/// the partial body it needs to compute a resume offset.
+///
+/// Kept as a free function (no `&self`) so the streaming logic can be
+/// unit-tested with synthetic `Stream`s built from `stream::iter(…)`
+/// instead of needing a fully-constructed `DomainFronter`.
+async fn stream_chunks_to_writer<W, S>(
+    writer: &mut W,
+    head: &[u8],
+    probe_body: &[u8],
+    total: u64,
+    fetches: S,
+    url_for_log: &str,
+) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    S: futures_util::Stream<Item = (u64, u64, Result<Vec<u8>, &'static str>)>,
+{
+    use futures_util::stream::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    writer.write_all(head).await?;
+    writer.write_all(probe_body).await?;
+    // Flush head + probe body to the wire before kicking off remote
+    // chunk fetches. First bytes hit the client immediately so the
+    // browser / download manager sees the response start (status
+    // code + Content-Length, plus the first 256 KiB of body) while
+    // the Apps Script round-trips for the remaining chunks are in
+    // flight. Without this, intermediate buffering (TLS writer
+    // buffer, kernel send buffer with small initial cwnd, browsers'
+    // own pre-read thresholds) can make the progress bar sit at
+    // zero for the first several hundred ms of the download.
+    //
+    // Propagate flush errors here — if the client already
+    // disconnected, no point firing N more Apps Script calls.
+    writer.flush().await?;
+    futures_util::pin_mut!(fetches);
+
+    // Progress accounting: bytes emitted as wire body so far (the
+    // probe body, plus every successfully-written chunk). The head
+    // doesn't count — it's protocol framing, not body progress.
+    // `next_progress_log_at` is the next body-byte threshold at
+    // which we emit a progress line, advanced past the current
+    // count each time so a single large chunk crossing multiple
+    // intervals only logs once.
+    let mut body_bytes_emitted: u64 = probe_body.len() as u64;
+    let mut next_progress_log_at: u64 = STREAM_PROGRESS_LOG_INTERVAL_BYTES;
+
+    while let Some((s, e, chunk_result)) = fetches.next().await {
+        match chunk_result {
+            Ok(c) => {
+                writer.write_all(&c).await?;
+                body_bytes_emitted = body_bytes_emitted.saturating_add(c.len() as u64);
+                if body_bytes_emitted >= next_progress_log_at {
+                    // Percentage is well-defined here: streaming
+                    // branch is only reached for total >
+                    // APPS_SCRIPT_BODY_MAX_BYTES (≥ 40 MiB), so the
+                    // divisor is never zero.
+                    let pct = (body_bytes_emitted * 100) / total;
+                    tracing::info!(
+                        "range-parallel-stream: {}/{} MiB ({}%) emitted for {}",
+                        body_bytes_emitted / (1024 * 1024),
+                        total / (1024 * 1024),
+                        pct,
+                        url_for_log,
+                    );
+                    // Advance to the next interval past the current
+                    // count — a chunk much larger than the interval
+                    // (shouldn't happen at 256 KiB chunks, but defend
+                    // against future tuning) skips intermediate
+                    // thresholds rather than firing N log lines back
+                    // to back.
+                    next_progress_log_at = body_bytes_emitted
+                        .saturating_add(STREAM_PROGRESS_LOG_INTERVAL_BYTES);
+                }
+            }
+            Err(reason) => {
+                tracing::warn!(
+                    "range-parallel-stream: invalid chunk {}-{} for {} ({}); truncating response",
+                    s, e, url_for_log, reason,
+                );
+                // Flush the committed prefix to the wire before
+                // declaring failure — see function doc. We
+                // deliberately ignore a flush failure here: if the
+                // socket is already broken the original
+                // chunk-validation error is still the more useful
+                // diagnosis for the caller.
+                let _ = writer.flush().await;
+                return Err(std::io::Error::other(format!(
+                    "range-parallel-stream chunk failure: {}",
+                    reason
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Glue between probe response + chunk stream + writer. Composes
+/// `assemble_200_head` (builds a synthetic 200 with
+/// `Content-Length: total`), the caller's head-transform closure
+/// (e.g. CORS injection), and `stream_chunks_to_writer` (writes the
+/// transformed head, the probe body, then each chunk in order).
+///
+/// Extracted as a free function so the streaming-branch wiring in
+/// `do_relay_parallel_range_to` is unit-testable without a live
+/// `DomainFronter`. A test can feed a synthetic probe-header set, a
+/// probe body, and a `stream::iter(…)` of canned chunk results, then
+/// inspect the bytes written to a `Vec<u8>` to assert the right
+/// composition (head → probe → chunks in order, transform_head
+/// applied to the head only, mid-stream Err propagation with the
+/// committed prefix intact).
+async fn stream_range_response_to<W, S, F>(
+    writer: &mut W,
+    probe_resp_headers: &[(String, String)],
+    probe_body: &[u8],
+    total: u64,
+    chunks_stream: S,
+    transform_head: &F,
+    url_for_log: &str,
+) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    S: futures_util::Stream<Item = (u64, u64, Result<Vec<u8>, &'static str>)>,
+    F: Fn(&[u8]) -> Vec<u8>,
+{
+    let head = assemble_200_head(probe_resp_headers, total);
+    let head = transform_head(&head);
+    stream_chunks_to_writer(writer, &head, probe_body, total, chunks_stream, url_for_log).await
+}
+
+/// Tiny adapter that lets `relay_parallel_range_to` write into a
+/// `Vec<u8>` so the backward-compat `relay_parallel_range` wrapper
+/// can stay on the writer-based code path. `Vec<u8>` itself doesn't
+/// implement `tokio::io::AsyncWrite`; this just extends in-place,
+/// never fails, and never needs to block — `poll_*` immediately
+/// returns `Ready`.
+struct VecAsyncWriter<'a>(&'a mut Vec<u8>);
+
+impl tokio::io::AsyncWrite for VecAsyncWriter<'_> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.get_mut().0.extend_from_slice(buf);
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
 }
 
 fn normalize_x_graphql_url(url: &str) -> String {
@@ -4752,16 +5357,6 @@ Content-Length: 45812\r\n\r\n"
     }
 
     #[test]
-    fn stitched_range_capacity_rejects_absurd_total() {
-        assert_eq!(
-            checked_stitched_range_capacity(MAX_STITCHED_RANGE_BYTES),
-            Some(MAX_STITCHED_RANGE_BYTES as usize),
-        );
-        assert_eq!(checked_stitched_range_capacity(MAX_STITCHED_RANGE_BYTES + 1), None);
-        assert_eq!(checked_stitched_range_capacity(u64::MAX), None);
-    }
-
-    #[test]
     fn extract_exact_range_body_rejects_body_length_mismatch() {
         let raw = b"HTTP/1.1 206 Partial Content\r\n\
 Content-Range: bytes 5-9/20\r\n\
@@ -4779,6 +5374,797 @@ Content-Length: 5\r\n\r\n\
 hello";
         let err = extract_exact_range_body(raw, 10, 14, 20).unwrap_err();
         assert_eq!(err, "unexpected Content-Range");
+    }
+
+    #[test]
+    fn assemble_200_head_uses_declared_length_and_strips_range_meta() {
+        // Streaming path passes `total` (full file size) as the declared
+        // length even though the body hasn't been assembled yet. The head
+        // block must carry that as Content-Length and must NOT carry the
+        // probe's Content-Range (would mark response as partial and
+        // clients would reject mid-stream chunks past the probe's end).
+        let probe_headers = vec![
+            ("Content-Type".to_string(), "application/octet-stream".to_string()),
+            ("Content-Range".to_string(), "bytes 0-262143/109605203".to_string()),
+            ("Content-Length".to_string(), "262144".to_string()),
+            ("Content-Encoding".to_string(), "gzip".to_string()),
+            ("Transfer-Encoding".to_string(), "chunked".to_string()),
+            ("Connection".to_string(), "close".to_string()),
+            ("Cache-Control".to_string(), "max-age=300".to_string()),
+        ];
+        let head = assemble_200_head(&probe_headers, 109_605_203);
+        let s = std::str::from_utf8(&head).unwrap();
+        assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(s.ends_with("\r\n\r\n"));
+        assert!(s.contains("Content-Length: 109605203\r\n"));
+        // Hop-by-hop and content-meta the buffered path strips must
+        // ALSO be stripped by the streaming head (else range responses
+        // would mislead clients).
+        assert!(!s.contains("Content-Range:"));
+        assert!(!s.contains("Content-Encoding:"));
+        assert!(!s.contains("Transfer-Encoding:"));
+        assert!(!s.contains("Connection:"));
+        // Original Content-Length from the probe must NOT survive —
+        // we computed our own from `total`.
+        assert!(!s.contains("Content-Length: 262144\r\n"));
+        // Non-stripped headers pass through.
+        assert!(s.contains("Content-Type: application/octet-stream\r\n"));
+        assert!(s.contains("Cache-Control: max-age=300\r\n"));
+    }
+
+    #[test]
+    fn assemble_200_head_matches_full_200_head_for_buffered_path() {
+        // The two assemblers must agree on header semantics so a
+        // response taken via the buffered path is byte-identical (in
+        // its head block) to the same response taken via the streaming
+        // path. Lock that in here so future header-skip changes don't
+        // drift between the two.
+        let headers = vec![
+            ("Content-Type".to_string(), "text/html".to_string()),
+            ("Content-Range".to_string(), "bytes 0-9/10".to_string()),
+            ("X-Custom".to_string(), "foo".to_string()),
+        ];
+        let body = b"helloworld";
+        let full = assemble_full_200(&headers, body);
+        let head_only = assemble_200_head(&headers, body.len() as u64);
+        let sep = b"\r\n\r\n";
+        let idx = full.windows(sep.len()).position(|w| w == sep).unwrap();
+        assert_eq!(&full[..idx + sep.len()], head_only.as_slice());
+    }
+
+    #[tokio::test]
+    async fn write_response_with_head_transform_applies_to_head_not_body() {
+        // The bridge between writer-based API and the buffered/error
+        // paths: head gets the transform; body bytes are forwarded
+        // unchanged so binary payloads aren't corrupted by an
+        // accidental UTF-8 round-trip in the transform path.
+        let response = b"HTTP/1.1 200 OK\r\nContent-Type: app/octet-stream\r\nContent-Length: 4\r\n\r\n\x00\x01\x02\xff";
+        let mut buf: Vec<u8> = Vec::new();
+        let transform = |head: &[u8]| -> Vec<u8> {
+            // Tag the head so we can prove the transform ran on it.
+            // Strip the trailing CRLFCRLF terminator, append a new
+            // header line, then restore the terminator.
+            let sep = b"\r\n\r\n";
+            let mut out = head.strip_suffix(sep).unwrap_or(head).to_vec();
+            out.extend_from_slice(b"\r\nX-Tag: yes\r\n\r\n");
+            out
+        };
+        write_response_with_head_transform(&mut buf, response, &transform)
+            .await
+            .unwrap();
+        let sep_pos = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let (head, body) = (&buf[..sep_pos + 4], &buf[sep_pos + 4..]);
+        let head_s = std::str::from_utf8(head).unwrap();
+        assert!(head_s.contains("X-Tag: yes\r\n"));
+        // Body is byte-identical — no UTF-8 lossy conversion.
+        assert_eq!(body, b"\x00\x01\x02\xff");
+    }
+
+    #[tokio::test]
+    async fn write_response_with_head_transform_passes_through_when_no_terminator() {
+        // Defensive: a payload missing `\r\n\r\n` (corrupted upstream,
+        // raw error blob) must be forwarded byte-identical so we don't
+        // synthesise a fake header for non-HTTP/1.x bytes.
+        let response = b"not an http response";
+        let mut buf: Vec<u8> = Vec::new();
+        let transform = |_: &[u8]| -> Vec<u8> { b"XX".to_vec() };
+        write_response_with_head_transform(&mut buf, response, &transform)
+            .await
+            .unwrap();
+        assert_eq!(buf.as_slice(), response);
+    }
+
+    #[test]
+    fn plan_remaining_ranges_basic_chunking() {
+        // probe covered 0..=3 of a 20-byte file at 5-byte chunks →
+        // remaining ranges are 4-8, 9-13, 14-18, 19-19.
+        let ranges: Vec<_> = plan_remaining_ranges(3, 20, 5).collect();
+        assert_eq!(ranges, vec![(4, 8), (9, 13), (14, 18), (19, 19)]);
+    }
+
+    #[test]
+    fn plan_remaining_ranges_yields_nothing_when_probe_covers_everything() {
+        // Defensive: even though the caller is supposed to short-circuit
+        // when the probe covers the entity, the iterator itself must be
+        // a no-op rather than emit a bogus 0-length range.
+        let ranges: Vec<_> = plan_remaining_ranges(19, 20, 5).collect();
+        assert!(ranges.is_empty());
+    }
+
+    #[test]
+    fn plan_remaining_ranges_handles_huge_total_lazily_without_oom() {
+        // Regression for the DoS introduced when the buffered+streaming
+        // refactor (1.9.23) initially built the full ranges Vec before
+        // branching on size. A hostile origin advertising
+        // `Content-Range: bytes 0-262143/<huge>` can pass the probe
+        // checks (matching 256 KiB body, valid total) and used to drive
+        // ~6 GB of `Vec<(u64, u64)>` allocation for a 100 TiB total.
+        //
+        // Lazy iteration must let us pull a bounded number of items
+        // from a u64::MAX-sized total without panicking or allocating
+        // the whole plan. Pulling 10 items proves we never materialised
+        // ~2^44 of them up front.
+        let total = u64::MAX;
+        let chunk = 256 * 1024;
+        let probe_end = chunk - 1;
+        let first_ten: Vec<_> = plan_remaining_ranges(probe_end, total, chunk).take(10).collect();
+        assert_eq!(first_ten.len(), 10);
+        // First range starts right after the probe.
+        assert_eq!(first_ten[0].0, probe_end + 1);
+        // Each range covers exactly one chunk except possibly the last
+        // — which here can't be the tail because we only took 10.
+        for (s, e) in &first_ten {
+            assert_eq!(e - s + 1, chunk);
+        }
+        // Successive ranges are contiguous.
+        for w in first_ten.windows(2) {
+            assert_eq!(w[1].0, w[0].1 + 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_chunks_to_writer_writes_head_probe_then_chunks_in_order() {
+        // Happy path: streaming writer must emit
+        //   head + probe_body + chunk1_body + chunk2_body + …
+        // in input order so a download client reading byte 0 onward
+        // sees a coherent response.
+        use futures_util::stream::{self, StreamExt as _};
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n";
+        let probe = b"AB";
+        // The streaming function consumes whatever `Stream` it's given;
+        // tests feed it `stream::iter` of synthetic chunk results so
+        // we exercise the writer + ordering logic without needing a
+        // live DomainFronter / Apps Script.
+        let fetches = stream::iter(vec![
+            (2u64, 5u64, Ok::<Vec<u8>, &'static str>(b"CDEF".to_vec())),
+            (6u64, 9u64, Ok::<Vec<u8>, &'static str>(b"GHIJ".to_vec())),
+        ]);
+        let mut buf = Vec::new();
+        stream_chunks_to_writer(
+            &mut VecAsyncWriter(&mut buf),
+            head,
+            probe,
+            10,
+            fetches.map(|x| x),
+            "https://example.test/file",
+        )
+        .await
+        .unwrap();
+        // Whole wire output: head, then probe body, then chunks in
+        // input order — no chunk reordered to "fastest first."
+        let expected: Vec<u8> = [head.as_slice(), probe.as_slice(), b"CDEF", b"GHIJ"].concat();
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn dispatch_range_response_wrapper_buffers_through_64mib_ceiling() {
+        // Pre-1.9.23 behavior preservation: `relay_parallel_range ->
+        // Vec<u8>` used to stitch range-capable responses up to the
+        // old `MAX_STITCHED_RANGE_BYTES` cap of 64 MiB. The first
+        // round of this PR collapsed that cap into the new 40 MiB
+        // streaming threshold, regressing 40-64 MiB downloads
+        // through the wrapper (Apps Script's single-GET path returns
+        // 502/504 above ~40 MiB). Restored via separate constants:
+        // wrapper stays buffered up to BUFFERED_STITCH_MAX_BYTES,
+        // not APPS_SCRIPT_BODY_MAX_BYTES.
+        assert_eq!(
+            dispatch_range_response(40 * 1024 * 1024, false),
+            RangeDispatch::Buffered,
+        );
+        assert_eq!(
+            dispatch_range_response(50 * 1024 * 1024, false),
+            RangeDispatch::Buffered,
+        );
+        assert_eq!(
+            dispatch_range_response(BUFFERED_STITCH_MAX_BYTES, false),
+            RangeDispatch::Buffered,
+        );
+    }
+
+    #[test]
+    fn dispatch_range_response_wrapper_falls_back_above_buffered_cap() {
+        // Lock-in for the Vec<u8> wrapper contract (Issue #162):
+        // above the buffered ceiling the wrapper MUST NOT take the
+        // streaming branch (which would emit a partial 200 OK that
+        // a `Vec<u8>` consumer can't react to). Above the buffered
+        // cap, fall back to single GET — same path the pre-1.9.23
+        // wrapper took above its 64 MiB cliff.
+        assert_eq!(
+            dispatch_range_response(BUFFERED_STITCH_MAX_BYTES + 1, false),
+            RangeDispatch::FallbackSingleGet,
+        );
+        assert_eq!(
+            dispatch_range_response(100 * 1024 * 1024, false),
+            RangeDispatch::FallbackSingleGet,
+        );
+        assert_eq!(
+            dispatch_range_response(u64::MAX, false),
+            RangeDispatch::FallbackSingleGet,
+        );
+    }
+
+    #[test]
+    fn dispatch_range_response_writer_api_streams_above_apps_script_ceiling() {
+        // Writer-based API contract: streams above the Apps Script
+        // single-GET ceiling so large downloads (>40 MiB) actually
+        // deliver. Without this, we'd be back to the pre-fix 504
+        // timeout for the 104 MiB DMG that motivated #1042. The
+        // writer API streams in the 40-64 MiB band too (where the
+        // wrapper would still buffer): that's intentional — on
+        // chunk failure, streaming truncates and the download client
+        // resumes via Range, while the buffered path's fallback
+        // can't recover at this size anyway.
+        //
+        // Upper bound is the streaming cap MAX_STREAMED_RANGE_BYTES
+        // (quota-DoS guard); above it, see
+        // `dispatch_range_response_rejects_streamed_totals_above_streaming_cap`.
+        assert_eq!(
+            dispatch_range_response(APPS_SCRIPT_BODY_MAX_BYTES + 1, true),
+            RangeDispatch::Stream,
+        );
+        assert_eq!(
+            dispatch_range_response(50 * 1024 * 1024, true),
+            RangeDispatch::Stream,
+        );
+        assert_eq!(
+            dispatch_range_response(BUFFERED_STITCH_MAX_BYTES + 1, true),
+            RangeDispatch::Stream,
+        );
+        // Just under the streaming cap still streams.
+        assert_eq!(
+            dispatch_range_response(MAX_STREAMED_RANGE_BYTES, true),
+            RangeDispatch::Stream,
+        );
+    }
+
+    #[test]
+    fn dispatch_range_response_rejects_streamed_totals_above_streaming_cap() {
+        // Quota-DoS guard for the writer API: a hostile origin can
+        // advertise an absurd Content-Range total (e.g. u64::MAX) and
+        // pass the probe checks with a normal-sized first-chunk body,
+        // making us issue chunk Apps Script calls until the client
+        // disconnects. Each call counts toward the daily quota
+        // (~20 k requests/day free tier), so an unattended hostile
+        // download would lock the user out of the relay. Refuse
+        // anything above MAX_STREAMED_RANGE_BYTES instead of
+        // streaming.
+        assert_eq!(
+            dispatch_range_response(MAX_STREAMED_RANGE_BYTES + 1, true),
+            RangeDispatch::RejectTooLarge,
+        );
+        assert_eq!(
+            dispatch_range_response(u64::MAX, true),
+            RangeDispatch::RejectTooLarge,
+        );
+        // At the cap, streaming is still allowed. The boundary is
+        // strict greater-than so the constant itself is reachable.
+        assert_eq!(
+            dispatch_range_response(MAX_STREAMED_RANGE_BYTES, true),
+            RangeDispatch::Stream,
+        );
+        // Wrapper (streaming_allowed=false) hits its own
+        // BUFFERED_STITCH_MAX_BYTES cliff far below MAX_STREAMED_…,
+        // so any oversized total routes to FallbackSingleGet (Apps
+        // Script's single-GET will reject it naturally), not to
+        // RejectTooLarge.
+        assert_eq!(
+            dispatch_range_response(MAX_STREAMED_RANGE_BYTES + 1, false),
+            RangeDispatch::FallbackSingleGet,
+        );
+        assert_eq!(
+            dispatch_range_response(u64::MAX, false),
+            RangeDispatch::FallbackSingleGet,
+        );
+    }
+
+    #[test]
+    fn dispatch_range_response_at_or_below_apps_script_ceiling_stays_buffered() {
+        // At or below the Apps Script ceiling, both API surfaces stay
+        // buffered — the buffered path has a real recovery story (a
+        // chunk failure falls back to single GET, which delivers a
+        // complete file when ≤ 40 MiB).
+        for streaming_allowed in [true, false] {
+            assert_eq!(
+                dispatch_range_response(APPS_SCRIPT_BODY_MAX_BYTES, streaming_allowed),
+                RangeDispatch::Buffered,
+            );
+            assert_eq!(
+                dispatch_range_response(1024 * 1024, streaming_allowed),
+                RangeDispatch::Buffered,
+            );
+            assert_eq!(
+                dispatch_range_response(1, streaming_allowed),
+                RangeDispatch::Buffered,
+            );
+            assert_eq!(
+                dispatch_range_response(0, streaming_allowed),
+                RangeDispatch::Buffered,
+            );
+        }
+    }
+
+    /// Test-only `AsyncWrite` that records the byte-offset of every
+    /// `poll_flush` call. Used to verify
+    /// `stream_chunks_to_writer` flushes the committed prefix before
+    /// surfacing a chunk-validation error — critical for TLS streams
+    /// where the partial body sits in the TLS writer's in-memory
+    /// buffer and would otherwise be dropped on connection close.
+    struct FlushTrackingWriter {
+        buf: Vec<u8>,
+        /// Byte offset (relative to `buf.len()` at the time) of each
+        /// `poll_flush` call. Lets a test assert "flush happened
+        /// after byte N had been written."
+        flushed_at: Vec<usize>,
+    }
+
+    impl FlushTrackingWriter {
+        fn new() -> Self {
+            Self { buf: Vec::new(), flushed_at: Vec::new() }
+        }
+    }
+
+    impl tokio::io::AsyncWrite for FlushTrackingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.get_mut().buf.extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let me = self.get_mut();
+            let at = me.buf.len();
+            me.flushed_at.push(at);
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_chunks_to_writer_flushes_before_returning_chunk_error() {
+        // TLS-safety lock-in: chunk-validation failure surfaces as
+        // `Err`, and the caller (proxy_server.rs) typically uses `?`
+        // to propagate — which means the post-error `stream.flush()`
+        // in the caller never runs. Without the in-function flush,
+        // bytes buffered inside the TLS writer get dropped when the
+        // connection closes, and the download client sees a clean
+        // empty body instead of the partial prefix it needs to
+        // resume via Range. This test asserts flush() is called
+        // after the committed prefix bytes have been written and
+        // before the function returns.
+        use futures_util::stream::{self, StreamExt as _};
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\n";
+        let probe = b"AB";
+        let fetches = stream::iter(vec![
+            (2u64, 5u64, Ok::<Vec<u8>, &'static str>(b"CDEF".to_vec())),
+            (6u64, 9u64, Err::<Vec<u8>, &'static str>("validation failure")),
+        ]);
+        let mut writer = FlushTrackingWriter::new();
+        let result = stream_chunks_to_writer(
+            &mut writer,
+            head,
+            probe,
+            12,
+            fetches.map(|x| x),
+            "https://example.test/file",
+        )
+        .await;
+        assert!(result.is_err());
+
+        // Bytes written before the failure: head + probe + first
+        // chunk = head_len + 2 + 4.
+        let expected_committed = head.len() + 2 + 4;
+        assert_eq!(writer.buf.len(), expected_committed);
+
+        // Flush must have been called after the committed prefix
+        // was in place — i.e., at the same byte count as `buf.len()`.
+        assert!(
+            writer.flushed_at.iter().any(|&at| at == expected_committed),
+            "flush() must run after committed prefix is written; flushed_at={:?}, expected at byte {}",
+            writer.flushed_at,
+            expected_committed,
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_chunks_to_writer_emits_progress_log_at_each_16mib_boundary() {
+        // User feedback on PR #1085: large streamed downloads went
+        // silent in the logs between "starting N chunks" and
+        // completion, with no progress signal. This test locks in
+        // the periodic progress lines by capturing the tracing
+        // output of a synthetic 40 MiB stream and counting how many
+        // `range-parallel-stream:` lines mention "MiB" (the progress
+        // lines do; the start-up summary phrases it differently).
+        //
+        // At 40 MiB total and 16 MiB intervals we expect two
+        // crossings — at 16 MiB and 32 MiB. Strictly *not* one at
+        // 0 MiB (the threshold must be reached, not just initialised)
+        // and *not* one at 40 MiB (40 < next_progress_log_at=48 once
+        // we've crossed 32 MiB).
+        use futures_util::stream;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone, Default)]
+        struct LogCapture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for LogCapture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for LogCapture {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .with_target(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // 40 MiB total. Probe is one 256 KiB chunk; the rest of the
+        // file is 159 same-sized chunks fed as a synthetic stream.
+        let chunk_size: u64 = 256 * 1024;
+        let total: u64 = 40 * 1024 * 1024;
+        let probe_body = vec![0u8; chunk_size as usize];
+        let mut chunks_data: Vec<(u64, u64, Result<Vec<u8>, &'static str>)> = Vec::new();
+        let mut start = chunk_size;
+        while start < total {
+            let end = (start + chunk_size - 1).min(total - 1);
+            let len = (end - start + 1) as usize;
+            chunks_data.push((start, end, Ok(vec![0u8; len])));
+            start = end + 1;
+        }
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", total).into_bytes();
+
+        let mut buf: Vec<u8> = Vec::new();
+        stream_chunks_to_writer(
+            &mut VecAsyncWriter(&mut buf),
+            &head,
+            &probe_body,
+            total,
+            stream::iter(chunks_data),
+            "https://example.test/big",
+        )
+        .await
+        .unwrap();
+        // Wire output sanity: head + 40 MiB body, exactly.
+        assert_eq!(buf.len() as u64, head.len() as u64 + total);
+
+        // Inspect the captured log. The two progress lines should
+        // mention `16/40` and `32/40` (MiB emitted / MiB total).
+        // Drop the subscriber guard so any inadvertent log lines
+        // from drop-handlers don't race with our read.
+        drop(_guard);
+        let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        let progress_lines: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains("range-parallel-stream:") && l.contains(" MiB ("))
+            .collect();
+        assert_eq!(
+            progress_lines.len(),
+            2,
+            "expected 2 progress lines at the 16 / 32 MiB crossings; full log:\n{}",
+            log,
+        );
+        assert!(
+            progress_lines[0].contains("16/40 MiB (40%)"),
+            "first progress line should read 16/40 MiB (40%); got: {}",
+            progress_lines[0],
+        );
+        assert!(
+            progress_lines[1].contains("32/40 MiB (80%)"),
+            "second progress line should read 32/40 MiB (80%); got: {}",
+            progress_lines[1],
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_chunks_to_writer_flushes_after_head_and_probe_for_first_byte_latency() {
+        // "First bytes quickly" lock-in: after writing head + probe
+        // body, the function must flush before going into the
+        // chunk-fetch loop. Without this, the response start
+        // (status code, headers, first 256 KiB of body) may sit in
+        // intermediate buffers (TLS writer, kernel send buffer with
+        // small initial cwnd, intermediate proxy buffers) while we
+        // round-trip ~2s/chunk to Apps Script for the remaining
+        // chunks — giving the user a "stuck at 0%" progress bar
+        // for hundreds of ms to seconds on a multi-MiB download.
+        use futures_util::stream::{self, StreamExt as _};
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\n\r\n";
+        let probe = b"AB";
+        let fetches = stream::iter(vec![
+            (2u64, 5u64, Ok::<Vec<u8>, &'static str>(b"CDEF".to_vec())),
+            (6u64, 9u64, Ok::<Vec<u8>, &'static str>(b"GHIJ".to_vec())),
+            (10u64, 13u64, Ok::<Vec<u8>, &'static str>(b"KLMN".to_vec())),
+        ]);
+        let mut writer = FlushTrackingWriter::new();
+        stream_chunks_to_writer(
+            &mut writer,
+            head,
+            probe,
+            14,
+            fetches.map(|x| x),
+            "https://example.test/file",
+        )
+        .await
+        .unwrap();
+
+        // At least one flush must land at byte offset = head + probe
+        // (BEFORE any chunk bytes), proving the early flush ran.
+        let head_plus_probe = head.len() + probe.len();
+        assert!(
+            writer.flushed_at.iter().any(|&at| at == head_plus_probe),
+            "early flush must run after head+probe but before chunks; flushed_at={:?}, expected at byte {}",
+            writer.flushed_at,
+            head_plus_probe,
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_branch_with_real_cors_transform_emits_acl_headers_then_body() {
+        // Cross-module integration test: the streaming branch's
+        // `transform_head` closure is wired up in proxy_server.rs
+        // from the request's Origin header to call
+        // `inject_cors_into_head`. Helper tests cover the head
+        // assembler and the CORS rewriter in isolation; this test
+        // composes them as the production proxy dispatch does, so
+        // a regression in either the closure construction or the
+        // head-only CORS variant surfaces here.
+        use crate::proxy_server::inject_cors_into_head;
+        use futures_util::stream::{self, StreamExt as _};
+
+        let cors_origin: Option<String> = Some("https://www.youtube.com".to_string());
+        // Same closure the proxy_server dispatch uses (see
+        // proxy_server.rs `handle_mitm_request`).
+        let transform = |head: &[u8]| -> Vec<u8> {
+            match cors_origin.as_deref() {
+                Some(o) => inject_cors_into_head(head, o).unwrap_or_else(|| head.to_vec()),
+                None => head.to_vec(),
+            }
+        };
+
+        let probe_headers = vec![
+            ("Content-Type".to_string(), "application/octet-stream".to_string()),
+            ("Content-Range".to_string(), "bytes 0-3/12".to_string()),
+            // Origin sent ACL=* with credentials — exactly the YouTube
+            // comments failure mode `inject_cors_response_headers`
+            // was added to fix. The streaming-path CORS variant must
+            // strip this and substitute the request origin.
+            ("Access-Control-Allow-Origin".to_string(), "*".to_string()),
+        ];
+        let probe_body = b"ABCD";
+        let chunks = stream::iter(vec![
+            (4u64, 7u64, Ok::<Vec<u8>, &'static str>(b"EFGH".to_vec())),
+            (8u64, 11u64, Ok::<Vec<u8>, &'static str>(b"IJKL".to_vec())),
+        ]);
+        let mut buf: Vec<u8> = Vec::new();
+        stream_range_response_to(
+            &mut VecAsyncWriter(&mut buf),
+            &probe_headers,
+            probe_body,
+            12,
+            chunks.map(|x| x),
+            &transform,
+            "https://example.test/big-file",
+        )
+        .await
+        .unwrap();
+
+        let sep_pos = buf.windows(4).position(|w| w == b"\r\n\r\n").expect("head terminator");
+        let head_s = std::str::from_utf8(&buf[..sep_pos + 4]).unwrap();
+        let body = &buf[sep_pos + 4..];
+
+        // Wildcard origin is gone; request origin is echoed.
+        assert!(
+            !head_s.contains("Access-Control-Allow-Origin: *"),
+            "wildcard origin must be stripped, head was: {}", head_s,
+        );
+        assert!(head_s.contains("Access-Control-Allow-Origin: https://www.youtube.com\r\n"));
+        assert!(head_s.contains("Access-Control-Allow-Credentials: true\r\n"));
+        assert!(head_s.contains("Vary: Origin\r\n"));
+        // Synthesised Content-Length = full advertised total.
+        assert!(head_s.contains("Content-Length: 12\r\n"));
+        // Body unaffected by the head transform; chunks in order.
+        assert_eq!(body, b"ABCDEFGHIJKL");
+    }
+
+    #[tokio::test]
+    async fn stream_range_response_to_assembles_head_from_probe_and_streams_chunks() {
+        // Integration test for the streaming-branch wiring in
+        // `do_relay_parallel_range_to`: given a probe response (the
+        // probe's response headers + first-chunk body), a known
+        // total, and a stream of remaining chunk results, the
+        // streaming branch must:
+        //   1. Build the response head from the probe headers via
+        //      `assemble_200_head` (keeps Content-Type etc., strips
+        //      Content-Range and writes Content-Length=total).
+        //   2. Apply the caller's `transform_head` closure to the
+        //      assembled head (e.g. CORS injection).
+        //   3. Write head → probe body → chunks (in input order)
+        //      with no reordering, no body buffering.
+        //
+        // Helper-only tests can miss the composition wiring
+        // (assemble + transform + stream_chunks); this test
+        // exercises all three together through the same free
+        // function the production dispatch uses.
+        use futures_util::stream::{self, StreamExt as _};
+        let probe_headers = vec![
+            ("Content-Type".to_string(), "application/octet-stream".to_string()),
+            ("Content-Range".to_string(), "bytes 0-3/12".to_string()),
+            ("Content-Length".to_string(), "4".to_string()),
+            ("X-Origin-Hint".to_string(), "abcd".to_string()),
+        ];
+        let probe_body = b"ABCD";
+        let total: u64 = 12;
+        let chunks = stream::iter(vec![
+            (4u64, 7u64, Ok::<Vec<u8>, &'static str>(b"EFGH".to_vec())),
+            (8u64, 11u64, Ok::<Vec<u8>, &'static str>(b"IJKL".to_vec())),
+        ]);
+        let transform = |head: &[u8]| -> Vec<u8> {
+            // Append a synthetic CORS-style header so we can assert
+            // the transform actually got the head bytes, not the
+            // probe body.
+            let sep = b"\r\n\r\n";
+            let mut out = head.strip_suffix(sep).unwrap_or(head).to_vec();
+            out.extend_from_slice(b"\r\nX-Transform: applied\r\n\r\n");
+            out
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        stream_range_response_to(
+            &mut VecAsyncWriter(&mut buf),
+            &probe_headers,
+            probe_body,
+            total,
+            chunks.map(|x| x),
+            &transform,
+            "https://example.test/big-file",
+        )
+        .await
+        .unwrap();
+
+        let sep_pos = buf.windows(4).position(|w| w == b"\r\n\r\n").expect("head terminator");
+        let head = &buf[..sep_pos + 4];
+        let body = &buf[sep_pos + 4..];
+        let head_s = std::str::from_utf8(head).unwrap();
+
+        // Composition #1: assemble_200_head ran with the probe
+        // headers and the full total.
+        assert!(head_s.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(head_s.contains("Content-Length: 12\r\n"));
+        // Original Content-Length from the probe (=4) must be gone.
+        assert!(!head_s.contains("Content-Length: 4\r\n"));
+        // Content-Range is stripped (it described the probe slice,
+        // not the synthesised full response).
+        assert!(!head_s.contains("Content-Range:"));
+        // Non-stripped probe headers pass through.
+        assert!(head_s.contains("Content-Type: application/octet-stream\r\n"));
+        assert!(head_s.contains("X-Origin-Hint: abcd\r\n"));
+
+        // Composition #2: transform_head ran on the assembled head.
+        assert!(head_s.contains("X-Transform: applied\r\n"));
+
+        // Composition #3: body is probe_body followed by chunks in
+        // input order, with no reordering or interleaving.
+        assert_eq!(body, b"ABCDEFGHIJKL");
+    }
+
+    #[tokio::test]
+    async fn stream_range_response_to_propagates_mid_stream_chunk_failure() {
+        // Integration counterpart: the streaming branch must
+        // propagate a mid-stream chunk failure as Err, and the
+        // committed prefix (head + probe + earlier-good chunks)
+        // must already be on the wire so the download client can
+        // resume via Range. Combined with the flush test above,
+        // this gives end-to-end coverage of the failure surface.
+        use futures_util::stream::{self, StreamExt as _};
+        let probe_headers = vec![
+            ("Content-Type".to_string(), "application/octet-stream".to_string()),
+            ("Content-Range".to_string(), "bytes 0-3/12".to_string()),
+        ];
+        let probe_body = b"ABCD";
+        let chunks = stream::iter(vec![
+            (4u64, 7u64, Ok::<Vec<u8>, &'static str>(b"EFGH".to_vec())),
+            (8u64, 11u64, Err::<Vec<u8>, &'static str>("chunk validation failure")),
+        ]);
+        let identity = |head: &[u8]| head.to_vec();
+        let mut buf: Vec<u8> = Vec::new();
+        let result = stream_range_response_to(
+            &mut VecAsyncWriter(&mut buf),
+            &probe_headers,
+            probe_body,
+            12,
+            chunks.map(|x| x),
+            &identity,
+            "https://example.test/big-file",
+        )
+        .await;
+        assert!(result.is_err(), "mid-stream chunk failure must propagate as Err");
+
+        let sep_pos = buf.windows(4).position(|w| w == b"\r\n\r\n").expect("head terminator");
+        let body = &buf[sep_pos + 4..];
+        // Committed prefix: probe + first good chunk. NOT the failed
+        // chunk and NOT any "after-failure" chunks (there aren't any
+        // in this test, but the contract is "stop on first error").
+        assert_eq!(body, b"ABCDEFGH");
+    }
+
+    #[tokio::test]
+    async fn stream_chunks_to_writer_aborts_on_chunk_validation_failure() {
+        // Mid-stream chunk failure must return Err *after* the head,
+        // probe body, and earlier successful chunks have been
+        // committed. Single-GET fallback isn't possible at this point
+        // — we've already written wire bytes — and partial write +
+        // Err is what the caller (TLS socket) needs to surface a
+        // Content-Length mismatch to the download client so it
+        // retries via Range from the partial position.
+        use futures_util::stream::{self, StreamExt as _};
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\n";
+        let probe = b"AB";
+        let fetches = stream::iter(vec![
+            (2u64, 5u64, Ok::<Vec<u8>, &'static str>(b"CDEF".to_vec())),
+            (6u64, 9u64, Err::<Vec<u8>, &'static str>("Content-Range/body length mismatch")),
+            // This third chunk must NOT be written — the function must
+            // bail on the first Err.
+            (10u64, 11u64, Ok::<Vec<u8>, &'static str>(b"KL".to_vec())),
+        ]);
+        let mut buf = Vec::new();
+        let result = stream_chunks_to_writer(
+            &mut VecAsyncWriter(&mut buf),
+            head,
+            probe,
+            12,
+            fetches.map(|x| x),
+            "https://example.test/file",
+        )
+        .await;
+        assert!(result.is_err(), "must return Err on first chunk failure");
+        // Bytes already committed up to (but not past) the failure:
+        // head + probe + successfully-validated chunk 1.
+        let expected: Vec<u8> = [head.as_slice(), probe.as_slice(), b"CDEF"].concat();
+        assert_eq!(
+            buf, expected,
+            "post-failure chunks must not be written; partial body length tells client to retry"
+        );
     }
 
     #[test]
