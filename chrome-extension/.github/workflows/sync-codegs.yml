@@ -1,0 +1,36 @@
+# Runs when this folder is the Git repository root (e.g. ardalan-ab/mhrv-helper-extension).
+# In the main monorepo, use .github/workflows/chrome-extension.yml instead (same cmp logic).
+
+name: Code.gs sync with upstream
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bundled-matches-upstream-main:
+    name: bundled Code.gs matches upstream main
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out extension repository
+        uses: actions/checkout@v4
+
+      - name: Fetch canonical Code.gs from main project (main branch)
+        run: |
+          curl -fsSL \
+            'https://raw.githubusercontent.com/therealaleph/MasterHttpRelayVPN-RUST/main/assets/apps_script/Code.gs' \
+            -o /tmp/upstream-Code.gs
+
+      - name: Compare with bundled Code.gs
+        run: |
+          if ! cmp -s Code.gs /tmp/upstream-Code.gs; then
+            echo "::error::Bundled Code.gs differs from therealaleph/MasterHttpRelayVPN-RUST main (assets/apps_script/Code.gs). Copy the upstream file into this repo and commit."
+            diff -u /tmp/upstream-Code.gs Code.gs || true
+            exit 1
+          fi
+          echo "OK: bundled Code.gs matches upstream main."

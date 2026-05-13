@@ -258,6 +258,10 @@ footer {
   border-radius: 8px;
   background: rgba(5, 150, 105, 0.1);
   display: inline-block;
+  max-width: 100%;
+  box-sizing: border-box;
+  word-break: break-word;
+  text-align: start;
 }
 
 #message.error {

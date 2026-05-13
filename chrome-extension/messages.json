@@ -38,10 +38,11 @@
     "copyError": "Could not copy {item}.",
     "fetchError": "Failed to load Code.gs at all."
     ,
-    "scriptUpToDate": "Your bundled Code.gs matches the latest upstream version.",
-    "scriptOutdated": "Update available: your bundled Code.gs differs from upstream.",
-    "scriptCheckFailed": "Could not verify Code.gs version.",
-    "scriptCheckNetworkBlocked": "Could not reach upstream to check Code.gs (network blocked/offline)."
+    "scriptUpToDateDetail": "Bundled Code.gs matches main. GitHub API: blob {sha}… ({size} bytes).",
+    "scriptOutdatedDetail": "Bundled Code.gs differs from main. Upstream blob {sha}… ({size} bytes). Update bundled Code.gs from the main repo.",
+    "scriptCheckApiError": "GitHub API ({status}): {detail}",
+    "scriptCheckRawFailed": "GitHub API OK but file body missing: {detail}",
+    "scriptCheckFailed": "Could not verify Code.gs version."
   },
   "fa": {
     "appName": "کمک‌کننده اسکریپت اپس mhrv-rs",
@@ -82,9 +83,10 @@
     "copyError": "کپی {item} امکان‌پذیر نبود.",
     "fetchError": "بارگذاری Code.gs به طور کامل ناموفق بود."
     ,
-    "scriptUpToDate": "Code.gs داخلی افزونه با آخرین نسخه upstream یکسان است.",
-    "scriptOutdated": "به‌روزرسانی موجود است: Code.gs داخلی افزونه با upstream متفاوت است.",
-    "scriptCheckFailed": "امکان بررسی نسخه Code.gs وجود ندارد.",
-    "scriptCheckNetworkBlocked": "امکان دسترسی به upstream برای بررسی Code.gs نبود (اینترنت/شبکه مسدود یا آفلاین)."
+    "scriptUpToDateDetail": "Code.gs داخل افزونه با main یکی است. API گیت‌هاب: blob {sha}… ({size} بایت).",
+    "scriptOutdatedDetail": "Code.gs داخل افزونه با main فرق دارد. blob upstream: {sha}… ({size} بایت). فایل را از مخزن اصلی به‌روز کن.",
+    "scriptCheckApiError": "خطای API گیت‌هاب ({status}): {detail}",
+    "scriptCheckRawFailed": "API گیت‌هاب OK بود اما بدنهٔ فایل نیامد: {detail}",
+    "scriptCheckFailed": "امکان بررسی نسخه Code.gs وجود ندارد."
   }
 }

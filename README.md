@@ -28,6 +28,10 @@
 - 🖥️ **Works on** Mac, Windows, Linux, Android, OpenWRT routers
 - 🦊 **Any browser or app** that supports HTTP proxy or SOCKS5
 
+## Community helpers
+
+- **[mhrv-helper-extension](https://github.com/ardalan-ab/mhrv-helper-extension)** (Chrome, maintained by [@ardalan-ab](https://github.com/ardalan-ab)) — optional helper to generate an `AUTH_KEY`, copy `Code.gs`, and a `config.json` snippet for Apps Script mode. [How to use (English)](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/HOW_TO_USE.md) · [راهنمای فارسی](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/HOW_TO_USE.fa.md).
+
 ## How it works (the simple picture)
 
 ```
@@ -75,7 +79,7 @@ ISPs can't read inside encrypted HTTPS. They only see the address — `www.googl
 
 > **Tip:** if you ever update `Code.gs` later, don't make a new deployment. Edit the code, then go to **Deploy → Manage deployments → ✏️ → Version: New version → Deploy**. The Deployment ID stays the same.
 >
-> **Optional:** use `chrome-extension/README.md` for a browser helper that generates `Code.gs` and local config automatically.
+> **Optional:** use the community [Chrome extension](https://github.com/ardalan-ab/mhrv-helper-extension) — see [How to use](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/HOW_TO_USE.md) (English) or [راهنمای فارسی](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/HOW_TO_USE.fa.md).
 
 ### Step 2 — Download mhrv-rs
 
@@ -200,6 +204,10 @@ Most of the Rust code in this port was written with [Anthropic's Claude](https:/
 - 🖥️ **روی** مک، ویندوز، لینوکس، اندروید، روتر OpenWRT کار می‌کند
 - 🦊 **هر مرورگر یا برنامه‌ای** که از HTTP proxy یا SOCKS5 پشتیبانی کند
 
+## ابزارهای جامعه
+
+- **[mhrv-helper-extension](https://github.com/ardalan-ab/mhrv-helper-extension)** (کروم، نگهداری [@ardalan-ab](https://github.com/ardalan-ab)) — افزونهٔ اختیاری برای تولید `AUTH_KEY`، کپی `Code.gs` و قطعهٔ `config.json` در حالت Apps Script. [راهنمای فارسی](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/HOW_TO_USE.fa.md) · [How to use (English)](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/HOW_TO_USE.md).
+
 ## چطور کار می‌کند (تصویر ساده)
 
 ```
@@ -246,6 +254,8 @@ ISP داخل HTTPS رمزشده را نمی‌تواند بخواند. فقط آ
 ۱۱. گوگل یک **Deployment ID** نشانت می‌دهد (یک رشتهٔ تصادفی طولانی). **کپی‌اش کن** — در مرحلهٔ ۳ لازم داری.
 
 > **نکته:** اگر بعداً `Code.gs` را به‌روزرسانی کنی، Deployment جدید نساز. کد را ویرایش کن، بعد **Deploy → Manage deployments → ✏️ → Version: New version → Deploy**. Deployment ID همان قبلی می‌ماند.
+>
+> **اختیاری:** افزونهٔ اختیاری کروم [mhrv-helper-extension](https://github.com/ardalan-ab/mhrv-helper-extension) — [راهنمای فارسی](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/HOW_TO_USE.fa.md) · [How to use (English)](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/HOW_TO_USE.md).
 
 ### مرحلهٔ ۲ — دانلود mhrv-rs
 

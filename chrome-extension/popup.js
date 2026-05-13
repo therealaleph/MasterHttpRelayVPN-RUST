@@ -1,6 +1,14 @@
 const AUTH_KEY_PLACEHOLDER = 'CHANGE_ME_TO_A_STRONG_SECRET';
 const CODE_FILE = 'Code.gs';
 const CODE_FILE_URL = 'https://raw.githubusercontent.com/therealaleph/MasterHttpRelayVPN-RUST/main/assets/apps_script/Code.gs';
+const CODE_GS_API_URL =
+  'https://api.github.com/repos/therealaleph/MasterHttpRelayVPN-RUST/contents/assets/apps_script/Code.gs?ref=main';
+
+const GITHUB_API_HEADERS = {
+  Accept: 'application/vnd.github+json',
+  'X-GitHub-Api-Version': '2022-11-28',
+  'User-Agent': 'mhrv-helper-extension',
+};
 let codeTemplate = '';
 let messages = {};
 
@@ -55,7 +63,12 @@ async function loadMessages() {
         scriptNotLoaded: "Script template not loaded yet.",
         generateKeyFirst: "Generate an auth key first.",
         copyError: "Could not copy {item}.",
-        fetchError: "Failed to load Code.gs at all."
+        fetchError: "Failed to load Code.gs at all.",
+        scriptUpToDateDetail: "Bundled Code.gs matches main. GitHub API: blob {sha}… ({size} bytes).",
+        scriptOutdatedDetail: "Bundled Code.gs differs from main. Upstream blob {sha}… ({size} bytes). Update bundled Code.gs from the main repo.",
+        scriptCheckApiError: "GitHub API ({status}): {detail}",
+        scriptCheckRawFailed: "GitHub API OK but file body missing: {detail}",
+        scriptCheckFailed: "Could not verify Code.gs version.",
       }
     };
   }
@@ -190,11 +203,68 @@ function copyText(text, label) {
   );
 }
 
+async function fetchGithubCodeGsMetadata() {
+  const response = await fetch(CODE_GS_API_URL, {
+    cache: 'no-store',
+    headers: GITHUB_API_HEADERS,
+  });
+  const text = await response.text();
+  let json = null;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    // non-JSON body
+  }
+  return { ok: response.ok, status: response.status, json, text };
+}
+
+function decodeGithubFileContent(json) {
+  if (json.encoding === 'base64' && typeof json.content === 'string') {
+    const b64 = json.content.replace(/\n/g, '');
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return new TextDecoder('utf-8').decode(bytes);
+  }
+  return null;
+}
+
+async function getUpstreamCodeGsTextFromApi(json) {
+  const inline = decodeGithubFileContent(json);
+  if (inline != null) {
+    return inline;
+  }
+  if (json.download_url) {
+    const r = await fetch(json.download_url, { cache: 'no-store' });
+    if (!r.ok) {
+      throw new Error(`download_url HTTP ${r.status}`);
+    }
+    return r.text();
+  }
+  throw new Error('API response has no file body (content / download_url).');
+}
+
+function formatApiErrorDetail(status, json, rawText) {
+  if (json && typeof json.message === 'string') {
+    return json.message;
+  }
+  if (json && typeof json.error === 'string') {
+    return json.error;
+  }
+  const trimmed = (rawText || '').trim();
+  if (trimmed) {
+    return trimmed.slice(0, 240);
+  }
+  return `HTTP ${status}`;
+}
+
 async function checkScriptVersion() {
   elements.scriptProgress.style.display = 'block';
   try {
-    const [remoteResp, localResp] = await Promise.all([
-      fetch(CODE_FILE_URL, { cache: 'no-store' }),
+    const [apiResult, localResp] = await Promise.all([
+      fetchGithubCodeGsMetadata(),
       fetch(chrome.runtime.getURL(CODE_FILE)),
     ]);
 
@@ -206,24 +276,64 @@ async function checkScriptVersion() {
     const localText = await localResp.text();
     const localHash = await sha256(localText);
 
-    if (!remoteResp.ok) {
-      // Network / censorship realities: just report we couldn't check.
-      showMessage(getMessage('scriptCheckNetworkBlocked'), true);
+    if (!apiResult.ok) {
+      const detail = formatApiErrorDetail(apiResult.status, apiResult.json, apiResult.text);
+      showMessage(
+        getMessage('scriptCheckApiError', {
+          status: String(apiResult.status),
+          detail,
+        }),
+        true
+      );
       return;
     }
 
-    const remoteText = await remoteResp.text();
-    const remoteHash = await sha256(remoteText);
+    const meta = apiResult.json;
+    const upstreamSha = typeof meta.sha === 'string' ? meta.sha : '';
+    const shortSha = upstreamSha.length >= 7 ? upstreamSha.slice(0, 7) : upstreamSha || '—';
+    const upstreamSize =
+      meta.size != null && Number.isFinite(Number(meta.size)) ? String(meta.size) : '—';
+
+    let upstreamText;
+    try {
+      upstreamText = await getUpstreamCodeGsTextFromApi(meta);
+    } catch (err) {
+      console.error(err);
+      showMessage(
+        getMessage('scriptCheckRawFailed', { detail: err.message || String(err) }),
+        true
+      );
+      return;
+    }
+
+    const remoteHash = await sha256(upstreamText);
 
     if (remoteHash === localHash) {
-      showMessage(getMessage('scriptUpToDate'));
+      showMessage(
+        getMessage('scriptUpToDateDetail', {
+          sha: shortSha,
+          size: upstreamSize,
+        })
+      );
       return;
     }
 
-    showMessage(getMessage('scriptOutdated'), true);
+    showMessage(
+      getMessage('scriptOutdatedDetail', {
+        sha: shortSha,
+        size: upstreamSize,
+      }),
+      true
+    );
   } catch (err) {
     console.error(err);
-    showMessage(getMessage('scriptCheckFailed'), true);
+    showMessage(
+      getMessage('scriptCheckApiError', {
+        status: '—',
+        detail: err.message || String(err),
+      }),
+      true
+    );
   } finally {
     elements.scriptProgress.style.display = 'none';
   }
