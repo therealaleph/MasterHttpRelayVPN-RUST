@@ -390,6 +390,10 @@ pub struct DomainFronter {
     /// h2_fallbacks)` ratio indicates an unhealthy h2 conn or a flaky
     /// middlebox eating h2 frames; consider `force_http1: true`.
     h2_fallbacks: AtomicU64,
+    /// We adjust H2OPENTIMEOUT dynamically based on how user's network
+    /// operates, so that they won't experience things like h1 open timed out after 8s
+    /// Which would happen because of network's latency & how it operates.
+    pub h2_open_timeout: AtomicU64,
     /// Per-host breakdown of traffic going through this fronter. Keyed by
     /// the host of the URL (e.g. "api.x.com"). Read-mostly; only touched
     /// on the slow path (once per relayed request), so a plain Mutex is
@@ -614,6 +618,7 @@ impl DomainFronter {
             relay_failures: AtomicU64::new(0),
             bytes_relayed: AtomicU64::new(0),
             h2_calls: AtomicU64::new(0),
+            h2_open_timeout: AtomicU64::new(8),
             h2_fallbacks: AtomicU64::new(0),
             per_site: Arc::new(std::sync::Mutex::new(HashMap::new())),
             today_calls: AtomicU64::new(0),
@@ -957,11 +962,12 @@ impl DomainFronter {
             let tls = self.tls_connector_h1.connect(name, tcp).await?;
             Ok::<_, FronterError>(tls)
         };
-        match tokio::time::timeout(Duration::from_secs(H1_OPEN_TIMEOUT_SECS), work).await {
+        let h2_open_timeout = self.h2_open_timeout.load(Ordering::SeqCst);
+        match tokio::time::timeout(Duration::from_secs(h2_open_timeout), work).await {
             Ok(r) => r,
             Err(_) => Err(FronterError::Relay(format!(
                 "h1 open timed out after {}s",
-                H1_OPEN_TIMEOUT_SECS
+                h2_open_timeout
             ))),
         }
     }
