@@ -19,10 +19,27 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::net::UdpSocket;
 
 /// Magic address that the client connects to via the tunnel protocol.
-/// `198.18.0.0/15` is reserved for benchmarking (RFC 2544) and will
-/// never be a real destination.
-pub const UDPGW_MAGIC_IP: [u8; 4] = [198, 18, 0, 1];
+/// `192.0.2.0/24` is reserved for documentation (RFC 5737 TEST-NET-1)
+/// and will never be a real destination.
+///
+/// Must NOT live in `198.18.0.0/15`: tun2proxy's `--dns virtual` allocator
+/// (used by the Android client in Full mode) synthesises fake IPs in that
+/// range for hostname lookups. If the magic IP collided with one of those
+/// synthetic IPs, every request to whichever hostname got that allocation
+/// would be silently mis-routed into the udpgw path. See issue #251.
+pub const UDPGW_MAGIC_IP: [u8; 4] = [192, 0, 2, 1];
+/// Pre-formatted dotted-quad form of `UDPGW_MAGIC_IP`. Compared against
+/// incoming hostnames in [`is_udpgw_dest`]; kept in sync with the octets
+/// above by the `magic_host_matches_octets` test.
+pub const UDPGW_MAGIC_HOST: &str = "192.0.2.1";
 pub const UDPGW_MAGIC_PORT: u16 = 7300;
+
+/// Pre-#251 magic IP — still recognised by `is_udpgw_dest` for one
+/// deprecation cycle so users who upgrade the `mhrv-tunnel` Docker
+/// container ahead of the Android APK don't lose Full-mode UDP relay
+/// during the version-skew window. Slated for removal in v1.10.0.
+const LEGACY_UDPGW_MAGIC_IP: [u8; 4] = [198, 18, 0, 1];
+const LEGACY_UDPGW_MAGIC_HOST: &str = "198.18.0.1";
 
 const FLAG_KEEPALIVE: u8 = 0x01;
 const FLAG_DATA: u8 = 0x02;
@@ -195,8 +212,12 @@ fn serialise_frame(frame: &Frame) -> Vec<u8> {
 // -------------------------------------------------------------------------
 
 /// Returns `true` if the connect destination is the magic udpgw address.
+///
+/// Accepts both the current `UDPGW_MAGIC_HOST` (`192.0.2.1`) and the legacy
+/// `LEGACY_UDPGW_MAGIC_HOST` (`198.18.0.1`) so a v1.9.25+ tunnel-node still
+/// works with pre-#251 Android clients during the upgrade window.
 pub fn is_udpgw_dest(host: &str, port: u16) -> bool {
-    port == UDPGW_MAGIC_PORT && host == format!("{}.{}.{}.{}", UDPGW_MAGIC_IP[0], UDPGW_MAGIC_IP[1], UDPGW_MAGIC_IP[2], UDPGW_MAGIC_IP[3])
+    port == UDPGW_MAGIC_PORT && (host == UDPGW_MAGIC_HOST || host == LEGACY_UDPGW_MAGIC_HOST)
 }
 
 /// Per-conn_id persistent UDP socket with a background reader that
@@ -505,8 +526,41 @@ mod tests {
 
     #[test]
     fn is_udpgw_dest_works() {
+        // Current magic IP — must be recognised.
+        assert!(is_udpgw_dest("192.0.2.1", 7300));
+        // Legacy pre-#251 magic IP — still recognised for one deprecation
+        // cycle so old Android clients keep working against a new tunnel-node.
+        // Remove this assertion (and `LEGACY_UDPGW_MAGIC_IP`) in v1.10.0.
         assert!(is_udpgw_dest("198.18.0.1", 7300));
+        // Wrong port on either IP, or unrelated host on the magic port, must not match.
+        assert!(!is_udpgw_dest("192.0.2.1", 80));
         assert!(!is_udpgw_dest("198.18.0.1", 80));
         assert!(!is_udpgw_dest("8.8.8.8", 7300));
+    }
+
+    #[test]
+    fn magic_host_matches_octets() {
+        // The dotted-quad `_HOST` constants are what `is_udpgw_dest` actually
+        // compares against — but the `_IP` octet arrays are what tests and
+        // future humans reason about. If they drift, `is_udpgw_dest` silently
+        // stops matching what the Android client is sending. Pin them here.
+        let dotted = |ip: [u8; 4]| format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+        assert_eq!(dotted(UDPGW_MAGIC_IP), UDPGW_MAGIC_HOST);
+        assert_eq!(dotted(LEGACY_UDPGW_MAGIC_IP), LEGACY_UDPGW_MAGIC_HOST);
+    }
+
+    #[test]
+    fn magic_ip_outside_virtual_dns_range() {
+        // tun2proxy's `--dns virtual` allocator synthesises fake IPs inside
+        // 198.18.0.0/15 (covers 198.18.0.0 – 198.19.255.255). The *current*
+        // magic IP MUST stay outside that range — see #251. The legacy IP
+        // is intentionally still in the bad range (that was the bug); it
+        // is exempt and will be removed in v1.10.0.
+        let [a, b, _, _] = UDPGW_MAGIC_IP;
+        assert!(
+            !(a == 198 && (b == 18 || b == 19)),
+            "UDPGW_MAGIC_IP {:?} is inside 198.18.0.0/15 — will collide with tun2proxy --dns virtual (see #251)",
+            UDPGW_MAGIC_IP
+        );
     }
 }
