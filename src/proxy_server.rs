@@ -940,6 +940,17 @@ async fn handle_socks5_client(
         }
     }
 
+    // Reject STUN/TURN UDP ports immediately so WebRTC (Meet,
+    // Telegram calls) skips UDP ICE candidates and falls back to
+    // TCP TURN on :443 without waiting for a timeout.
+    if matches!(port, 3478 | 5349 | 19302) {
+        tracing::info!("SOCKS5 CONNECT -> {}:{} (STUN/TURN blocked, forcing TCP fallback)", host, port);
+        sock.write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await?;
+        sock.flush().await?;
+        return Ok(());
+    }
+
     tracing::info!("SOCKS5 CONNECT -> {}:{}", host, port);
 
     // Success reply with zeroed BND.

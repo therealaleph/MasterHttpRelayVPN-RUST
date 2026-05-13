@@ -111,6 +111,13 @@ object Native {
     external fun statsJson(handle: Long): String
 
     /**
+     * Pipeline debug overlay snapshot. Returns a JSON blob with elevated
+     * session count, batch semaphore usage, and recent ramp/drop events.
+     * Temporary — for debugging pipeline behavior on-device.
+     */
+    external fun pipelineDebugJson(): String
+
+    /**
      * Start tun2proxy via its CLI args C API (`tun2proxy_run_with_cli_args`).
      * Resolved at runtime via dlsym from libtun2proxy.so — no fork needed.
      *

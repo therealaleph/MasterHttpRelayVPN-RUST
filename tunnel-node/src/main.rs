@@ -71,7 +71,7 @@ const STRAGGLER_SETTLE_MAX: Duration = Duration::from_millis(1000);
 /// `BATCH_TIMEOUT` (30 s) and Apps Script's UrlFetch ceiling (~60 s).
 /// Tested on censored networks in Iran where users reported smoother
 /// Telegram video playback and fewer session resets at this value.
-const LONGPOLL_DEADLINE: Duration = Duration::from_secs(2);
+const LONGPOLL_DEADLINE: Duration = Duration::from_secs(4);
 
 /// Bound on each UDP session's inbound queue. Beyond this we drop oldest
 /// to keep recent voice/media packets moving — a stale RTP frame is

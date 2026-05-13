@@ -64,8 +64,12 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(35);
 /// connect saves one Apps Script round-trip per new flow.
 const CLIENT_FIRST_DATA_WAIT: Duration = Duration::from_millis(50);
 
-/// Baseline pipeline depth when idle (no data flowing).
+/// Floor depth after a drop (first empty reply).
 const INFLIGHT_IDLE: usize = 1;
+
+/// Optimistic starting depth — every session gets 2 in-flight polls
+/// without needing an elevation permit. Drops to IDLE on first empty.
+const INFLIGHT_OPTIMIST: usize = 2;
 
 /// Maximum pipeline depth when data is actively flowing. Ramps up on
 /// data-bearing replies, drops back to IDLE after consecutive empties.
@@ -75,7 +79,7 @@ const INFLIGHT_ACTIVE: usize = 10;
 const INFLIGHT_COOLDOWN: u32 = 3;
 
 /// Max sessions that can run at elevated pipeline depth per deployment.
-const MAX_ELEVATED_PER_DEPLOYMENT: u64 = 6;
+const MAX_ELEVATED_PER_DEPLOYMENT: u64 = 30;
 
 /// Adaptive coalesce defaults: after each new op arrives, wait another
 /// step for more ops. Resets on every arrival, up to max from the first
@@ -127,6 +131,128 @@ const UNREACHABLE_CACHE_TTL: Duration = Duration::from_secs(30);
 /// Hard cap on negative-cache size. Browsing pulls in dozens of distinct
 /// hosts; we don't want a runaway map. Pruned opportunistically on insert.
 const UNREACHABLE_CACHE_MAX: usize = 256;
+
+// ---------------------------------------------------------------------------
+// Pipeline debug overlay state — temporary, polled from Android UI.
+// ---------------------------------------------------------------------------
+pub(crate) mod pipeline_debug {
+    use std::collections::VecDeque;
+    use std::sync::{Mutex, OnceLock};
+    use portable_atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
+
+    const EVENT_CAP: usize = 30;
+
+    struct SessionInfo {
+        depth: usize,
+        inflight: usize,
+        elevated: bool,
+    }
+
+    struct State {
+        events: Mutex<VecDeque<String>>,
+        elevated: AtomicU64,
+        max_elevated: AtomicU64,
+        active_batches: AtomicU64,
+        max_batch_slots: AtomicU64,
+        active_sessions: AtomicU64,
+        sessions: Mutex<std::collections::HashMap<String, SessionInfo>>,
+    }
+
+    fn state() -> &'static State {
+        static S: OnceLock<State> = OnceLock::new();
+        S.get_or_init(|| State {
+            events: Mutex::new(VecDeque::with_capacity(EVENT_CAP)),
+            elevated: AtomicU64::new(0),
+            max_elevated: AtomicU64::new(0),
+            active_batches: AtomicU64::new(0),
+            max_batch_slots: AtomicU64::new(0),
+            active_sessions: AtomicU64::new(0),
+            sessions: Mutex::new(std::collections::HashMap::new()),
+        })
+    }
+
+    pub fn push_event(msg: String) {
+        if let Ok(mut g) = state().events.lock() {
+            if g.len() >= EVENT_CAP { g.pop_front(); }
+            g.push_back(msg);
+        }
+    }
+
+    pub fn set_limits(max_elev: u64, max_batches: u64) {
+        state().max_elevated.store(max_elev, Ordering::Relaxed);
+        state().max_batch_slots.store(max_batches, Ordering::Relaxed);
+    }
+
+    pub fn set_elevated(n: u64) {
+        state().elevated.store(n, Ordering::Relaxed);
+    }
+
+    pub fn batch_acquire() {
+        state().active_batches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn batch_release() {
+        state().active_batches.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn session_start(sid: &str) {
+        state().active_sessions.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut g) = state().sessions.lock() {
+            g.insert(sid[..sid.len().min(8)].to_string(), SessionInfo { depth: 2, inflight: 0, elevated: false });
+        }
+    }
+
+    pub fn session_end(sid: &str) {
+        state().active_sessions.fetch_sub(1, Ordering::Relaxed);
+        if let Ok(mut g) = state().sessions.lock() {
+            g.remove(&sid[..sid.len().min(8)]);
+        }
+    }
+
+    pub fn session_update(sid: &str, depth: usize, inflight: usize, elevated: bool) {
+        if let Ok(mut g) = state().sessions.lock() {
+            if let Some(info) = g.get_mut(&sid[..sid.len().min(8)]) {
+                info.depth = depth;
+                info.inflight = inflight;
+                info.elevated = elevated;
+            }
+        }
+    }
+
+    pub fn to_json() -> String {
+        let s = state();
+        let events_json = if let Ok(g) = s.events.lock() {
+            let escaped: Vec<String> = g.iter().map(|e| {
+                format!("\"{}\"", e.replace('\\', "\\\\").replace('"', "\\\""))
+            }).collect();
+            format!("[{}]", escaped.join(","))
+        } else {
+            "[]".to_string()
+        };
+        let sessions_json = if let Ok(g) = s.sessions.lock() {
+            let entries: Vec<String> = g.iter().map(|(sid, info)| {
+                format!(
+                    r#"{{"sid":"{}","depth":{},"inflight":{},"elevated":{}}}"#,
+                    sid, info.depth, info.inflight, info.elevated,
+                )
+            }).collect();
+            format!("[{}]", entries.join(","))
+        } else {
+            "[]".to_string()
+        };
+        format!(
+            r#"{{"elevated":{},"max_elevated":{},"active_batches":{},"max_batch_slots":{},"active_sessions":{},"sessions":{},"events":{}}}"#,
+            s.elevated.load(Ordering::Relaxed),
+            s.max_elevated.load(Ordering::Relaxed),
+            s.active_batches.load(Ordering::Relaxed),
+            s.max_batch_slots.load(Ordering::Relaxed),
+            s.active_sessions.load(Ordering::Relaxed),
+            sessions_json,
+            events_json,
+        )
+    }
+}
 
 /// Ports where the *server* speaks first (SMTP banner, SSH identification,
 /// POP3/IMAP greeting, FTP banner). On these, waiting for client bytes
@@ -310,7 +436,7 @@ pub struct TunnelMux {
     /// `request_timeout_secs` would see sessions abandon replies just
     /// before the batch would have completed.
     reply_timeout: Duration,
-    /// How many sessions are currently at elevated pipeline depth (> INFLIGHT_IDLE).
+    /// How many sessions are currently at elevated pipeline depth (>= 3).
     elevated_sessions: AtomicU64,
     max_elevated: u64,
 }
@@ -343,7 +469,7 @@ impl TunnelMux {
         );
         let step = if coalesce_step_ms > 0 { coalesce_step_ms } else { DEFAULT_COALESCE_STEP_MS };
         let max = if coalesce_max_ms > 0 { coalesce_max_ms } else { DEFAULT_COALESCE_MAX_MS };
-        tracing::info!("batch coalesce: step={}ms max={}ms, pipeline max depth: {}", step, max, INFLIGHT_ACTIVE);
+        tracing::info!("batch coalesce: step={}ms max={}ms, pipeline max depth: {}, optimist: {}", step, max, INFLIGHT_ACTIVE, INFLIGHT_OPTIMIST);
         // Reply timeout co-varies with `request_timeout_secs` so an
         // operator who raises the batch budget doesn't have sessions
         // abandoning replies just before the HTTP round-trip would
@@ -352,6 +478,10 @@ impl TunnelMux {
         let reply_timeout = fronter
             .batch_timeout()
             .saturating_add(REPLY_TIMEOUT_SLACK);
+        pipeline_debug::set_limits(
+            MAX_ELEVATED_PER_DEPLOYMENT * unique_n as u64,
+            (CONCURRENCY_PER_DEPLOYMENT * unique_n) as u64,
+        );
         let (tx, rx) = mpsc::channel(512);
         tokio::spawn(mux_loop(rx, fronter, step, max));
         Arc::new(Self {
@@ -928,9 +1058,13 @@ async fn fire_batch(
         .cloned()
         .unwrap_or_else(|| Arc::new(Semaphore::new(CONCURRENCY_PER_DEPLOYMENT)));
     let permit = sem.acquire_owned().await.unwrap();
+    pipeline_debug::batch_acquire();
     let f = fronter.clone();
 
     tokio::spawn(async move {
+        struct BatchGuard;
+        impl Drop for BatchGuard { fn drop(&mut self) { pipeline_debug::batch_release(); } }
+        let _batch_guard = BatchGuard;
         let _permit = permit;
         let t0 = std::time::Instant::now();
         let n_ops = pending_ops.len();
@@ -1113,6 +1247,7 @@ pub async fn tunnel_connection(
     };
 
     tracing::info!("tunnel session {} opened for {}:{}", sid, host, port);
+    pipeline_debug::session_start(&sid);
 
     // Run the first-response write + tunnel_loop inside an async block so
     // any io-error propagates via `?` without bypassing the Close below.
@@ -1142,6 +1277,7 @@ pub async fn tunnel_connection(
     .await;
 
     mux.send(MuxMsg::Close { sid: sid.clone() }).await;
+    pipeline_debug::session_end(&sid);
     tracing::info!("tunnel session {} closed for {}:{}", sid, host, port);
     result
 }
@@ -1323,10 +1459,11 @@ async fn tunnel_loop(
     let mut next_write_seq: u64 = 0;
     let mut pending_writes: BTreeMap<u64, (TunnelResponse, String)> = BTreeMap::new();
     let inflight_cap = INFLIGHT_ACTIVE;
-    let mut max_inflight = INFLIGHT_IDLE.min(inflight_cap);
+    let mut max_inflight = INFLIGHT_OPTIMIST.min(inflight_cap);
     let mut eof_seen = false;
     let mut consecutive_data: u32 = 0;
     let mut is_elevated = false;
+    let mut total_download_bytes: u64 = 0;
 
     enum ReplyOutcome {
         Ok(TunnelResponse, String),
@@ -1405,29 +1542,48 @@ async fn tunnel_loop(
                 }
             }));
 
-            // Pre-fill pipeline when depth > IDLE: send additional polls
-            // with a brief pause between each so the mux_loop fires them
-            // in separate batches. At idle depth, refill-on-reply is enough.
+            // Pre-fill pipeline when depth > IDLE: 1s between each op
+            // so they land in separate batches. After the stagger,
+            // check client socket for data to merge.
             while max_inflight > INFLIGHT_IDLE && inflight.len() < max_inflight {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if !upload_closed && buffered_upload.is_none() && pending_client_data.is_none() {
+                    buf.reserve(READ_CHUNK);
+                    match tokio::time::timeout(Duration::from_millis(20), reader.read_buf(&mut buf)).await {
+                        Ok(Ok(0)) => { upload_closed = true; }
+                        Ok(Ok(n)) => { buffered_upload = Some(extract_bytes(&mut buf, n)); }
+                        Ok(Err(_)) => { upload_closed = true; }
+                        Err(_) => {}
+                    }
+                }
+                let data = if let Some(d) = pending_client_data.take() {
+                    d
+                } else if let Some(d) = buffered_upload.take() {
+                    consecutive_empty = 0;
+                    d
+                } else {
+                    Bytes::new()
+                };
+                let was_empty_poll = data.is_empty();
                 let seq = next_send_seq;
                 next_send_seq += 1;
                 let (reply_tx, reply_rx) = oneshot::channel();
                 let send_at = Instant::now();
                 tracing::debug!(
-                    "sess {}: send seq={}, inflight={}, poll",
+                    "sess {}: send seq={}, inflight={}, {}",
                     &sid[..sid.len().min(8)],
                     seq,
                     inflight.len() + 1,
+                    if was_empty_poll { "poll" } else { "data+poll" },
                 );
                 mux.send(MuxMsg::Data {
                     sid: sid.to_string(),
-                    data: Bytes::new(),
+                    data,
                     seq: Some(seq),
                     reply: reply_tx,
                 })
                 .await;
-                let meta = InflightMeta { seq, was_empty_poll: true, send_at };
+                let meta = InflightMeta { seq, was_empty_poll, send_at };
                 inflight.push(Box::pin(async move {
                     match tokio::time::timeout(REPLY_TIMEOUT, reply_rx).await {
                         Ok(Ok(Ok((r, sid)))) => (meta, ReplyOutcome::Ok(r, sid)),
@@ -1493,9 +1649,10 @@ async fn tunnel_loop(
                             if got_data {
                                 consecutive_empty = 0;
                                 consecutive_data = consecutive_data.saturating_add(1);
+                                let bytes = resp.d.as_ref().map(|d| d.len() as u64 * 3 / 4).unwrap_or(0);
+                                total_download_bytes += bytes;
                             } else {
                                 consecutive_empty = consecutive_empty.saturating_add(1);
-                                consecutive_data = 0;
                             }
                             if is_eof { eof_seen = true; }
 
@@ -1504,7 +1661,12 @@ async fn tunnel_loop(
                                 let (_, (buffered_resp, _)) = entry.remove_entry();
                                 let buf_eof = buffered_resp.eof.unwrap_or(false);
                                 match write_tunnel_response(&mut writer, &buffered_resp).await? {
-                                    WriteOutcome::Wrote => { consecutive_empty = 0; }
+                                    WriteOutcome::Wrote => {
+                                        consecutive_empty = 0;
+                                        consecutive_data = consecutive_data.saturating_add(1);
+                                        let bytes = buffered_resp.d.as_ref().map(|d| d.len() as u64 * 3 / 4).unwrap_or(0);
+                                        total_download_bytes += bytes;
+                                    }
                                     WriteOutcome::NoData => {
                                         consecutive_empty = consecutive_empty.saturating_add(1);
                                     }
@@ -1517,28 +1679,31 @@ async fn tunnel_loop(
                             pending_writes.insert(meta.seq, (resp, script_id));
                         }
 
-                        // Adaptive pipeline depth: ramp up when data is
-                        // flowing, drop back when idle. At most
-                        // MAX_ELEVATED_SESSIONS can be above idle depth.
+                        // Adaptive pipeline depth: optimist start at 2,
+                        // drop to 1 on first empty, ramp to 3+ with
+                        // elevation permit (cap only counts depth >= 3).
+                        tracing::info!(
+                            "sess {}: depth={} cd={} ce={} inf={} has_seq={}",
+                            &sid[..sid.len().min(8)],
+                            max_inflight, consecutive_data, consecutive_empty, inflight.len(), resp_has_seq,
+                        );
                         if resp_has_seq {
                             let prev = max_inflight;
-                            if consecutive_data >= 1 && max_inflight < inflight_cap && !is_elevated {
-                                tracing::debug!(
-                                    "sess {}: elevation check: counter={}, cap={}",
-                                    &sid[..sid.len().min(8)],
-                                    mux.elevated_sessions.load(Ordering::Relaxed),
-                                    mux.max_elevated,
-                                );
-                            }
-                            if consecutive_empty >= 1 && is_elevated {
+                            if consecutive_empty >= 2 && max_inflight > INFLIGHT_IDLE {
                                 max_inflight = INFLIGHT_IDLE.min(inflight_cap);
-                                mux.elevated_sessions.fetch_sub(1, Ordering::Relaxed);
-                                is_elevated = false;
-                            } else if consecutive_data >= 2 && max_inflight < inflight_cap {
+                                if is_elevated {
+                                    let n = mux.elevated_sessions.fetch_sub(1, Ordering::Relaxed);
+                                    pipeline_debug::set_elevated(n.saturating_sub(1));
+                                    is_elevated = false;
+                                }
+                            } else if consecutive_data >= 1 && max_inflight < INFLIGHT_OPTIMIST {
+                                max_inflight = INFLIGHT_OPTIMIST.min(inflight_cap);
+                            } else if consecutive_data >= 2 && max_inflight >= INFLIGHT_OPTIMIST && max_inflight < inflight_cap && total_download_bytes >= 32 * 1024 {
                                 if !is_elevated {
                                     let cur = mux.elevated_sessions.load(Ordering::Relaxed);
                                     if cur < mux.max_elevated {
-                                        mux.elevated_sessions.fetch_add(1, Ordering::Relaxed);
+                                        let n = mux.elevated_sessions.fetch_add(1, Ordering::Relaxed);
+                                        pipeline_debug::set_elevated(n + 1);
                                         is_elevated = true;
                                         max_inflight = (max_inflight + 1).min(inflight_cap);
                                     }
@@ -1546,25 +1711,42 @@ async fn tunnel_loop(
                                     max_inflight = (max_inflight + 1).min(inflight_cap);
                                 }
                             }
+                            pipeline_debug::session_update(&sid, max_inflight, inflight.len(), is_elevated);
                             if max_inflight != prev {
-                                tracing::debug!(
-                                    "sess {}: pipeline depth {} → {}",
+                                tracing::info!(
+                                    "sess {}: pipeline {} → {}{}",
                                     &sid[..sid.len().min(8)],
                                     prev, max_inflight,
+                                    if is_elevated { " [elevated]" } else { "" },
                                 );
+                                pipeline_debug::push_event(format!(
+                                    "{} {}→{}{}",
+                                    &sid[..sid.len().min(8)],
+                                    prev, max_inflight,
+                                    if is_elevated { " E" } else { "" },
+                                ));
                             }
                         }
 
-                        // Fill pipeline slots. When depth is above idle
-                        // (data flowing), fill all slots with 5ms spacing
-                        // so polls land in separate batches. At idle depth,
-                        // send just one refill.
+                        // Fill pipeline slots. Always stagger 1s between
+                        // ops so each lands in a separate batch — proper
+                        // pipelining requires continuous separate responses.
+                        // After the stagger, check client socket for data
+                        // to merge: data ops over empty polls.
                         while !eof_seen && inflight.len() < max_inflight && consecutive_empty < 3 {
-                            // Stagger polls 1s apart so they land in
-                            // separate batches. Skip the delay for the
-                            // first refill (immediate) and at idle depth.
-                            if inflight.len() > 0 && max_inflight > INFLIGHT_IDLE {
+                            if max_inflight > INFLIGHT_IDLE {
                                 tokio::time::sleep(Duration::from_secs(1)).await;
+                            }
+                            // Read any client data that arrived during the
+                            // stagger. Prefer data ops over empty polls.
+                            if !upload_closed && buffered_upload.is_none() && pending_client_data.is_none() {
+                                buf.reserve(READ_CHUNK);
+                                match tokio::time::timeout(Duration::from_millis(20), reader.read_buf(&mut buf)).await {
+                                    Ok(Ok(0)) => { upload_closed = true; }
+                                    Ok(Ok(n)) => { buffered_upload = Some(extract_bytes(&mut buf, n)); }
+                                    Ok(Err(_)) => { upload_closed = true; }
+                                    Err(_) => {}
+                                }
                             }
                             let data = if let Some(d) = pending_client_data.take() {
                                 d
@@ -1626,6 +1808,9 @@ async fn tunnel_loop(
             }
 
             // Read from client socket while waiting for replies.
+            // If the client closes (read returns 0 or error), break
+            // immediately — don't wait for in-flight polls to drain,
+            // they're serving a dead session.
             _ = async {
                 buf.reserve(READ_CHUNK);
                 match reader.read_buf(&mut buf).await {
@@ -1635,12 +1820,65 @@ async fn tunnel_loop(
                     }
                     Err(_) => { upload_closed = true; }
                 }
-            }, if can_read => {}
+            }, if can_read => {
+                if upload_closed { break; }
+                // Fast-path: client has upload data but all pipeline
+                // slots are full. Send immediately as an extra op
+                // outside the depth cap so uploads aren't blocked
+                // behind polls waiting at the tunnel-node.
+                if buffered_upload.is_some() && inflight.len() >= max_inflight && inflight.len() < max_inflight + 4 {
+                    // Brief coalesce: wait 20ms for more client data
+                    // to arrive so we batch multiple small writes into
+                    // one op instead of one per read.
+                    buf.reserve(READ_CHUNK);
+                    match tokio::time::timeout(Duration::from_millis(20), reader.read_buf(&mut buf)).await {
+                        Ok(Ok(0)) => { break; }
+                        Ok(Ok(n)) => {
+                            let extra = extract_bytes(&mut buf, n);
+                            let merged = buffered_upload.take().unwrap();
+                            let mut combined = bytes::BytesMut::with_capacity(merged.len() + extra.len());
+                            combined.extend_from_slice(&merged);
+                            combined.extend_from_slice(&extra);
+                            buffered_upload = Some(combined.freeze());
+                        }
+                        Ok(Err(_)) => { break; }
+                        Err(_) => {} // timeout — no more data, send what we have
+                    }
+                    let data = buffered_upload.take().unwrap();
+                    let seq = next_send_seq;
+                    next_send_seq += 1;
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    let send_at = Instant::now();
+                    tracing::info!(
+                        "sess {}: fast-path upload seq={}, inflight={}",
+                        &sid[..sid.len().min(8)],
+                        seq,
+                        inflight.len() + 1,
+                    );
+                    consecutive_empty = 0;
+                    mux.send(MuxMsg::Data {
+                        sid: sid.to_string(),
+                        data,
+                        seq: Some(seq),
+                        reply: reply_tx,
+                    }).await;
+                    let meta = InflightMeta { seq, was_empty_poll: false, send_at };
+                    inflight.push(Box::pin(async move {
+                        match tokio::time::timeout(REPLY_TIMEOUT, reply_rx).await {
+                            Ok(Ok(Ok((r, sid)))) => (meta, ReplyOutcome::Ok(r, sid)),
+                            Ok(Ok(Err(e))) => (meta, ReplyOutcome::BatchErr(e)),
+                            Ok(Err(_)) => (meta, ReplyOutcome::Dropped),
+                            Err(_) => (meta, ReplyOutcome::Timeout),
+                        }
+                    }));
+                }
+            }
         }
     }
 
     if is_elevated {
-        mux.elevated_sessions.fetch_sub(1, Ordering::Relaxed);
+        let n = mux.elevated_sessions.fetch_sub(1, Ordering::Relaxed);
+        pipeline_debug::set_elevated(n.saturating_sub(1));
     }
     Ok(())
 }
@@ -2067,10 +2305,12 @@ mod tests {
             ),
         }
 
-        // With pipelining, a second op may already be in flight. Reply
-        // to any remaining messages so the loop can exit cleanly.
+        // With pipelining (INFLIGHT_OPTIMIST=2), the second op is
+        // launched after a 1 s stagger sleep, so we need to wait long
+        // enough for it to arrive. Reply to any remaining messages so the
+        // loop can exit cleanly.
         let mut seq = 1u64;
-        while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+        while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(1500), rx.recv()).await {
             if let MuxMsg::Data { reply, .. } = msg {
                 let _ = reply.send(Ok((
                     TunnelResponse {
@@ -2084,7 +2324,7 @@ mod tests {
             }
         }
 
-        let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle)
+        let _ = tokio::time::timeout(Duration::from_secs(4), loop_handle)
             .await
             .expect("tunnel_loop did not exit after eof");
     }
@@ -2585,8 +2825,9 @@ mod tests {
         }
         assert!(found_upload, "upload data must appear in a subsequent op");
 
-        // Drain any remaining in-flight ops.
-        while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+        // Drain any remaining in-flight ops (stagger sleep is 1 s,
+        // so allow enough time for late-arriving ops).
+        while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(1500), rx.recv()).await {
             if let MuxMsg::Data { reply, .. } = msg {
                 let _ = reply.send(Ok((
                     TunnelResponse {
@@ -2600,7 +2841,7 @@ mod tests {
             }
         }
 
-        let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle)
+        let _ = tokio::time::timeout(Duration::from_secs(4), loop_handle)
             .await
             .expect("tunnel_loop did not exit after eof");
     }
