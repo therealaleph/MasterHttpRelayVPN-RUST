@@ -5,7 +5,7 @@
 //! Each Apps Script deployment (account) gets its own concurrency pool of
 //! 30 in-flight requests — matching the per-account Apps Script limit.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 // `AtomicU64` from `std::sync::atomic` requires hardware-backed 64-bit
 // atomics, which 32-bit MIPS (`mipsel-unknown-linux-musl` — our OpenWRT
 // router target) does not provide — the std type isn't even defined
@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use bytes::{Bytes, BytesMut};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, Semaphore};
@@ -52,11 +53,29 @@ const MAX_BATCH_OPS: usize = 50;
 /// batch makes exactly one attempt (see `fire_batch` docs).
 const REPLY_TIMEOUT_SLACK: Duration = Duration::from_secs(5);
 
+/// Per-inflight reply timeout used by the pipelined poll loop. Each
+/// in-flight future independently times out after this duration so a
+/// dead target on the tunnel-node side doesn't block the session.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(35);
+
 /// How long we'll briefly hold the client socket after the local
 /// CONNECT/SOCKS5 handshake, waiting for the client's first bytes (the
 /// TLS ClientHello for HTTPS). Bundling those bytes with the tunnel-node
 /// connect saves one Apps Script round-trip per new flow.
 const CLIENT_FIRST_DATA_WAIT: Duration = Duration::from_millis(50);
+
+/// Baseline pipeline depth when idle (no data flowing).
+const INFLIGHT_IDLE: usize = 1;
+
+/// Maximum pipeline depth when data is actively flowing. Ramps up on
+/// data-bearing replies, drops back to IDLE after consecutive empties.
+const INFLIGHT_ACTIVE: usize = 10;
+
+/// How many consecutive empty replies before dropping from active to idle depth.
+const INFLIGHT_COOLDOWN: u32 = 3;
+
+/// Max sessions that can run at elevated pipeline depth per deployment.
+const MAX_ELEVATED_PER_DEPLOYMENT: u64 = 6;
 
 /// Adaptive coalesce defaults: after each new op arrives, wait another
 /// step for more ops. Resets on every arrival, up to max from the first
@@ -174,6 +193,7 @@ enum MuxMsg {
     Data {
         sid: String,
         data: Bytes,
+        seq: Option<u64>,
         reply: BatchedReply,
     },
     UdpOpen {
@@ -209,6 +229,7 @@ struct PendingOp {
     /// only `connect_data`, which uses presence of `d` as the signal
     /// that the caller is opting into the bundled-first-bytes flow).
     encode_empty: bool,
+    seq: Option<u64>,
 }
 
 pub struct TunnelMux {
@@ -289,6 +310,9 @@ pub struct TunnelMux {
     /// `request_timeout_secs` would see sessions abandon replies just
     /// before the batch would have completed.
     reply_timeout: Duration,
+    /// How many sessions are currently at elevated pipeline depth (> INFLIGHT_IDLE).
+    elevated_sessions: AtomicU64,
+    max_elevated: u64,
 }
 
 impl TunnelMux {
@@ -319,7 +343,7 @@ impl TunnelMux {
         );
         let step = if coalesce_step_ms > 0 { coalesce_step_ms } else { DEFAULT_COALESCE_STEP_MS };
         let max = if coalesce_max_ms > 0 { coalesce_max_ms } else { DEFAULT_COALESCE_MAX_MS };
-        tracing::info!("batch coalesce: step={}ms max={}ms", step, max);
+        tracing::info!("batch coalesce: step={}ms max={}ms, pipeline max depth: {}", step, max, INFLIGHT_ACTIVE);
         // Reply timeout co-varies with `request_timeout_secs` so an
         // operator who raises the batch budget doesn't have sessions
         // abandoning replies just before the HTTP round-trip would
@@ -344,6 +368,8 @@ impl TunnelMux {
             preread_total_events: AtomicU64::new(0),
             unreachable_cache: Mutex::new(HashMap::new()),
             reply_timeout,
+            elevated_sessions: AtomicU64::new(0),
+            max_elevated: MAX_ELEVATED_PER_DEPLOYMENT * unique_n as u64,
         })
     }
 
@@ -704,10 +730,11 @@ async fn mux_loop(mut rx: mpsc::Receiver<MuxMsg>, fronter: Arc<DomainFronter>, c
                         port: Some(port),
                         data: Some(data),
                         encode_empty: true,
+                        seq: None,
                     };
                     accum.push_or_fire(op, op_bytes, reply, &sems, &fronter).await;
                 }
-                MuxMsg::Data { sid, data, reply } => {
+                MuxMsg::Data { sid, data, seq, reply } => {
                     let op_bytes = encoded_len(data.len());
                     let op = PendingOp {
                         op: "data",
@@ -716,6 +743,7 @@ async fn mux_loop(mut rx: mpsc::Receiver<MuxMsg>, fronter: Arc<DomainFronter>, c
                         port: None,
                         data: if data.is_empty() { None } else { Some(data) },
                         encode_empty: false,
+                        seq,
                     };
                     accum.push_or_fire(op, op_bytes, reply, &sems, &fronter).await;
                 }
@@ -733,6 +761,7 @@ async fn mux_loop(mut rx: mpsc::Receiver<MuxMsg>, fronter: Arc<DomainFronter>, c
                         port: Some(port),
                         data: if data.is_empty() { None } else { Some(data) },
                         encode_empty: false,
+                        seq: None,
                     };
                     accum.push_or_fire(op, op_bytes, reply, &sems, &fronter).await;
                 }
@@ -745,6 +774,7 @@ async fn mux_loop(mut rx: mpsc::Receiver<MuxMsg>, fronter: Arc<DomainFronter>, c
                         port: None,
                         data: if data.is_empty() { None } else { Some(data) },
                         encode_empty: false,
+                        seq: None,
                     };
                     accum.push_or_fire(op, op_bytes, reply, &sems, &fronter).await;
                 }
@@ -764,6 +794,7 @@ async fn mux_loop(mut rx: mpsc::Receiver<MuxMsg>, fronter: Arc<DomainFronter>, c
                 port: None,
                 data: None,
                 encode_empty: false,
+                seq: None,
             });
         }
 
@@ -868,6 +899,7 @@ fn encode_pending(p: PendingOp) -> BatchOp {
         host: p.host,
         port: p.port,
         d,
+        seq: p.seq,
     }
 }
 
@@ -1267,6 +1299,13 @@ fn is_connect_data_unsupported_error_str(e: &str) -> bool {
     (e.contains("unknown op") || e.contains("unknown tunnel op")) && e.contains("connect_data")
 }
 
+/// Metadata for one in-flight Data op, returned alongside its reply.
+struct InflightMeta {
+    seq: u64,
+    was_empty_poll: bool,
+    send_at: Instant,
+}
+
 async fn tunnel_loop(
     sock: &mut TcpStream,
     sid: &str,
@@ -1274,174 +1313,335 @@ async fn tunnel_loop(
     mut pending_client_data: Option<Bytes>,
 ) -> std::io::Result<()> {
     let (mut reader, mut writer) = sock.split();
-    // `BytesMut` + `read_buf` + a per-read decision between
-    // `split().freeze()` (zero-copy) and `copy_from_slice` + `clear`
-    // (right-sized copy, buffer reused).
-    //
-    // Why the split decision: `bytes` 1.x refcounts the *whole*
-    // backing allocation, so a frozen `Bytes` from a partial read
-    // pins all `READ_CHUNK` bytes until it drops. Under semaphore
-    // saturation or reply timeouts, dozens of small TLS records or
-    // HTTP/2 frames can each retain ~64 KB instead of their actual
-    // payload size — order-of-magnitude memory regression on
-    // constrained targets (router builds with 64 MB RAM).
-    //
-    // Threshold: at ≥ half-buffer the saved memcpy outweighs the
-    // wasted slack, and these reads are typically streaming bulk
-    // transfer where the `Bytes` flushes through the mux quickly.
-    // Below that, copy out and `clear()` so the same allocation
-    // serves the next read — equivalent memory profile to the old
-    // `vec![0u8; 65536]` + `to_vec()` code on small-read workloads.
     const READ_CHUNK: usize = 65536;
-    const ZERO_COPY_THRESHOLD: usize = READ_CHUNK / 2;
     let mut buf = BytesMut::with_capacity(READ_CHUNK);
     let mut consecutive_empty = 0u32;
+    let mut buffered_upload: Option<Bytes> = None;
+    let mut upload_closed = false;
+
+    let mut next_send_seq: u64 = 0;
+    let mut next_write_seq: u64 = 0;
+    let mut pending_writes: BTreeMap<u64, (TunnelResponse, String)> = BTreeMap::new();
+    let inflight_cap = INFLIGHT_ACTIVE;
+    let mut max_inflight = INFLIGHT_IDLE.min(inflight_cap);
+    let mut eof_seen = false;
+    let mut consecutive_data: u32 = 0;
+    let mut is_elevated = false;
+
+    enum ReplyOutcome {
+        Ok(TunnelResponse, String),
+        BatchErr(String),
+        Timeout,
+        Dropped,
+    }
+    type ReplyFut = std::pin::Pin<Box<dyn std::future::Future<Output = (InflightMeta, ReplyOutcome)> + Send>>;
+    let mut inflight: FuturesUnordered<ReplyFut> = FuturesUnordered::new();
 
     loop {
-        // Cadence depends on whether the tunnel-node is doing long-poll
-        // drains. With long-poll, the server holds empty polls open up
-        // to its `LONGPOLL_DEADLINE` (~5 s currently), so the client
-        // can keep this read timeout short — the wait is on the wire,
-        // not here. Against *legacy* tunnel-nodes (no long-poll, fast
-        // empty replies), the same short cadence + always-poll behavior
-        // would generate continuous round-trips on idle sessions and
-        // burn Apps Script quota.
-        //
-        // Both the read timeout and the skip-empty-when-idle decision
-        // are gated on `all_legacy` — i.e. *every known deployment is
-        // currently legacy*. Per-deployment "skip when this script is
-        // legacy" sounds appealing but is unsafe: the next op's
-        // deployment is chosen by `next_script_id()` only when the
-        // batch fires, so the loop can't predict where the empty poll
-        // will land. Suppressing polls based on the *previous* reply's
-        // script would stall remote→client data on mixed setups —
-        // round-robin would never reach the long-poll-capable peer for
-        // this session if every iteration short-circuits before
-        // sending. Cost of the conservative gate: legacy peers see
-        // some wasted empty polls when at least one peer is healthy,
-        // bounded by round-robin fan-out. Worth it to keep pushed
-        // bytes flowing.
         let all_legacy = mux.all_servers_legacy();
-        let client_data = if let Some(data) = pending_client_data.take() {
-            Some(data)
-        } else {
-            let read_timeout = match (all_legacy, consecutive_empty) {
-                (_, 0) => Duration::from_millis(20),
-                (_, 1) => Duration::from_millis(80),
-                (_, 2) => Duration::from_millis(200),
-                (false, _) => Duration::from_millis(500),
-                (true, _) => Duration::from_secs(30),
+
+        // When no ops are in flight and we can send, we must gather data
+        // (possibly blocking on client read) before entering the select.
+        // When ops ARE in flight, send empty polls to keep the pipeline full.
+        if !eof_seen && inflight.is_empty() {
+            let client_data = if let Some(data) = pending_client_data.take() {
+                Some(data)
+            } else if let Some(data) = buffered_upload.take() {
+                consecutive_empty = 0;
+                Some(data)
+            } else if upload_closed {
+                None
+            } else {
+                let read_timeout = match (all_legacy, consecutive_empty) {
+                    (_, 0) => Duration::from_millis(20),
+                    (_, 1) => Duration::from_millis(80),
+                    (_, 2) => Duration::from_millis(200),
+                    (false, 3..=5) => Duration::from_secs(3),
+                    (false, _) => Duration::from_secs(8),
+                    (true, _) => Duration::from_secs(30),
+                };
+                buf.reserve(READ_CHUNK);
+                match tokio::time::timeout(read_timeout, reader.read_buf(&mut buf)).await {
+                    Ok(Ok(0)) => break,
+                    Ok(Ok(n)) => {
+                        consecutive_empty = 0;
+                        Some(extract_bytes(&mut buf, n))
+                    }
+                    Ok(Err(_)) => break,
+                    Err(_) => None,
+                }
             };
 
-            buf.reserve(READ_CHUNK);
-            match tokio::time::timeout(read_timeout, reader.read_buf(&mut buf)).await {
-                Ok(Ok(0)) => break,
-                Ok(Ok(n)) => {
-                    consecutive_empty = 0;
-                    if n >= ZERO_COPY_THRESHOLD {
-                        // Big read: split off the filled region. The
-                        // frozen `Bytes` is at-least-half-full, so the
-                        // saved 64 KB memcpy outweighs the brief
-                        // retention until the mux drains.
-                        Some(buf.split().freeze())
-                    } else {
-                        // Small read: copy out a payload-sized `Bytes`
-                        // and `clear()` so the buffer is reused on the
-                        // next iter (no `reserve` allocation needed
-                        // because the alloc stays uniquely owned).
-                        // Bounds retention to actual data even when
-                        // the mux is backpressured.
-                        let owned = Bytes::copy_from_slice(&buf[..n]);
-                        buf.clear();
-                        Some(owned)
-                    }
-                }
-                Ok(Err(_)) => break,
-                Err(_) => None,
+            if all_legacy && client_data.is_none() && consecutive_empty > 3 {
+                continue;
             }
-        };
 
-        // Skip empty polls only when *every* deployment is legacy. With
-        // even one long-poll-capable peer, round-robin will land some
-        // empty polls there where the server holds them open and can
-        // deliver pushed bytes — that's the whole point of long-poll,
-        // so we must keep emitting. See the `all_legacy` comment above
-        // for why a per-deployment gate here would stall mixed setups.
-        if all_legacy && client_data.is_none() && consecutive_empty > 3 {
+            let data = client_data.unwrap_or_else(Bytes::new);
+            let was_empty_poll = data.is_empty();
+            let seq = next_send_seq;
+            next_send_seq += 1;
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let send_at = Instant::now();
+            mux.send(MuxMsg::Data {
+                sid: sid.to_string(),
+                data,
+                seq: Some(seq),
+                reply: reply_tx,
+            })
+            .await;
+            tracing::debug!(
+                "sess {}: send seq={}, inflight=1, {}",
+                &sid[..sid.len().min(8)],
+                seq,
+                if was_empty_poll { "poll" } else { "data" },
+            );
+            let meta = InflightMeta { seq, was_empty_poll, send_at };
+            inflight.push(Box::pin(async move {
+                match tokio::time::timeout(REPLY_TIMEOUT, reply_rx).await {
+                    Ok(Ok(Ok((r, sid)))) => (meta, ReplyOutcome::Ok(r, sid)),
+                    Ok(Ok(Err(e))) => (meta, ReplyOutcome::BatchErr(e)),
+                    Ok(Err(_)) => (meta, ReplyOutcome::Dropped),
+                    Err(_) => (meta, ReplyOutcome::Timeout),
+                }
+            }));
+
+            // Pre-fill pipeline when depth > IDLE: send additional polls
+            // with a brief pause between each so the mux_loop fires them
+            // in separate batches. At idle depth, refill-on-reply is enough.
+            while max_inflight > INFLIGHT_IDLE && inflight.len() < max_inflight {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                let seq = next_send_seq;
+                next_send_seq += 1;
+                let (reply_tx, reply_rx) = oneshot::channel();
+                let send_at = Instant::now();
+                tracing::debug!(
+                    "sess {}: send seq={}, inflight={}, poll",
+                    &sid[..sid.len().min(8)],
+                    seq,
+                    inflight.len() + 1,
+                );
+                mux.send(MuxMsg::Data {
+                    sid: sid.to_string(),
+                    data: Bytes::new(),
+                    seq: Some(seq),
+                    reply: reply_tx,
+                })
+                .await;
+                let meta = InflightMeta { seq, was_empty_poll: true, send_at };
+                inflight.push(Box::pin(async move {
+                    match tokio::time::timeout(REPLY_TIMEOUT, reply_rx).await {
+                        Ok(Ok(Ok((r, sid)))) => (meta, ReplyOutcome::Ok(r, sid)),
+                        Ok(Ok(Err(e))) => (meta, ReplyOutcome::BatchErr(e)),
+                        Ok(Err(_)) => (meta, ReplyOutcome::Dropped),
+                        Err(_) => (meta, ReplyOutcome::Timeout),
+                    }
+                }));
+            }
+        }
+
+        if inflight.is_empty() && eof_seen {
+            break;
+        }
+        if inflight.is_empty() {
             continue;
         }
 
-        let data = client_data.unwrap_or_else(Bytes::new);
-        let was_empty_poll = data.is_empty();
+        let can_read = !upload_closed && buffered_upload.is_none();
 
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let send_at = Instant::now();
-        mux.send(MuxMsg::Data {
-            sid: sid.to_string(),
-            data,
-            reply: reply_tx,
-        })
-        .await;
+        // Wait for replies, overlapping with client reads.
+        tokio::select! {
+            biased;
 
-        // Bounded-wait on reply: if the batch this op landed in is slow
-        // (dead target on the tunnel-node side), don't block this session
-        // forever — timeout and let it retry on the next tick.
-        let (resp, script_id) = match tokio::time::timeout(mux.reply_timeout(), reply_rx).await {
-            Ok(Ok(Ok((r, sid_used)))) => (r, sid_used),
-            Ok(Ok(Err(e))) => {
-                tracing::debug!("tunnel data error: {}", e);
-                break;
+            Some((meta, outcome)) = inflight.next() => {
+                match outcome {
+                    ReplyOutcome::Ok(resp, script_id) => {
+                        let has_data = resp.d.as_ref().map(|d| !d.is_empty()).unwrap_or(false);
+                        tracing::debug!(
+                            "sess {}: recv seq={}, rtt={:?}, data={}, inflight={}",
+                            &sid[..sid.len().min(8)],
+                            meta.seq,
+                            meta.send_at.elapsed(),
+                            has_data,
+                            inflight.len(),
+                        );
+                        if meta.was_empty_poll {
+                            let reply_was_empty = resp.d.as_deref().map(str::is_empty).unwrap_or(true);
+                            if reply_was_empty && meta.send_at.elapsed() < LEGACY_DETECT_THRESHOLD {
+                                mux.mark_server_no_longpoll(&script_id);
+                            }
+                        }
+
+                        if resp.seq.is_none() {
+                            max_inflight = 1;
+                        }
+
+                        if let Some(ref e) = resp.e {
+                            tracing::debug!("tunnel error: {}", e);
+                            break;
+                        }
+
+                        let is_eof = resp.eof.unwrap_or(false);
+                        let resp_has_seq = resp.seq.is_some();
+
+                        if meta.seq == next_write_seq {
+                            let got_data = match write_tunnel_response(&mut writer, &resp).await? {
+                                WriteOutcome::Wrote => true,
+                                WriteOutcome::NoData => false,
+                                WriteOutcome::BadBase64 => break,
+                            };
+                            next_write_seq += 1;
+                            if got_data {
+                                consecutive_empty = 0;
+                                consecutive_data = consecutive_data.saturating_add(1);
+                            } else {
+                                consecutive_empty = consecutive_empty.saturating_add(1);
+                                consecutive_data = 0;
+                            }
+                            if is_eof { eof_seen = true; }
+
+                            while let Some(entry) = pending_writes.first_entry() {
+                                if *entry.key() != next_write_seq { break; }
+                                let (_, (buffered_resp, _)) = entry.remove_entry();
+                                let buf_eof = buffered_resp.eof.unwrap_or(false);
+                                match write_tunnel_response(&mut writer, &buffered_resp).await? {
+                                    WriteOutcome::Wrote => { consecutive_empty = 0; }
+                                    WriteOutcome::NoData => {
+                                        consecutive_empty = consecutive_empty.saturating_add(1);
+                                    }
+                                    WriteOutcome::BadBase64 => break,
+                                }
+                                next_write_seq += 1;
+                                if buf_eof { eof_seen = true; }
+                            }
+                        } else {
+                            pending_writes.insert(meta.seq, (resp, script_id));
+                        }
+
+                        // Adaptive pipeline depth: ramp up when data is
+                        // flowing, drop back when idle. At most
+                        // MAX_ELEVATED_SESSIONS can be above idle depth.
+                        if resp_has_seq {
+                            let prev = max_inflight;
+                            if consecutive_data >= 1 && max_inflight < inflight_cap && !is_elevated {
+                                tracing::debug!(
+                                    "sess {}: elevation check: counter={}, cap={}",
+                                    &sid[..sid.len().min(8)],
+                                    mux.elevated_sessions.load(Ordering::Relaxed),
+                                    mux.max_elevated,
+                                );
+                            }
+                            if consecutive_empty >= 1 && is_elevated {
+                                max_inflight = INFLIGHT_IDLE.min(inflight_cap);
+                                mux.elevated_sessions.fetch_sub(1, Ordering::Relaxed);
+                                is_elevated = false;
+                            } else if consecutive_data >= 2 && max_inflight < inflight_cap {
+                                if !is_elevated {
+                                    let cur = mux.elevated_sessions.load(Ordering::Relaxed);
+                                    if cur < mux.max_elevated {
+                                        mux.elevated_sessions.fetch_add(1, Ordering::Relaxed);
+                                        is_elevated = true;
+                                        max_inflight = (max_inflight + 1).min(inflight_cap);
+                                    }
+                                } else {
+                                    max_inflight = (max_inflight + 1).min(inflight_cap);
+                                }
+                            }
+                            if max_inflight != prev {
+                                tracing::debug!(
+                                    "sess {}: pipeline depth {} → {}",
+                                    &sid[..sid.len().min(8)],
+                                    prev, max_inflight,
+                                );
+                            }
+                        }
+
+                        // Fill pipeline slots. When depth is above idle
+                        // (data flowing), fill all slots with 5ms spacing
+                        // so polls land in separate batches. At idle depth,
+                        // send just one refill.
+                        while !eof_seen && inflight.len() < max_inflight && consecutive_empty < 3 {
+                            // Stagger polls 1s apart so they land in
+                            // separate batches. Skip the delay for the
+                            // first refill (immediate) and at idle depth.
+                            if inflight.len() > 0 && max_inflight > INFLIGHT_IDLE {
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                            }
+                            let data = if let Some(d) = pending_client_data.take() {
+                                d
+                            } else if let Some(d) = buffered_upload.take() {
+                                consecutive_empty = 0;
+                                d
+                            } else {
+                                Bytes::new()
+                            };
+                            let was_empty_poll = data.is_empty();
+                            let seq = next_send_seq;
+                            next_send_seq += 1;
+                            let (reply_tx, reply_rx) = oneshot::channel();
+                            let send_at = Instant::now();
+                            tracing::debug!(
+                                "sess {}: send seq={}, inflight={}",
+                                &sid[..sid.len().min(8)],
+                                seq,
+                                inflight.len() + 1,
+                            );
+                            mux.send(MuxMsg::Data {
+                                sid: sid.to_string(),
+                                data,
+                                seq: Some(seq),
+                                reply: reply_tx,
+                            })
+                            .await;
+                            let meta = InflightMeta { seq, was_empty_poll, send_at };
+                            inflight.push(Box::pin(async move {
+                                match tokio::time::timeout(REPLY_TIMEOUT, reply_rx).await {
+                                    Ok(Ok(Ok((r, sid)))) => (meta, ReplyOutcome::Ok(r, sid)),
+                                    Ok(Ok(Err(e))) => (meta, ReplyOutcome::BatchErr(e)),
+                                    Ok(Err(_)) => (meta, ReplyOutcome::Dropped),
+                                    Err(_) => (meta, ReplyOutcome::Timeout),
+                                }
+                            }));
+                            // At idle depth, just one refill.
+                            if max_inflight <= INFLIGHT_IDLE {
+                                break;
+                            }
+                        }
+                    }
+                    ReplyOutcome::BatchErr(e) => {
+                        tracing::debug!("tunnel data error: {}", e);
+                        break;
+                    }
+                    ReplyOutcome::Timeout => {
+                        tracing::warn!(
+                            "sess {}: reply timeout (seq {}), retrying",
+                            &sid[..sid.len().min(8)],
+                            meta.seq
+                        );
+                        consecutive_empty = consecutive_empty.saturating_add(1);
+                    }
+                    ReplyOutcome::Dropped => {
+                        break;
+                    }
+                }
             }
-            Ok(Err(_)) => break, // channel dropped
-            Err(_) => {
-                tracing::warn!("sess {}: reply timeout, retrying", &sid[..sid.len().min(8)]);
-                consecutive_empty = consecutive_empty.saturating_add(1);
-                continue;
-            }
-        };
 
-        // Per-deployment legacy detection: an empty-in/empty-out round
-        // trip that finishes well under `LEGACY_DETECT_THRESHOLD` is
-        // structurally impossible on a long-poll-capable tunnel-node
-        // (the server holds the response either until data arrives or
-        // until its long-poll deadline). One observation marks *this
-        // specific* deployment as legacy for `LEGACY_RECOVER_AFTER`;
-        // peers stay on the fast path. The aggregate `all_legacy` gate
-        // only flips once *every* deployment has been so marked.
-        if was_empty_poll {
-            let reply_was_empty = resp.d.as_deref().map(str::is_empty).unwrap_or(true);
-            if reply_was_empty && send_at.elapsed() < LEGACY_DETECT_THRESHOLD {
-                mux.mark_server_no_longpoll(&script_id);
-            }
-        }
-
-        if let Some(ref e) = resp.e {
-            tracing::debug!("tunnel error: {}", e);
-            break;
-        }
-
-        let got_data = match write_tunnel_response(&mut writer, &resp).await? {
-            WriteOutcome::Wrote => true,
-            WriteOutcome::NoData => false,
-            WriteOutcome::BadBase64 => {
-                // Tunnel-node gave us garbage; tear the session down but
-                // do NOT propagate as an io error — the caller's Close
-                // guard will clean up on the tunnel-node side.
-                break;
-            }
-        };
-
-        if resp.eof.unwrap_or(false) {
-            break;
-        }
-
-        if got_data {
-            consecutive_empty = 0;
-        } else {
-            consecutive_empty = consecutive_empty.saturating_add(1);
+            // Read from client socket while waiting for replies.
+            _ = async {
+                buf.reserve(READ_CHUNK);
+                match reader.read_buf(&mut buf).await {
+                    Ok(0) => { upload_closed = true; }
+                    Ok(n) => {
+                        buffered_upload = Some(extract_bytes(&mut buf, n));
+                    }
+                    Err(_) => { upload_closed = true; }
+                }
+            }, if can_read => {}
         }
     }
 
+    if is_elevated {
+        mux.elevated_sessions.fetch_sub(1, Ordering::Relaxed);
+    }
     Ok(())
 }
 
@@ -1479,6 +1679,20 @@ where
     }
 }
 
+/// Extract bytes from the read buffer, applying the zero-copy threshold.
+/// Reads >= half the buffer use split+freeze (zero-copy); smaller reads
+/// copy out and clear so the buffer allocation is reused.
+fn extract_bytes(buf: &mut BytesMut, n: usize) -> Bytes {
+    const ZERO_COPY_THRESHOLD: usize = 65536 / 2;
+    if n >= ZERO_COPY_THRESHOLD {
+        buf.split().freeze()
+    } else {
+        let owned = Bytes::copy_from_slice(&buf[..n]);
+        buf.clear();
+        owned
+    }
+}
+
 pub fn decode_udp_packets(resp: &TunnelResponse) -> Result<Vec<Vec<u8>>, String> {
     let Some(pkts) = resp.pkts.as_ref() else {
         return Ok(Vec::new());
@@ -1507,6 +1721,7 @@ mod tests {
             eof: None,
             e: e.map(str::to_string),
             code: code.map(str::to_string),
+            seq: None,
         }
     }
 
@@ -1741,6 +1956,8 @@ mod tests {
             // generous fixed value here; production derives this from
             // `fronter.batch_timeout()` (see `TunnelMux::start`).
             reply_timeout: Duration::from_secs(35),
+            elevated_sessions: AtomicU64::new(0),
+            max_elevated: MAX_ELEVATED_PER_DEPLOYMENT * num_scripts as u64,
         });
         (mux, rx)
     }
@@ -1820,7 +2037,7 @@ mod tests {
             .expect("mux channel closed unexpectedly");
 
         match msg {
-            MuxMsg::Data { sid, data, reply } => {
+            MuxMsg::Data { sid, data, reply, .. } => {
                 assert_eq!(sid, "sid-under-test");
                 assert_eq!(&data[..], b"CLIENTHELLO");
                 // Reply with eof so tunnel_loop unwinds cleanly.
@@ -1832,6 +2049,7 @@ mod tests {
                         eof: Some(true),
                         e: None,
                         code: None,
+                        seq: Some(0),
                     },
                     "test-script".to_string(),
                 )));
@@ -1847,6 +2065,23 @@ mod tests {
                     MuxMsg::Close { .. } => "Close",
                 }
             ),
+        }
+
+        // With pipelining, a second op may already be in flight. Reply
+        // to any remaining messages so the loop can exit cleanly.
+        let mut seq = 1u64;
+        while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+            if let MuxMsg::Data { reply, .. } = msg {
+                let _ = reply.send(Ok((
+                    TunnelResponse {
+                        sid: Some("sid-under-test".into()),
+                        d: None, pkts: None, eof: Some(true),
+                        e: None, code: None, seq: Some(seq),
+                    },
+                    "test-script".to_string(),
+                )));
+                seq += 1;
+            }
         }
 
         let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle)
@@ -1892,19 +2127,20 @@ mod tests {
         // the aggregate gate stays false and the loop keeps polling.
         // The 60 s timeout below is paused-time, so it only "elapses"
         // if rx.recv() truly never resolves (i.e. the loop has stalled).
-        for i in 0..6u32 {
+        let mut received = 0u32;
+        while received < 6 {
             let msg = tokio::time::timeout(Duration::from_secs(60), rx.recv())
                 .await
                 .unwrap_or_else(|_| panic!(
                     "loop stopped emitting at iteration {} — regression: per-deployment skip-when-idle stalled session even though long-poll-capable peer was available",
-                    i
+                    received
                 ))
                 .expect("mux channel closed unexpectedly");
             match msg {
-                MuxMsg::Data { sid, data, reply } => {
+                MuxMsg::Data { sid, data, seq, reply } => {
                     assert_eq!(sid, "sid-mixed");
                     assert!(data.is_empty(), "expected empty poll, got {} bytes", data.len());
-                    let last = i == 5;
+                    let last = received == 5;
                     let _ = reply.send(Ok((
                         TunnelResponse {
                             sid: Some("sid-mixed".into()),
@@ -1913,13 +2149,15 @@ mod tests {
                             eof: if last { Some(true) } else { None },
                             e: None,
                             code: None,
+                            seq,
                         },
                         "script-A".to_string(),
                     )));
+                    received += 1;
                 }
                 _ => panic!(
                     "iteration {}: expected Data poll, got a different MuxMsg variant",
-                    i
+                    received
                 ),
             }
         }
@@ -2120,6 +2358,7 @@ mod tests {
             port: None,
             data: Some(Bytes::from_static(b"x")),
             encode_empty: false,
+            seq: None,
         };
         let mk_reply = || oneshot::channel::<Result<(TunnelResponse, String), String>>().0;
 
@@ -2165,6 +2404,7 @@ mod tests {
             port: None,
             data: Some(Bytes::from_static(b"hello")),
             encode_empty: false,
+            seq: None,
         };
         let b = encode_pending(op);
         assert_eq!(b.op, "data");
@@ -2182,6 +2422,7 @@ mod tests {
             port: None,
             data: None,
             encode_empty: false,
+            seq: None,
         };
         assert!(encode_pending(empty_poll).d.is_none());
 
@@ -2193,6 +2434,7 @@ mod tests {
             port: None,
             data: None,
             encode_empty: false,
+            seq: None,
         };
         assert!(encode_pending(udp_poll).d.is_none());
 
@@ -2204,6 +2446,7 @@ mod tests {
             port: None,
             data: None,
             encode_empty: false,
+            seq: None,
         };
         assert!(encode_pending(close).d.is_none());
     }
@@ -2221,6 +2464,7 @@ mod tests {
             port: Some(443),
             data: Some(Bytes::new()),
             encode_empty: true,
+            seq: None,
         };
         let b = encode_pending(op);
         assert_eq!(b.op, "connect_data");
@@ -2236,6 +2480,7 @@ mod tests {
             port: Some(443),
             data: Some(Bytes::from_static(b"\x16\x03\x01")), // ClientHello prefix
             encode_empty: true,
+            seq: None,
         };
         let b = encode_pending(op);
         assert_eq!(b.d.as_deref(), Some(B64.encode(b"\x16\x03\x01").as_str()));
@@ -2259,5 +2504,104 @@ mod tests {
         assert_eq!(mux.preread_win_total_us.load(Ordering::Relaxed), 5_000);
         // Five record_* calls, so trigger counter is at 5.
         assert_eq!(mux.preread_total_events.load(Ordering::Relaxed), 5);
+    }
+
+    /// Client data written to the socket *during* the reply wait must be
+    /// buffered and sent in a subsequent op — not blocked until the reply
+    /// arrives and a fresh read-timeout elapses.
+    #[tokio::test]
+    async fn tunnel_loop_reads_client_during_reply_wait() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let mut server_side = accept.await.unwrap();
+
+        let (mux, mut rx) = mux_for_test();
+
+        let loop_handle = tokio::spawn({
+            let mux = mux.clone();
+            async move { tunnel_loop(&mut server_side, "sid-overlap", &mux, None).await }
+        });
+
+        // With pipelining (N=2), the loop may send two ops before we
+        // can write client data. Collect all initial ops, reply to each,
+        // then write data and check a subsequent op carries it.
+        let mut pending_replies: Vec<BatchedReply> = Vec::new();
+        let mut seq: u64 = 0;
+
+        // Drain initial ops (up to N=2).
+        while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            if let MuxMsg::Data { reply, .. } = msg {
+                pending_replies.push(reply);
+            }
+            if pending_replies.len() >= INFLIGHT_ACTIVE { break; }
+        }
+
+        // Write client data while replies are pending.
+        client.write_all(b"UPLOAD_DATA").await.unwrap();
+        client.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Reply to all pending ops (no eof, no data).
+        for reply in pending_replies.drain(..) {
+            let _ = reply.send(Ok((
+                TunnelResponse {
+                    sid: Some("sid-overlap".into()),
+                    d: None, pkts: None, eof: None,
+                    e: None, code: None, seq: Some(seq),
+                },
+                "test-script".to_string(),
+            )));
+            seq += 1;
+        }
+
+        // Now check that a subsequent op carries the buffered upload data.
+        let mut found_upload = false;
+        for _ in 0..4 {
+            let msg = match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+                Ok(Some(m)) => m,
+                _ => break,
+            };
+            if let MuxMsg::Data { data, reply, .. } = msg {
+                if &data[..] == b"UPLOAD_DATA" {
+                    found_upload = true;
+                }
+                let _ = reply.send(Ok((
+                    TunnelResponse {
+                        sid: Some("sid-overlap".into()),
+                        d: None, pkts: None,
+                        eof: Some(found_upload),
+                        e: None, code: None, seq: Some(seq),
+                    },
+                    "test-script".to_string(),
+                )));
+                seq += 1;
+                if found_upload { break; }
+            }
+        }
+        assert!(found_upload, "upload data must appear in a subsequent op");
+
+        // Drain any remaining in-flight ops.
+        while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+            if let MuxMsg::Data { reply, .. } = msg {
+                let _ = reply.send(Ok((
+                    TunnelResponse {
+                        sid: Some("sid-overlap".into()),
+                        d: None, pkts: None, eof: Some(true),
+                        e: None, code: None, seq: Some(seq),
+                    },
+                    "test-script".to_string(),
+                )));
+                seq += 1;
+            }
+        }
+
+        let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle)
+            .await
+            .expect("tunnel_loop did not exit after eof");
     }
 }
