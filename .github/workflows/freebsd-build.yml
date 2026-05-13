@@ -9,48 +9,44 @@ on:
 
 jobs:
   freebsd:
-    name: FreeBSD ${{ matrix.freebsd-version }} / ${{ matrix.target }}
+    name: FreeBSD x86_64
     runs-on: ubuntu-latest
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - freebsd-version: "14.2"
-            target: x86_64-unknown-freebsd
-          - freebsd-version: "15.0"
-            target: x86_64-unknown-freebsd
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build on FreeBSD ${{ matrix.freebsd-version }}
+      - name: Build on FreeBSD 15.0
         uses: vmactions/freebsd-vm@v1
         with:
-          release: ${{ matrix.freebsd-version }}
+          release: "15.0"
           usesh: true
           prepare: |
-            pkg install -y curl git bash gmake pkgconf
+            pkg install -y curl git bash gmake pkgconf openssl
             curl https://sh.rustup.rs -sSf | sh -s -- -y
           run: |
             set -e
+
             . "$HOME/.cargo/env"
 
             rustup default stable
+
             rustc --version
             cargo --version
 
-            cargo build --release
+            cargo build --release --bin mhrv-rs --bin mhrv-rs-ui
 
-            mkdir -p dist
-            BIN_NAME="your-binary-name"
+            mkdir -p dist/freebsd-x86_64
 
-            cp "target/release/$BIN_NAME" "dist/${BIN_NAME}-freebsd-${{ matrix.freebsd-version }}-x86_64"
-            tar -C dist -czf "dist/${BIN_NAME}-freebsd-${{ matrix.freebsd-version }}-x86_64.tar.gz" "${BIN_NAME}-freebsd-${{ matrix.freebsd-version }}-x86_64"
+            cp target/release/mhrv-rs dist/freebsd-x86_64/
+            cp target/release/mhrv-rs-ui dist/freebsd-x86_64/
+
+            tar -C dist \
+              -czf mhrv-rs-freebsd-x86_64.tar.gz \
+              freebsd-x86_64
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: freebsd-${{ matrix.freebsd-version }}-x86_64
-          path: dist/*.tar.gz
+          name: mhrv-rs-freebsd-x86_64
+          path: mhrv-rs-freebsd-x86_64.tar.gz
