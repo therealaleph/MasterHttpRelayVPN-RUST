@@ -213,9 +213,10 @@ Most of the Rust code in this port was written with [Anthropic's Claude](https:/
 ## ابزارهای جامعه
 
 برای اجرای mhrv-rs به این ابزارها نیاز نیست؛ فقط برای راحتی اینجا آمده‌اند.
-
-- **[mhrv-helper-extension](https://github.com/ardalan-ab/mhrv-helper-extension)** — افزونهٔ کروم (Manifest V3) با نگهداری **[ardalan-ab](https://github.com/ardalan-ab)** برای کمک در راه‌اندازی Apps Script: تولید `AUTH_KEY`، گرفتن یا fallback به `Code.gs` رسمی، و کپی قطعهٔ `config.json`. **مخزن:** `https://github.com/ardalan-ab/mhrv-helper-extension` — [README (فارسی)](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/README.fa.md) · [README (English)](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/README.md) — [راهنمای استفاده (فارسی)](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/HOW_TO_USE.fa.md) · [How to use (English)](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/HOW_TO_USE.md).
-
+- افزونهٔ [mhrv-helper-extension](https://github.com/ardalan-ab/mhrv-helper-extension) — کروم (Manifest V3) با نگهداری [ardalan-ab](https://github.com/ardalan-ab) برای کمک در راه‌اندازی Apps Script: تولید AUTH_KEY، گرفتن یا fallback به Code.gs رسمی، و کپی قطعهٔ config.json.
+- مخزن: https://github.com/ardalan-ab/mhrv-helper-extension
+- خواندن [README (فارسی)](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/README.fa.md) · [README (English)](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/README.md)
+- راهنمای [استفاده (فارسی)](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/HOW_TO_USE.fa.md) · [How to use (English)](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/HOW_TO_USE.md)
 ## چطور کار می‌کند (تصویر ساده)
 
 ```
