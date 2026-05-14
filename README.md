@@ -160,6 +160,8 @@ If something doesn't work:
 
 **ISP blocks `script.google.com` itself.** mhrv-rs has a `direct` mode that uses only the SNI-rewrite tunnel (no Apps Script). Use it once to access `script.google.com` to deploy your script, then switch to apps_script mode. See [direct mode](docs/guide.md#direct-mode).
 
+**I want to use mhrv-rs as Psiphon's (or xray's) upstream proxy.** Run mhrv-rs in `direct` mode and point Psiphon's *upstream proxy* setting at the host:port shown under the Connect button. Unfronted hosts pass through as raw TCP, so Psiphon's bootstrap traffic reaches Psiphon's servers untouched. See [docs/use-as-upstream.md](docs/use-as-upstream.md).
+
 **My Google search shows up without JavaScript.** The Apps Script `User-Agent` is fixed to `Google-Apps-Script` (Google won't let scripts change it), so some sites serve a no-JS fallback. Workaround: add the affected domain to your `hosts` map so it goes through the SNI-rewrite tunnel with your real browser User-Agent. `google.com`, `youtube.com`, `fonts.googleapis.com` are already on this list by default.
 
 **More questions:** [full FAQ in the long guide](docs/guide.md#faq).
@@ -329,6 +331,8 @@ System Settings → Network → Wi-Fi → Details → **Proxies** → هر دو 
 **تلگرام پایدار نیست.** تلگرام از MTProto استفاده می‌کند که Apps Script نمی‌فهمد. روی کامپیوترت با [xray](https://github.com/XTLS/Xray-core) جفتش کن — [بخش تلگرام در راهنمای کامل](docs/guide.fa.md#تلگرام-با-xray).
 
 **ISP خود `script.google.com` را مسدود کرده.** mhrv-rs یک حالت `direct` دارد که فقط از تونل بازنویسی SNI استفاده می‌کند (بدون Apps Script). یک‌بار از این حالت استفاده کن تا به `script.google.com` برسی و اسکریپت را دیپلوی کنی، بعد به حالت apps_script سوئیچ کن. [حالت direct](docs/guide.fa.md#حالت-direct).
+
+**می‌خواهم از mhrv-rs به‌عنوان پروکسی upstream برای Psiphon (یا xray) استفاده کنم.** mhrv-rs را در حالت `direct` اجرا کن و در تنظیمات Psiphon قسمت *upstream proxy* را روی host:port که زیر دکمهٔ Connect نمایش داده می‌شود تنظیم کن. هاست‌هایی که در لیست fronting قرار ندارند به‌صورت raw TCP عبور می‌کنند، پس ترافیک bootstrap سایفون به سرورهای سایفون دست‌نخورده می‌رسد. [docs/use-as-upstream.fa.md](docs/use-as-upstream.fa.md).
 
 **جست‌وجوی گوگلم بدون JavaScript ظاهر می‌شود.** `User-Agent` Apps Script ثابت روی `Google-Apps-Script` است (گوگل نمی‌گذارد اسکریپت‌ها عوضش کنند)، پس بعضی سایت‌ها نسخهٔ بدون JS برمی‌گردانند. راه‌حل: دامنهٔ مورد نظر را به `hosts` اضافه کن تا از تونل بازنویسی SNI با User-Agent واقعی مرورگرت برود. `google.com`، `youtube.com`، `fonts.googleapis.com` به‌طور پیش‌فرض در این لیست‌اند.
 

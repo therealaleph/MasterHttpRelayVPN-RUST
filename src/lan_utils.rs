@@ -60,6 +60,26 @@ pub fn is_loopback_only(listen_host: &str) -> bool {
     matches!(trimmed.as_str(), "127.0.0.1" | "localhost" | "::1" | "[::1]")
 }
 
+/// Map a `listen_host` bind value to an address that a client on the
+/// same machine can actually connect to. Wildcard binds (`0.0.0.0`,
+/// `[::]`, `::`, empty/whitespace) collapse to `127.0.0.1`; explicit
+/// addresses pass through unchanged.
+///
+/// Use this when generating UI strings like "Upstream proxy:
+/// 127.0.0.1:8085 [copy]" — pasting `0.0.0.0:8085` into Psiphon (or
+/// any TCP client) fails on Windows because Winsock rejects
+/// `INADDR_ANY` as a connect target, and on Linux/macOS it works
+/// only by accident. For "advertise this address to other devices
+/// on the LAN" you want the LAN IP from `detect_lan_ip()` instead.
+pub fn advertise_proxy_host(listen_host: &str) -> String {
+    let trimmed = listen_host.trim();
+    if trimmed.is_empty() || is_share_on_lan(trimmed) {
+        "127.0.0.1".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,6 +104,25 @@ mod tests {
         assert!(is_loopback_only("[::1]"));
         assert!(!is_loopback_only("0.0.0.0"));
         assert!(!is_loopback_only("192.168.1.42"));
+    }
+
+    #[test]
+    fn advertise_proxy_host_collapses_wildcards_to_loopback() {
+        // Wildcard binds → 127.0.0.1 (only sane same-device client target)
+        assert_eq!(advertise_proxy_host("0.0.0.0"), "127.0.0.1");
+        assert_eq!(advertise_proxy_host(" 0.0.0.0 "), "127.0.0.1");
+        assert_eq!(advertise_proxy_host("[::]"), "127.0.0.1");
+        assert_eq!(advertise_proxy_host("::"), "127.0.0.1");
+        // Empty / whitespace → 127.0.0.1 (matches socket-bind default)
+        assert_eq!(advertise_proxy_host(""), "127.0.0.1");
+        assert_eq!(advertise_proxy_host("   "), "127.0.0.1");
+        // Explicit loopback passes through (already correct for clients)
+        assert_eq!(advertise_proxy_host("127.0.0.1"), "127.0.0.1");
+        assert_eq!(advertise_proxy_host("localhost"), "localhost");
+        // Explicit non-wildcard LAN/host address passes through —
+        // user picked it deliberately, don't second-guess them
+        assert_eq!(advertise_proxy_host("192.168.1.42"), "192.168.1.42");
+        assert_eq!(advertise_proxy_host("10.0.0.5"), "10.0.0.5");
     }
 
     #[test]

@@ -13,7 +13,7 @@ use mhrv_rs::cert_installer::{install_ca, reconcile_sudo_environment, remove_ca}
 use mhrv_rs::config::{Config, FrontingGroup, ScriptId};
 use mhrv_rs::data_dir;
 use mhrv_rs::domain_fronter::{DomainFronter, DEFAULT_GOOGLE_SNI_POOL};
-use mhrv_rs::lan_utils::{detect_lan_ip, is_share_on_lan};
+use mhrv_rs::lan_utils::{advertise_proxy_host, detect_lan_ip, is_share_on_lan};
 use mhrv_rs::mitm::{MitmCertManager, CA_CERT_FILE};
 use mhrv_rs::proxy_server::ProxyServer;
 use mhrv_rs::{scan_ips, scan_sni, test_cmd};
@@ -969,6 +969,13 @@ impl eframe::App for App {
                         )
                         .color(OK_GREEN));
                     });
+                    ui.horizontal(|ui| {
+                        ui.add_space(120.0 + 8.0);
+                        ui.small(egui::RichText::new(
+                            "Also works as upstream proxy for Psiphon / xray — unfronted hosts pass through as raw TCP. Setup: docs/use-as-upstream.md (FA: docs/use-as-upstream.fa.md).",
+                        )
+                        .color(egui::Color32::from_gray(150)));
+                    });
                 }
                 if self.form.mode == "full" {
                     ui.horizontal(|ui| {
@@ -1547,6 +1554,70 @@ impl eframe::App for App {
                     }
                 }
             });
+
+            // Upstream-proxy hint: when running in direct mode, surface the
+            // listen address with a one-click copy so users wiring this up as
+            // Psiphon/xray's upstream don't have to read the config to find
+            // the port. Direct mode is the only sane mode for that use case
+            // — apps_script and full try to relay everything through Apps
+            // Script, which breaks Psiphon's binary protocol. See
+            // docs/use-as-upstream.md.
+            //
+            // The copied address is normalized via `advertise_proxy_host` so
+            // a wildcard bind (`0.0.0.0`, `[::]`) becomes `127.0.0.1` for
+            // same-device pasting — Winsock rejects `0.0.0.0` as a connect
+            // target on Windows, so leaking the raw bind would break the
+            // most common Psiphon-on-Windows setup. The LAN IP (for *other*
+            // devices) is shown on a second line when the bind is wildcard.
+            if running
+                && (self.form.mode == "direct" || self.form.mode == "google_only")
+            {
+                ui.add_space(4.0);
+                let port = if self.form.listen_port.trim().is_empty() {
+                    "8085".to_string()
+                } else {
+                    self.form.listen_port.trim().to_string()
+                };
+                let same_device_host = advertise_proxy_host(&self.form.listen_host);
+                let upstream = format!("{}:{}", same_device_host, port);
+                ui.horizontal(|ui| {
+                    ui.small(egui::RichText::new("Upstream for Psiphon / xray:")
+                        .color(egui::Color32::from_gray(150)));
+                    ui.small(egui::RichText::new(&upstream)
+                        .monospace()
+                        .color(OK_GREEN));
+                    if ui.small_button("copy")
+                        .on_hover_text("Paste into Psiphon → Options → Upstream Proxy (or xray's outbound HTTP).")
+                        .clicked()
+                    {
+                        ui.output_mut(|o| o.copied_text = upstream.clone());
+                        self.toast = Some((format!("Copied {}", upstream), Instant::now()));
+                    }
+                });
+                // Second line: if the proxy is bound on all interfaces, show
+                // the LAN IP so the user can also paste it on a phone or
+                // second machine. Skipped when bound to loopback only —
+                // there's no other-device address to advertise.
+                if is_share_on_lan(&self.form.listen_host) {
+                    if let Some(lan) = detect_lan_ip() {
+                        let lan_upstream = format!("{}:{}", lan, port);
+                        ui.horizontal(|ui| {
+                            ui.small(egui::RichText::new("From another device on your network:")
+                                .color(egui::Color32::from_gray(150)));
+                            ui.small(egui::RichText::new(&lan_upstream)
+                                .monospace()
+                                .color(OK_GREEN));
+                            if ui.small_button("copy")
+                                .on_hover_text("Use this when Psiphon (or any client) runs on a different device on the same Wi-Fi.")
+                                .clicked()
+                            {
+                                ui.output_mut(|o| o.copied_text = lan_upstream.clone());
+                                self.toast = Some((format!("Copied {}", lan_upstream), Instant::now()));
+                            }
+                        });
+                    }
+                }
+            }
 
             // Secondary actions — smaller, grouped together on their own line.
             ui.add_space(4.0);

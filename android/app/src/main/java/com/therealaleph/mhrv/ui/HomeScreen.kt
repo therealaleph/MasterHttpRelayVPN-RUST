@@ -337,6 +337,77 @@ fun HomeScreen(
                 )
             }
 
+            // Upstream-proxy hint: while running in Direct mode, surface the
+            // local listen port with a one-tap copy so users wiring this up
+            // as an upstream don't have to dig through config. Direct is the
+            // only mode that makes sense here — apps_script and full try to
+            // relay everything via Apps Script, which breaks binary protocols
+            // like Psiphon's. See docs/use-as-upstream.md.
+            //
+            // Gating on PROXY_ONLY: Android allows only one active VPN at a
+            // time. If mhrv-rs is running its own VpnService (VPN_TUN mode),
+            // Psiphon cannot establish its own VPN and the upstream address
+            // here is not actionable. Show the warning copy first so the
+            // user knows to stop, flip to PROXY_ONLY, and Connect again
+            // before pasting the address into Psiphon.
+            //
+            // Vertical Column instead of horizontal Row: in Persian and at
+            // larger font sizes the label + monospace address + copy button
+            // would cramp into a single line. Stacking lets each part wrap
+            // naturally and keeps the copy button reachable.
+            if (isVpnRunning && cfg.mode == Mode.DIRECT) {
+                Spacer(Modifier.height(8.dp))
+                val clipboard = LocalClipboardManager.current
+                val ctx = LocalContext.current
+                val upstreamPort = cfg.listenPort
+                val upstream = "127.0.0.1:$upstreamPort"
+                val copiedMsg = stringResource(R.string.snack_upstream_copied, upstream)
+                val proxyOnly = cfg.connectionMode == ConnectionMode.PROXY_ONLY
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    if (!proxyOnly) {
+                        Text(
+                            stringResource(R.string.direct_upstream_vpn_tun_warning),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = ErrRed,
+                        )
+                    }
+                    Text(
+                        stringResource(R.string.direct_upstream_label),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        SelectionContainer(modifier = Modifier.weight(1f)) {
+                            Text(
+                                upstream,
+                                style = MaterialTheme.typography.bodyMedium.copy(
+                                    fontFamily = FontFamily.Monospace,
+                                ),
+                                color = if (proxyOnly) OkGreen else MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        TextButton(
+                            onClick = {
+                                clipboard.setText(AnnotatedString(upstream))
+                                Toast.makeText(ctx, copiedMsg, Toast.LENGTH_SHORT).show()
+                            },
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                        ) {
+                            Text(
+                                stringResource(R.string.btn_copy_lower),
+                                style = MaterialTheme.typography.labelMedium,
+                            )
+                        }
+                    }
+                }
+            }
+
             Spacer(Modifier.height(4.dp))
 
             val appsScriptEnabled = cfg.mode == Mode.APPS_SCRIPT || cfg.mode == Mode.FULL
@@ -901,6 +972,13 @@ private fun ModeDropdown(
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        if (mode == Mode.DIRECT) {
+            Text(
+                stringResource(R.string.direct_upstream_help),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
     }
 }
 

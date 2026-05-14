@@ -113,6 +113,13 @@
     <string name="btn_view_quota_on_google">View quota on Google →</string>
     <string name="usage_today_note">Estimate — this is what this device relayed. Google\'s dashboard has the authoritative number.</string>
 
+    <!-- Direct mode upstream-proxy banner (see docs/use-as-upstream.md). -->
+    <string name="direct_upstream_help">Also works as an upstream proxy for Psiphon / xray — unfronted hosts pass through as raw TCP.</string>
+    <string name="direct_upstream_label">Upstream for Psiphon / xray:</string>
+    <string name="direct_upstream_vpn_tun_warning">Psiphon needs Android\'s single VPN slot. Stop mhrv-rs, switch Connection mode to PROXY_ONLY, then Connect again — only then can Psiphon use the address below.</string>
+    <string name="btn_copy_lower">copy</string>
+    <string name="snack_upstream_copied">Copied %1$s</string>
+
     <!-- "How to use" guide body. Localized — FA copy lives in values-fa. -->
     <string name="help_how_to_use">1. Paste one or more Apps Script deployment URLs (or bare IDs) and your auth_key.\n2. Tap Install MITM certificate. Confirm the dialog — the cert is saved to Downloads/mhrv-ca.crt and the Settings app opens. Use Settings\' search bar to find \"CA certificate\", tap that result (NOT \"VPN &amp; app user certificate\" or \"Wi-Fi\"), and pick mhrv-ca.crt from Downloads. You\'ll be asked to set a screen lock if you don\'t have one (Android requirement).\n3. Before tapping Start, expand \"SNI pool + tester\" and hit \"Test all\". If every entry times out, your google_ip is unreachable — replace it with one that resolves locally (e.g. `nslookup www.google.com` on any working device).\n4. Tap Start. Accept the VPN prompt. The full TUN bridge routes every app on the device through the proxy — no per-app setup needed.\n5. If Chrome shows \"504 Relay timeout\": your Apps Script deployment isn\'t responding. Redeploy the script, grab the new /exec URL, and paste it above. Watch Live logs for \"Relay timeout\" vs \"connect:\" errors to tell which layer is failing.\n\nKnown limitation — Cloudflare Turnstile (\"Verify you are human\") will loop endlessly on most CF-protected sites. Every Apps Script request uses a rotating Google-datacenter egress IP + a fixed \"Google-Apps-Script\" User-Agent + a Google TLS fingerprint. The cf_clearance cookie is bound to the (IP, UA, JA3) tuple the challenge was solved against, so the NEXT request — from a different egress IP — gets re-challenged. Nothing in this app can fix that; it\'s inherent to Apps Script as a relay. Sites that only gate the initial page load (not every request) will work after one solve.</string>
 </resources>
