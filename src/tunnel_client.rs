@@ -173,53 +173,14 @@ pub(crate) mod pipeline_debug {
         })
     }
 
-    pub fn push_event(msg: String) {
-        if let Ok(mut g) = state().events.lock() {
-            if g.len() >= EVENT_CAP { g.pop_front(); }
-            g.push_back(msg);
-        }
-    }
-
-    pub fn set_limits(max_elev: u64, max_batches: u64) {
-        state().max_elevated.store(max_elev, Ordering::Relaxed);
-        state().max_batch_slots.store(max_batches, Ordering::Relaxed);
-    }
-
-    pub fn set_elevated(n: u64) {
-        state().elevated.store(n, Ordering::Relaxed);
-    }
-
-    pub fn batch_acquire() {
-        state().active_batches.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn batch_release() {
-        state().active_batches.fetch_sub(1, Ordering::Relaxed);
-    }
-
-    pub fn session_start(sid: &str) {
-        state().active_sessions.fetch_add(1, Ordering::Relaxed);
-        if let Ok(mut g) = state().sessions.lock() {
-            g.insert(sid[..sid.len().min(8)].to_string(), SessionInfo { depth: 2, inflight: 0, elevated: false });
-        }
-    }
-
-    pub fn session_end(sid: &str) {
-        state().active_sessions.fetch_sub(1, Ordering::Relaxed);
-        if let Ok(mut g) = state().sessions.lock() {
-            g.remove(&sid[..sid.len().min(8)]);
-        }
-    }
-
-    pub fn session_update(sid: &str, depth: usize, inflight: usize, elevated: bool) {
-        if let Ok(mut g) = state().sessions.lock() {
-            if let Some(info) = g.get_mut(&sid[..sid.len().min(8)]) {
-                info.depth = depth;
-                info.inflight = inflight;
-                info.elevated = elevated;
-            }
-        }
-    }
+    pub fn push_event(_msg: String) {}
+    pub fn set_limits(_max_elev: u64, _max_batches: u64) {}
+    pub fn set_elevated(_n: u64) {}
+    pub fn batch_acquire() {}
+    pub fn batch_release() {}
+    pub fn session_start(_sid: &str) {}
+    pub fn session_end(_sid: &str) {}
+    pub fn session_update(_sid: &str, _depth: usize, _inflight: usize, _elevated: bool) {}
 
     pub fn to_json() -> String {
         let s = state();
@@ -362,7 +323,7 @@ struct PendingOp {
 }
 
 pub struct TunnelMux {
-    tx: mpsc::Sender<MuxMsg>,
+    tx: mpsc::UnboundedSender<MuxMsg>,
     /// Set to `true` after the first time the tunnel-node rejects
     /// `connect_data` as unsupported. Subsequent sessions skip the
     /// optimistic path entirely and go straight to plain connect + data.
@@ -485,7 +446,7 @@ impl TunnelMux {
             MAX_ELEVATED_PER_DEPLOYMENT * unique_n as u64,
             (CONCURRENCY_PER_DEPLOYMENT * unique_n) as u64,
         );
-        let (tx, rx) = mpsc::channel(512);
+        let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(mux_loop(rx, fronter, step, max));
         Arc::new(Self {
             tx,
@@ -513,8 +474,12 @@ impl TunnelMux {
         self.reply_timeout
     }
 
+    fn send_sync(&self, msg: MuxMsg) {
+        let _ = self.tx.send(msg);
+    }
+
     async fn send(&self, msg: MuxMsg) {
-        let _ = self.tx.send(msg).await;
+        let _ = self.tx.send(msg);
     }
 
     pub async fn udp_open(
@@ -775,7 +740,7 @@ impl TunnelMux {
     }
 }
 
-async fn mux_loop(mut rx: mpsc::Receiver<MuxMsg>, fronter: Arc<DomainFronter>, coalesce_step_ms: u64, coalesce_max_ms: u64) {
+async fn mux_loop(mut rx: mpsc::UnboundedReceiver<MuxMsg>, fronter: Arc<DomainFronter>, coalesce_step_ms: u64, coalesce_max_ms: u64) {
     let coalesce_step = Duration::from_millis(coalesce_step_ms);
     let coalesce_max = Duration::from_millis(coalesce_max_ms);
     // One semaphore per deployment ID, each allowing 30 concurrent requests.
@@ -1137,6 +1102,10 @@ async fn fire_batch(
                     if let Some(resp) = batch_resp.r.get(idx) {
                         let _ = reply.send(Ok((resp.clone(), script_id.clone())));
                     } else {
+                        tracing::error!(
+                            "batch response mismatch: idx={} but r.len()={} (sent {} ops) from script {}",
+                            idx, batch_resp.r.len(), n_ops, sid_short,
+                        );
                         let _ = reply.send(Err(format!(
                             "missing response in batch from script {}",
                             sid_short
@@ -1547,7 +1516,7 @@ async fn upload_task(
                 }
                 Ok(Ok(more_n)) => {
                     data.extend_from_slice(&buf[..more_n]);
-                    // Extend window if we hit 32KB threshold
+                    // Extend window if we hit 8KB threshold
                     if !extended && data.len() >= 8 * 1024 {
                         deadline = tokio::time::Instant::now() + Duration::from_secs(1);
                         extended = true;
@@ -2309,7 +2278,7 @@ mod tests {
     /// Build a TunnelMux whose send channel is exposed to the test rather
     /// than wired to a real DomainFronter. Lets tests assert what messages
     /// the client would emit without needing network or apps_script.
-    fn mux_for_test() -> (Arc<TunnelMux>, mpsc::Receiver<MuxMsg>) {
+    fn mux_for_test() -> (Arc<TunnelMux>, mpsc::UnboundedReceiver<MuxMsg>) {
         mux_for_test_with(2)
     }
 
@@ -2317,8 +2286,8 @@ mod tests {
     /// per-deployment legacy state's aggregate gate (`all_servers_legacy`)
     /// requires `legacy_deployments.len() == num_scripts`, so tests that
     /// exercise that gate need to control how many "deployments" exist.
-    fn mux_for_test_with(num_scripts: usize) -> (Arc<TunnelMux>, mpsc::Receiver<MuxMsg>) {
-        let (tx, rx) = mpsc::channel(16);
+    fn mux_for_test_with(num_scripts: usize) -> (Arc<TunnelMux>, mpsc::UnboundedReceiver<MuxMsg>) {
+        let (tx, rx) = mpsc::unbounded_channel();
         let mux = Arc::new(TunnelMux {
             tx,
             connect_data_unsupported: Arc::new(AtomicBool::new(false)),
