@@ -1426,6 +1426,8 @@ struct InflightMeta {
 struct InflightEntry {
     meta: InflightMeta,
     reply_rx: oneshot::Receiver<Result<(TunnelResponse, String), String>>,
+    /// Held until reply is processed — releases upload flow control permit.
+    _upload_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 /// Upload task: reads from the client socket, accumulates data (50ms
@@ -1444,6 +1446,7 @@ async fn upload_task(
     eof_seen: Arc<AtomicBool>,
     inflight_tx: mpsc::UnboundedSender<InflightEntry>,
     initial_data: Option<Bytes>,
+    upload_sem: Arc<Semaphore>,
 ) {
     const READ_CHUNK: usize = 512 * 1024;
     let mut buf = vec![0u8; READ_CHUNK];
@@ -1473,6 +1476,7 @@ async fn upload_task(
             let entry = InflightEntry {
                 meta: InflightMeta { seq, was_empty_poll: false, send_at },
                 reply_rx,
+                _upload_permit: None, // initial data — no flow control
             };
             if inflight_tx.send(entry).is_err() {
                 return; // download task gone
@@ -1532,6 +1536,9 @@ async fn upload_task(
 
         if data.is_empty() { continue; }
 
+        // Flow control: wait for a permit before sending.
+        let permit = upload_sem.clone().acquire_owned().await.unwrap();
+
         let seq = next_send_seq.fetch_add(1, Ordering::Relaxed);
         let wseq = next_data_write_seq;
         next_data_write_seq += 1;
@@ -1551,6 +1558,7 @@ async fn upload_task(
         let entry = InflightEntry {
             meta: InflightMeta { seq, was_empty_poll: false, send_at },
             reply_rx,
+            _upload_permit: Some(permit),
         };
         if inflight_tx.send(entry).is_err() {
             break; // download task gone
@@ -1581,6 +1589,7 @@ async fn tunnel_loop(
     // the mux, and forwards InflightEntry to the download task.
     // Pending client data is seeded as the first send inside the upload
     // task via an initial_data parameter.
+    let upload_sem = Arc::new(Semaphore::new(3)); // max 3 unacked upload ops
     let _upload_handle = tokio::spawn(upload_task(
         reader,
         sid.to_string(),
@@ -1590,6 +1599,7 @@ async fn tunnel_loop(
         eof_seen.clone(),
         inflight_tx,  // move the only sender to the upload task
         pending_client_data.clone(),
+        upload_sem,
     ));
     // The download task does NOT hold an inflight_tx clone — when the
     // upload task exits and drops the sender, inflight_rx.recv() returns
@@ -1616,14 +1626,20 @@ async fn tunnel_loop(
     let mut inflight: FuturesUnordered<ReplyFut> = FuturesUnordered::new();
 
     // Helper: wrap a reply_rx into a ReplyFut with timeout.
-    fn wrap_reply(meta: InflightMeta, reply_rx: oneshot::Receiver<Result<(TunnelResponse, String), String>>) -> std::pin::Pin<Box<dyn std::future::Future<Output = (InflightMeta, ReplyOutcome)> + Send>> {
+    fn wrap_reply(
+        meta: InflightMeta,
+        reply_rx: oneshot::Receiver<Result<(TunnelResponse, String), String>>,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = (InflightMeta, ReplyOutcome)> + Send>> {
         Box::pin(async move {
-            match tokio::time::timeout(REPLY_TIMEOUT, reply_rx).await {
+            let result = match tokio::time::timeout(REPLY_TIMEOUT, reply_rx).await {
                 Ok(Ok(Ok((r, sid)))) => (meta, ReplyOutcome::Ok(r, sid)),
                 Ok(Ok(Err(e))) => (meta, ReplyOutcome::BatchErr(e)),
                 Ok(Err(_)) => (meta, ReplyOutcome::Dropped),
                 Err(_) => (meta, ReplyOutcome::Timeout),
-            }
+            };
+            drop(permit); // release upload flow control permit AFTER reply
+            result
         })
     }
 
@@ -1672,7 +1688,7 @@ async fn tunnel_loop(
                     &sid[..sid.len().min(8)],
                     entry.meta.seq,
                 );
-                inflight.push(wrap_reply(entry.meta, entry.reply_rx));
+                inflight.push(wrap_reply(entry.meta, entry.reply_rx, entry._upload_permit));
             }
             None => {
                 // Upload task exited before sending — nothing to do.
@@ -1699,13 +1715,14 @@ async fn tunnel_loop(
                 meta.seq,
                 inflight.len() + 1,
             );
-            inflight.push(wrap_reply(meta, reply_rx));
+            inflight.push(wrap_reply(meta, reply_rx, None));
         }
     }
 
     // Timer for staggered refill polls — fires in the select, never blocks.
     let mut refill_at: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
-    let mut refill_steps: u32 = 0; // counts 100ms steps; poll after 10 (1s)
+    let mut refill_steps: u32 = 0;
+    let mut data_ops_in_flight: u32 = 0;
 
     // Schedule initial refill if pre-fill didn't fill all slots.
     if inflight.len() < max_inflight {
@@ -1767,7 +1784,7 @@ async fn tunnel_loop(
                             &sid[..sid.len().min(8)],
                             entry.meta.seq,
                         );
-                        inflight.push(wrap_reply(entry.meta, entry.reply_rx));
+                        inflight.push(wrap_reply(entry.meta, entry.reply_rx, entry._upload_permit));
                         continue;
                     }
                     None => {
@@ -1782,7 +1799,7 @@ async fn tunnel_loop(
             tracing::debug!(
                 "sess {}: keepalive poll seq={}", &sid[..sid.len().min(8)], meta.seq
             );
-            inflight.push(wrap_reply(meta, reply_rx));
+            inflight.push(wrap_reply(meta, reply_rx, None));
         }
 
         // Drain any InflightEntry items from the upload task before
@@ -1790,8 +1807,9 @@ async fn tunnel_loop(
         while let Ok(entry) = inflight_rx.try_recv() {
             if !entry.meta.was_empty_poll {
                 consecutive_empty = 0;
+                data_ops_in_flight += 1;
             }
-            inflight.push(wrap_reply(entry.meta, entry.reply_rx));
+            inflight.push(wrap_reply(entry.meta, entry.reply_rx, entry._upload_permit));
         }
 
         tokio::select! {
@@ -1801,13 +1819,14 @@ async fn tunnel_loop(
             Some(entry) = inflight_rx.recv() => {
                 if !entry.meta.was_empty_poll {
                     consecutive_empty = 0;
+                    data_ops_in_flight += 1;
                 }
-                inflight.push(wrap_reply(entry.meta, entry.reply_rx));
+                inflight.push(wrap_reply(entry.meta, entry.reply_rx, entry._upload_permit));
             }
 
             // Refill timer: 100ms steps, send empty poll after 10 steps
             // (1s) for batch separation.
-            _ = async { refill_at.as_mut().unwrap().await }, if refill_at.is_some() => {
+            _ = async { refill_at.as_mut().unwrap().await }, if refill_at.is_some() && data_ops_in_flight == 0 => {
                 refill_at = None;
                 if !eof_seen.load(Ordering::Relaxed)
                     && inflight.len() < max_inflight
@@ -1817,7 +1836,7 @@ async fn tunnel_loop(
                     if refill_steps >= 10 {
                         let (meta, reply_rx, send_fut) = send_empty_poll(sid, &next_send_seq, mux);
                         send_fut.await;
-                        inflight.push(wrap_reply(meta, reply_rx));
+                        inflight.push(wrap_reply(meta, reply_rx, None));
                         refill_steps = 0;
 
                         if inflight.len() < max_inflight && max_inflight > INFLIGHT_IDLE {
@@ -1833,6 +1852,9 @@ async fn tunnel_loop(
             Some((meta, outcome)) = inflight.next() => {
                 match outcome {
                     ReplyOutcome::Ok(resp, script_id) => {
+                        if !meta.was_empty_poll {
+                            data_ops_in_flight = data_ops_in_flight.saturating_sub(1);
+                        }
                         let has_data = resp.d.as_ref().map(|d| !d.is_empty()).unwrap_or(false);
                         tracing::debug!(
                             "sess {}: recv seq={}, rtt={:?}, data={}, inflight={}",
@@ -1956,7 +1978,7 @@ async fn tunnel_loop(
                         // Schedule refill if pipeline needs more polls.
                         if !eof_seen.load(Ordering::Relaxed)
                             && inflight.len() < max_inflight
-                            // consecutive_empty gate removed — keep polling
+                            && data_ops_in_flight == 0
                             && refill_at.is_none()
                         {
                             refill_at = Some(Box::pin(tokio::time::sleep(
