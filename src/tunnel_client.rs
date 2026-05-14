@@ -1535,9 +1535,12 @@ async fn upload_task(
             if eof_seen.load(Ordering::Relaxed) { break; }
             let now = tokio::time::Instant::now();
             if now >= deadline { break; }
-            if data.len() >= 1024 * 1024 { break; } // 1MB cap
+            if data.len() >= 256 * 1024 { break; } // 256KB cap
             let remaining = deadline - now;
-            match tokio::time::timeout(remaining, reader.read(&mut buf)).await {
+            // Cap per-read wait at 10ms: if no data for 10ms (gap
+            // between video chunk and heartbeat), send what we have.
+            let read_timeout = Duration::from_millis(10).min(remaining);
+            match tokio::time::timeout(read_timeout, reader.read(&mut buf)).await {
                 Ok(Ok(0)) => {
                     upload_closed.store(true, Ordering::Release);
                     break;
@@ -1545,7 +1548,7 @@ async fn upload_task(
                 Ok(Ok(more_n)) => {
                     data.extend_from_slice(&buf[..more_n]);
                     // Extend window if we hit 32KB threshold
-                    if !extended && data.len() >= 32 * 1024 {
+                    if !extended && data.len() >= 8 * 1024 {
                         deadline = tokio::time::Instant::now() + Duration::from_secs(1);
                         extended = true;
                     }
