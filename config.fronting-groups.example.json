@@ -10,24 +10,42 @@
   "fronting_groups": [
     {
       "name": "vercel",
-      "ip": "76.76.21.21",
-      "sni": "react.dev",
+      "ip": "216.230.84.193",
+      "sni": "nextjs.org",
       "domains": [
-        "vercel.com",
-        "vercel.app",
-        "vercel.dev",
-        "vercel.live",
-        "vercel.sh",
+        "ai-sdk.dev",
+        "err.sh",
+        "hyper.is",
         "nextjs.org",
         "now.sh",
-        "cursor.com",
-        "ai-sdk.dev"
+        "skills.sh",
+        "static.fun",
+        "title.sh",
+        "turborepo.org",
+        "vercel-dns.com",
+        "vercel-status.com",
+        "vercel.app",
+        "vercel.blog",
+        "vercel.com",
+        "vercel.dev",
+        "vercel.events",
+        "vercel.live",
+        "vercel.pub",
+        "vercel.sh",
+        "vercel.store",
+        "zeit-world.co.uk",
+        "zeit-world.com",
+        "zeit-world.net",
+        "zeit-world.org",
+        "zeit.co",
+        "zeit.sh",
+        "zeitworld.com"
       ]
     },
     {
       "name": "fastly",
-      "ip": "151.101.1.140",
-      "sni": "www.python.org",
+      "ip": "151.101.128.223",
+      "sni": "pypi.org",
       "domains": [
         "redd.it",
         "reddit.com",
@@ -46,8 +64,6 @@
         "githubusercontent.com",
         "github.io",
 
-        "pypi.org",
-
         "fastly.com",
         "fastly-edge.com",
         "fastly-terrarium.com",
@@ -58,7 +74,7 @@
 
         "www.pinterest.com",
         "pinimg.com",
-        
+
         "cnn.com",
         "cnn.io",
         "cnn.it",
@@ -73,13 +89,47 @@
       ]
     },
     {
-      "name": "netlify",
-      "ip": "35.157.26.135",
-      "sni": "letsencrypt.org",
+      "name": "amazon-cloudfront",
+      "ip": "3.33.186.135",
+      "sni": "kubernetes.io",
       "domains": [
+        "bitballoon.com",
         "netlify.app",
-        "netlify.com"
+        "netlify.com",
+        "netlifystatus.com"
       ]
+    },
+    {
+      "name": "github-central",
+      "ip": "140.82.113.21",
+      "sni": "central.github.com",
+      "domains": [
+        "objects-origin.githubusercontent.com",
+        "api.individual.githubcopilot.com",
+        "glb-db52c2cf8be544.github.com",
+        "api.githubcopilot.com"
+      ]
+    },
+    {
+      "name": "github-alive",
+      "ip": "140.82.112.26",
+      "sni": "alive.github.com",
+      "domains": [
+        "alive.github.com",
+        "live.github.com"
+      ]
+    },
+    {
+      "name": "github",
+      "ip": "140.82.121.3",
+      "sni": "github.com",
+      "domains": ["gist.github.com"]
+    },
+    {
+      "name": "pubmed",
+      "ip": "34.107.134.59",
+      "sni": "pubmed.ncbi.nlm.nih.gov",
+      "domains": ["pmc.ncbi.nlm.nih.gov"]
     }
   ]
 }
