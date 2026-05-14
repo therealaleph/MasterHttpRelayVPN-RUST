@@ -3037,7 +3037,7 @@ impl DomainFronter {
             let start = text.find('{').ok_or_else(|| {
                 FronterError::BadResponse(format!(
                     "no json in tunnel response: {}",
-                    &text[..text.len().min(200)]
+                    &text.chars().take(200).collect::<String>()
                 ))
             })?;
             let end = text.rfind('}').ok_or_else(|| {
@@ -3205,7 +3205,7 @@ impl DomainFronter {
             let start = text.find('{').ok_or_else(|| {
                 FronterError::BadResponse(format!(
                     "no json in batch response: {}",
-                    &text[..text.len().min(200)]
+                    &text.chars().take(200).collect::<String>()
                 ))
             })?;
             let end = text.rfind('}').ok_or_else(|| {
@@ -4578,13 +4578,13 @@ fn parse_relay_json(body: &[u8]) -> Result<Vec<u8>, FronterError> {
                 let start = text.find('{').ok_or_else(|| {
                     FronterError::BadResponse(format!(
                         "no json in: {}",
-                        &text[..text.len().min(200)]
+                        &text.chars().take(200).collect::<String>()
                     ))
                 })?;
                 let end = text.rfind('}').ok_or_else(|| {
                     FronterError::BadResponse(format!(
                         "no json end in: {}",
-                        &text[..text.len().min(200)]
+                        &text.chars().take(200).collect::<String>()
                     ))
                 })?;
                 serde_json::from_str(&text[start..=end])?
