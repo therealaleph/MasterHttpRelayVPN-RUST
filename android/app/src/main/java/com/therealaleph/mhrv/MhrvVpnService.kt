@@ -268,7 +268,7 @@ class MhrvVpnService : VpnService() {
             append(" --dns virtual")
             append(" --verbosity info")
             append(" --close-fd-on-drop true")
-            if (cfg.mode == Mode.FULL) append(" --udpgw-server 198.18.0.1:7300")
+            if (cfg.mode == Mode.FULL) append(" --udpgw-server $UDPGW_MAGIC_DEST")
         }
         val worker = Thread({
             try {
@@ -499,5 +499,14 @@ class MhrvVpnService : VpnService() {
         private const val NOTIF_ID = 0x1001
         private const val MTU = 1500
         const val ACTION_STOP = "com.therealaleph.mhrv.STOP"
+
+        // Magic udpgw destination passed to tun2proxy in Full mode. MUST stay
+        // outside tun2proxy's --dns virtual range (198.18.0.0/15) — otherwise
+        // virtual DNS can synthesise the magic IP for a real hostname and
+        // silently mis-route its traffic into the udpgw path. See issue #251
+        // and `UDPGW_MAGIC_IP` / `UDPGW_MAGIC_PORT` in tunnel-node/src/udpgw.rs.
+        // Wire-protocol convention: both sides must agree. v1.9.25+ tunnel-nodes
+        // also accept the legacy 198.18.0.1:7300 for one deprecation cycle.
+        private const val UDPGW_MAGIC_DEST = "192.0.2.1:7300"
     }
 }
