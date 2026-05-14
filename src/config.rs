@@ -209,13 +209,6 @@ pub struct Config {
     #[serde(default = "default_block_stun")]
     pub block_stun: bool,
 
-    /// Max unacked upload ops per session. Limits how many data ops can
-    /// be in flight before the upload task pauses. Lower = more responsive
-    /// acks (better for messaging), higher = more throughput (better for
-    /// file uploads). 0 = unlimited. Default 3.
-    #[serde(default = "default_upload_cap")]
-    pub upload_cap: u8,
-
     #[serde(default = "default_block_quic")]
     pub block_quic: bool,
     /// When true, suppress the random `_pad` field that v1.8.0+ adds
@@ -512,7 +505,6 @@ fn default_tunnel_doh() -> bool { true }
 /// causes TCP-over-TCP meltdown (<1 Mbps). Browsers fall back to
 /// HTTPS/TCP within seconds of the silent UDP drop. Issue #793.
 fn default_block_stun() -> bool { true }
-fn default_upload_cap() -> u8 { 3 }
 fn default_block_quic() -> bool { true }
 
 /// Default for `block_doh`: `true` (browser DoH is rejected so the
