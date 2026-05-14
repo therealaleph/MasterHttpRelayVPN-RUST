@@ -153,6 +153,11 @@ struct SessionInner {
     /// to wake the drain phase as soon as any session has something to
     /// ship, replacing the old fixed-sleep heuristic.
     notify: Notify,
+    /// Sequence-ordered write buffer: pipelined data ops may arrive
+    /// out of order (different batches completing at different times).
+    /// We buffer out-of-order writes and flush in seq order.
+    next_write_seq: Mutex<Option<u64>>,
+    pending_writes: Mutex<std::collections::BTreeMap<u64, Vec<u8>>>,
 }
 
 struct ManagedSession {
@@ -212,6 +217,8 @@ async fn create_session(host: &str, port: u16) -> std::io::Result<ManagedSession
         eof: AtomicBool::new(false),
         last_active: Mutex::new(Instant::now()),
         notify: Notify::new(),
+        next_write_seq: Mutex::new(None),
+        pending_writes: Mutex::new(std::collections::BTreeMap::new()),
     });
 
     let inner_ref = inner.clone();
@@ -231,6 +238,8 @@ fn create_udpgw_session() -> ManagedSession {
         eof: AtomicBool::new(false),
         last_active: Mutex::new(Instant::now()),
         notify: Notify::new(),
+        next_write_seq: Mutex::new(None),
+        pending_writes: Mutex::new(std::collections::BTreeMap::new()),
     });
 
     let inner_ref = inner.clone();
@@ -241,7 +250,7 @@ fn create_udpgw_session() -> ManagedSession {
 }
 
 async fn reader_task(mut reader: impl AsyncRead + Unpin, session: Arc<SessionInner>) {
-    let mut buf = vec![0u8; 512 * 1024];
+    let mut buf = vec![0u8; 2 * 1024 * 1024];
     loop {
         match reader.read(&mut buf).await {
             Ok(0) => {
@@ -678,6 +687,7 @@ struct BatchOp {
     #[serde(default)] port: Option<u16>,
     #[serde(default)] d: Option<String>, // base64 data
     #[serde(default)] seq: Option<u64>,
+    #[serde(default)] wseq: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -896,10 +906,54 @@ async fn handle_batch(
                             };
                             if !bytes.is_empty() {
                                 had_writes_or_connects = true;
-                                tracing::info!("session {} upload {}KB", &sid[..sid.len().min(8)], bytes.len() / 1024);
-                                let mut w = inner.writer.lock().await;
-                                let _ = w.write_all(&bytes).await;
-                                let _ = w.flush().await;
+                                tracing::info!(
+                                    "session {} upload {}B wseq={:?}",
+                                    &sid[..sid.len().min(8)], bytes.len(), op.wseq,
+                                );
+                                match op.wseq {
+                                    None => {
+                                        // Old client (no wseq): write immediately.
+                                        let mut w = inner.writer.lock().await;
+                                        let _ = w.write_all(&bytes).await;
+                                        let _ = w.flush().await;
+                                    }
+                                    Some(wseq) => {
+                                        let mut nws = inner.next_write_seq.lock().await;
+                                        let expected = nws.get_or_insert(wseq);
+
+                                        if wseq < *expected {
+                                            // Stale / duplicate — skip.
+                                            tracing::debug!(
+                                                "session {} wseq {} < expected {} — skipping",
+                                                &sid[..sid.len().min(8)], wseq, *expected,
+                                            );
+                                        } else if wseq == *expected {
+                                            // In order — write immediately.
+                                            let mut w = inner.writer.lock().await;
+                                            let _ = w.write_all(&bytes).await;
+                                            *expected += 1;
+
+                                            // Flush any buffered writes that
+                                            // are now in sequence.
+                                            let mut pw = inner.pending_writes.lock().await;
+                                            while let Some(entry) = pw.first_entry() {
+                                                if *entry.key() != *expected { break; }
+                                                let (_, buffered) = entry.remove_entry();
+                                                let _ = w.write_all(&buffered).await;
+                                                *expected += 1;
+                                            }
+                                            let _ = w.flush().await;
+                                        } else {
+                                            // Out of order — buffer for later.
+                                            tracing::debug!(
+                                                "session {} wseq {} > expected {} — buffering",
+                                                &sid[..sid.len().min(8)], wseq, *expected,
+                                            );
+                                            let mut pw = inner.pending_writes.lock().await;
+                                            pw.insert(wseq, bytes);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }

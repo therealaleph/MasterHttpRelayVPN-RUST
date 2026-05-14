@@ -23,6 +23,7 @@ use bytes::{Bytes, BytesMut};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::net::tcp::OwnedReadHalf;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 
 use crate::domain_fronter::{BatchOp, DomainFronter, FronterError, TunnelResponse};
@@ -320,6 +321,7 @@ enum MuxMsg {
         sid: String,
         data: Bytes,
         seq: Option<u64>,
+        wseq: Option<u64>,
         reply: BatchedReply,
     },
     UdpOpen {
@@ -356,6 +358,7 @@ struct PendingOp {
     /// that the caller is opting into the bundled-first-bytes flow).
     encode_empty: bool,
     seq: Option<u64>,
+    wseq: Option<u64>,
 }
 
 pub struct TunnelMux {
@@ -861,10 +864,11 @@ async fn mux_loop(mut rx: mpsc::Receiver<MuxMsg>, fronter: Arc<DomainFronter>, c
                         data: Some(data),
                         encode_empty: true,
                         seq: None,
+                        wseq: None,
                     };
                     accum.push_or_fire(op, op_bytes, reply, &sems, &fronter).await;
                 }
-                MuxMsg::Data { sid, data, seq, reply } => {
+                MuxMsg::Data { sid, data, seq, wseq, reply } => {
                     let op_bytes = encoded_len(data.len());
                     let op = PendingOp {
                         op: "data",
@@ -874,6 +878,7 @@ async fn mux_loop(mut rx: mpsc::Receiver<MuxMsg>, fronter: Arc<DomainFronter>, c
                         data: if data.is_empty() { None } else { Some(data) },
                         encode_empty: false,
                         seq,
+                        wseq,
                     };
                     accum.push_or_fire(op, op_bytes, reply, &sems, &fronter).await;
                 }
@@ -892,6 +897,7 @@ async fn mux_loop(mut rx: mpsc::Receiver<MuxMsg>, fronter: Arc<DomainFronter>, c
                         data: if data.is_empty() { None } else { Some(data) },
                         encode_empty: false,
                         seq: None,
+                        wseq: None,
                     };
                     accum.push_or_fire(op, op_bytes, reply, &sems, &fronter).await;
                 }
@@ -905,6 +911,7 @@ async fn mux_loop(mut rx: mpsc::Receiver<MuxMsg>, fronter: Arc<DomainFronter>, c
                         data: if data.is_empty() { None } else { Some(data) },
                         encode_empty: false,
                         seq: None,
+                        wseq: None,
                     };
                     accum.push_or_fire(op, op_bytes, reply, &sems, &fronter).await;
                 }
@@ -925,6 +932,7 @@ async fn mux_loop(mut rx: mpsc::Receiver<MuxMsg>, fronter: Arc<DomainFronter>, c
                 data: None,
                 encode_empty: false,
                 seq: None,
+                wseq: None,
             });
         }
 
@@ -1030,6 +1038,7 @@ fn encode_pending(p: PendingOp) -> BatchOp {
         port: p.port,
         d,
         seq: p.seq,
+        wseq: p.wseq,
     }
 }
 
@@ -1272,7 +1281,7 @@ pub async fn tunnel_connection(
                 return Ok(());
             }
         }
-        tunnel_loop(&mut sock, &sid, mux, pending_client_data).await
+        tunnel_loop(sock, &sid, mux, pending_client_data).await
     }
     .await;
 
@@ -1442,28 +1451,187 @@ struct InflightMeta {
     send_at: Instant,
 }
 
+/// An in-flight entry sent from the upload task to the download task.
+/// Bundles the metadata with the oneshot receiver so the download task
+/// can track and await the reply without knowing how the op was sent.
+struct InflightEntry {
+    meta: InflightMeta,
+    reply_rx: oneshot::Receiver<Result<(TunnelResponse, String), String>>,
+}
+
+/// Upload task: reads from the client socket, accumulates data (50ms
+/// coalesce window), and sends `MuxMsg::Data` with `wseq` directly to
+/// the mux. Sends an `InflightEntry` to the download task so it can
+/// track the reply. Completely independent of the download path.
+///
+/// If `initial_data` is provided, it is sent as the very first data op
+/// (wseq=0) before reading from the socket.
+async fn upload_task(
+    mut reader: OwnedReadHalf,
+    sid: String,
+    mux: Arc<TunnelMux>,
+    next_send_seq: Arc<AtomicU64>,
+    upload_closed: Arc<AtomicBool>,
+    eof_seen: Arc<AtomicBool>,
+    inflight_tx: mpsc::UnboundedSender<InflightEntry>,
+    initial_data: Option<Bytes>,
+) {
+    const READ_CHUNK: usize = 512 * 1024;
+    let mut buf = vec![0u8; READ_CHUNK];
+    let mut next_data_write_seq: u64 = 0;
+    let sid_short = &sid[..sid.len().min(8)];
+
+    // Send pending client data (e.g. buffered ClientHello) as the first
+    // data-bearing op before reading the socket.
+    if let Some(data) = initial_data {
+        if !data.is_empty() {
+            let seq = next_send_seq.fetch_add(1, Ordering::Relaxed);
+            let wseq = next_data_write_seq;
+            next_data_write_seq += 1;
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let send_at = Instant::now();
+            tracing::info!(
+                "sess {}: upload initial data seq={} wseq={} len={}B",
+                sid_short, seq, wseq, data.len(),
+            );
+            mux.send(MuxMsg::Data {
+                sid: sid.clone(),
+                data,
+                seq: Some(seq),
+                wseq: Some(wseq),
+                reply: reply_tx,
+            }).await;
+            let entry = InflightEntry {
+                meta: InflightMeta { seq, was_empty_poll: false, send_at },
+                reply_rx,
+            };
+            if inflight_tx.send(entry).is_err() {
+                return; // download task gone
+            }
+        }
+    }
+
+    loop {
+        if eof_seen.load(Ordering::Relaxed) { break; }
+        let n = match reader.read(&mut buf).await {
+            Ok(0) => {
+                upload_closed.store(true, Ordering::Release);
+                break;
+            }
+            Ok(n) => n,
+            Err(_) => {
+                upload_closed.store(true, Ordering::Release);
+                break;
+            }
+        };
+
+        let mut data = Vec::from(&buf[..n]);
+
+        // Adaptive accumulation: 50ms initial window. If >= 32KB
+        // accumulated (large upload), extend to 1MB or 1s.
+        let mut deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+        let mut extended = false;
+        loop {
+            if eof_seen.load(Ordering::Relaxed) { break; }
+            let now = tokio::time::Instant::now();
+            if now >= deadline { break; }
+            if data.len() >= 1024 * 1024 { break; } // 1MB cap
+            let remaining = deadline - now;
+            match tokio::time::timeout(remaining, reader.read(&mut buf)).await {
+                Ok(Ok(0)) => {
+                    upload_closed.store(true, Ordering::Release);
+                    break;
+                }
+                Ok(Ok(more_n)) => {
+                    data.extend_from_slice(&buf[..more_n]);
+                    // Extend window if we hit 32KB threshold
+                    if !extended && data.len() >= 32 * 1024 {
+                        deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+                        extended = true;
+                    }
+                }
+                Ok(Err(_)) => {
+                    upload_closed.store(true, Ordering::Release);
+                    break;
+                }
+                Err(_) => break, // timeout — send what we have
+            }
+        }
+
+        if data.is_empty() { continue; }
+
+        let seq = next_send_seq.fetch_add(1, Ordering::Relaxed);
+        let wseq = next_data_write_seq;
+        next_data_write_seq += 1;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let send_at = Instant::now();
+        tracing::info!(
+            "sess {}: upload send seq={} wseq={} len={}B",
+            sid_short, seq, wseq, data.len(),
+        );
+        mux.send(MuxMsg::Data {
+            sid: sid.clone(),
+            data: Bytes::from(data),
+            seq: Some(seq),
+            wseq: Some(wseq),
+            reply: reply_tx,
+        }).await;
+        let entry = InflightEntry {
+            meta: InflightMeta { seq, was_empty_poll: false, send_at },
+            reply_rx,
+        };
+        if inflight_tx.send(entry).is_err() {
+            break; // download task gone
+        }
+    }
+}
+
 async fn tunnel_loop(
-    sock: &mut TcpStream,
+    sock: TcpStream,
     sid: &str,
     mux: &Arc<TunnelMux>,
-    mut pending_client_data: Option<Bytes>,
+    pending_client_data: Option<Bytes>,
 ) -> std::io::Result<()> {
-    let (mut reader, mut writer) = sock.split();
-    const READ_CHUNK: usize = 512 * 1024;
-    let mut buf = BytesMut::with_capacity(READ_CHUNK);
-    let mut consecutive_empty = 0u32;
-    let mut buffered_upload: Option<Bytes> = None;
-    let mut upload_closed = false;
+    let (reader, mut writer) = sock.into_split();
 
-    let mut next_send_seq: u64 = 0;
-    let mut next_write_seq: u64 = 0;
-    let mut pending_writes: BTreeMap<u64, (TunnelResponse, String)> = BTreeMap::new();
+    let has_pending = pending_client_data.is_some();
+
+    let next_send_seq = Arc::new(AtomicU64::new(0));
+    let upload_closed = Arc::new(AtomicBool::new(false));
+    let eof_seen = Arc::new(AtomicBool::new(false));
+
+    // Channel for the upload task to send InflightEntry to the download
+    // task. Unbounded so the upload task never blocks on the download path.
+    let (inflight_tx, mut inflight_rx) = mpsc::unbounded_channel::<InflightEntry>();
+
+    // Upload task: reads from the client socket, accumulates data with
+    // a 50ms coalesce window, sends MuxMsg::Data with wseq directly to
+    // the mux, and forwards InflightEntry to the download task.
+    // Pending client data is seeded as the first send inside the upload
+    // task via an initial_data parameter.
+    let _upload_handle = tokio::spawn(upload_task(
+        reader,
+        sid.to_string(),
+        mux.clone(),
+        next_send_seq.clone(),
+        upload_closed.clone(),
+        eof_seen.clone(),
+        inflight_tx,  // move the only sender to the upload task
+        pending_client_data.clone(),
+    ));
+    // The download task does NOT hold an inflight_tx clone — when the
+    // upload task exits and drops the sender, inflight_rx.recv() returns
+    // None, which lets the download task detect upload completion.
+
+    // ── Download task (inline) ──────────────────────────────────────────
     let inflight_cap = INFLIGHT_ACTIVE;
     let mut max_inflight = INFLIGHT_OPTIMIST.min(inflight_cap);
-    let mut eof_seen = false;
+    let mut consecutive_empty = 0u32;
     let mut consecutive_data: u32 = 0;
     let mut is_elevated = false;
     let mut total_download_bytes: u64 = 0;
+    let mut next_write_seq: u64 = 0;
+    let mut pending_writes: BTreeMap<u64, (TunnelResponse, String)> = BTreeMap::new();
 
     enum ReplyOutcome {
         Ok(TunnelResponse, String),
@@ -1471,162 +1639,225 @@ async fn tunnel_loop(
         Timeout,
         Dropped,
     }
-    type ReplyFut = std::pin::Pin<Box<dyn std::future::Future<Output = (InflightMeta, ReplyOutcome)> + Send>>;
+    type ReplyFut =
+        std::pin::Pin<Box<dyn std::future::Future<Output = (InflightMeta, ReplyOutcome)> + Send>>;
     let mut inflight: FuturesUnordered<ReplyFut> = FuturesUnordered::new();
 
-    loop {
-        let all_legacy = mux.all_servers_legacy();
-
-        // When no ops are in flight and we can send, we must gather data
-        // (possibly blocking on client read) before entering the select.
-        // When ops ARE in flight, send empty polls to keep the pipeline full.
-        if !eof_seen && inflight.is_empty() {
-            let client_data = if let Some(data) = pending_client_data.take() {
-                Some(data)
-            } else if let Some(data) = buffered_upload.take() {
-                consecutive_empty = 0;
-                Some(data)
-            } else if upload_closed {
-                None
-            } else {
-                let read_timeout = match (all_legacy, consecutive_empty) {
-                    (_, 0) => Duration::from_millis(20),
-                    (_, 1) => Duration::from_millis(80),
-                    (_, 2) => Duration::from_millis(200),
-                    (false, 3..=5) => Duration::from_secs(3),
-                    (false, _) => Duration::from_secs(8),
-                    (true, _) => Duration::from_secs(30),
-                };
-                buf.reserve(READ_CHUNK);
-                match tokio::time::timeout(read_timeout, reader.read_buf(&mut buf)).await {
-                    Ok(Ok(0)) => break,
-                    Ok(Ok(n)) => {
-                        consecutive_empty = 0;
-                        let mut data = extract_bytes(&mut buf, n);
-                        // Loop-read: accumulate more upload data (up to 1s)
-                        let deadline = Instant::now() + Duration::from_secs(1);
-                        loop {
-                            if Instant::now() >= deadline { break; }
-                            buf.reserve(READ_CHUNK);
-                            match tokio::time::timeout(Duration::from_millis(20), reader.read_buf(&mut buf)).await {
-                                Ok(Ok(0)) => { upload_closed = true; break; }
-                                Ok(Ok(n)) => {
-                                    let extra = extract_bytes(&mut buf, n);
-                                    let mut combined = bytes::BytesMut::with_capacity(data.len() + extra.len());
-                                    combined.extend_from_slice(&data);
-                                    combined.extend_from_slice(&extra);
-                                    data = combined.freeze();
-                                }
-                                Ok(Err(_)) => { upload_closed = true; break; }
-                                Err(_) => break, // no more data
-                            }
-                        }
-                        Some(data)
-                    }
-                    Ok(Err(_)) => break,
-                    Err(_) => None,
-                }
-            };
-
-            if all_legacy && client_data.is_none() && consecutive_empty > 3 {
-                continue;
+    // Helper: wrap a reply_rx into a ReplyFut with timeout.
+    fn wrap_reply(meta: InflightMeta, reply_rx: oneshot::Receiver<Result<(TunnelResponse, String), String>>) -> std::pin::Pin<Box<dyn std::future::Future<Output = (InflightMeta, ReplyOutcome)> + Send>> {
+        Box::pin(async move {
+            match tokio::time::timeout(REPLY_TIMEOUT, reply_rx).await {
+                Ok(Ok(Ok((r, sid)))) => (meta, ReplyOutcome::Ok(r, sid)),
+                Ok(Ok(Err(e))) => (meta, ReplyOutcome::BatchErr(e)),
+                Ok(Err(_)) => (meta, ReplyOutcome::Dropped),
+                Err(_) => (meta, ReplyOutcome::Timeout),
             }
+        })
+    }
 
-            let data = client_data.unwrap_or_else(Bytes::new);
-            let was_empty_poll = data.is_empty();
-            let seq = next_send_seq;
-            next_send_seq += 1;
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let send_at = Instant::now();
-            mux.send(MuxMsg::Data {
-                sid: sid.to_string(),
-                data,
+    /// Send an empty poll Data op, returning the InflightMeta and reply
+    /// receiver. Upload data is handled exclusively by the upload task
+    /// — the download task only sends empty polls for pipeline refill.
+    #[inline]
+    fn send_empty_poll<'a>(
+        sid: &'a str,
+        next_send_seq: &AtomicU64,
+        mux: &'a Arc<TunnelMux>,
+    ) -> (
+        InflightMeta,
+        oneshot::Receiver<Result<(TunnelResponse, String), String>>,
+        std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>,
+    ) {
+        let seq = next_send_seq.fetch_add(1, Ordering::Relaxed);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let send_at = Instant::now();
+        let sid_owned = sid.to_string();
+        let mux_ref = mux.clone();
+        let send_fut = Box::pin(async move {
+            mux_ref.send(MuxMsg::Data {
+                sid: sid_owned,
+                data: Bytes::new(),
                 seq: Some(seq),
+                wseq: None,
                 reply: reply_tx,
             })
             .await;
-            tracing::debug!(
-                "sess {}: send seq={}, inflight=1, {}",
-                &sid[..sid.len().min(8)],
-                seq,
-                if was_empty_poll { "poll" } else { "data" },
-            );
-            let meta = InflightMeta { seq, was_empty_poll, send_at };
-            inflight.push(Box::pin(async move {
-                match tokio::time::timeout(REPLY_TIMEOUT, reply_rx).await {
-                    Ok(Ok(Ok((r, sid)))) => (meta, ReplyOutcome::Ok(r, sid)),
-                    Ok(Ok(Err(e))) => (meta, ReplyOutcome::BatchErr(e)),
-                    Ok(Err(_)) => (meta, ReplyOutcome::Dropped),
-                    Err(_) => (meta, ReplyOutcome::Timeout),
-                }
-            }));
+        });
+        let meta = InflightMeta { seq, was_empty_poll: true, send_at };
+        (meta, reply_rx, send_fut)
+    }
 
-            // Pre-fill pipeline when depth > IDLE: 1s between each op
-            // so they land in separate batches. After the stagger,
-            // check client socket for data to merge.
-            while max_inflight > INFLIGHT_IDLE && inflight.len() < max_inflight {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                if !upload_closed && buffered_upload.is_none() && pending_client_data.is_none() {
-                    buf.reserve(READ_CHUNK);
-                    match tokio::time::timeout(Duration::from_millis(20), reader.read_buf(&mut buf)).await {
-                        Ok(Ok(0)) => { upload_closed = true; }
-                        Ok(Ok(n)) => { buffered_upload = Some(extract_bytes(&mut buf, n)); }
-                        Ok(Err(_)) => { upload_closed = true; }
-                        Err(_) => {}
-                    }
-                }
-                let data = if let Some(d) = pending_client_data.take() {
-                    d
-                } else if let Some(d) = buffered_upload.take() {
-                    consecutive_empty = 0;
-                    d
-                } else {
-                    Bytes::new()
-                };
-                let was_empty_poll = data.is_empty();
-                let seq = next_send_seq;
-                next_send_seq += 1;
-                let (reply_tx, reply_rx) = oneshot::channel();
-                let send_at = Instant::now();
+    // If there is pending client data, the upload task sends it as
+    // its first op (wseq=0, with a wseq). Wait for that InflightEntry
+    // to arrive before sending pre-fill polls, so the data-bearing op
+    // reaches the mux first and the tunnel-node sees the ClientHello
+    // before any empty polls.
+    if has_pending {
+        match inflight_rx.recv().await {
+            Some(entry) => {
                 tracing::debug!(
-                    "sess {}: send seq={}, inflight={}, {}",
+                    "sess {}: pending data inflight seq={}",
                     &sid[..sid.len().min(8)],
-                    seq,
-                    inflight.len() + 1,
-                    if was_empty_poll { "poll" } else { "data+poll" },
+                    entry.meta.seq,
                 );
-                mux.send(MuxMsg::Data {
-                    sid: sid.to_string(),
-                    data,
-                    seq: Some(seq),
-                    reply: reply_tx,
-                })
-                .await;
-                let meta = InflightMeta { seq, was_empty_poll, send_at };
-                inflight.push(Box::pin(async move {
-                    match tokio::time::timeout(REPLY_TIMEOUT, reply_rx).await {
-                        Ok(Ok(Ok((r, sid)))) => (meta, ReplyOutcome::Ok(r, sid)),
-                        Ok(Ok(Err(e))) => (meta, ReplyOutcome::BatchErr(e)),
-                        Ok(Err(_)) => (meta, ReplyOutcome::Dropped),
-                        Err(_) => (meta, ReplyOutcome::Timeout),
+                inflight.push(wrap_reply(entry.meta, entry.reply_rx));
+            }
+            None => {
+                // Upload task exited before sending — nothing to do.
+            }
+        }
+    }
+
+    // Send initial pre-fill empty polls (optimist depth), staggered
+    // 1s apart so they land in separate batches. The pending data op
+    // (if any) already occupies one slot.
+    {
+        let polls_to_send = max_inflight.saturating_sub(inflight.len());
+        for i in 0..polls_to_send {
+            if i > 0 {
+                // Stagger pre-fill polls 1s apart so they land in
+                // separate batches.
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            let (meta, reply_rx, send_fut) = send_empty_poll(sid, &next_send_seq, mux);
+            send_fut.await;
+            tracing::debug!(
+                "sess {}: prefill poll seq={}, inflight={}",
+                &sid[..sid.len().min(8)],
+                meta.seq,
+                inflight.len() + 1,
+            );
+            inflight.push(wrap_reply(meta, reply_rx));
+        }
+    }
+
+    // Timer for staggered refill polls — fires in the select, never blocks.
+    let mut refill_at: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+    let mut refill_steps: u32 = 0; // counts 100ms steps; poll after 10 (1s)
+
+    // Schedule initial refill if pre-fill didn't fill all slots.
+    if inflight.len() < max_inflight {
+        refill_at = Some(Box::pin(tokio::time::sleep(Duration::from_millis(100))));
+        refill_steps = 0;
+    }
+
+    // Main download loop.
+    loop {
+        // If nothing in flight and tunnel EOF, we're done.
+        if inflight.is_empty() && eof_seen.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // If nothing in flight and upload closed with no more inflight
+        // entries coming, break.
+        if inflight.is_empty() && upload_closed.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // If eof was seen but inflight is not empty, give remaining
+        // replies a short grace period to deliver any buffered data
+        // before the remote connection closed. After 500ms, abandon them.
+        if eof_seen.load(Ordering::Relaxed) && !inflight.is_empty() {
+            match tokio::time::timeout(Duration::from_millis(500), inflight.next()).await {
+                Ok(Some((meta, ReplyOutcome::Ok(resp, script_id)))) => {
+                    if meta.seq == next_write_seq {
+                        let _ = write_tunnel_response(&mut writer, &resp).await;
+                        next_write_seq += 1;
+                        // Flush any buffered out-of-order writes.
+                        while let Some(entry) = pending_writes.first_entry() {
+                            if *entry.key() != next_write_seq { break; }
+                            let (_, (buffered_resp, _)) = entry.remove_entry();
+                            let _ = write_tunnel_response(&mut writer, &buffered_resp).await;
+                            next_write_seq += 1;
+                        }
+                    } else {
+                        pending_writes.insert(meta.seq, (resp, script_id));
                     }
-                }));
+                    continue; // loop back to check eof + empty
+                }
+                _ => break, // timeout or error — abandon remaining
             }
         }
 
-        if inflight.is_empty() && eof_seen {
-            break;
-        }
-        if inflight.is_empty() {
-            continue;
+        // When inflight is empty and we haven't seen eof, send an empty
+        // poll to keep the session alive. If all servers are legacy and
+        // we've had many consecutive empties, wait for the upload task
+        // to produce an InflightEntry (data op) before sending.
+        if inflight.is_empty() && !eof_seen.load(Ordering::Relaxed) {
+            let all_legacy = mux.all_servers_legacy();
+            if all_legacy && consecutive_empty > 3 {
+                // Wait for upload task to produce an inflight entry or close.
+                match inflight_rx.recv().await {
+                    Some(entry) => {
+                        consecutive_empty = 0;
+                        tracing::debug!(
+                            "sess {}: legacy keepalive from upload seq={}",
+                            &sid[..sid.len().min(8)],
+                            entry.meta.seq,
+                        );
+                        inflight.push(wrap_reply(entry.meta, entry.reply_rx));
+                        continue;
+                    }
+                    None => {
+                        // Channel closed — upload task exited.
+                        break;
+                    }
+                }
+            }
+
+            let (meta, reply_rx, send_fut) = send_empty_poll(sid, &next_send_seq, mux);
+            send_fut.await;
+            tracing::debug!(
+                "sess {}: keepalive poll seq={}", &sid[..sid.len().min(8)], meta.seq
+            );
+            inflight.push(wrap_reply(meta, reply_rx));
         }
 
-        let can_read = !upload_closed && buffered_upload.is_none();
+        // Drain any InflightEntry items from the upload task before
+        // entering the select — non-blocking.
+        while let Ok(entry) = inflight_rx.try_recv() {
+            if !entry.meta.was_empty_poll {
+                consecutive_empty = 0;
+            }
+            inflight.push(wrap_reply(entry.meta, entry.reply_rx));
+        }
 
-        // Wait for replies, overlapping with client reads.
         tokio::select! {
             biased;
 
+            // Accept inflight entries from the upload task.
+            Some(entry) = inflight_rx.recv() => {
+                if !entry.meta.was_empty_poll {
+                    consecutive_empty = 0;
+                }
+                inflight.push(wrap_reply(entry.meta, entry.reply_rx));
+            }
+
+            // Refill timer: 100ms steps, send empty poll after 10 steps
+            // (1s) for batch separation.
+            _ = async { refill_at.as_mut().unwrap().await }, if refill_at.is_some() => {
+                refill_at = None;
+                if !eof_seen.load(Ordering::Relaxed)
+                    && inflight.len() < max_inflight
+                {
+                    refill_steps += 1;
+
+                    if refill_steps >= 10 {
+                        let (meta, reply_rx, send_fut) = send_empty_poll(sid, &next_send_seq, mux);
+                        send_fut.await;
+                        inflight.push(wrap_reply(meta, reply_rx));
+                        refill_steps = 0;
+
+                        if inflight.len() < max_inflight && max_inflight > INFLIGHT_IDLE {
+                            refill_at = Some(Box::pin(tokio::time::sleep(Duration::from_millis(100))));
+                        }
+                    } else {
+                        refill_at = Some(Box::pin(tokio::time::sleep(Duration::from_millis(100))));
+                    }
+                }
+            }
+
+            // Process completed replies.
             Some((meta, outcome)) = inflight.next() => {
                 match outcome {
                     ReplyOutcome::Ok(resp, script_id) => {
@@ -1639,13 +1870,6 @@ async fn tunnel_loop(
                             has_data,
                             inflight.len(),
                         );
-                        if meta.was_empty_poll {
-                            let reply_was_empty = resp.d.as_deref().map(str::is_empty).unwrap_or(true);
-                            if reply_was_empty && meta.send_at.elapsed() < LEGACY_DETECT_THRESHOLD {
-                                mux.mark_server_no_longpoll(&script_id);
-                            }
-                        }
-
                         if resp.seq.is_none() {
                             max_inflight = 1;
                         }
@@ -1658,6 +1882,7 @@ async fn tunnel_loop(
                         let is_eof = resp.eof.unwrap_or(false);
                         let resp_has_seq = resp.seq.is_some();
 
+                        // Write in-order to client.
                         if meta.seq == next_write_seq {
                             let got_data = match write_tunnel_response(&mut writer, &resp).await? {
                                 WriteOutcome::Wrote => true,
@@ -1673,8 +1898,11 @@ async fn tunnel_loop(
                             } else {
                                 consecutive_empty = consecutive_empty.saturating_add(1);
                             }
-                            if is_eof { eof_seen = true; }
+                            if is_eof {
+                                eof_seen.store(true, Ordering::Relaxed);
+                            }
 
+                            // Flush buffered out-of-order writes.
                             while let Some(entry) = pending_writes.first_entry() {
                                 if *entry.key() != next_write_seq { break; }
                                 let (_, (buffered_resp, _)) = entry.remove_entry();
@@ -1692,15 +1920,15 @@ async fn tunnel_loop(
                                     WriteOutcome::BadBase64 => break,
                                 }
                                 next_write_seq += 1;
-                                if buf_eof { eof_seen = true; }
+                                if buf_eof {
+                                    eof_seen.store(true, Ordering::Relaxed);
+                                }
                             }
                         } else {
                             pending_writes.insert(meta.seq, (resp, script_id));
                         }
 
-                        // Adaptive pipeline depth: optimist start at 2,
-                        // drop to 1 on first empty, ramp to 3+ with
-                        // elevation permit (cap only counts depth >= 3).
+                        // Adaptive pipeline depth management.
                         tracing::info!(
                             "sess {}: depth={} cd={} ce={} inf={} has_seq={}",
                             &sid[..sid.len().min(8)],
@@ -1717,7 +1945,11 @@ async fn tunnel_loop(
                                 }
                             } else if consecutive_data >= 1 && max_inflight < INFLIGHT_OPTIMIST {
                                 max_inflight = INFLIGHT_OPTIMIST.min(inflight_cap);
-                            } else if consecutive_data >= 2 && max_inflight >= INFLIGHT_OPTIMIST && max_inflight < inflight_cap && total_download_bytes >= 32 * 1024 {
+                            } else if consecutive_data >= 2
+                                && max_inflight >= INFLIGHT_OPTIMIST
+                                && max_inflight < inflight_cap
+                                && total_download_bytes >= 32 * 1024
+                            {
                                 if !is_elevated {
                                     let cur = mux.elevated_sessions.load(Ordering::Relaxed);
                                     if cur < mux.max_elevated {
@@ -1730,82 +1962,35 @@ async fn tunnel_loop(
                                     max_inflight = (max_inflight + 1).min(inflight_cap);
                                 }
                             }
-                            pipeline_debug::session_update(&sid, max_inflight, inflight.len(), is_elevated);
+                            pipeline_debug::session_update(sid, max_inflight, inflight.len(), is_elevated);
                             if max_inflight != prev {
                                 tracing::info!(
-                                    "sess {}: pipeline {} → {}{}",
+                                    "sess {}: pipeline {} -> {}{}",
                                     &sid[..sid.len().min(8)],
-                                    prev, max_inflight,
+                                    prev,
+                                    max_inflight,
                                     if is_elevated { " [elevated]" } else { "" },
                                 );
                                 pipeline_debug::push_event(format!(
-                                    "{} {}→{}{}",
+                                    "{} {}->{}{}",
                                     &sid[..sid.len().min(8)],
-                                    prev, max_inflight,
+                                    prev,
+                                    max_inflight,
                                     if is_elevated { " E" } else { "" },
                                 ));
                             }
                         }
 
-                        // Fill pipeline slots. Always stagger 1s between
-                        // ops so each lands in a separate batch — proper
-                        // pipelining requires continuous separate responses.
-                        // After the stagger, check client socket for data
-                        // to merge: data ops over empty polls.
-                        while !eof_seen && inflight.len() < max_inflight && consecutive_empty < 3 {
-                            if max_inflight > INFLIGHT_IDLE {
-                                tokio::time::sleep(Duration::from_secs(1)).await;
-                            }
-                            // Read any client data that arrived during the
-                            // stagger. Prefer data ops over empty polls.
-                            if !upload_closed && buffered_upload.is_none() && pending_client_data.is_none() {
-                                buf.reserve(READ_CHUNK);
-                                match tokio::time::timeout(Duration::from_millis(20), reader.read_buf(&mut buf)).await {
-                                    Ok(Ok(0)) => { upload_closed = true; }
-                                    Ok(Ok(n)) => { buffered_upload = Some(extract_bytes(&mut buf, n)); }
-                                    Ok(Err(_)) => { upload_closed = true; }
-                                    Err(_) => {}
-                                }
-                            }
-                            let data = if let Some(d) = pending_client_data.take() {
-                                d
-                            } else if let Some(d) = buffered_upload.take() {
-                                consecutive_empty = 0;
-                                d
-                            } else {
-                                Bytes::new()
-                            };
-                            let was_empty_poll = data.is_empty();
-                            let seq = next_send_seq;
-                            next_send_seq += 1;
-                            let (reply_tx, reply_rx) = oneshot::channel();
-                            let send_at = Instant::now();
-                            tracing::debug!(
-                                "sess {}: send seq={}, inflight={}",
-                                &sid[..sid.len().min(8)],
-                                seq,
-                                inflight.len() + 1,
-                            );
-                            mux.send(MuxMsg::Data {
-                                sid: sid.to_string(),
-                                data,
-                                seq: Some(seq),
-                                reply: reply_tx,
-                            })
-                            .await;
-                            let meta = InflightMeta { seq, was_empty_poll, send_at };
-                            inflight.push(Box::pin(async move {
-                                match tokio::time::timeout(REPLY_TIMEOUT, reply_rx).await {
-                                    Ok(Ok(Ok((r, sid)))) => (meta, ReplyOutcome::Ok(r, sid)),
-                                    Ok(Ok(Err(e))) => (meta, ReplyOutcome::BatchErr(e)),
-                                    Ok(Err(_)) => (meta, ReplyOutcome::Dropped),
-                                    Err(_) => (meta, ReplyOutcome::Timeout),
-                                }
-                            }));
-                            // At idle depth, just one refill.
-                            if max_inflight <= INFLIGHT_IDLE {
-                                break;
-                            }
+                        // Schedule refill if pipeline needs more polls.
+                        if !eof_seen.load(Ordering::Relaxed)
+                            && inflight.len() < max_inflight
+                            // consecutive_empty gate removed — keep polling
+                            && refill_at.is_none()
+                        {
+                            refill_at = Some(Box::pin(tokio::time::sleep(
+                                if max_inflight > INFLIGHT_IDLE { Duration::from_millis(100) } else { Duration::ZERO }
+                            )));
+                            refill_steps = 0;
                         }
                     }
                     ReplyOutcome::BatchErr(e) => {
@@ -1816,7 +2001,7 @@ async fn tunnel_loop(
                         tracing::warn!(
                             "sess {}: reply timeout (seq {}), retrying",
                             &sid[..sid.len().min(8)],
-                            meta.seq
+                            meta.seq,
                         );
                         consecutive_empty = consecutive_empty.saturating_add(1);
                     }
@@ -1826,79 +2011,10 @@ async fn tunnel_loop(
                 }
             }
 
-            // Read from client socket while waiting for replies.
-            // If the client closes (read returns 0 or error), break
-            // immediately — don't wait for in-flight polls to drain,
-            // they're serving a dead session.
-            _ = async {
-                buf.reserve(READ_CHUNK);
-                match reader.read_buf(&mut buf).await {
-                    Ok(0) => { upload_closed = true; }
-                    Ok(n) => {
-                        buffered_upload = Some(extract_bytes(&mut buf, n));
-                    }
-                    Err(_) => { upload_closed = true; }
-                }
-            }, if can_read => {
-                if upload_closed { break; }
-                // Fast-path: client has upload data but all pipeline
-                // slots are full. Send immediately as an extra op
-                // outside the depth cap so uploads aren't blocked
-                // behind polls waiting at the tunnel-node.
-                if buffered_upload.is_some() && inflight.len() >= max_inflight && inflight.len() < max_inflight + 4 {
-                    // Loop-coalesce: keep reading client data up to
-                    // 200ms so we pack a fatter upload per op.
-                    let coalesce_deadline = Instant::now() + Duration::from_millis(200);
-                    loop {
-                        if Instant::now() >= coalesce_deadline { break; }
-                        buf.reserve(READ_CHUNK);
-                        match tokio::time::timeout(Duration::from_millis(20), reader.read_buf(&mut buf)).await {
-                            Ok(Ok(0)) => { upload_closed = true; break; }
-                            Ok(Ok(n)) => {
-                                let extra = extract_bytes(&mut buf, n);
-                                let merged = buffered_upload.take().unwrap();
-                                let mut combined = bytes::BytesMut::with_capacity(merged.len() + extra.len());
-                                combined.extend_from_slice(&merged);
-                                combined.extend_from_slice(&extra);
-                                buffered_upload = Some(combined.freeze());
-                            }
-                            Ok(Err(_)) => { upload_closed = true; break; }
-                            Err(_) => break, // no more data
-                        }
-                    }
-                    if upload_closed { break; }
-                    let data = buffered_upload.take().unwrap();
-                    let seq = next_send_seq;
-                    next_send_seq += 1;
-                    let (reply_tx, reply_rx) = oneshot::channel();
-                    let send_at = Instant::now();
-                    tracing::info!(
-                        "sess {}: fast-path upload seq={}, inflight={}",
-                        &sid[..sid.len().min(8)],
-                        seq,
-                        inflight.len() + 1,
-                    );
-                    consecutive_empty = 0;
-                    mux.send(MuxMsg::Data {
-                        sid: sid.to_string(),
-                        data,
-                        seq: Some(seq),
-                        reply: reply_tx,
-                    }).await;
-                    let meta = InflightMeta { seq, was_empty_poll: false, send_at };
-                    inflight.push(Box::pin(async move {
-                        match tokio::time::timeout(REPLY_TIMEOUT, reply_rx).await {
-                            Ok(Ok(Ok((r, sid)))) => (meta, ReplyOutcome::Ok(r, sid)),
-                            Ok(Ok(Err(e))) => (meta, ReplyOutcome::BatchErr(e)),
-                            Ok(Err(_)) => (meta, ReplyOutcome::Dropped),
-                            Err(_) => (meta, ReplyOutcome::Timeout),
-                        }
-                    }));
-                }
-            }
         }
     }
 
+    // Release elevation permit.
     if is_elevated {
         let n = mux.elevated_sessions.fetch_sub(1, Ordering::Relaxed);
         pipeline_debug::set_elevated(n.saturating_sub(1));
@@ -2280,14 +2396,14 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
         let _client = TcpStream::connect(addr).await.unwrap();
-        let mut server_side = accept.await.unwrap();
+        let server_side = accept.await.unwrap();
 
         let (mux, mut rx) = mux_for_test();
         let pending = Some(Bytes::from_static(b"CLIENTHELLO"));
 
         let loop_handle = tokio::spawn({
             let mux = mux.clone();
-            async move { tunnel_loop(&mut server_side, "sid-under-test", &mux, pending).await }
+            async move { tunnel_loop(server_side, "sid-under-test", &mux, pending).await }
         });
 
         // The first message tunnel_loop emits must be Data carrying the
@@ -2371,7 +2487,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
         let _client = TcpStream::connect(addr).await.unwrap();
-        let mut server_side = accept.await.unwrap();
+        let server_side = accept.await.unwrap();
 
         // 2 deployments, only A marked legacy → all_servers_legacy = false.
         let (mux, mut rx) = mux_for_test_with(2);
@@ -2380,7 +2496,7 @@ mod tests {
 
         let loop_handle = tokio::spawn({
             let mux = mux.clone();
-            async move { tunnel_loop(&mut server_side, "sid-mixed", &mux, None).await }
+            async move { tunnel_loop(server_side, "sid-mixed", &mux, None).await }
         });
 
         // Reply to 6 empty polls, all from A. With the regression
@@ -2400,7 +2516,7 @@ mod tests {
                 ))
                 .expect("mux channel closed unexpectedly");
             match msg {
-                MuxMsg::Data { sid, data, seq, reply } => {
+                MuxMsg::Data { sid, data, seq, reply, .. } => {
                     assert_eq!(sid, "sid-mixed");
                     assert!(data.is_empty(), "expected empty poll, got {} bytes", data.len());
                     let last = received == 5;
@@ -2622,6 +2738,7 @@ mod tests {
             data: Some(Bytes::from_static(b"x")),
             encode_empty: false,
             seq: None,
+            wseq: None,
         };
         let mk_reply = || oneshot::channel::<Result<(TunnelResponse, String), String>>().0;
 
@@ -2668,6 +2785,7 @@ mod tests {
             data: Some(Bytes::from_static(b"hello")),
             encode_empty: false,
             seq: None,
+            wseq: None,
         };
         let b = encode_pending(op);
         assert_eq!(b.op, "data");
@@ -2686,6 +2804,7 @@ mod tests {
             data: None,
             encode_empty: false,
             seq: None,
+            wseq: None,
         };
         assert!(encode_pending(empty_poll).d.is_none());
 
@@ -2698,6 +2817,7 @@ mod tests {
             data: None,
             encode_empty: false,
             seq: None,
+            wseq: None,
         };
         assert!(encode_pending(udp_poll).d.is_none());
 
@@ -2710,6 +2830,7 @@ mod tests {
             data: None,
             encode_empty: false,
             seq: None,
+            wseq: None,
         };
         assert!(encode_pending(close).d.is_none());
     }
@@ -2728,6 +2849,7 @@ mod tests {
             data: Some(Bytes::new()),
             encode_empty: true,
             seq: None,
+            wseq: None,
         };
         let b = encode_pending(op);
         assert_eq!(b.op, "connect_data");
@@ -2744,6 +2866,7 @@ mod tests {
             data: Some(Bytes::from_static(b"\x16\x03\x01")), // ClientHello prefix
             encode_empty: true,
             seq: None,
+            wseq: None,
         };
         let b = encode_pending(op);
         assert_eq!(b.d.as_deref(), Some(B64.encode(b"\x16\x03\x01").as_str()));
@@ -2781,13 +2904,13 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
         let mut client = TcpStream::connect(addr).await.unwrap();
-        let mut server_side = accept.await.unwrap();
+        let server_side = accept.await.unwrap();
 
         let (mux, mut rx) = mux_for_test();
 
         let loop_handle = tokio::spawn({
             let mux = mux.clone();
-            async move { tunnel_loop(&mut server_side, "sid-overlap", &mux, None).await }
+            async move { tunnel_loop(server_side, "sid-overlap", &mux, None).await }
         });
 
         // With pipelining (N=2), the loop may send two ops before we

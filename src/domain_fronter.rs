@@ -532,6 +532,8 @@ pub struct BatchOp {
     pub d: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wseq: Option<u64>,
 }
 
 /// Batch tunnel response from Apps Script / tunnel node.
