@@ -73,7 +73,7 @@ const INFLIGHT_OPTIMIST: usize = 2;
 
 /// Maximum pipeline depth when data is actively flowing. Ramps up on
 /// data-bearing replies, drops back to IDLE after consecutive empties.
-const INFLIGHT_ACTIVE: usize = 10;
+const INFLIGHT_ACTIVE: usize = 4;
 
 /// How many consecutive empty replies before dropping from active to idle depth.
 const INFLIGHT_COOLDOWN: u32 = 3;
@@ -1449,7 +1449,7 @@ async fn tunnel_loop(
     mut pending_client_data: Option<Bytes>,
 ) -> std::io::Result<()> {
     let (mut reader, mut writer) = sock.split();
-    const READ_CHUNK: usize = 65536;
+    const READ_CHUNK: usize = 512 * 1024;
     let mut buf = BytesMut::with_capacity(READ_CHUNK);
     let mut consecutive_empty = 0u32;
     let mut buffered_upload: Option<Bytes> = None;
@@ -1502,7 +1502,26 @@ async fn tunnel_loop(
                     Ok(Ok(0)) => break,
                     Ok(Ok(n)) => {
                         consecutive_empty = 0;
-                        Some(extract_bytes(&mut buf, n))
+                        let mut data = extract_bytes(&mut buf, n);
+                        // Loop-read: accumulate more upload data (up to 1s)
+                        let deadline = Instant::now() + Duration::from_secs(1);
+                        loop {
+                            if Instant::now() >= deadline { break; }
+                            buf.reserve(READ_CHUNK);
+                            match tokio::time::timeout(Duration::from_millis(20), reader.read_buf(&mut buf)).await {
+                                Ok(Ok(0)) => { upload_closed = true; break; }
+                                Ok(Ok(n)) => {
+                                    let extra = extract_bytes(&mut buf, n);
+                                    let mut combined = bytes::BytesMut::with_capacity(data.len() + extra.len());
+                                    combined.extend_from_slice(&data);
+                                    combined.extend_from_slice(&extra);
+                                    data = combined.freeze();
+                                }
+                                Ok(Err(_)) => { upload_closed = true; break; }
+                                Err(_) => break, // no more data
+                            }
+                        }
+                        Some(data)
                     }
                     Ok(Err(_)) => break,
                     Err(_) => None,
@@ -1827,23 +1846,27 @@ async fn tunnel_loop(
                 // outside the depth cap so uploads aren't blocked
                 // behind polls waiting at the tunnel-node.
                 if buffered_upload.is_some() && inflight.len() >= max_inflight && inflight.len() < max_inflight + 4 {
-                    // Brief coalesce: wait 20ms for more client data
-                    // to arrive so we batch multiple small writes into
-                    // one op instead of one per read.
-                    buf.reserve(READ_CHUNK);
-                    match tokio::time::timeout(Duration::from_millis(20), reader.read_buf(&mut buf)).await {
-                        Ok(Ok(0)) => { break; }
-                        Ok(Ok(n)) => {
-                            let extra = extract_bytes(&mut buf, n);
-                            let merged = buffered_upload.take().unwrap();
-                            let mut combined = bytes::BytesMut::with_capacity(merged.len() + extra.len());
-                            combined.extend_from_slice(&merged);
-                            combined.extend_from_slice(&extra);
-                            buffered_upload = Some(combined.freeze());
+                    // Loop-coalesce: keep reading client data up to
+                    // 200ms so we pack a fatter upload per op.
+                    let coalesce_deadline = Instant::now() + Duration::from_millis(200);
+                    loop {
+                        if Instant::now() >= coalesce_deadline { break; }
+                        buf.reserve(READ_CHUNK);
+                        match tokio::time::timeout(Duration::from_millis(20), reader.read_buf(&mut buf)).await {
+                            Ok(Ok(0)) => { upload_closed = true; break; }
+                            Ok(Ok(n)) => {
+                                let extra = extract_bytes(&mut buf, n);
+                                let merged = buffered_upload.take().unwrap();
+                                let mut combined = bytes::BytesMut::with_capacity(merged.len() + extra.len());
+                                combined.extend_from_slice(&merged);
+                                combined.extend_from_slice(&extra);
+                                buffered_upload = Some(combined.freeze());
+                            }
+                            Ok(Err(_)) => { upload_closed = true; break; }
+                            Err(_) => break, // no more data
                         }
-                        Ok(Err(_)) => { break; }
-                        Err(_) => {} // timeout — no more data, send what we have
                     }
+                    if upload_closed { break; }
                     let data = buffered_upload.take().unwrap();
                     let seq = next_send_seq;
                     next_send_seq += 1;

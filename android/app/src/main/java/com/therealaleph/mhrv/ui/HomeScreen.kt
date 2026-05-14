@@ -1288,6 +1288,28 @@ private fun AdvancedSettings(
             )
         }
 
+        // Block STUN/TURN toggle
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    "Block STUN/TURN",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Text(
+                    "Reject STUN/TURN ports (3478/5349/19302). Forces WebRTC apps (Meet, WhatsApp) to TCP fallback — instant connect.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Switch(
+                checked = cfg.blockStun,
+                onCheckedChange = { onChange(cfg.copy(blockStun = it)) },
+            )
+        }
+
         // Block DoH toggle
         Row(
             verticalAlignment = Alignment.CenterVertically,

@@ -202,6 +202,13 @@ pub struct Config {
     /// flag lets users who care about consistency over peak speed
     /// opt out of QUIC at the source rather than discovering its
     /// failure modes later. Issue #213.
+    /// Block STUN/TURN UDP ports (3478, 5349, 19302) at the SOCKS5 listener.
+    /// Forces WebRTC apps (Google Meet, Discord, WhatsApp) to fall back to
+    /// TCP TURN on port 443, skipping the 10-30s UDP ICE timeout. Default
+    /// true — TCP fallback works for all tested apps and connects instantly.
+    #[serde(default = "default_block_stun")]
+    pub block_stun: bool,
+
     #[serde(default = "default_block_quic")]
     pub block_quic: bool,
     /// When true, suppress the random `_pad` field that v1.8.0+ adds
@@ -497,6 +504,7 @@ fn default_tunnel_doh() -> bool { true }
 /// Default for `block_quic`: `true`. QUIC over the TCP-based tunnel
 /// causes TCP-over-TCP meltdown (<1 Mbps). Browsers fall back to
 /// HTTPS/TCP within seconds of the silent UDP drop. Issue #793.
+fn default_block_stun() -> bool { true }
 fn default_block_quic() -> bool { true }
 
 /// Default for `block_doh`: `true` (browser DoH is rejected so the

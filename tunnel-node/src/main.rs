@@ -241,7 +241,7 @@ fn create_udpgw_session() -> ManagedSession {
 }
 
 async fn reader_task(mut reader: impl AsyncRead + Unpin, session: Arc<SessionInner>) {
-    let mut buf = vec![0u8; 65536];
+    let mut buf = vec![0u8; 512 * 1024];
     loop {
         match reader.read(&mut buf).await {
             Ok(0) => {
@@ -896,6 +896,7 @@ async fn handle_batch(
                             };
                             if !bytes.is_empty() {
                                 had_writes_or_connects = true;
+                                tracing::info!("session {} upload {}KB", &sid[..sid.len().min(8)], bytes.len() / 1024);
                                 let mut w = inner.writer.lock().await;
                                 let _ = w.write_all(&bytes).await;
                                 let _ = w.flush().await;
@@ -1090,16 +1091,31 @@ async fn handle_batch(
         // short of the cliff; deferred sessions drain on the next poll.
         let mut remaining_budget: usize = BATCH_RESPONSE_BUDGET;
         for (i, sid, inner, seq) in &tcp_drains {
-            let (data, eof) = drain_now(inner, remaining_budget).await;
-            let drained = data.len();
-            if eof {
+            // Drain in a loop: keep reading until the buffer is empty
+            // so we catch data that arrives during the drain itself.
+            let mut all_data = Vec::new();
+            let mut final_eof = false;
+            let drain_deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                let (data, eof) = drain_now(inner, remaining_budget.saturating_sub(all_data.len())).await;
+                if eof { final_eof = true; }
+                if data.is_empty() { break; }
+                all_data.extend_from_slice(&data);
+                if final_eof || all_data.len() >= remaining_budget { break; }
+                if Instant::now() >= drain_deadline { break; }
+                // Brief yield to let reader_task finish its current read
+                tokio::task::yield_now().await;
+            }
+            let drained = all_data.len();
+            if drained > 0 {
+                tracing::info!("session {} drained {}KB", &sid[..sid.len().min(8)], drained / 1024);
+            }
+            if final_eof {
                 tcp_eof_sids.push(sid.clone());
             }
-            results.push((*i, tcp_drain_response(sid.clone(), data, eof, *seq)));
+            results.push((*i, tcp_drain_response(sid.clone(), all_data, final_eof, *seq)));
             remaining_budget = remaining_budget.saturating_sub(drained);
             if remaining_budget == 0 {
-                // Budget exhausted; remaining sessions in `tcp_drains` keep
-                // their buffered data and pick up next batch.
                 break;
             }
         }
