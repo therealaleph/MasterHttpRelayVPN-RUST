@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 pub mod cache;
+pub mod cdn_discover;
 pub mod cert_installer;
 pub mod config;
 pub mod data_dir;

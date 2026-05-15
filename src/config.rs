@@ -860,6 +860,29 @@ mod tests {
         let cfg: Config = serde_json::from_str(s).unwrap();
         assert!(cfg.validate().is_err());
     }
+
+    #[test]
+    fn fronting_group_serde_round_trip_matches_android_encoder() {
+        // The Android `ConfigStore.encode()` ships fronting_groups across
+        // devices as serde-compatible JSON. If the field shapes drift
+        // (e.g. someone renames `sni` → `front_sni` on the Rust side),
+        // an exported QR/URL silently stops importing on the desktop.
+        // This test pins the exact JSON shape both sides agree on.
+        let json = r#"{
+            "name": "fastly",
+            "ip": "151.101.0.223",
+            "sni": "python.org",
+            "domains": ["reddit.com", "github.com"]
+        }"#;
+        let g: FrontingGroup = serde_json::from_str(json).unwrap();
+        assert_eq!(g.name, "fastly");
+        assert_eq!(g.ip, "151.101.0.223");
+        assert_eq!(g.sni, "python.org");
+        assert_eq!(g.domains, vec!["reddit.com", "github.com"]);
+        let reserialized = serde_json::to_value(&g).unwrap();
+        let original: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(reserialized, original, "serde round-trip changed shape");
+    }
 }
 
 #[cfg(test)]

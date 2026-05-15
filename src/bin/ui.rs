@@ -9,6 +9,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 
+use mhrv_rs::cdn_discover::{discover_front, DiscoveredFront};
 use mhrv_rs::cert_installer::{install_ca, reconcile_sudo_environment, remove_ca};
 use mhrv_rs::config::{Config, FrontingGroup, ScriptId};
 use mhrv_rs::data_dir;
@@ -127,6 +128,12 @@ struct UiState {
     last_test_msg_at: Option<Instant>,
     /// Per-SNI probe results, populated by Cmd::TestSni / TestAllSni.
     sni_probe: HashMap<String, SniProbeState>,
+    /// Most-recent "discover CDN front" result, populated by
+    /// Cmd::DiscoverFront. Cleared when the user dismisses the
+    /// results panel or starts a new discovery. None = idle,
+    /// Some(InFlight) = probing in background, Some(Done(...)) =
+    /// resolved + probed and ready for the user to Add.
+    discover_state: Option<DiscoverState>,
     /// Most recent result of the Check-for-updates button (issue #15).
     /// `None` = never checked this session. `Some(InFlight)` during the
     /// probe, then the resolved outcome.
@@ -169,6 +176,25 @@ enum SniProbeState {
     Failed(String),
 }
 
+/// State of the most-recent "Discover CDN front by hostname" run.
+/// Held in `UiState::discover_state` so the result panel survives
+/// repaint cycles. Cleared by the Dismiss button or by starting a
+/// new discovery.
+#[derive(Clone, Debug)]
+enum DiscoverState {
+    /// Probe is running. The hostname is kept so the UI can show
+    /// "Discovering <hostname>…" without having to remember the
+    /// input on its own.
+    InFlight { hostname: String },
+    /// DNS resolved and at least one IP was probed. May or may
+    /// not have any *successful* probes — the panel renders the
+    /// list either way so the user sees what failed and why.
+    Done(DiscoveredFront),
+    /// Top-level failure: bad input, DNS timeout, etc. Not a per-IP
+    /// probe failure — those land inside `Done` with `error: Some`.
+    Error { hostname: String, message: String },
+}
+
 enum Cmd {
     Start(Config),
     Stop,
@@ -205,6 +231,11 @@ enum Cmd {
         url: String,
         name: String,
     },
+    /// Resolve `hostname` to all of its A/AAAA records and TLS-probe
+    /// each one with SNI=hostname, so the user can drop the best IP
+    /// into a new `FrontingGroup` without hand-running `dig` and
+    /// `openssl s_client`. See `mhrv_rs::cdn_discover`.
+    DiscoverFront { hostname: String },
 }
 
 struct App {
@@ -241,6 +272,27 @@ struct FormState {
     /// Text field buffer for the "+ add custom SNI" input at the bottom of
     /// the SNI editor window.
     sni_custom_input: String,
+    /// Text field buffer for the "Discover CDN front by hostname" input in
+    /// the Fronting-groups editor. Ephemeral UI state — never persisted to
+    /// config.json; the actual discovered group lives in `fronting_groups`.
+    discover_hostname_input: String,
+    /// Per-group raw text buffers for the "domains" field, indexed
+    /// in lockstep with `fronting_groups` (same length, same order).
+    /// Why a Vec instead of a HashMap keyed by group name: duplicate
+    /// `name` values are legal in `fronting_groups` (the proxy
+    /// startup logs a warning but otherwise honours them — see
+    /// `proxy_server.rs::ProxyServer::new`), so name-keyed buffers
+    /// would collide and silently overwrite one group's domains
+    /// with another's. Position-keyed buffers don't have that bug.
+    /// Add/Remove flows must touch both Vecs together to keep them
+    /// in sync; helper methods enforce that.
+    ///
+    /// Re-joining `g.domains` every frame would strip the user's
+    /// in-flight `,` / `\n` separators and break manual typing
+    /// (issue: "typing a comma collapses into invalid text"), so
+    /// the buffer is the source of truth while editing and we parse
+    /// only at save time inside `to_config()`.
+    domain_buffers: Vec<String>,
     /// Whether the floating SNI editor window is open.
     sni_editor_open: bool,
     /// Whether the Recent log panel is shown. User toggles with a checkbox.
@@ -377,6 +429,16 @@ fn load_form() -> (FormState, Option<String>) {
             show_auth_key: false,
             sni_pool,
             sni_custom_input: String::new(),
+            discover_hostname_input: String::new(),
+            // Seed buffers from the loaded groups (newline-joined, since
+            // that's the on-screen separator the editor uses). Length
+            // must match `fronting_groups` length so position indexing
+            // stays valid through edits.
+            domain_buffers: c
+                .fronting_groups
+                .iter()
+                .map(|g| g.domains.join("\n"))
+                .collect(),
             sni_editor_open: false,
             show_log: true,
             fetch_ips_from_api: c.fetch_ips_from_api,
@@ -416,6 +478,8 @@ fn load_form() -> (FormState, Option<String>) {
             show_auth_key: false,
             sni_pool: sni_pool_for_form(None, "www.google.com"),
             sni_custom_input: String::new(),
+            discover_hostname_input: String::new(),
+            domain_buffers: Vec::new(),
             sni_editor_open: false,
             show_log: true,
             fetch_ips_from_api: false,
@@ -604,9 +668,24 @@ impl FormState {
             // expose a toggle yet (Android does), so this is a config-only
             // round-trip — we keep whatever the user has in config.json.
             block_doh: self.block_doh,
-            // Multi-edge fronting groups: file-edited only for now,
-            // round-tripped through the UI so Save doesn't drop them.
-            fronting_groups: self.fronting_groups.clone(),
+            // Multi-edge fronting groups. Drop draft groups (no domains
+            // yet, or only blank entries) at save time — `Config::validate()`
+            // in src/config.rs rejects empty `domains` lists with a hard
+            // error, so passing them through would make the proxy refuse
+            // to start. The editor keeps them in the live form so the user
+            // can fill them in; on save we filter.
+            //
+            // Source-of-truth for the domains list: the position-indexed
+            // `domain_buffers` Vec, parsed by
+            // `build_fronting_groups_from_editor`. The editor seeds the
+            // buffer from `g.domains.join("\n")` so a loaded-but-
+            // untouched group round-trips identically. Empty-domain
+            // groups are dropped here so `Config::validate()` doesn't
+            // refuse the proxy on next start.
+            fronting_groups: build_fronting_groups_from_editor(
+                &self.fronting_groups,
+                &self.domain_buffers,
+            ),
             // PR #448 (Android): adaptive coalesce window. Desktop UI
             // doesn't expose sliders for these yet (Android does), so
             // we pass 0 to keep the compiled defaults (40ms step,
@@ -797,6 +876,82 @@ const ACCENT: egui::Color32 = egui::Color32::from_rgb(70, 120, 180);
 const ACCENT_HOVER: egui::Color32 = egui::Color32::from_rgb(90, 145, 205);
 const OK_GREEN: egui::Color32 = egui::Color32::from_rgb(80, 180, 100);
 const ERR_RED: egui::Color32 = egui::Color32::from_rgb(220, 110, 110);
+
+/// Build the on-disk `fronting_groups` Vec from the live editor state.
+///
+/// `groups[i]` and `buffers[i]` are paired by position — the editor in
+/// `FormState` maintains this invariant. For each row:
+///
+///   - parse the raw edit buffer into a list of domains (split on
+///     `,` and `\n`, trim, drop empty entries),
+///   - if the parsed list is empty, drop the row entirely (so a draft
+///     row with no domains doesn't survive into a saved config —
+///     `Config::validate()` would otherwise reject it),
+///   - otherwise emit a `FrontingGroup` with the cleaned domains.
+///
+/// `buffers` shorter than `groups` is tolerated: the missing tail
+/// reads from each group's existing `domains` field. The editor
+/// loop tops the buffer Vec up before rendering, but `to_config()`
+/// can also be called from non-editor sites (Test handler, etc.).
+///
+/// Critically: rows are *position-keyed*, not name-keyed. Duplicate
+/// `name` values are legal in `fronting_groups` (the proxy
+/// startup warns about them but honours them — see
+/// `proxy_server.rs::ProxyServer::new`), and a previous version of
+/// this code keyed buffers by name in a HashMap, which silently
+/// collapsed two same-named groups' domain lists into one. The
+/// indexed shape eliminates that data-loss bug. See the
+/// `duplicate_group_names_get_distinct_buffers` test below.
+fn build_fronting_groups_from_editor(
+    groups: &[FrontingGroup],
+    buffers: &[String],
+) -> Vec<FrontingGroup> {
+    // Dedup preserving insertion order. The Android
+    // `ConfigStore.toJson()` applies the same `.distinct()` pass, so
+    // this keeps saved configs consistent across the two clients — a
+    // user who hand-pastes a duplicate-laden list ends up with the
+    // same on-disk representation regardless of which UI they used.
+    fn dedup_preserve_order(items: impl Iterator<Item = String>) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for s in items {
+            if seen.insert(s.clone()) {
+                out.push(s);
+            }
+        }
+        out
+    }
+
+    groups
+        .iter()
+        .enumerate()
+        .filter_map(|(i, g)| {
+            let cleaned: Vec<String> = match buffers.get(i) {
+                Some(buf) => dedup_preserve_order(
+                    buf.split(|c: char| c == ',' || c == '\n')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty()),
+                ),
+                None => dedup_preserve_order(
+                    g.domains
+                        .iter()
+                        .map(|d| d.trim().to_string())
+                        .filter(|d| !d.is_empty()),
+                ),
+            };
+            if cleaned.is_empty() {
+                None
+            } else {
+                Some(FrontingGroup {
+                    name: g.name.clone(),
+                    ip: g.ip.clone(),
+                    sni: g.sni.clone(),
+                    domains: cleaned,
+                })
+            }
+        })
+        .collect()
+}
 
 /// Draw a "section card" — a rounded frame with a faint fill and a small
 /// heading above it. Used to visually group related form rows.
@@ -989,6 +1144,269 @@ impl eframe::App for App {
             });
 
             let direct_mode = self.form.mode == "direct" || self.form.mode == "google_only";
+
+            // ── Section: Fronting groups (CDN edge MITM targets) ───────────
+            // Lets users add Vercel / Fastly / Akamai / Netlify edges (or any
+            // multi-tenant CDN) by typing a known-hosted hostname; we resolve
+            // it via DNS + TLS-probe each IP and let the user add the best
+            // one as a new `FrontingGroup`. See `mhrv_rs::cdn_discover` for
+            // the probe logic. The editor lives outside `direct_mode` gating
+            // because fronting groups also fire in `apps_script` mode — only
+            // `full` mode short-circuits them (warned at proxy startup).
+            section(ui, "Fronting groups (CDN edges)", |ui| {
+                ui.small(egui::RichText::new(
+                    "Route specific domains through a CDN edge instead of the Apps Script relay. \
+                     Pick a hostname known to live on the CDN (e.g. python.org → Fastly, react.dev → Vercel) \
+                     and click Discover — we'll resolve it and pick the best IP.",
+                )
+                .color(egui::Color32::from_gray(150)));
+                ui.add_space(4.0);
+
+                // ─ Existing groups list ────────────────────────────────────
+                // Defensive: keep `domain_buffers` in sync with
+                // `fronting_groups` in case anything else mutated the
+                // groups Vec without going through this editor (a
+                // future code path, or a load that bypassed the
+                // constructor). Out of sync would silently mis-key
+                // every domain edit; bring them back to par before
+                // we render.
+                while self.form.domain_buffers.len() < self.form.fronting_groups.len() {
+                    let idx = self.form.domain_buffers.len();
+                    self.form.domain_buffers
+                        .push(self.form.fronting_groups[idx].domains.join("\n"));
+                }
+                self.form.domain_buffers.truncate(self.form.fronting_groups.len());
+
+                let mut remove_idx: Option<usize> = None;
+                for i in 0..self.form.fronting_groups.len() {
+                    // Snapshot draft state from the buffer (source of
+                    // truth for in-flight edits); `g.domains` is only
+                    // a fallback for groups loaded from disk that the
+                    // user hasn't touched, but the constructor already
+                    // primed the buffer with `g.domains.join("\n")`
+                    // so reads off the buffer cover both paths.
+                    let has_domains = self.form.domain_buffers[i]
+                        .split(|c: char| c == ',' || c == '\n')
+                        .any(|s| !s.trim().is_empty());
+                    let g = &self.form.fronting_groups[i];
+                    let g_name = g.name.clone();
+                    let g_ip = g.ip.clone();
+                    let g_sni = g.sni.clone();
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(&g_name).strong());
+                        ui.label(egui::RichText::new(format!(
+                            "→ {}  via {}",
+                            g_ip, g_sni,
+                        ))
+                        .monospace()
+                        .color(egui::Color32::from_gray(170)));
+                        // Draft warning: surface that Save will drop this
+                        // group so the user doesn't think they configured
+                        // something that quietly disappears. Matches the
+                        // filter in `to_config()`.
+                        if !has_domains {
+                            ui.small(egui::RichText::new("(draft — won't save until you list domains)")
+                                .color(ERR_RED));
+                        }
+                        if ui.small_button("remove")
+                            .on_hover_text("Delete this fronting group. Takes effect on the next Save config + restart.")
+                            .clicked()
+                        {
+                            remove_idx = Some(i);
+                        }
+                    });
+                    // Domains list edited via the position-indexed buffer
+                    // (see FormState::domain_buffers). Splitting on every
+                    // keystroke would strip a freshly typed `, ` or `\n`
+                    // separator the moment the user hit the key, which
+                    // makes adding a second domain manually impossible.
+                    // The buffer is the source of truth while editing;
+                    // parsing happens once at save time inside
+                    // `to_config()`.
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.form.domain_buffers[i])
+                            .hint_text("domains to front, one per line (or comma-separated)")
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(2),
+                    );
+                    // CDN-edge mismatch warning. Domains here are routed
+                    // to `g.ip` with `SNI=g.sni` — they must be served
+                    // by the same edge as `sni`, otherwise the inner
+                    // Host header leaks to the wrong CDN backend and
+                    // the request fails (wrong cert, 404, or a returned
+                    // page that isn't what the user asked for). See
+                    // docs/fronting-groups.md.
+                    ui.small(egui::RichText::new(
+                        "⚠ Only list domains you know are served by the same edge as the SNI above — \
+                         a mismatch returns wrong-cert errors or a default page.",
+                    )
+                    .color(egui::Color32::from_rgb(220, 180, 100)));
+                    ui.add_space(4.0);
+                }
+                if let Some(idx) = remove_idx {
+                    // Both Vecs must be touched together — they are
+                    // length-locked. Removing only from one would
+                    // shift the alignment for every subsequent group
+                    // and the buffer-for-group-N rendering would point
+                    // at the wrong row.
+                    self.form.fronting_groups.remove(idx);
+                    if idx < self.form.domain_buffers.len() {
+                        self.form.domain_buffers.remove(idx);
+                    }
+                }
+
+                // ─ Discover-by-hostname row ────────────────────────────────
+                ui.separator();
+                ui.add_space(4.0);
+                // Snapshot the discovery state so we can read+render it
+                // without holding the lock through the closure (the Add
+                // button mutates fronting_groups, which is on self.form,
+                // and we want the UI thread free to do that without
+                // contending with the background thread.)
+                let discover_state = self.shared.state.lock().unwrap().discover_state.clone();
+                let in_flight = matches!(discover_state, Some(DiscoverState::InFlight { .. }));
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [120.0, 20.0],
+                        egui::Label::new(egui::RichText::new("Discover front")
+                            .color(egui::Color32::from_gray(200))),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.form.discover_hostname_input)
+                            .hint_text("hostname (e.g. python.org)")
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(120.0 + 8.0);
+                    let btn_label = if in_flight { "Discovering…" } else { "Discover" };
+                    let btn = egui::Button::new(btn_label)
+                        .min_size(egui::vec2(100.0, 22.0))
+                        .rounding(4.0);
+                    let enabled = !in_flight
+                        && !self.form.discover_hostname_input.trim().is_empty();
+                    if ui.add_enabled(enabled, btn)
+                        .on_hover_text(
+                            "DNS-resolve the hostname and TLS-probe each returned IP \
+                             with SNI=hostname. Successful IPs can be added below as a \
+                             new fronting group."
+                        )
+                        .clicked()
+                    {
+                        let hostname = self.form.discover_hostname_input.trim().to_string();
+                        let _ = self.cmd_tx.send(Cmd::DiscoverFront { hostname });
+                    }
+                });
+
+                // ─ Discover results panel ──────────────────────────────────
+                match &discover_state {
+                    Some(DiscoverState::InFlight { hostname }) => {
+                        ui.add_space(4.0);
+                        ui.small(egui::RichText::new(format!(
+                            "Discovering {} — resolving DNS and probing IPs…",
+                            hostname,
+                        ))
+                        .color(egui::Color32::from_gray(170)));
+                    }
+                    Some(DiscoverState::Error { hostname, message }) => {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.small(egui::RichText::new(format!("✗ {}: {}", hostname, message))
+                                .color(ERR_RED));
+                            if ui.small_button("dismiss").clicked() {
+                                self.shared.state.lock().unwrap().discover_state = None;
+                            }
+                        });
+                    }
+                    Some(DiscoverState::Done(df)) => {
+                        let hostname = df.hostname.clone();
+                        let n_ok = df.ips.iter().filter(|r| r.is_ok()).count();
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            let header = if n_ok > 0 {
+                                format!("{} — {} of {} IPs reachable", hostname, n_ok, df.ips.len())
+                            } else {
+                                format!("{} — no IPs reachable", hostname)
+                            };
+                            ui.small(egui::RichText::new(header)
+                                .color(if n_ok > 0 { OK_GREEN } else { ERR_RED }));
+                            if ui.small_button("dismiss").clicked() {
+                                self.shared.state.lock().unwrap().discover_state = None;
+                            }
+                        });
+                        // Per-IP rows. Successful entries get an Add button
+                        // that appends a new FrontingGroup pointing at that
+                        // IP, with hostname as the SNI and an empty domains
+                        // list (user fills in what to front via this edge).
+                        let mut to_add: Option<String> = None;
+                        for r in &df.ips {
+                            ui.horizontal(|ui| {
+                                let (marker, color, detail) = match (&r.latency_ms, &r.error) {
+                                    (Some(ms), _) => ("✓", OK_GREEN, format!("{} ms", ms)),
+                                    (None, Some(e)) => ("✗", ERR_RED, e.clone()),
+                                    (None, None) => ("?", egui::Color32::from_gray(160), "unknown".into()),
+                                };
+                                ui.small(egui::RichText::new(marker).color(color));
+                                ui.small(egui::RichText::new(&r.ip).monospace());
+                                ui.small(egui::RichText::new(detail)
+                                    .color(egui::Color32::from_gray(150)));
+                                if r.is_ok() {
+                                    if ui.small_button("add as fronting group")
+                                        .on_hover_text(
+                                            "Append a new fronting group with this IP and SNI=hostname. \
+                                             You then list the domains you want fronted through this edge."
+                                        )
+                                        .clicked()
+                                    {
+                                        to_add = Some(r.ip.clone());
+                                    }
+                                }
+                            });
+                        }
+                        if let Some(ip) = to_add {
+                            // Pick a unique name to avoid log-line ambiguity
+                            // (proxy_server warns on duplicate group names).
+                            let base_name = hostname.clone();
+                            let name = if self.form.fronting_groups.iter()
+                                .any(|g| g.name == base_name)
+                            {
+                                let mut n = 2;
+                                loop {
+                                    let candidate = format!("{}-{}", base_name, n);
+                                    if !self.form.fronting_groups.iter()
+                                        .any(|g| g.name == candidate)
+                                    {
+                                        break candidate;
+                                    }
+                                    n += 1;
+                                }
+                            } else {
+                                base_name
+                            };
+                            self.form.fronting_groups.push(FrontingGroup {
+                                name,
+                                ip,
+                                sni: hostname.clone(),
+                                domains: Vec::new(),
+                            });
+                            // Position-locked buffer: must push in lockstep
+                            // with `fronting_groups` so index-keyed reads
+                            // (editor render, to_config) stay valid.
+                            self.form.domain_buffers.push(String::new());
+                            // Clear the input + result so the next discovery
+                            // doesn't re-trigger an Add on stale state.
+                            self.form.discover_hostname_input.clear();
+                            self.shared.state.lock().unwrap().discover_state = None;
+                            self.toast = Some((
+                                format!("Added fronting group for {} — fill in domains and Save config.",
+                                    hostname),
+                                Instant::now(),
+                            ));
+                        }
+                    }
+                    None => {}
+                }
+            });
 
             // ── Section: Apps Script relay ────────────────────────────────
             section(ui, "Apps Script relay", |ui| {
@@ -2473,6 +2891,31 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                     }
                 });
             }
+            Ok(Cmd::DiscoverFront { hostname }) => {
+                // Mark in-flight synchronously so the UI's "Discover"
+                // button can disable on the next frame instead of
+                // letting the user double-tap. The background tokio
+                // task fires off the DNS resolve + TLS probes and
+                // writes the Done/Error variant when it completes.
+                {
+                    let mut st = shared.state.lock().unwrap();
+                    st.discover_state = Some(DiscoverState::InFlight {
+                        hostname: hostname.clone(),
+                    });
+                }
+                let shared2 = shared.clone();
+                rt.spawn(async move {
+                    let result = discover_front(&hostname).await;
+                    let new_state = match result {
+                        Ok(df) => DiscoverState::Done(df),
+                        Err(msg) => DiscoverState::Error {
+                            hostname,
+                            message: msg,
+                        },
+                    };
+                    shared2.state.lock().unwrap().discover_state = Some(new_state);
+                });
+            }
             Ok(Cmd::TestSni { google_ip, sni }) => {
                 let shared2 = shared.clone();
                 {
@@ -2783,5 +3226,136 @@ fn push_log(shared: &Shared, msg: &str) {
     s.log.push_back(line);
     while s.log.len() > LOG_MAX {
         s.log.pop_front();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_group(name: &str, ip: &str, sni: &str, domains: &[&str]) -> FrontingGroup {
+        FrontingGroup {
+            name: name.into(),
+            ip: ip.into(),
+            sni: sni.into(),
+            domains: domains.iter().map(|s| (*s).into()).collect(),
+        }
+    }
+
+    #[test]
+    fn duplicate_group_names_get_distinct_buffers() {
+        // Regression guard for the buffer-keyed-by-name bug.
+        //
+        // `Config::validate()` and `ProxyServer::new()` accept two
+        // fronting groups with the same `name` (warning-only; see
+        // `proxy_server.rs`). An earlier version of this UI keyed
+        // the per-group domain edit buffer by `group.name` in a
+        // HashMap, which silently collapsed the two same-named
+        // groups into one buffer entry — editing the second group
+        // would overwrite the first's domains, and on Save one
+        // group's domain list would disappear into the other.
+        //
+        // The position-indexed Vec design here makes that
+        // impossible: two distinct rows have two distinct buffer
+        // slots regardless of name. This test pins that behaviour
+        // by exercising the save path with two same-named groups
+        // and checking both keep their own domains.
+        let groups = vec![
+            mk_group("akamai", "2.22.151.143", "www.bbc.com", &[]),
+            mk_group("akamai", "2.22.151.150", "www.akamai.com", &[]),
+        ];
+        // Each buffer carries different domains. Pre-fix, the
+        // HashMap would have collapsed these into one entry —
+        // whichever group rendered last would have won.
+        let buffers = vec![
+            "reddit.com\ngithub.com".to_string(),
+            "microsoft.com\nicloud.com".to_string(),
+        ];
+        let out = build_fronting_groups_from_editor(&groups, &buffers);
+        assert_eq!(out.len(), 2, "both same-named groups must survive");
+        assert_eq!(out[0].name, "akamai");
+        assert_eq!(out[0].ip, "2.22.151.143");
+        assert_eq!(out[0].domains, vec!["reddit.com", "github.com"]);
+        assert_eq!(out[1].name, "akamai");
+        assert_eq!(out[1].ip, "2.22.151.150");
+        assert_eq!(out[1].domains, vec!["microsoft.com", "icloud.com"]);
+    }
+
+    #[test]
+    fn empty_buffer_drops_group_before_save() {
+        // `Config::validate()` rejects `fronting_groups[i].domains`
+        // being empty. The editor keeps draft groups (no domains
+        // entered yet) visible so the user can fill them in, but
+        // the save path filters them out so the persisted config
+        // is always valid. Pre-fix the draft entry would survive
+        // into `to_config()` with `domains: []` and the next proxy
+        // start would error out.
+        let groups = vec![
+            mk_group("draft-only", "1.2.3.4", "example.com", &[]),
+            mk_group("real", "5.6.7.8", "real.example", &[]),
+        ];
+        let buffers = vec![
+            // First group: only whitespace and empty separators —
+            // simulates the user clicking "add as fronting group"
+            // from a Discover result but not typing any domains yet.
+            "  \n , \n".to_string(),
+            // Second group: legit content.
+            "site.test".to_string(),
+        ];
+        let out = build_fronting_groups_from_editor(&groups, &buffers);
+        assert_eq!(out.len(), 1, "draft group should be dropped");
+        assert_eq!(out[0].name, "real");
+        assert_eq!(out[0].domains, vec!["site.test"]);
+    }
+
+    #[test]
+    fn buffer_separators_trim_and_dedup_blanks() {
+        // Mixed separators (`,`, `\n`) + whitespace + blanks all
+        // get normalized into a clean Vec<String>. This is what
+        // the user gets when pasting from a Telegram channel that
+        // formatted the list with mixed delimiters.
+        let groups = vec![mk_group("g", "1.1.1.1", "sni.test", &[])];
+        let buffers = vec![
+            "  a.com , b.com\n\n c.com,  ,\nd.com  ".to_string(),
+        ];
+        let out = build_fronting_groups_from_editor(&groups, &buffers);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].domains, vec!["a.com", "b.com", "c.com", "d.com"]);
+    }
+
+    #[test]
+    fn buffer_dedups_domains_preserving_first_seen_order() {
+        // Aligns with the Android `ConfigStore.toJson()` `.distinct()`
+        // pass — a user pasting a list with duplicates ends up with
+        // the same on-disk shape regardless of which UI they used.
+        // Order of first appearance is preserved so a curated list
+        // (Telegram channel paste) keeps its meaningful ordering.
+        let groups = vec![mk_group("g", "1.1.1.1", "sni.test", &[])];
+        let buffers = vec!["a.com\nb.com\na.com\nc.com\n  B.COM  \nb.com".to_string()];
+        let out = build_fronting_groups_from_editor(&groups, &buffers);
+        assert_eq!(out.len(), 1);
+        // `B.COM` and `b.com` differ in case — domain matching on
+        // the proxy side is case-insensitive but the dedup here is
+        // byte-exact, matching the Android `.distinct()` behaviour.
+        // That's intentional: aggressive case-collapsing here would
+        // surprise a user who deliberately typed varied casing.
+        assert_eq!(
+            out[0].domains,
+            vec!["a.com", "b.com", "c.com", "B.COM"],
+        );
+    }
+
+    #[test]
+    fn missing_buffer_falls_back_to_existing_domains() {
+        // `to_config()` can be called from non-editor sites
+        // (Test, Start handlers) where the buffer Vec might be
+        // shorter than the groups Vec — for instance right at
+        // first launch before the editor has rendered. In that
+        // case the existing `g.domains` is the source of truth.
+        let groups = vec![mk_group("loaded", "9.9.9.9", "x.test", &["alpha.test", "beta.test"])];
+        let buffers: Vec<String> = vec![]; // no buffers — should fall back
+        let out = build_fronting_groups_from_editor(&groups, &buffers);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].domains, vec!["alpha.test", "beta.test"]);
     }
 }

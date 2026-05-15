@@ -487,6 +487,98 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_statsJson<'a>(
 // tun2proxy CLI API wrapper (dlsym — no fork or patch needed)
 // ---------------------------------------------------------------------------
 
+/// `Native.discoverFront(hostname)` -> String JSON.
+///
+/// Resolves `hostname` to its A/AAAA records and TLS-probes each one
+/// with `SNI=hostname` so the Kotlin UI can populate a new
+/// `FrontingGroup` from one click instead of asking the user to dig
+/// + openssl s_client by hand. See `crate::cdn_discover`.
+///
+/// JSON shape on success:
+/// `{"hostname":"python.org","ips":[{"ip":"151.101.0.223","ok":true,"latencyMs":45}, ...]}`
+///
+/// On top-level failure (bad input, DNS timeout, etc.):
+/// `{"hostname":"python.org","error":"dns: ..."}`
+///
+/// Worst-case wall time is ~15s (3s DNS timeout + 3 probe waves of
+/// 4s each at 8-way concurrency over the 24-IP cap, both TCP and
+/// TLS handshakes bounded). Typical case for a healthy CDN is well
+/// under 1s. Always call from a background dispatcher.
+#[no_mangle]
+pub extern "system" fn Java_com_therealaleph_mhrv_Native_discoverFront<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass,
+    hostname: JString,
+) -> jstring {
+    let result_json = safe(
+        r#"{"hostname":"","error":"panic"}"#.to_string(),
+        AssertUnwindSafe(|| {
+            install_logging_once();
+            let host = jstring_to_string(&mut env, &hostname);
+            if host.trim().is_empty() {
+                return r#"{"hostname":"","error":"hostname is empty"}"#.to_string();
+            }
+            let Some(rt) = one_shot_runtime() else {
+                return r#"{"hostname":"","error":"tokio init failed"}"#.to_string();
+            };
+            // Use serde_json::json! here (unlike `update_check_to_json`
+            // above, which is fixed-shape and ASCII-only). Probe `error`
+            // strings come from OS / TLS / DNS layers and routinely
+            // contain non-ASCII bytes, control chars, or both — the
+            // hand-rolled `replace('"').replace('\\')` pattern would
+            // miss `\n` / `\t` / `\x00` and produce malformed JSON the
+            // Kotlin side rejects.
+            match rt.block_on(crate::cdn_discover::discover_front(&host)) {
+                Ok(df) => {
+                    let ips: Vec<serde_json::Value> = df
+                        .ips
+                        .iter()
+                        .map(|r| match (&r.latency_ms, &r.error) {
+                            (Some(ms), _) => serde_json::json!({
+                                "ip": r.ip,
+                                "ok": true,
+                                "latencyMs": ms,
+                            }),
+                            (None, Some(e)) => serde_json::json!({
+                                "ip": r.ip,
+                                "ok": false,
+                                "error": e,
+                            }),
+                            (None, None) => serde_json::json!({
+                                "ip": r.ip,
+                                "ok": false,
+                                "error": "unknown",
+                            }),
+                        })
+                        .collect();
+                    tracing::info!(
+                        "discover_front: {} -> {} ips, {} ok",
+                        df.hostname,
+                        df.ips.len(),
+                        df.ips.iter().filter(|r| r.is_ok()).count(),
+                    );
+                    serde_json::json!({
+                        "hostname": df.hostname,
+                        "ips": ips,
+                    })
+                    .to_string()
+                }
+                Err(e) => {
+                    tracing::warn!("discover_front: {} FAIL: {}", host, e);
+                    serde_json::json!({
+                        "hostname": host,
+                        "error": e,
+                    })
+                    .to_string()
+                }
+            }
+        }),
+    );
+    env.new_string(result_json)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
 /// `Native.runTun2proxy(cliArgs, tunMtu)` -> int
 ///
 /// Calls `tun2proxy_run_with_cli_args` from libtun2proxy.so via dlsym.

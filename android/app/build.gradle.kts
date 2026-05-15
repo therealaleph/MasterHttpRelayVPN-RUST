@@ -142,6 +142,35 @@ dependencies {
 
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
+
+    // ---- JVM unit tests (app/src/test) -----------------------------------
+    // Pure-JVM tests run on the host without an emulator. The Android
+    // SDK ships `android.jar` with method stubs that throw at runtime
+    // ("Method ... not mocked.") — for code that uses `JSONObject`
+    // (everything in ConfigStore) we'd otherwise need Robolectric.
+    // Pulling the real `org.json` artifact instead is much lighter
+    // (~70 KB vs Robolectric's ~30 MB classpath) and the API is
+    // bit-for-bit identical to android.jar's, so the production code
+    // runs unchanged under test.
+    //
+    // Tests covered by this scaffold:
+    //   - ConfigStore round-trip with fronting_groups + draft-drop
+    //   - Discover-front JNI JSON parser
+    // Adding more tests just needs a new file under
+    // `app/src/test/java/com/therealaleph/mhrv/`.
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20231013")
+}
+
+// Pick the JUnit 4 runner for all unit-test tasks. AGP doesn't
+// auto-select between JUnit 4 and 5 — without this the test task
+// will compile but report `No tests found` because no runner is
+// registered. (Unit tests don't pull in the cargo/JNI chain on
+// their own: `testDebugUnitTest` doesn't depend on
+// `mergeDebugJniLibFolders`, so the Rust crate isn't built for
+// the host JVM test loop — keeps the test cycle fast.)
+tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
+    useJUnit()
 }
 
 // --------------------------------------------------------------------------

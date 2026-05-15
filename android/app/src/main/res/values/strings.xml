@@ -120,6 +120,25 @@
     <string name="btn_copy_lower">copy</string>
     <string name="snack_upstream_copied">Copied %1$s</string>
 
+    <!-- Fronting groups editor (Network section). -->
+    <string name="sec_fronting_groups">CDN fronting groups</string>
+    <string name="fronting_help">Route specific domains through a CDN edge instead of the Apps Script relay. Type a hostname known to live on the CDN (e.g. python.org → Fastly, react.dev → Vercel) and tap Discover.</string>
+    <string name="fronting_hint_hostname">hostname (e.g. python.org)</string>
+    <string name="fronting_hint_domains">domains to front through this edge, one per line</string>
+    <string name="btn_discover">Discover</string>
+    <string name="btn_discovering">Discovering…</string>
+    <string name="btn_dismiss">dismiss</string>
+    <string name="btn_remove_group">remove</string>
+    <string name="btn_add_as_group">add as fronting group</string>
+    <string name="fronting_discovering_fmt">Discovering %1$s — resolving DNS and probing IPs…</string>
+    <string name="fronting_result_ok_fmt">%1$s — %2$d of %3$d IPs reachable</string>
+    <string name="fronting_result_none_fmt">%1$s — no IPs reachable</string>
+    <string name="fronting_result_error_fmt">%1$s: %2$s</string>
+    <string name="fronting_latency_ms_fmt">%1$d ms</string>
+    <string name="fronting_group_added_fmt">Added fronting group for %1$s — fill in domains and Save.</string>
+    <string name="fronting_group_draft_warning">Draft — won\'t save until you list at least one domain.</string>
+    <string name="fronting_edge_mismatch_warning">⚠ Only list domains you know are served by the same edge as the SNI above — a mismatch returns wrong-cert errors or a default page.</string>
+
     <!-- "How to use" guide body. Localized — FA copy lives in values-fa. -->
     <string name="help_how_to_use">1. Paste one or more Apps Script deployment URLs (or bare IDs) and your auth_key.\n2. Tap Install MITM certificate. Confirm the dialog — the cert is saved to Downloads/mhrv-ca.crt and the Settings app opens. Use Settings\' search bar to find \"CA certificate\", tap that result (NOT \"VPN &amp; app user certificate\" or \"Wi-Fi\"), and pick mhrv-ca.crt from Downloads. You\'ll be asked to set a screen lock if you don\'t have one (Android requirement).\n3. Before tapping Start, expand \"SNI pool + tester\" and hit \"Test all\". If every entry times out, your google_ip is unreachable — replace it with one that resolves locally (e.g. `nslookup www.google.com` on any working device).\n4. Tap Start. Accept the VPN prompt. The full TUN bridge routes every app on the device through the proxy — no per-app setup needed.\n5. If Chrome shows \"504 Relay timeout\": your Apps Script deployment isn\'t responding. Redeploy the script, grab the new /exec URL, and paste it above. Watch Live logs for \"Relay timeout\" vs \"connect:\" errors to tell which layer is failing.\n\nKnown limitation — Cloudflare Turnstile (\"Verify you are human\") will loop endlessly on most CF-protected sites. Every Apps Script request uses a rotating Google-datacenter egress IP + a fixed \"Google-Apps-Script\" User-Agent + a Google TLS fingerprint. The cf_clearance cookie is bound to the (IP, UA, JA3) tuple the challenge was solved against, so the NEXT request — from a different egress IP — gets re-challenged. Nothing in this app can fix that; it\'s inherent to Apps Script as a relay. Sites that only gate the initial page load (not every request) will work after one solve.</string>
 </resources>

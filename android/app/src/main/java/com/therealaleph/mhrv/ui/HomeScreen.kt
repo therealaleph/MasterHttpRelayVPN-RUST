@@ -36,6 +36,7 @@ import androidx.compose.ui.unit.sp
 import com.therealaleph.mhrv.CaInstall
 import com.therealaleph.mhrv.ConfigStore
 import com.therealaleph.mhrv.DEFAULT_SNI_POOL
+import com.therealaleph.mhrv.FrontingGroup
 import com.therealaleph.mhrv.MhrvConfig
 import com.therealaleph.mhrv.Mode
 import com.therealaleph.mhrv.Native
@@ -528,6 +529,17 @@ fun HomeScreen(
             // touch it should leave Rust's auto-expansion to handle it.
             CollapsibleSection(title = stringResource(R.string.sec_sni_pool_tester)) {
                 SniPoolEditor(
+                    cfg = cfg,
+                    onChange = ::persist,
+                )
+            }
+
+            // CDN fronting groups: collapsed by default. Surfaces the
+            // "discover front by hostname" flow that lets users add new
+            // CDN edges without hand-editing config.json. See
+            // docs/use-as-upstream.md for the underlying technique.
+            CollapsibleSection(title = stringResource(R.string.sec_fronting_groups)) {
+                FrontingGroupsEditor(
                     cfg = cfg,
                     onChange = ::persist,
                 )
@@ -1241,6 +1253,324 @@ private fun parseProbeResult(json: String?): ProbeState {
         }
     } catch (_: Throwable) {
         ProbeState.Err("bad json")
+    }
+}
+
+// =========================================================================
+// CDN fronting groups editor + discover-by-hostname.
+// =========================================================================
+
+/**
+ * Result of one "Discover front" call against `Native.discoverFront()`.
+ *
+ * `internal` rather than `private` so the JVM unit-test module under
+ * `app/src/test/` can reach in and assert against the parsed shape.
+ * The class is otherwise a UI-only ephemeral state container.
+ */
+internal sealed class DiscoverState {
+    object Idle : DiscoverState()
+    /** Probe is running. Kept so the UI can show "Discovering <hostname>…". */
+    data class InFlight(val hostname: String) : DiscoverState()
+    /** Top-level failure (bad input, DNS timeout, etc.). */
+    data class Error(val hostname: String, val message: String) : DiscoverState()
+    /** DNS resolved; per-IP probe results follow. */
+    data class Done(val hostname: String, val ips: List<DiscoveredIp>) : DiscoverState()
+}
+
+/** One probed IP from a `DiscoverState.Done`. `internal` for the same reason. */
+internal data class DiscoveredIp(
+    val ip: String,
+    val ok: Boolean,
+    val latencyMs: Int?,
+    val error: String?,
+)
+
+/**
+ * Parse the JSON blob returned by `Native.discoverFront()`. Shape is
+ * documented on the Native binding — `ok=true` rows carry `latencyMs`,
+ * `ok=false` rows carry `error`. Top-level `error` field means the
+ * resolve itself failed (bad input, DNS timeout); in that case `ips`
+ * is absent and we return Error.
+ *
+ * `internal` for testability (see DiscoverState).
+ */
+internal fun parseDiscoverResult(json: String?): DiscoverState {
+    if (json.isNullOrBlank()) {
+        return DiscoverState.Error("", "no response from native layer")
+    }
+    return try {
+        val obj = JSONObject(json)
+        val hostname = obj.optString("hostname", "")
+        val topErr = obj.optString("error", "")
+        if (topErr.isNotBlank()) {
+            return DiscoverState.Error(hostname, topErr)
+        }
+        val arr = obj.optJSONArray("ips") ?: return DiscoverState.Error(hostname, "no ips in response")
+        val ips = buildList {
+            for (i in 0 until arr.length()) {
+                val r = arr.optJSONObject(i) ?: continue
+                val ip = r.optString("ip", "")
+                if (ip.isBlank()) continue
+                val ok = r.optBoolean("ok", false)
+                val latency = if (r.has("latencyMs")) r.optInt("latencyMs") else null
+                val err = r.optString("error", "").takeIf { it.isNotBlank() }
+                add(DiscoveredIp(ip = ip, ok = ok, latencyMs = latency, error = err))
+            }
+        }
+        DiscoverState.Done(hostname, ips)
+    } catch (t: Throwable) {
+        DiscoverState.Error("", t.message ?: "parse failed")
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun FrontingGroupsEditor(
+    cfg: MhrvConfig,
+    onChange: (MhrvConfig) -> Unit,
+) {
+    val scope = rememberCoroutineScope()
+    val ctx = LocalContext.current
+    var hostname by rememberSaveable { mutableStateOf("") }
+    var discover by remember { mutableStateOf<DiscoverState>(DiscoverState.Idle) }
+
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            stringResource(R.string.fronting_help),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        // Existing groups list — each row is name + ip via sni, a domains
+        // editor below, and a remove button. Persisted via onChange after
+        // every edit so a backgrounded app doesn't lose unsaved changes.
+        cfg.frontingGroups.forEachIndexed { idx, g ->
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(
+                        MaterialTheme.colorScheme.surfaceVariant,
+                        RoundedCornerShape(8.dp),
+                    )
+                    .padding(8.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        g.name,
+                        style = MaterialTheme.typography.titleSmall,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(
+                        onClick = {
+                            val next = cfg.frontingGroups.toMutableList().apply { removeAt(idx) }
+                            onChange(cfg.copy(frontingGroups = next))
+                        },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                    ) {
+                        Text(stringResource(R.string.btn_remove_group), color = ErrRed)
+                    }
+                }
+                Text(
+                    "${g.ip}  via  ${g.sni}",
+                    style = MaterialTheme.typography.labelSmall.copy(
+                        fontFamily = FontFamily.Monospace,
+                    ),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                // Draft warning: surface that Save will drop this group so
+                // the user doesn't think it'll persist. Matches the filter
+                // in ConfigStore.toJson().
+                val hasDomains = g.domains.any { it.isNotBlank() }
+                if (!hasDomains) {
+                    Text(
+                        stringResource(R.string.fronting_group_draft_warning),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = ErrRed,
+                    )
+                }
+                // Domains edited as one newline-separated text field. Split
+                // on every change so the persisted form stays canonical and
+                // the user can also paste a comma-separated list if they
+                // want — both separators are accepted on save.
+                var domainsText by remember(g.domains) {
+                    mutableStateOf(g.domains.joinToString("\n"))
+                }
+                OutlinedTextField(
+                    value = domainsText,
+                    onValueChange = { v ->
+                        domainsText = v
+                        val parsed = v.split('\n', ',')
+                            .map { it.trim() }
+                            .filter { it.isNotEmpty() }
+                        val next = cfg.frontingGroups.toMutableList().apply {
+                            this[idx] = g.copy(domains = parsed)
+                        }
+                        onChange(cfg.copy(frontingGroups = next))
+                    },
+                    placeholder = { Text(stringResource(R.string.fronting_hint_domains)) },
+                    modifier = Modifier.fillMaxWidth(),
+                    minLines = 2,
+                )
+                // CDN-edge mismatch warning: domains here are routed to
+                // g.ip with SNI=g.sni; misconfigured entries leak the
+                // inner Host to the wrong backend. See
+                // docs/fronting-groups.md.
+                Text(
+                    stringResource(R.string.fronting_edge_mismatch_warning),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = androidx.compose.ui.graphics.Color(0xFFDCB464),
+                )
+            }
+        }
+
+        // Discover-by-hostname row.
+        OutlinedTextField(
+            value = hostname,
+            onValueChange = { hostname = it },
+            label = { Text(stringResource(R.string.fronting_hint_hostname)) },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        val inFlight = discover is DiscoverState.InFlight
+        Button(
+            onClick = {
+                val h = hostname.trim()
+                if (h.isEmpty()) return@Button
+                discover = DiscoverState.InFlight(h)
+                scope.launch {
+                    val json = withContext(Dispatchers.IO) {
+                        runCatching { Native.discoverFront(h) }.getOrNull()
+                    }
+                    discover = parseDiscoverResult(json)
+                }
+            },
+            enabled = !inFlight && hostname.isNotBlank(),
+            modifier = Modifier.align(Alignment.End),
+        ) {
+            Text(
+                if (inFlight) stringResource(R.string.btn_discovering)
+                else stringResource(R.string.btn_discover),
+            )
+        }
+
+        // Discover result panel.
+        when (val s = discover) {
+            is DiscoverState.Idle -> Unit
+            is DiscoverState.InFlight -> {
+                Text(
+                    stringResource(R.string.fronting_discovering_fmt, s.hostname),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            is DiscoverState.Error -> {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        stringResource(R.string.fronting_result_error_fmt, s.hostname, s.message),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = ErrRed,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(
+                        onClick = { discover = DiscoverState.Idle },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                    ) { Text(stringResource(R.string.btn_dismiss)) }
+                }
+            }
+            is DiscoverState.Done -> {
+                val okCount = s.ips.count { it.ok }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        if (okCount > 0) {
+                            stringResource(
+                                R.string.fronting_result_ok_fmt,
+                                s.hostname,
+                                okCount,
+                                s.ips.size,
+                            )
+                        } else {
+                            stringResource(R.string.fronting_result_none_fmt, s.hostname)
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (okCount > 0) OkGreen else ErrRed,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(
+                        onClick = { discover = DiscoverState.Idle },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                    ) { Text(stringResource(R.string.btn_dismiss)) }
+                }
+                s.ips.forEach { r ->
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        val marker = if (r.ok) "✓" else "✗"
+                        val color = if (r.ok) OkGreen else ErrRed
+                        Text(marker, color = color)
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            r.ip,
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontFamily = FontFamily.Monospace,
+                            ),
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            when {
+                                r.ok && r.latencyMs != null ->
+                                    stringResource(R.string.fronting_latency_ms_fmt, r.latencyMs)
+                                else -> r.error ?: ""
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.weight(1f),
+                        )
+                        if (r.ok) {
+                            TextButton(
+                                onClick = {
+                                    // Pick a unique name to avoid log-line
+                                    // ambiguity (proxy_server warns on dup
+                                    // group names).
+                                    val base = s.hostname
+                                    val existing = cfg.frontingGroups.map { it.name }.toSet()
+                                    val name = if (base !in existing) base else {
+                                        var n = 2
+                                        var candidate = "$base-$n"
+                                        while (candidate in existing) {
+                                            n++
+                                            candidate = "$base-$n"
+                                        }
+                                        candidate
+                                    }
+                                    val next = cfg.frontingGroups + FrontingGroup(
+                                        name = name,
+                                        ip = r.ip,
+                                        sni = s.hostname,
+                                        domains = emptyList(),
+                                    )
+                                    onChange(cfg.copy(frontingGroups = next))
+                                    Toast.makeText(
+                                        ctx,
+                                        ctx.getString(R.string.fronting_group_added_fmt, s.hostname),
+                                        Toast.LENGTH_SHORT,
+                                    ).show()
+                                    hostname = ""
+                                    discover = DiscoverState.Idle
+                                },
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                            ) {
+                                Text(
+                                    stringResource(R.string.btn_add_as_group),
+                                    style = MaterialTheme.typography.labelSmall,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

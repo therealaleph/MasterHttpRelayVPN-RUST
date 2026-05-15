@@ -111,6 +111,31 @@ object Native {
     external fun statsJson(handle: Long): String
 
     /**
+     * Resolve `hostname` to its A/AAAA records and TLS-probe each
+     * resolved IP with `SNI=hostname`. Returns a JSON blob the UI
+     * can hand into a new fronting group without further parsing.
+     *
+     * Success shape:
+     * ```
+     * {"hostname":"python.org","ips":[
+     *   {"ip":"151.101.0.223","ok":true,"latencyMs":45},
+     *   {"ip":"...","ok":false,"error":"connect timeout"}
+     * ]}
+     * ```
+     *
+     * Failure shape (bad input, DNS timeout, etc.):
+     * ```
+     * {"hostname":"python.org","error":"dns: ..."}
+     * ```
+     *
+     * BLOCKS for up to ~15s in the worst case (3s DNS timeout +
+     * 3 probe waves of 4s each at 8-way concurrency over the
+     * 24-IP cap). Typical case for a healthy CDN is well under 1s.
+     * Always call from a background dispatcher.
+     */
+    external fun discoverFront(hostname: String): String
+
+    /**
      * Start tun2proxy via its CLI args C API (`tun2proxy_run_with_cli_args`).
      * Resolved at runtime via dlsym from libtun2proxy.so — no fork needed.
      *

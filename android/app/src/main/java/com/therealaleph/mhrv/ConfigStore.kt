@@ -77,6 +77,36 @@ enum class UiLang { AUTO, FA, EN }
  */
 enum class Mode { APPS_SCRIPT, DIRECT, FULL }
 
+/**
+ * One multi-edge fronting group. Mirrors the Rust-side `FrontingGroup`
+ * in [`src/config.rs`](../../../../../../src/config.rs).
+ *
+ * Tells the proxy: when a CONNECT to one of [domains] arrives, dial
+ * [ip]:443, send the TLS handshake with `SNI=`[sni], then forward the
+ * inner HTTP `Host` to that edge. Picking a benign edge-hosted [sni]
+ * lets DPI see only that hostname while the real target stays inside
+ * the encrypted tunnel.
+ */
+data class FrontingGroup(
+    /** Human-readable label used in log lines. Free-form. */
+    val name: String,
+    /** Edge IP to dial. Today a single IP per group. */
+    val ip: String,
+    /**
+     * SNI on the outbound TLS handshake. Must be served by the same
+     * edge as [domains] or the edge will refuse / 404. Auto-populated
+     * from the hostname the user typed when discovering via
+     * `Native.discoverFront`.
+     */
+    val sni: String,
+    /**
+     * Domains routed through this edge. Case-insensitive; an entry
+     * matches the host exactly OR as a dot-anchored suffix (entry
+     * `vercel.com` matches `app.vercel.com` too).
+     */
+    val domains: List<String>,
+)
+
 data class MhrvConfig(
     val mode: Mode = Mode.APPS_SCRIPT,
 
@@ -161,6 +191,14 @@ data class MhrvConfig(
 
     /** UI language toggle. Non-Rust; honoured only by the Android wrapper. */
     val uiLang: UiLang = UiLang.AUTO,
+
+    /**
+     * Multi-edge fronting groups. Each group routes a list of target
+     * domains via a chosen CDN edge IP + SNI. See [FrontingGroup] and
+     * `src/config.rs` for semantics. Today populated from the in-app
+     * "Discover front by hostname" flow.
+     */
+    val frontingGroups: List<FrontingGroup> = emptyList(),
 ) {
     /**
      * Extract just the deployment ID from either a full
@@ -257,6 +295,41 @@ data class MhrvConfig(
             // who need it can do that on the desktop UI and paste the IP.
             put("fetch_ips_from_api", false)
             put("max_ips_to_scan", 20)
+
+            // Fronting groups: the snake_case JSON shape must match the
+            // Rust-side `FrontingGroup` serde format exactly, otherwise
+            // the proxy will refuse to start with "missing field". The
+            // `domains` array is trimmed/de-duped at write time so a
+            // user pasting messy input doesn't poison the persisted
+            // form.
+            //
+            // Drop draft groups (no domains yet) at save time:
+            // `Config::validate()` in src/config.rs rejects empty
+            // `domains` lists with a hard error, so persisting them
+            // would make Native.startProxy() return 0. The UI keeps
+            // them visible so the user can still fill in domains;
+            // they survive into the saved file only once non-empty.
+            val savableGroups = frontingGroups.mapNotNull { g ->
+                val cleaned = g.domains
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() }
+                    .distinct()
+                if (cleaned.isEmpty()) null else g.copy(domains = cleaned)
+            }
+            if (savableGroups.isNotEmpty()) {
+                put("fronting_groups", JSONArray().apply {
+                    savableGroups.forEach { g ->
+                        put(JSONObject().apply {
+                            put("name", g.name)
+                            put("ip", g.ip)
+                            put("sni", g.sni)
+                            put("domains", JSONArray().apply {
+                                g.domains.forEach { put(it) }
+                            })
+                        })
+                    }
+                })
+            }
 
             // Android-only: surfaced in the UI dropdown. The Rust side
             // doesn't read this key (serde ignores unknown fields), which
@@ -355,6 +428,30 @@ object ConfigStore {
             .distinct()
         if (cleanBypassDohHosts.isNotEmpty()) {
             obj.put("bypass_doh_hosts", JSONArray().apply { cleanBypassDohHosts.forEach { put(it) } })
+        }
+        // Fronting groups: include only fully-populated entries so the QR
+        // receiver doesn't import drafts that the proxy would refuse to
+        // load. Same drop-empty-domains rule as toJson(). Domains are
+        // trimmed + de-duped here so a sharer with messy input doesn't
+        // push that mess across devices.
+        val savableGroups = cfg.frontingGroups.mapNotNull { g ->
+            val cleaned = g.domains
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+                .distinct()
+            if (cleaned.isEmpty()) null else g.copy(domains = cleaned)
+        }
+        if (savableGroups.isNotEmpty()) {
+            obj.put("fronting_groups", JSONArray().apply {
+                savableGroups.forEach { g ->
+                    put(JSONObject().apply {
+                        put("name", g.name)
+                        put("ip", g.ip)
+                        put("sni", g.sni)
+                        put("domains", JSONArray().apply { g.domains.forEach { put(it) } })
+                    })
+                }
+            })
         }
 
         // Compress with DEFLATE then base64.
@@ -476,6 +573,25 @@ object ConfigStore {
                 "en" -> UiLang.EN
                 else -> UiLang.AUTO
             },
+            frontingGroups = obj.optJSONArray("fronting_groups")?.let { arr ->
+                buildList {
+                    for (i in 0 until arr.length()) {
+                        val g = arr.optJSONObject(i) ?: continue
+                        val name = g.optString("name", "").trim()
+                        val ip = g.optString("ip", "").trim()
+                        val sni = g.optString("sni", "").trim()
+                        if (name.isEmpty() || ip.isEmpty() || sni.isEmpty()) continue
+                        val domains = g.optJSONArray("domains")?.let { dArr ->
+                            buildList<String> {
+                                for (j in 0 until dArr.length()) {
+                                    add(dArr.optString(j))
+                                }
+                            }
+                        }?.filter { it.isNotBlank() }.orEmpty()
+                        add(FrontingGroup(name = name, ip = ip, sni = sni, domains = domains))
+                    }
+                }
+            }.orEmpty(),
         )
     }
 }

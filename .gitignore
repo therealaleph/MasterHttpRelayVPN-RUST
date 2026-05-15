@@ -4,3 +4,4 @@
 /config.json
 .DS_Store
 /SCR-*.png
+.claude/
