@@ -3037,6 +3037,12 @@ impl DomainFronter {
             let end = text.rfind('}').ok_or_else(|| {
                 FronterError::BadResponse("no json end in tunnel response".into())
             })?;
+            if start > end {
+                return Err(FronterError::BadResponse(format!(
+                    "no valid json object in: {}",
+                    &text.chars().take(200).collect::<String>()
+                )));
+            }
             &text[start..=end]
         };
         Ok(serde_json::from_str(json_str)?)
@@ -3205,6 +3211,12 @@ impl DomainFronter {
             let end = text.rfind('}').ok_or_else(|| {
                 FronterError::BadResponse("no json end in batch response".into())
             })?;
+            if start > end {
+                return Err(FronterError::BadResponse(format!(
+                    "no valid json object in: {}",
+                    &text.chars().take(200).collect::<String>()
+                )));
+            }
             &text[start..=end]
         };
         // Don't log payload content. Batch responses carry base64-encoded
@@ -4574,6 +4586,12 @@ fn parse_relay_json(body: &[u8]) -> Result<Vec<u8>, FronterError> {
                         &text[..text.len().min(200)]
                     ))
                 })?;
+                if start > end {
+                    return Err(FronterError::BadResponse(format!(
+                        "no valid json object in: {}",
+                        &text.chars().take(200).collect::<String>()
+                    )));
+                }
                 serde_json::from_str(&text[start..=end])?
             }
         }
