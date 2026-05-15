@@ -2685,15 +2685,7 @@ impl DomainFronter {
         let app_body = self
             .send_prebuilt_payload_through_relay(outer_payload)
             .await?;
-
-        // temporary diagnostics for exit-node response debugging.
-        // Logs the raw app_body before parse_exit_node_response() is called.
-        tracing::debug!(
-            "EXIT_DIAG app_body len={} first_200={:?}",
-            app_body.len(),
-            String::from_utf8_lossy(&app_body[..app_body.len().min(200)])
-        );
-
+         
         let result = parse_exit_node_response(&app_body);
         result
     }
