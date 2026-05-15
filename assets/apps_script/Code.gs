@@ -161,6 +161,9 @@ function _doSingle(req) {
     return _json({ e: "bad url" });
   }
 
+  // ── Optional cache path ────────────────────────────────
+  // Only entered when CACHE_SPREADSHEET_ID is configured and
+  // the request qualifies as a public, cachable GET.
   if (_canUseCache(req)) {
     var cached = _getFromCache(req.u, req.h);
     if (cached) {
@@ -181,25 +184,41 @@ function _doSingle(req) {
         cached: false,
       });
     }
-    // _fetchAndCache returned null → fall through to normal relay
+    // If _fetchAndCache returns null (spreadsheet unavailable),
+    // fall through to the normal relay path below.
   }
 
-  var opts = _buildOpts(req);
-  var resp = UrlFetchApp.fetch(req.u, opts);
+  // ── Normal relay (cache disabled or unavailable) ────────
+  // Wrap the fetch + body encode in try/catch so any failure surfaces as
+  // a JSON error envelope the Rust client can parse. Without this, throws
+  // from UrlFetchApp.fetch (URL too long, payload too large, quota
+  // exhausted, 6-minute execution timeout) or from base64Encode (response
+  // body near Apps Script's ~50 MB ceiling can blow the V8 heap during
+  // encode) propagate unhandled, and Apps Script serves its default
+  // `<title>Web App</title>` HTML error page — which the client then
+  // reports as "Relay failed: bad response: no json in: <title>Web App>..."
+  // and the user has no signal as to the actual cause. Mirrors the
+  // per-item try/catch in _doBatch below.
+  try {
+    var opts = _buildOpts(req);
+    var resp = UrlFetchApp.fetch(req.u, opts);
 
-  // Raw-return mode for exit-node path.
-  // r:true = return destination body verbatim so Rust gets {s,h,b} unwrapped.
-  if (req.r === true) {
-    return ContentService
-      .createTextOutput(resp.getContentText())
-      .setMimeType(ContentService.MimeType.JSON);
+    // Raw-return mode for exit-node path.
+    // r:true = return destination body verbatim so Rust gets {s,h,b} unwrapped.
+    if (req.r === true) {
+      return ContentService
+        .createTextOutput(resp.getContentText())
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+
+    return _json({
+      s: resp.getResponseCode(),
+      h: _respHeaders(resp),
+      b: Utilities.base64Encode(resp.getContent()),
+    });
+  } catch (err) {
+    return _json({ e: "fetch failed: " + String(err) });
   }
-
-  return _json({
-    s: resp.getResponseCode(),
-    h: _respHeaders(resp),
-    b: Utilities.base64Encode(resp.getContent()),
-  });
 }
 
 // ── Batch Request ──────────────────────────────────────────

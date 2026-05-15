@@ -2686,14 +2686,15 @@ impl DomainFronter {
             .send_prebuilt_payload_through_relay(outer_payload)
             .await?;
 
-        tracing::warn!(
+        // temporary diagnostics for exit-node response debugging.
+        // Logs the raw app_body before parse_exit_node_response() is called.
+        tracing::debug!(
             "EXIT_DIAG app_body len={} first_200={:?}",
             app_body.len(),
             String::from_utf8_lossy(&app_body[..app_body.len().min(200)])
         );
 
         let result = parse_exit_node_response(&app_body);
-        tracing::warn!("EXIT_DIAG parse_result ok={}", result.is_ok());
         result
     }
 
@@ -3969,7 +3970,7 @@ fn unix_to_ymd_utc(secs: u64) -> (i64, u32, u32) {
 fn parse_exit_node_response(body: &[u8]) -> Result<Vec<u8>, FronterError> {
     let json_start = body
         .windows(4)
-        .position(|w| w == b"\r\n\r\n") 
+        .position(|w| w == b"\r\n\r\n")
         .map(|i| i + 4)
         .unwrap_or(0);
     let json_bytes = &body[json_start..];
