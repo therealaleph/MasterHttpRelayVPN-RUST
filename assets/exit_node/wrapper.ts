@@ -36,7 +36,22 @@
 // secret. The wrapper imports the handler from exit_node.ts directly,
 // so changing the constant in exit_node.ts is all you need.
 
-import handler from "./exit_node.ts";
+import exitNode from "./exit_node.ts";
+
+const handler =
+  typeof exitNode === "function" ? exitNode : exitNode.fetch.bind(exitNode);
+
+function concatChunks(chunks: Uint8Array[]): Blob | undefined {
+  if (!chunks.length) return undefined;
+  const len = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const out = new Uint8Array(len);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return new Blob([out.buffer as ArrayBuffer]);
+}
 
 // Deno (preferred)
 if (typeof (globalThis as any).Deno !== "undefined") {
@@ -94,7 +109,7 @@ else if (typeof (globalThis as any).process !== "undefined") {
     // Build a web-standard Request from Node's IncomingMessage.
     const chunks: Uint8Array[] = [];
     for await (const c of req) chunks.push(c as Uint8Array);
-    const body = chunks.length ? Buffer.concat(chunks) : undefined;
+    const body = concatChunks(chunks);
 
     const url = `http://${req.headers.host ?? hostname}${req.url ?? "/"}`;
     const webReq = new Request(url, {
