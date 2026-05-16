@@ -41,7 +41,7 @@ impl Mode {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum ScriptId {
     One(String),
@@ -661,6 +661,159 @@ impl Config {
         }
         Vec::new()
     }
+}
+
+// TOML intermediate structs
+//
+// The flat `Config` struct and all its callers are unchanged. These structs
+// only exist inside Config::load_toml and the JSON->TOML migration writer.
+// Both paths produce a flat Config in the end via From<TomlConfig>.
+
+/// [relay] section of config.toml.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TomlRelay {
+    pub mode: String,
+    #[serde(default)]
+    pub script_id: Option<ScriptId>,
+    #[serde(default)]
+    pub script_ids: Option<ScriptId>,
+    #[serde(default)]
+    pub auth_key: String,
+    #[serde(default)]
+    pub parallel_relay: u8,
+    #[serde(default)]
+    pub enable_batching: bool,
+    #[serde(default)]
+    pub coalesce_step_ms: u16,
+    #[serde(default)]
+    pub coalesce_max_ms: u16,
+    #[serde(default)]
+    pub youtube_via_relay: bool,
+    #[serde(default)]
+    pub normalize_x_graphql: bool,
+    #[serde(default)]
+    pub disable_padding: bool,
+    #[serde(default)]
+    pub force_http1: bool,
+    #[serde(default = "default_auto_blacklist_strikes")]
+    pub auto_blacklist_strikes: u32,
+    #[serde(default = "default_auto_blacklist_window_secs")]
+    pub auto_blacklist_window_secs: u64,
+    #[serde(default = "default_auto_blacklist_cooldown_secs")]
+    pub auto_blacklist_cooldown_secs: u64,
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+}
+
+/// [network] section of config.toml.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TomlNetwork {
+    #[serde(default = "default_google_ip")]
+    pub google_ip: String,
+    #[serde(default = "default_front_domain")]
+    pub front_domain: String,
+    #[serde(default = "default_listen_host")]
+    pub listen_host: String,
+    #[serde(default = "default_listen_port")]
+    pub listen_port: u16,
+    #[serde(default)]
+    pub socks5_port: Option<u16>,
+    #[serde(default = "default_verify_ssl")]
+    pub verify_ssl: bool,
+    #[serde(default)]
+    pub upstream_socks5: Option<String>,
+    #[serde(default = "default_block_quic")]
+    pub block_quic: bool,
+    #[serde(default = "default_block_stun")]
+    pub block_stun: bool,
+    #[serde(default)]
+    pub sni_hosts: Option<Vec<String>>,
+    #[serde(default)]
+    pub passthrough_hosts: Vec<String>,
+    #[serde(default = "default_tunnel_doh")]
+    pub tunnel_doh: bool,
+    #[serde(default = "default_block_doh")]
+    pub block_doh: bool,
+    #[serde(default)]
+    pub bypass_doh_hosts: Vec<String>,
+    #[serde(default)]
+    pub hosts: HashMap<String, String>,
+}
+
+impl Default for TomlNetwork {
+    fn default() -> Self {
+        Self {
+            google_ip: default_google_ip(),
+            front_domain: default_front_domain(),
+            listen_host: default_listen_host(),
+            listen_port: default_listen_port(),
+            socks5_port: None,
+            verify_ssl: default_verify_ssl(),
+            upstream_socks5: None,
+            block_quic: default_block_quic(),
+            block_stun: default_block_stun(),
+            sni_hosts: None,
+            passthrough_hosts: Vec::new(),
+            tunnel_doh: default_tunnel_doh(),
+            block_doh: default_block_doh(),
+            bypass_doh_hosts: Vec::new(),
+            hosts: HashMap::new(),
+        }
+    }
+}
+
+/// [scan] section of config.toml.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TomlScan {
+    #[serde(default = "default_fetch_ips_from_api")]
+    pub fetch_ips_from_api: bool,
+    #[serde(default = "default_max_ips_to_scan")]
+    pub max_ips_to_scan: usize,
+    #[serde(default = "default_scan_batch_size")]
+    pub scan_batch_size: usize,
+    #[serde(default = "default_google_ip_validation")]
+    pub google_ip_validation: bool,
+}
+
+impl Default for TomlScan {
+    fn default() -> Self {
+        Self {
+            fetch_ips_from_api: default_fetch_ips_from_api(),
+            max_ips_to_scan: default_max_ips_to_scan(),
+            scan_batch_size: default_scan_batch_size(),
+            google_ip_validation: default_google_ip_validation(),
+        }
+    }
+}
+
+/// [logging] section of config.toml.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TomlLogging {
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
+}
+
+impl Default for TomlLogging {
+    fn default() -> Self {
+        Self { log_level: default_log_level() }
+    }
+}
+
+/// Root config.toml document. Deserialized first, then flattened into
+/// `Config` via `From<TomlConfig>` so the rest of the codebase is untouched.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct TomlConfig {
+    pub relay: TomlRelay,
+    #[serde(default)]
+    pub network: TomlNetwork,
+    #[serde(default)]
+    pub scan: TomlScan,
+    #[serde(default)]
+    pub logging: TomlLogging,
+    #[serde(default)]
+    pub exit_node: ExitNodeConfig,
+    #[serde(default)]
+    pub fronting_groups: Vec<FrontingGroup>,
 }
 
 #[cfg(test)]
