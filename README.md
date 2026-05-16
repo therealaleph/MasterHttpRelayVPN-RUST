@@ -12,7 +12,6 @@
 🇬🇧 [English Quick Start](#quick-start) · [Full Guide (advanced topics)](docs/guide.md)
 🇮🇷 [راه‌اندازی سریع فارسی](#راه‌اندازی-سریع) · [راهنمای کامل (مباحث پیشرفته)](docs/guide.fa.md)
 
-**Community helper (Chrome, optional):** [`github.com/ardalan-ab/mhrv-helper-extension`](https://github.com/ardalan-ab/mhrv-helper-extension) — maintained by [@ardalan-ab](https://github.com/ardalan-ab). Extension docs: [README (English)](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/README.md) · [README (فارسی)](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/README.fa.md). Usage: [HOW_TO_USE.md](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/HOW_TO_USE.md) · [HOW_TO_USE.fa.md](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/HOW_TO_USE.fa.md).
 
 <p align="center" dir="rtl">
   ۱. <a href="https://www.youtube.com/watch?v=voCwxgvWR5U" target="_blank" rel="noopener noreferrer">راهنمای تصویری راه اندازی به زبان فارسی</a> (YouTube)
@@ -29,12 +28,6 @@
 - ⚡ **One small file** (~3 MB), no Python, no Node.js, no dependencies
 - 🖥️ **Works on** Mac, Windows, Linux, Android, OpenWRT routers
 - 🦊 **Any browser or app** that supports HTTP proxy or SOCKS5
-
-## Community helpers
-
-Third-party tools are not required to run mhrv-rs; they are listed here for convenience.
-
-- **[mhrv-helper-extension](https://github.com/ardalan-ab/mhrv-helper-extension)** — Chrome extension (Manifest V3) maintained by **[ardalan-ab](https://github.com/ardalan-ab)**. It helps with Apps Script setup: generate an `AUTH_KEY`, fetch or fall back to canonical `Code.gs`, and copy a `config.json` snippet. **Repository:** `https://github.com/ardalan-ab/mhrv-helper-extension` — [README (English)](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/README.md) · [README (فارسی)](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/README.fa.md) — [How to use (English)](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/HOW_TO_USE.md) · [راهنمای استفاده (فارسی)](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/HOW_TO_USE.fa.md).
 
 ## How it works (the simple picture)
 
@@ -156,6 +149,12 @@ If something doesn't work:
 
 ---
 
+## Community helpers
+
+Third-party tools are not required to run mhrv-rs; they are listed here for convenience.
+
+- **[mhrv-helper-extension](https://github.com/ardalan-ab/mhrv-helper-extension)** — Chrome extension (Manifest V3) maintained by **[ardalan-ab](https://github.com/ardalan-ab)**. It helps with Apps Script setup: generate an `AUTH_KEY`, fetch or fall back to canonical `Code.gs`, and copy a `config.json` snippet. **Repository:** `https://github.com/ardalan-ab/mhrv-helper-extension` — [README (English)](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/README.md) · [README (فارسی)](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/README.fa.md) — [How to use (English)](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/HOW_TO_USE.md) · [راهنمای استفاده (فارسی)](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/HOW_TO_USE.fa.md).
+
 ## Common questions
 
 **Is this really free?** Yes. Google gives every account 20,000 outbound URL fetches per day on the free tier. That's plenty for one person's normal browsing. For a family of 3–4 sharing the same setup, make 2–3 deployments in different Google accounts and add all the IDs.
@@ -200,8 +199,6 @@ Most of the Rust code in this port was written with [Anthropic's Claude](https:/
 🇬🇧 [English Quick Start](#quick-start) · [Full Guide (advanced)](docs/guide.md)
 🇮🇷 [راه‌اندازی سریع](#راه‌اندازی-سریع) · [راهنمای کامل (پیشرفته)](docs/guide.fa.md)
 
-**ابزار جامعه (افزونهٔ کروم، اختیاری):** [`github.com/ardalan-ab/mhrv-helper-extension`](https://github.com/ardalan-ab/mhrv-helper-extension) — نگهداری [@ardalan-ab](https://github.com/ardalan-ab). مستندات افزونه: [README (فارسی)](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/README.fa.md) · [README (English)](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/README.md). راهنمای گام‌به‌گام: [HOW_TO_USE.fa.md](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/HOW_TO_USE.fa.md) · [HOW_TO_USE.md](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/HOW_TO_USE.md).
-
 ## چی به دست می‌آوری
 
 - 🌐 **عبور از DPI / مسدودسازی SNI** با لبهٔ گوگل به‌عنوان رله
@@ -210,13 +207,7 @@ Most of the Rust code in this port was written with [Anthropic's Claude](https:/
 - 🖥️ **روی** مک، ویندوز، لینوکس، اندروید، روتر OpenWRT کار می‌کند
 - 🦊 **هر مرورگر یا برنامه‌ای** که از HTTP proxy یا SOCKS5 پشتیبانی کند
 
-## ابزارهای جامعه
 
-برای اجرای mhrv-rs به این ابزارها نیاز نیست؛ فقط برای راحتی اینجا آمده‌اند.
-- افزونهٔ [mhrv-helper-extension](https://github.com/ardalan-ab/mhrv-helper-extension) — کروم (Manifest V3) با نگهداری [ardalan-ab](https://github.com/ardalan-ab) برای کمک در راه‌اندازی Apps Script: تولید AUTH_KEY، گرفتن یا fallback به Code.gs رسمی، و کپی قطعهٔ config.json.
-- مخزن: https://github.com/ardalan-ab/mhrv-helper-extension
-- خواندن [README (فارسی)](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/README.fa.md) · [README (English)](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/README.md)
-- راهنمای [استفاده (فارسی)](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/HOW_TO_USE.fa.md) · [How to use (English)](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/HOW_TO_USE.md)
 ## چطور کار می‌کند (تصویر ساده)
 
 ```
@@ -336,6 +327,14 @@ System Settings → Network → Wi-Fi → Details → **Proxies** → هر دو 
 - بخش [سؤالات رایج](#سؤالات-رایج) پایین را ببین
 
 ---
+## ابزارهای جامعه
+
+برای اجرای mhrv-rs به این ابزارها نیاز نیست؛ فقط برای راحتی اینجا آمده‌اند.
+- افزونهٔ [mhrv-helper-extension](https://github.com/ardalan-ab/mhrv-helper-extension) — کروم (Manifest V3) با نگهداری [ardalan-ab](https://github.com/ardalan-ab) برای کمک در راه‌اندازی Apps Script: تولید AUTH_KEY، گرفتن یا fallback به Code.gs رسمی، و کپی قطعهٔ config.json.
+- مخزن: https://github.com/ardalan-ab/mhrv-helper-extension
+- خواندن [README (فارسی)](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/README.fa.md) · [README (English)](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/README.md)
+- راهنمای [استفاده (فارسی)](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/HOW_TO_USE.fa.md) · [How to use (English)](https://github.com/ardalan-ab/mhrv-helper-extension/blob/main/HOW_TO_USE.md)
+
 
 ## سؤالات رایج
 
