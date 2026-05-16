@@ -1154,8 +1154,9 @@ async fn handle_batch(
                 let (data, eof) = drain_now(inner, remaining_budget.saturating_sub(all_data.len())).await;
                 if eof { final_eof = true; }
                 if data.is_empty() { break; }
+                let hit_session_cap = data.len() >= TCP_DRAIN_MAX_BYTES;
                 all_data.extend_from_slice(&data);
-                if final_eof || all_data.len() >= remaining_budget { break; }
+                if final_eof || hit_session_cap || all_data.len() >= remaining_budget { break; }
                 if Instant::now() >= drain_deadline { break; }
                 // Brief yield to let reader_task finish its current read
                 tokio::task::yield_now().await;
@@ -1813,6 +1814,8 @@ mod tests {
             eof: AtomicBool::new(false),
             last_active: Mutex::new(Instant::now()),
             notify: Notify::new(),
+            next_write_seq: Mutex::new(None),
+            pending_writes: Mutex::new(std::collections::BTreeMap::new()),
         })
     }
 
@@ -2064,6 +2067,8 @@ mod tests {
             eof: AtomicBool::new(false),
             last_active: Mutex::new(Instant::now()),
             notify: Notify::new(),
+            next_write_seq: Mutex::new(None),
+            pending_writes: Mutex::new(std::collections::BTreeMap::new()),
         });
         let _reader_handle = tokio::spawn(reader_task(reader, inner.clone()));
 

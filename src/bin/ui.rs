@@ -256,6 +256,10 @@ struct FormState {
     /// drop the user's setting. Not currently exposed as a UI control;
     /// users edit `block_quic` directly in `config.json` (Issue #213).
     block_quic: bool,
+    /// Round-tripped from config.json and exposed beside QUIC blocking.
+    /// Default true to push WebRTC apps toward TCP TURN instead of slow
+    /// UDP ICE retries.
+    block_stun: bool,
     /// Round-tripped from config.json. Not exposed as a UI control —
     /// users edit `disable_padding` directly when needed (Issue #391).
     /// Default false (padding active).
@@ -387,6 +391,7 @@ fn load_form() -> (FormState, Option<String>) {
             youtube_via_relay: c.youtube_via_relay,
             passthrough_hosts: c.passthrough_hosts.clone(),
             block_quic: c.block_quic,
+            block_stun: c.block_stun,
             disable_padding: c.disable_padding,
             force_http1: c.force_http1,
             tunnel_doh: c.tunnel_doh,
@@ -426,6 +431,7 @@ fn load_form() -> (FormState, Option<String>) {
             youtube_via_relay: false,
             passthrough_hosts: Vec::new(),
             block_quic: true,
+            block_stun: true,
             disable_padding: false,
             force_http1: false,
             tunnel_doh: true,
@@ -587,6 +593,7 @@ impl FormState {
             // control yet). Round-trip through the file so save
             // doesn't drop a user-set true.
             block_quic: self.block_quic,
+            block_stun: self.block_stun,
             // Issue #391: disable_padding is config-only for now.
             // Round-trip preserves the user's choice.
             disable_padding: self.disable_padding,
@@ -688,6 +695,9 @@ struct ConfigWire<'a> {
     /// emit only when the user has explicitly disabled the block.
     #[serde(skip_serializing_if = "is_true")]
     block_doh: bool,
+    /// Default true. Emit only when the user disables STUN/TURN blocking.
+    #[serde(skip_serializing_if = "is_true")]
+    block_stun: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     fronting_groups: &'a Vec<FrontingGroup>,
     /// Auto-blacklist tuning + batch timeout (#391, #444, #430). Skip
@@ -781,6 +791,7 @@ impl<'a> From<&'a Config> for ConfigWire<'a> {
             tunnel_doh: c.tunnel_doh,
             bypass_doh_hosts: &c.bypass_doh_hosts,
             block_doh: c.block_doh,
+            block_stun: c.block_stun,
             fronting_groups: &c.fronting_groups,
             auto_blacklist_strikes: c.auto_blacklist_strikes,
             auto_blacklist_window_secs: c.auto_blacklist_window_secs,
@@ -1272,6 +1283,15 @@ impl eframe::App for App {
                                  QUIC over the TCP-based tunnel causes TCP-over-TCP meltdown \
                                  (<1 Mbps). Browsers detect the drop and switch to TCP within seconds. \
                                  Issue #213, #793.",
+                            );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_space(120.0 + 8.0);
+                        ui.checkbox(&mut self.form.block_stun, "Block STUN/TURN UDP")
+                            .on_hover_text(
+                                "Drop WebRTC STUN/TURN UDP ports 3478, 5349, and 19302 so apps \
+                                 such as Meet, Discord, and WhatsApp move to TCP TURN instead of \
+                                 waiting on UDP ICE retries.",
                             );
                     });
                 });
