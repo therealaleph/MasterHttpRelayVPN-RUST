@@ -2685,10 +2685,9 @@ impl DomainFronter {
         let app_body = self
             .send_prebuilt_payload_through_relay(outer_payload)
             .await?;
-
-        // exit-node's JSON envelope: {s: u16, h: {...}, b: "<base64>"} on
-        // success, {e: "..."} on its own internal error.
-        parse_exit_node_response(&app_body)
+         
+        let result = parse_exit_node_response(&app_body);
+        result
     }
 
     /// Build the inner-layer payload that the exit node will execute.
@@ -3031,7 +3030,7 @@ impl DomainFronter {
             let start = text.find('{').ok_or_else(|| {
                 FronterError::BadResponse(format!(
                     "no json in tunnel response: {}",
-                    &text[..text.len().min(200)]
+                    &text.chars().take(200).collect::<String>()
                 ))
             })?;
             let end = text.rfind('}').ok_or_else(|| {
@@ -3199,7 +3198,7 @@ impl DomainFronter {
             let start = text.find('{').ok_or_else(|| {
                 FronterError::BadResponse(format!(
                     "no json in batch response: {}",
-                    &text[..text.len().min(200)]
+                    &text.chars().take(200).collect::<String>()
                 ))
             })?;
             let end = text.rfind('}').ok_or_else(|| {
@@ -3961,11 +3960,17 @@ fn unix_to_ymd_utc(secs: u64) -> (i64, u32, u32) {
 /// MITM TLS write-back path sees the same shape it gets from the regular
 /// Apps Script relay (status line + headers + body).
 fn parse_exit_node_response(body: &[u8]) -> Result<Vec<u8>, FronterError> {
-    let v: Value = serde_json::from_slice(body).map_err(|e| {
+    let json_start = body
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
+        .unwrap_or(0);
+    let json_bytes = &body[json_start..];
+    let v: Value = serde_json::from_slice(json_bytes).map_err(|e| {
         FronterError::Relay(format!(
             "exit-node response not valid JSON ({}): {}",
             e,
-            String::from_utf8_lossy(&body[..body.len().min(200)])
+            String::from_utf8_lossy(&json_bytes[..json_bytes.len().min(200)])
         ))
     })?;
 
@@ -4001,6 +4006,7 @@ fn parse_exit_node_response(body: &[u8]) -> Result<Vec<u8>, FronterError> {
         "transfer-encoding",
         "connection",
         "keep-alive",
+        "content-encoding", // exit node's fetch() auto-decompresses; header is stale
     ];
 
     let mut out = Vec::with_capacity(body_bytes.len() + 256);
@@ -4565,13 +4571,13 @@ fn parse_relay_json(body: &[u8]) -> Result<Vec<u8>, FronterError> {
                 let start = text.find('{').ok_or_else(|| {
                     FronterError::BadResponse(format!(
                         "no json in: {}",
-                        &text[..text.len().min(200)]
+                        &text.chars().take(200).collect::<String>()
                     ))
                 })?;
                 let end = text.rfind('}').ok_or_else(|| {
                     FronterError::BadResponse(format!(
                         "no json end in: {}",
-                        &text[..text.len().min(200)]
+                        &text.chars().take(200).collect::<String>()
                     ))
                 })?;
                 serde_json::from_str(&text[start..=end])?
