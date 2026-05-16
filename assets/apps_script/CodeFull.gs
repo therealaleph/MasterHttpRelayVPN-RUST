@@ -49,6 +49,9 @@ const SKIP_HEADERS = {
 // re-firing them.
 const SAFE_REPLAY_METHODS = { GET: 1, HEAD: 1, OPTIONS: 1 };
 
+// Compiled once to avoid re-parsing per request in the relay hot path.
+const URL_RE = /^https?:\/\//i;
+
 // HTML body for the bad-auth decoy. Mimics a minimal Apps Script-style
 // placeholder page — no proxy-shaped JSON, nothing distinctive enough
 // for a probe to fingerprint as a tunnel endpoint.
@@ -72,11 +75,15 @@ function _decoyOrError(jsonBody) {
 // does its own DoH lookup on a miss from inside Google's network.
 // Cache hits never reach the tunnel-node.
 //
-// Safety property: any failure (parse error, DoH unreachable,
-// CacheService error, refused qtype) returns null from _edgeDnsTry,
-// and the op falls through to the existing tunnel-node forward path.
-// Set false to disable and forward all DNS through the tunnel as
-// before.
+// Safety property: parse errors, refused qtypes, and "every DoH resolver
+// failed" return null from _edgeDnsResolve and the op falls through to
+// the existing tunnel-node forward path. CacheService failures (transient
+// quota, getAll exceptions, oversize keys) are softer: the per-batch
+// cache lookup is skipped and no put happens, but DoH still runs from
+// inside Google's network. The per-op outcome degrades to "uncached
+// forward via DoH" rather than "forwarded all the way to the tunnel-node".
+// Set ENABLE_EDGE_DNS_CACHE=false to disable the whole feature and route
+// all DNS through the tunnel as before.
 const ENABLE_EDGE_DNS_CACHE = true;
 
 // DoH endpoints tried in order on cache miss. All speak RFC 8484
@@ -96,8 +103,9 @@ const EDGE_DNS_MAX_TTL_S = 21600;   // 6h CacheService ceiling
 const EDGE_DNS_NEG_TTL_S = 45;
 const EDGE_DNS_CACHE_PREFIX = "edns:";
 // CacheService rejects keys longer than 250 chars. Names approaching the
-// 253-char DNS limit + prefix + qtype digits can exceed that, so we bail
-// before issuing the get/put. The op falls through to the tunnel-node.
+// 253-char DNS limit + prefix + qtype digits can exceed that, so keys
+// over this length get switched to a SHA-256-hashed form (see
+// _edgeDnsPrepare) rather than skipping the cache entirely.
 const EDGE_DNS_MAX_KEY_LEN = 240;
 
 // qtypes we refuse to cache and pass through to the tunnel-node:
@@ -183,6 +191,15 @@ function _doTunnel(req) {
 // Batch tunnel: forward all ops in one request to /tunnel/batch.
 // When ENABLE_EDGE_DNS_CACHE is true, udp_open/port=53 ops are served
 // locally where possible and only the remainder is forwarded.
+//
+// Edge-DNS resolution runs in two passes so the CacheService backend
+// is hit exactly once for the whole batch:
+//   pass 1: parse each candidate's question and collect cache keys
+//   one cache.getAll(keys) call serves every hit
+//   pass 2: resolve each candidate (cache hit → synth; miss → DoH; null
+//           → tunnel-node forward)
+// On a 5-DNS-query batch, this collapses 5 serial cache.get round trips
+// into one cache.getAll round trip.
 function _doTunnelBatch(req) {
   var ops = (req && req.ops) || [];
 
@@ -195,17 +212,57 @@ function _doTunnelBatch(req) {
   var forwardOps = [];
   var forwardIdx = [];
 
+  // Pass 1: route non-DNS ops to forward, parse DNS candidates.
+  var candidates = [];   // [{ i, prep }, ...]
   for (var i = 0; i < ops.length; i++) {
     var op = ops[i];
     if (op && op.op === "udp_open" && op.port === 53 && op.d) {
-      var synth = _edgeDnsTry(op);
-      if (synth) {
-        results[i] = synth;
+      var prep = _edgeDnsPrepare(op);
+      if (prep) {
+        candidates.push({ i: i, prep: prep });
         continue;
       }
     }
     forwardOps.push(op);
     forwardIdx.push(i);
+  }
+
+  // One batched cache lookup for every DNS candidate. CacheService.getAll
+  // returns a {key: value} map populated only for hits; missing keys are
+  // simply absent. Any failure (transient quota, backend hiccup) returns
+  // an empty map so each candidate falls through to its own DoH attempt
+  // with no cached put either — the safe degradation path.
+  var cacheMap = {};
+  var cache = null;
+  if (candidates.length > 0) {
+    try {
+      cache = CacheService.getScriptCache();
+      var keys = new Array(candidates.length);
+      for (var c = 0; c < candidates.length; c++) {
+        keys[c] = candidates[c].prep.key;
+      }
+      cacheMap = cache.getAll(keys) || {};
+    } catch (_) {
+      cacheMap = {};
+      cache = null;
+    }
+  }
+
+  // Pass 2: resolve each candidate. cacheMap doubles as the in-batch dedup
+  // table — a successful DoH writes its encoded reply back into cacheMap
+  // so a later candidate with the same qname/qtype hits without re-DoH.
+  // On null (cache miss + DoH all failed), append to the forward path so
+  // the tunnel-node still gets a chance.
+  for (var c = 0; c < candidates.length; c++) {
+    var cand = candidates[c];
+    var synth = _edgeDnsResolve(
+      cand.prep, cacheMap[cand.prep.key] || null, cache, cacheMap);
+    if (synth) {
+      results[cand.i] = synth;
+    } else {
+      forwardOps.push(ops[cand.i]);
+      forwardIdx.push(cand.i);
+    }
   }
 
   // All ops served locally — no tunnel-node round-trip.
@@ -279,7 +336,7 @@ function _spliceTunnelResults(forwardIdx, forwardedResults, allResults) {
 // ========================== HTTP relay mode ==========================
 
 function _doSingle(req) {
-  if (!req.u || typeof req.u !== "string" || !req.u.match(/^https?:\/\//i)) {
+  if (!req.u || typeof req.u !== "string" || !URL_RE.test(req.u)) {
     return _json({ e: "bad url" });
   }
   var opts = _buildOpts(req);
@@ -302,7 +359,7 @@ function _doBatch(items) {
       errorMap[i] = "bad item";
       continue;
     }
-    if (!item.u || typeof item.u !== "string" || !item.u.match(/^https?:\/\//i)) {
+    if (!item.u || typeof item.u !== "string" || !URL_RE.test(item.u)) {
       errorMap[i] = "bad url";
       continue;
     }
@@ -403,12 +460,20 @@ function _buildOpts(req) {
   return opts;
 }
 
+// Lazy module-level cache of the runtime feature check; reset between GAS
+// executions but reused across all responses inside a single execution
+// (batches of 50+ make this matter).
+var _hasGetAllHeaders = null;
+
 function _respHeaders(resp) {
-  try {
-    if (typeof resp.getAllHeaders === "function") {
+  if (_hasGetAllHeaders === null) {
+    _hasGetAllHeaders = (typeof resp.getAllHeaders === "function");
+  }
+  if (_hasGetAllHeaders) {
+    try {
       return resp.getAllHeaders();
-    }
-  } catch (err) {}
+    } catch (err) {}
+  }
   return resp.getHeaders();
 }
 
@@ -433,31 +498,54 @@ function _json(obj) {
 
 // ========================== Edge DNS helpers ==========================
 
-// Tries to serve a single udp_open DNS op from CacheService or DoH.
-// Returns a synthesized batch-result {sid, pkts, eof} on success, or null
-// on any failure / unsupported case so the caller can forward to the
-// tunnel-node. Null is the safe default — every error path returns null.
-function _edgeDnsTry(op) {
+// Phase-1 helper: parses a udp_open op into the data needed for both the
+// batched cache lookup and the eventual resolve. Returns {bytes, q, key}
+// on success, or null for unparseable/refused ops so the caller can route
+// them to the tunnel-node forward path.
+//
+// Long qnames that would exceed CacheService's 250-char key limit fall back
+// to a SHA-256-hashed key under a separate `edns:h:` namespace. The
+// 256-bit digest makes accidental collisions astronomically unlikely, and
+// the distinct namespace prevents short-name keys from colliding with
+// hashed long-name keys.
+function _edgeDnsPrepare(op) {
   try {
     var bytes = Utilities.base64Decode(op.d);
     if (!bytes || bytes.length < 12) return null;
-
     var q = _dnsParseQuestion(bytes);
     if (!q) return null;
     if (EDGE_DNS_REFUSE_QTYPES[q.qtype]) return null;
-
     var key = EDGE_DNS_CACHE_PREFIX + q.qtype + ":" + q.qname;
-    if (key.length > EDGE_DNS_MAX_KEY_LEN) return null;
-    var cache = CacheService.getScriptCache();
+    if (key.length > EDGE_DNS_MAX_KEY_LEN) {
+      key = EDGE_DNS_CACHE_PREFIX + "h:" + q.qtype + ":" + _sha256Hex(q.qname);
+    }
+    return { bytes: bytes, q: q, key: key };
+  } catch (_) {
+    return null;
+  }
+}
 
-    var stored = null;
-    try { stored = cache.get(key); } catch (_) {}
-    if (stored) {
+// Phase-2 helper: given a prepared op and an optional pre-fetched cache
+// value, returns a synthesized batch-result {sid, pkts, eof} on success,
+// or null on any failure so the caller can forward to the tunnel-node.
+//
+// `cache`    is the CacheService handle reused across the batch (or null
+//            if CacheService is unavailable, in which case DoH still runs
+//            but no put).
+// `localMap` is an optional in-batch lookup table (typically the same
+//            object returned by cache.getAll). When DoH succeeds, the
+//            encoded reply is written back to localMap[prep.key] so that
+//            a later candidate in the same batch with the same qname/qtype
+//            hits without a second DoH round-trip.
+function _edgeDnsResolve(prep, cachedReplyB64, cache, localMap) {
+  try {
+    if (cachedReplyB64) {
       try {
-        var hit = Utilities.base64Decode(stored);
+        var hit = Utilities.base64Decode(cachedReplyB64);
         if (hit && hit.length >= 12) {
-          // Rewrite txid to match this query (RFC 1035 §4.1.1).
-          var rewritten = _dnsRewriteTxid(hit, q.txid);
+          // Rewrite txid to match this query (RFC 1035 §4.1.1). Returns a
+          // copy so the cached bytes themselves are never mutated.
+          var rewritten = _dnsRewriteTxid(hit, prep.q.txid);
           return {
             sid: "edns-cache",
             pkts: [Utilities.base64Encode(rewritten)],
@@ -468,7 +556,7 @@ function _edgeDnsTry(op) {
     }
 
     for (var i = 0; i < EDGE_DNS_RESOLVERS.length; i++) {
-      var reply = _edgeDnsDoh(EDGE_DNS_RESOLVERS[i], bytes);
+      var reply = _edgeDnsDoh(EDGE_DNS_RESOLVERS[i], prep.bytes);
       if (!reply) continue;
 
       var rcode = reply[3] & 0x0F;
@@ -482,15 +570,24 @@ function _edgeDnsTry(op) {
         if (ttl > EDGE_DNS_MAX_TTL_S) ttl = EDGE_DNS_MAX_TTL_S;
       }
 
-      try {
-        cache.put(key, Utilities.base64Encode(reply), ttl);
-      } catch (_) {
-        // >100KB value or transient quota — still return the live answer.
+      // Encode once and reuse for both the persistent cache and the
+      // in-batch dedup map. The reply bytes carry the resolver-echoed
+      // txid; any future hit rewrites it to that request's txid.
+      var encoded = (cache || localMap) ? Utilities.base64Encode(reply) : null;
+      if (cache) {
+        try {
+          cache.put(prep.key, encoded, ttl);
+        } catch (_) {
+          // >100KB value or transient quota — still return the live answer.
+        }
+      }
+      if (localMap) {
+        localMap[prep.key] = encoded;
       }
 
       // The DoH reply already echoes our query's txid; rewrite defensively
       // in case a resolver mangles it.
-      var fixed = _dnsRewriteTxid(reply, q.txid);
+      var fixed = _dnsRewriteTxid(reply, prep.q.txid);
       return {
         sid: "edns-doh",
         pkts: [Utilities.base64Encode(fixed)],
@@ -501,6 +598,22 @@ function _edgeDnsTry(op) {
   } catch (err) {
     return null;
   }
+}
+
+// Hex-encodes the SHA-256 of a UTF-8 string. Used to keep long-qname cache
+// keys under CacheService's 250-char limit. 64 hex chars is well below the
+// cap and survives any future bumps to EDGE_DNS_MAX_KEY_LEN. SHA-256 over
+// MD5 here is just future-proofing — the hash isn't security-sensitive
+// (cache namespace only), but SHA-256 avoids any "why MD5?" discussion.
+function _sha256Hex(s) {
+  var d = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.SHA_256, s, Utilities.Charset.UTF_8);
+  var hex = "";
+  for (var i = 0; i < d.length; i++) {
+    var b = d[i] & 0xFF;
+    hex += (b < 16 ? "0" : "") + b.toString(16);
+  }
+  return hex;
 }
 
 // Single DoH GET against `url`. Returns the reply as a byte array, or null
@@ -623,6 +736,12 @@ function _dnsSkipName(bytes, off) {
 // big-endian 16-bit transaction id. Coerces to signed-byte range so the
 // result round-trips through Utilities.base64Encode regardless of whether
 // the runtime exposes bytes as signed Java int8 or unsigned JS numbers.
+//
+// Always copies — the cache-safety invariant (callers can hand in a buffer
+// they may reuse, e.g. a CacheService string round-tripped through decode)
+// is enforced here rather than via per-call-site reasoning. The copy is
+// cheap (~100 bytes for a typical DNS reply) compared to the surrounding
+// base64 encode/decode work.
 function _dnsRewriteTxid(bytes, txid) {
   var out = [];
   for (var i = 0; i < bytes.length; i++) out.push(bytes[i]);
