@@ -241,6 +241,7 @@ pub struct RewriteCtx {
     /// callers fall back to TCP/HTTPS. See config.rs `block_quic` for
     /// the trade-off. Issue #213.
     pub block_quic: bool,
+    pub block_stun: bool,
     /// If true, route DoH CONNECTs around the Apps Script tunnel via
     /// plain TCP. Default false via `Config::tunnel_doh = true` (flipped
     /// in v1.9.0, issue #468). See `DEFAULT_DOH_HOSTS` and
@@ -507,6 +508,7 @@ impl ProxyServer {
             youtube_via_relay: config.youtube_via_relay,
             passthrough_hosts: config.passthrough_hosts.clone(),
             block_quic: config.block_quic,
+            block_stun: config.block_stun,
             bypass_doh: !config.tunnel_doh,
             block_doh: config.block_doh,
             bypass_doh_hosts: config.bypass_doh_hosts.clone(),
@@ -938,6 +940,17 @@ async fn handle_socks5_client(
             sock.flush().await?;
             return Ok(());
         }
+    }
+
+    // Reject STUN/TURN UDP ports immediately so WebRTC (Meet,
+    // Telegram calls) skips UDP ICE candidates and falls back to
+    // TCP TURN on :443 without waiting for a timeout.
+    if rewrite_ctx.block_stun && matches!(port, 3478 | 5349 | 19302) {
+        tracing::info!("SOCKS5 CONNECT -> {}:{} (STUN/TURN blocked, forcing TCP fallback)", host, port);
+        sock.write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await?;
+        sock.flush().await?;
+        return Ok(());
     }
 
     tracing::info!("SOCKS5 CONNECT -> {}:{}", host, port);

@@ -491,6 +491,7 @@ fun HomeScreen(
             // client-side estimate only sees what this device relayed,
             // not what other devices on the same deployment consumed.
             UsageTodayCard()
+            PipelineDebugCard()
 
             CollapsibleSection(title = stringResource(R.string.sec_live_logs), initiallyExpanded = false) {
                 LiveLogPane()
@@ -1287,6 +1288,28 @@ private fun AdvancedSettings(
             )
         }
 
+        // Block STUN/TURN toggle
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    "Block STUN/TURN",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Text(
+                    "Reject STUN/TURN ports (3478/5349/19302). Forces WebRTC apps (Meet, WhatsApp) to TCP fallback — instant connect.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Switch(
+                checked = cfg.blockStun,
+                onCheckedChange = { onChange(cfg.copy(blockStun = it)) },
+            )
+        }
+
         // Block DoH toggle
         Row(
             verticalAlignment = Alignment.CenterVertically,
@@ -1642,6 +1665,104 @@ private fun UsageRow(label: String, value: String) {
             style = MaterialTheme.typography.bodyMedium,
             fontFamily = FontFamily.Monospace,
         )
+    }
+}
+
+@Composable
+private fun PipelineDebugCard() {
+    val isRunning by VpnState.isRunning.collectAsState()
+    if (!isRunning) return
+
+    var json by remember { mutableStateOf("") }
+    LaunchedEffect(isRunning) {
+        if (!isRunning) return@LaunchedEffect
+        while (true) {
+            val result = withContext(Dispatchers.IO) {
+                runCatching { Native.pipelineDebugJson() }
+            }
+            json = result.getOrDefault("")
+            if (result.isFailure) {
+                android.util.Log.e("PipeDbg", "pipelineDebugJson failed", result.exceptionOrNull())
+            }
+            delay(500)
+        }
+    }
+
+    val obj = remember(json) {
+        if (json.isBlank()) null
+        else runCatching { JSONObject(json) }.getOrNull()
+    }
+    if (obj == null) return
+
+    val elevated = obj.optInt("elevated", 0)
+    val maxElevated = obj.optInt("max_elevated", 0)
+    val batches = obj.optInt("active_batches", 0)
+    val maxBatches = obj.optInt("max_batch_slots", 0)
+    val events = remember(json) {
+        val arr = obj.optJSONArray("events") ?: return@remember emptyList<String>()
+        (0 until arr.length()).map { arr.getString(it) }
+    }
+
+    Spacer(Modifier.height(8.dp))
+    ElevatedCard(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Text(
+                "Pipeline Debug",
+                style = MaterialTheme.typography.titleSmall,
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text("Elevated", style = MaterialTheme.typography.bodySmall)
+                Text(
+                    "$elevated / $maxElevated",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                )
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text("Batches in-flight", style = MaterialTheme.typography.bodySmall)
+                Text(
+                    "$batches / $maxBatches",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                )
+            }
+            if (events.isNotEmpty()) {
+                Spacer(Modifier.height(4.dp))
+                Text("Events", style = MaterialTheme.typography.labelSmall)
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 150.dp)
+                        .clip(RoundedCornerShape(4.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant)
+                        .padding(6.dp)
+                ) {
+                    val listState = rememberLazyListState()
+                    LaunchedEffect(events.size) {
+                        if (events.isNotEmpty()) listState.animateScrollToItem(events.size - 1)
+                    }
+                    LazyColumn(state = listState) {
+                        items(events) { ev ->
+                            Text(
+                                ev,
+                                style = MaterialTheme.typography.bodySmall,
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 10.sp,
+                            )
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

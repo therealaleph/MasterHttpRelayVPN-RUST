@@ -514,6 +514,8 @@ pub struct TunnelResponse {
     /// `e` only when this is `None` and compatibility is needed.
     #[serde(default)]
     pub code: Option<String>,
+    #[serde(default)]
+    pub seq: Option<u64>,
 }
 
 /// A single op in a batch tunnel request.
@@ -528,6 +530,10 @@ pub struct BatchOp {
     pub port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub d: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wseq: Option<u64>,
 }
 
 /// Batch tunnel response from Apps Script / tunnel node.

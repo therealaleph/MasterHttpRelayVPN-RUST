@@ -199,7 +199,7 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_startProxy(
         // Try to build the runtime first — if allocation fails we want to
         // know before spinning up anything stateful.
         let rt = match tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(4)
             .enable_all()
             .thread_name("mhrv-worker")
             .build()
@@ -479,6 +479,20 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_statsJson<'a>(
             return String::new();
         };
         f.snapshot_stats().to_json()
+    }));
+    env.new_string(out).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+/// `Native.pipelineDebugJson()` -> String. Snapshot of pipeline debug state:
+/// elevated session count, batch semaphore usage, recent ramp/drop events.
+/// Temporary — for the debug overlay.
+#[no_mangle]
+pub extern "system" fn Java_com_therealaleph_mhrv_Native_pipelineDebugJson<'a>(
+    env: JNIEnv<'a>,
+    _class: JClass,
+) -> jstring {
+    let out = safe(String::new(), AssertUnwindSafe(|| {
+        crate::tunnel_client::pipeline_debug::to_json()
     }));
     env.new_string(out).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }

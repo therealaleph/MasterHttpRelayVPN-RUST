@@ -71,7 +71,7 @@ const STRAGGLER_SETTLE_MAX: Duration = Duration::from_millis(1000);
 /// `BATCH_TIMEOUT` (30 s) and Apps Script's UrlFetch ceiling (~60 s).
 /// Tested on censored networks in Iran where users reported smoother
 /// Telegram video playback and fewer session resets at this value.
-const LONGPOLL_DEADLINE: Duration = Duration::from_secs(15);
+const LONGPOLL_DEADLINE: Duration = Duration::from_secs(4);
 
 /// Bound on each UDP session's inbound queue. Beyond this we drop oldest
 /// to keep recent voice/media packets moving — a stale RTP frame is
@@ -153,6 +153,11 @@ struct SessionInner {
     /// to wake the drain phase as soon as any session has something to
     /// ship, replacing the old fixed-sleep heuristic.
     notify: Notify,
+    /// Sequence-ordered write buffer: pipelined data ops may arrive
+    /// out of order (different batches completing at different times).
+    /// We buffer out-of-order writes and flush in seq order.
+    next_write_seq: Mutex<Option<u64>>,
+    pending_writes: Mutex<std::collections::BTreeMap<u64, Vec<u8>>>,
 }
 
 struct ManagedSession {
@@ -212,6 +217,8 @@ async fn create_session(host: &str, port: u16) -> std::io::Result<ManagedSession
         eof: AtomicBool::new(false),
         last_active: Mutex::new(Instant::now()),
         notify: Notify::new(),
+        next_write_seq: Mutex::new(None),
+        pending_writes: Mutex::new(std::collections::BTreeMap::new()),
     });
 
     let inner_ref = inner.clone();
@@ -231,6 +238,8 @@ fn create_udpgw_session() -> ManagedSession {
         eof: AtomicBool::new(false),
         last_active: Mutex::new(Instant::now()),
         notify: Notify::new(),
+        next_write_seq: Mutex::new(None),
+        pending_writes: Mutex::new(std::collections::BTreeMap::new()),
     });
 
     let inner_ref = inner.clone();
@@ -241,7 +250,7 @@ fn create_udpgw_session() -> ManagedSession {
 }
 
 async fn reader_task(mut reader: impl AsyncRead + Unpin, session: Arc<SessionInner>) {
-    let mut buf = vec![0u8; 65536];
+    let mut buf = vec![0u8; 2 * 1024 * 1024];
     loop {
         match reader.read(&mut buf).await {
             Ok(0) => {
@@ -643,17 +652,19 @@ struct TunnelResponse {
     #[serde(skip_serializing_if = "Option::is_none")] eof: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")] e: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")] code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")] seq: Option<u64>,
 }
 
 impl TunnelResponse {
     fn error(msg: impl Into<String>) -> Self {
-        Self { sid: None, d: None, pkts: None, eof: None, e: Some(msg.into()), code: None }
+        Self { sid: None, d: None, pkts: None, eof: None, e: Some(msg.into()), code: None, seq: None }
     }
     fn unsupported_op(op: &str) -> Self {
         Self {
             sid: None, d: None, pkts: None, eof: None,
             e: Some(format!("unknown op: {}", op)),
             code: Some(CODE_UNSUPPORTED_OP.into()),
+            seq: None,
         }
     }
 }
@@ -675,6 +686,8 @@ struct BatchOp {
     #[serde(default)] host: Option<String>,
     #[serde(default)] port: Option<u16>,
     #[serde(default)] d: Option<String>, // base64 data
+    #[serde(default)] seq: Option<u64>,
+    #[serde(default)] wseq: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -797,8 +810,8 @@ async fn handle_batch(
     // map lock isn't held across the per-session read_buf / packets
     // mutex acquisition — without this, every other batch (and every
     // connect/close op) head-of-line-blocks behind the drain.
-    let mut tcp_drains: Vec<(usize, String, Arc<SessionInner>)> = Vec::new();
-    let mut udp_drains: Vec<(usize, String, Arc<UdpSessionInner>)> = Vec::new();
+    let mut tcp_drains: Vec<(usize, String, Arc<SessionInner>, Option<u64>)> = Vec::new();
+    let mut udp_drains: Vec<(usize, String, Arc<UdpSessionInner>, Option<u64>)> = Vec::new();
     // True iff the batch contained any op that performed a real action
     // upstream — a new connection or a non-empty data write. A batch of
     // only empty "data" / "udp_data" polls (and possibly closes) leaves
@@ -893,15 +906,60 @@ async fn handle_batch(
                             };
                             if !bytes.is_empty() {
                                 had_writes_or_connects = true;
-                                let mut w = inner.writer.lock().await;
-                                let _ = w.write_all(&bytes).await;
-                                let _ = w.flush().await;
+                                tracing::info!(
+                                    "session {} upload {}B wseq={:?}",
+                                    &sid[..sid.len().min(8)], bytes.len(), op.wseq,
+                                );
+                                match op.wseq {
+                                    None => {
+                                        // Old client (no wseq): write immediately.
+                                        let mut w = inner.writer.lock().await;
+                                        let _ = w.write_all(&bytes).await;
+                                        let _ = w.flush().await;
+                                    }
+                                    Some(wseq) => {
+                                        let mut nws = inner.next_write_seq.lock().await;
+                                        let expected = nws.get_or_insert(wseq);
+
+                                        if wseq < *expected {
+                                            // Stale / duplicate — skip.
+                                            tracing::debug!(
+                                                "session {} wseq {} < expected {} — skipping",
+                                                &sid[..sid.len().min(8)], wseq, *expected,
+                                            );
+                                        } else if wseq == *expected {
+                                            // In order — write immediately.
+                                            let mut w = inner.writer.lock().await;
+                                            let _ = w.write_all(&bytes).await;
+                                            *expected += 1;
+
+                                            // Flush any buffered writes that
+                                            // are now in sequence.
+                                            let mut pw = inner.pending_writes.lock().await;
+                                            while let Some(entry) = pw.first_entry() {
+                                                if *entry.key() != *expected { break; }
+                                                let (_, buffered) = entry.remove_entry();
+                                                let _ = w.write_all(&buffered).await;
+                                                *expected += 1;
+                                            }
+                                            let _ = w.flush().await;
+                                        } else {
+                                            // Out of order — buffer for later.
+                                            tracing::debug!(
+                                                "session {} wseq {} > expected {} — buffering",
+                                                &sid[..sid.len().min(8)], wseq, *expected,
+                                            );
+                                            let mut pw = inner.pending_writes.lock().await;
+                                            pw.insert(wseq, bytes);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
-                    tcp_drains.push((i, sid, inner));
+                    tcp_drains.push((i, sid, inner, op.seq));
                 } else {
-                    results.push((i, eof_response(sid)));
+                    results.push((i, eof_response(sid, op.seq)));
                 }
             }
             "udp_data" => {
@@ -942,9 +1000,9 @@ async fn handle_batch(
                     if had_uplink {
                         *inner.last_active.lock().await = Instant::now();
                     }
-                    udp_drains.push((i, sid, inner));
+                    udp_drains.push((i, sid, inner, op.seq));
                 } else {
-                    results.push((i, eof_response(sid)));
+                    results.push((i, eof_response(sid, op.seq)));
                 }
             }
             "close" => {
@@ -964,11 +1022,11 @@ async fn handle_batch(
         match join {
             Ok((i, NewConn::Connect(r))) => results.push((i, r)),
             Ok((i, NewConn::ConnectData(Ok((sid, inner))))) => {
-                tcp_drains.push((i, sid, inner));
+                tcp_drains.push((i, sid, inner, None));
             }
             Ok((i, NewConn::ConnectData(Err(r)))) => results.push((i, r)),
             Ok((i, NewConn::UdpOpen(Ok((sid, inner))))) => {
-                udp_drains.push((i, sid, inner));
+                udp_drains.push((i, sid, inner, None));
             }
             Ok((i, NewConn::UdpOpen(Err(r)))) => results.push((i, r)),
             Err(e) => {
@@ -999,9 +1057,9 @@ async fn handle_batch(
         // don't need to re-acquire the sessions map lock here. Cloning
         // the Arc is just a refcount bump.
         let tcp_inners: Vec<Arc<SessionInner>> =
-            tcp_drains.iter().map(|(_, _, inner)| inner.clone()).collect();
+            tcp_drains.iter().map(|(_, _, inner, _)| inner.clone()).collect();
         let udp_inners: Vec<Arc<UdpSessionInner>> =
-            udp_drains.iter().map(|(_, _, inner)| inner.clone()).collect();
+            udp_drains.iter().map(|(_, _, inner, _)| inner.clone()).collect();
 
         // Wake on whichever side has work first. The previous
         // `tokio::join!` was conjunctive — a TCP burst still paid the
@@ -1086,17 +1144,33 @@ async fn handle_batch(
         // Apps Script's 50 MiB response ceiling. This cap stops one session
         // short of the cliff; deferred sessions drain on the next poll.
         let mut remaining_budget: usize = BATCH_RESPONSE_BUDGET;
-        for (i, sid, inner) in &tcp_drains {
-            let (data, eof) = drain_now(inner, remaining_budget).await;
-            let drained = data.len();
-            if eof {
+        for (i, sid, inner, seq) in &tcp_drains {
+            // Drain in a loop: keep reading until the buffer is empty
+            // so we catch data that arrives during the drain itself.
+            let mut all_data = Vec::new();
+            let mut final_eof = false;
+            let drain_deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                let (data, eof) = drain_now(inner, remaining_budget.saturating_sub(all_data.len())).await;
+                if eof { final_eof = true; }
+                if data.is_empty() { break; }
+                let hit_session_cap = data.len() >= TCP_DRAIN_MAX_BYTES;
+                all_data.extend_from_slice(&data);
+                if final_eof || hit_session_cap || all_data.len() >= remaining_budget { break; }
+                if Instant::now() >= drain_deadline { break; }
+                // Brief yield to let reader_task finish its current read
+                tokio::task::yield_now().await;
+            }
+            let drained = all_data.len();
+            if drained > 0 {
+                tracing::info!("session {} drained {}KB", &sid[..sid.len().min(8)], drained / 1024);
+            }
+            if final_eof {
                 tcp_eof_sids.push(sid.clone());
             }
-            results.push((*i, tcp_drain_response(sid.clone(), data, eof)));
+            results.push((*i, tcp_drain_response(sid.clone(), all_data, final_eof, *seq)));
             remaining_budget = remaining_budget.saturating_sub(drained);
             if remaining_budget == 0 {
-                // Budget exhausted; remaining sessions in `tcp_drains` keep
-                // their buffered data and pick up next batch.
                 break;
             }
         }
@@ -1119,12 +1193,12 @@ async fn handle_batch(
         // trap that motivated the TCP-side fix reappears, and tracking
         // eof from the drain return rather than the atomic catches it.
         let mut udp_eof_sids: Vec<String> = Vec::new();
-        for (i, sid, inner) in &udp_drains {
+        for (i, sid, inner, seq) in &udp_drains {
             let (packets, eof) = drain_udp_now(inner).await;
             if eof {
                 udp_eof_sids.push(sid.clone());
             }
-            results.push((*i, udp_drain_response(sid.clone(), packets, eof)));
+            results.push((*i, udp_drain_response(sid.clone(), packets, eof, *seq)));
         }
         if !udp_eof_sids.is_empty() {
             let mut sessions = state.udp_sessions.lock().await;
@@ -1147,7 +1221,7 @@ async fn handle_batch(
     (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], json)
 }
 
-fn tcp_drain_response(sid: String, data: Vec<u8>, eof: bool) -> TunnelResponse {
+fn tcp_drain_response(sid: String, data: Vec<u8>, eof: bool, seq: Option<u64>) -> TunnelResponse {
     TunnelResponse {
         sid: Some(sid),
         d: if data.is_empty() { None } else { Some(B64.encode(&data)) },
@@ -1155,10 +1229,11 @@ fn tcp_drain_response(sid: String, data: Vec<u8>, eof: bool) -> TunnelResponse {
         eof: Some(eof),
         e: None,
         code: None,
+        seq,
     }
 }
 
-fn udp_drain_response(sid: String, packets: Vec<Vec<u8>>, eof: bool) -> TunnelResponse {
+fn udp_drain_response(sid: String, packets: Vec<Vec<u8>>, eof: bool, seq: Option<u64>) -> TunnelResponse {
     let pkts = if packets.is_empty() {
         None
     } else {
@@ -1171,10 +1246,11 @@ fn udp_drain_response(sid: String, packets: Vec<Vec<u8>>, eof: bool) -> TunnelRe
         eof: Some(eof),
         e: None,
         code: None,
+        seq,
     }
 }
 
-fn eof_response(sid: String) -> TunnelResponse {
+fn eof_response(sid: String, seq: Option<u64>) -> TunnelResponse {
     TunnelResponse {
         sid: Some(sid),
         d: None,
@@ -1182,6 +1258,7 @@ fn eof_response(sid: String) -> TunnelResponse {
         eof: Some(true),
         e: None,
         code: None,
+        seq,
     }
 }
 
@@ -1228,7 +1305,7 @@ async fn handle_connect(state: &AppState, host: Option<String>, port: Option<u16
     let sid = uuid::Uuid::new_v4().to_string();
     tracing::info!("session {} -> {}:{}", sid, host, port);
     state.sessions.lock().await.insert(sid.clone(), session);
-    TunnelResponse { sid: Some(sid), d: None, pkts: None, eof: Some(false), e: None, code: None }
+    TunnelResponse { sid: Some(sid), d: None, pkts: None, eof: Some(false), e: None, code: None, seq: None }
 }
 
 /// Open a session and write the client's first bytes in one round trip.
@@ -1350,6 +1427,7 @@ async fn handle_connect_data_single(
         eof: Some(eof),
         e: None,
         code: None,
+        seq: None,
     }
 }
 
@@ -1398,7 +1476,7 @@ async fn handle_data_single(state: &AppState, sid: Option<String>, data: Option<
         sid: Some(sid),
         d: if data.is_empty() { None } else { Some(B64.encode(&data)) },
         pkts: None,
-        eof: Some(eof), e: None, code: None,
+        eof: Some(eof), e: None, code: None, seq: None,
     }
 }
 
@@ -1415,7 +1493,7 @@ async fn handle_close(state: &AppState, sid: Option<String>) -> TunnelResponse {
         s.reader_handle.abort();
         tracing::info!("udp session {} closed by client", sid);
     }
-    TunnelResponse { sid: Some(sid), d: None, pkts: None, eof: Some(true), e: None, code: None }
+    TunnelResponse { sid: Some(sid), d: None, pkts: None, eof: Some(true), e: None, code: None, seq: None }
 }
 
 // ---------------------------------------------------------------------------
@@ -1736,6 +1814,8 @@ mod tests {
             eof: AtomicBool::new(false),
             last_active: Mutex::new(Instant::now()),
             notify: Notify::new(),
+            next_write_seq: Mutex::new(None),
+            pending_writes: Mutex::new(std::collections::BTreeMap::new()),
         })
     }
 
@@ -1987,6 +2067,8 @@ mod tests {
             eof: AtomicBool::new(false),
             last_active: Mutex::new(Instant::now()),
             notify: Notify::new(),
+            next_write_seq: Mutex::new(None),
+            pending_writes: Mutex::new(std::collections::BTreeMap::new()),
         });
         let _reader_handle = tokio::spawn(reader_task(reader, inner.clone()));
 
@@ -2343,7 +2425,7 @@ mod tests {
         );
 
         // The `udp_drain_response` helper threads eof into `eof: Some(true)`.
-        let resp = udp_drain_response("zombie".into(), pkts, eof);
+        let resp = udp_drain_response("zombie".into(), pkts, eof, None);
         assert_eq!(resp.eof, Some(true));
         assert!(resp.pkts.is_none());
     }

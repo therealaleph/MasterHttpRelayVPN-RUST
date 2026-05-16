@@ -35,6 +35,7 @@ class MhrvVpnService : VpnService() {
     private var proxyHandle: Long = 0L
     private var tun2proxyThread: Thread? = null
     private val tun2proxyRunning = AtomicBoolean(false)
+    private var debugOverlay: PipelineDebugOverlay? = null
 
     // Idempotency guard. teardown() is reachable from three paths:
     //   1. ACTION_STOP onStartCommand branch (background thread)
@@ -149,6 +150,7 @@ class MhrvVpnService : VpnService() {
             Log.i(TAG, "PROXY_ONLY mode: listeners up, skipping VpnService/TUN")
             VpnState.setProxyHandle(proxyHandle)
             VpnState.setRunning(true)
+            showDebugOverlay()
             return
         }
 
@@ -314,6 +316,16 @@ class MhrvVpnService : VpnService() {
         // a failed-to-establish run.
         VpnState.setProxyHandle(proxyHandle)
         VpnState.setRunning(true)
+        showDebugOverlay()
+    }
+
+    private fun showDebugOverlay() {
+        if (debugOverlay != null) return
+        if (!android.provider.Settings.canDrawOverlays(this)) {
+            Log.w(TAG, "overlay permission not granted — skipping debug overlay")
+            return
+        }
+        debugOverlay = PipelineDebugOverlay(this).also { it.show() }
     }
 
     /**
@@ -433,6 +445,10 @@ class MhrvVpnService : VpnService() {
         if (stillAlive) {
             Log.w(TAG, "tun2proxy thread still alive after join timeout — proceeding anyway")
         }
+
+        // Hide debug overlay before flipping UI state.
+        debugOverlay?.hide()
+        debugOverlay = null
 
         // Flip UI state last — the button reverts to Connect only after
         // the native-side cleanup actually happened, not optimistically.
