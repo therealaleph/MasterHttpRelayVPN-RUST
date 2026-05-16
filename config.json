@@ -1,0 +1,9 @@
+{
+  "exit_node": {
+    "enabled": true,
+    "relay_url": "https://masterhttprelayvpn-rust-71-f8q6jjjhpzjt.miroslavmirm.deno.net",
+    "psk": "0790515fe19a978d50b4bcd32e5ed8f14ff82886eaf4e86d7c6904691b08a8f4",
+    "mode": "selective",
+    "hosts": ["chatgpt.com", "claude.ai", "x.com", "grok.com", "openai.com"]
+  }
+}
