@@ -44,8 +44,8 @@
     },
     {
       "name": "fastly",
-      "ip": "151.101.128.223",
-      "sni": "files.pythonhosted.org",
+      "ip": "185.199.109.215",
+      "sni": "github.githubassets.com",
       "domains": [
         "redd.it",
         "reddit.com",
