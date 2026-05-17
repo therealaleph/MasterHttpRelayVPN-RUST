@@ -104,7 +104,23 @@ object Native {
      *     points scope as h2_calls. Compute h2 health as
      *     h2_calls / (h2_calls + h2_fallbacks)),
      *   h2_disabled (boolean: true when h2 fast path is permanently
-     *     off — config force_http1 set, or peer refused h2 via ALPN)
+     *     off — config force_http1 set, or peer refused h2 via ALPN),
+     *   forwarder_calls (successful upstream fetches via the
+     *     SNI-rewrite forwarder — fast path for non-/youtubei/
+     *     paths on `force_mitm_hosts`. Counted at upstream-success,
+     *     before the downstream write to the browser, so a client
+     *     disconnect mid-write still counts. Zero in non-AppsScript
+     *     modes / when no `relay_url_patterns` host is in play),
+     *   forwarder_bytes (response bytes successfully fetched by the
+     *     forwarder; same upstream-fetch-success semantic as
+     *     forwarder_calls),
+     *   forwarder_errors (forwarder dispatch errors — connect failure,
+     *     TLS error, read timeout, response cap exceeded. Distinct
+     *     from relay_failures: this counts fast-path-only misses
+     *     regardless of whether the relay-fallback then recovered the
+     *     request. Combine with relay_failures to distinguish "fast
+     *     path missed but request served" from "request failed
+     *     end-to-end")
      *
      * Cheap — just reads atomics. Safe to poll on a second-scale timer.
      */

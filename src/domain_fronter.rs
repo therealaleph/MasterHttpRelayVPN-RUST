@@ -390,6 +390,28 @@ pub struct DomainFronter {
     /// h2_fallbacks)` ratio indicates an unhealthy h2 conn or a flaky
     /// middlebox eating h2 frames; consider `force_http1: true`.
     h2_fallbacks: AtomicU64,
+    /// Successful SNI-rewrite HTTP forwarder calls (the b3b9220 path —
+    /// non-`/youtubei/` paths on `force_mitm_hosts` taking the direct
+    /// SNI-rewrite TLS path instead of burning Apps Script quota).
+    /// Counts upstream-fetch success: incremented as soon as the
+    /// forwarder has the response bytes in hand, BEFORE writing to the
+    /// browser. A client-disconnect during the downstream write still
+    /// counts — the path filter did upstream work, that's the metric.
+    /// Useful for diagnosing reports like #977: a high
+    /// `forwarder_calls / (forwarder_calls + relay_calls)` ratio means
+    /// the path filter is doing its job; a near-zero ratio means it's
+    /// inert (and any reported regression isn't from the forwarder).
+    forwarder_calls: AtomicU64,
+    /// Response bytes successfully fetched by the forwarder from the
+    /// upstream (Google edge). Same upstream-fetch-success semantic as
+    /// `forwarder_calls`.
+    forwarder_bytes: AtomicU64,
+    /// Forwarder dispatch errors — connect failure, TLS error, read
+    /// timeout, response cap exceeded, or upstream EOF before any
+    /// bytes. Counts the forwarder fast-path miss; says nothing about
+    /// whether the subsequent relay-path fallback recovered the
+    /// request. Use `relay_failures` for request-failure counting.
+    forwarder_errors: AtomicU64,
     /// Per-host breakdown of traffic going through this fronter. Keyed by
     /// the host of the URL (e.g. "api.x.com"). Read-mostly; only touched
     /// on the slow path (once per relayed request), so a plain Mutex is
@@ -438,6 +460,12 @@ pub struct DomainFronter {
     /// Pre-normalized (lowercased, leading-dot stripped) host list for
     /// fast O(N) match in `exit_node_matches`.
     exit_node_hosts: Vec<String>,
+    /// Strip SABR quality-track entries from `/videoplayback` POST
+    /// bodies. Mirrors `Config::sabr_strip`. Default `true`. Kill-switch
+    /// for users who hit the speed-up-playback buffering regression
+    /// reported in #977. See config.rs `sabr_strip` for the full
+    /// trade-off.
+    sabr_strip: bool,
 }
 
 /// Aggregated stats for one remote host.
@@ -621,6 +649,9 @@ impl DomainFronter {
             bytes_relayed: AtomicU64::new(0),
             h2_calls: AtomicU64::new(0),
             h2_fallbacks: AtomicU64::new(0),
+            forwarder_calls: AtomicU64::new(0),
+            forwarder_bytes: AtomicU64::new(0),
+            forwarder_errors: AtomicU64::new(0),
             per_site: Arc::new(std::sync::Mutex::new(HashMap::new())),
             today_calls: AtomicU64::new(0),
             today_bytes: AtomicU64::new(0),
@@ -656,6 +687,7 @@ impl DomainFronter {
                 .map(|h| h.trim().trim_start_matches('.').to_ascii_lowercase())
                 .filter(|h| !h.is_empty())
                 .collect(),
+            sabr_strip: config.sabr_strip,
         })
     }
 
@@ -689,6 +721,78 @@ impl DomainFronter {
     /// change. Clamped to `[5s, 300s]` at construction.
     pub(crate) fn batch_timeout(&self) -> Duration {
         self.batch_timeout
+    }
+
+    /// Record a successful upstream fetch by the SNI-rewrite forwarder.
+    /// `bytes` is the response size received from the Google edge.
+    /// Counted at the point of upstream success, BEFORE the proxy
+    /// writes the bytes to the browser — a client disconnect mid-write
+    /// still leaves the metric accurate (the path filter did its
+    /// work). Called by `proxy_server::handle_mitm_request`.
+    pub(crate) fn record_forwarder_call(&self, bytes: u64) {
+        self.forwarder_calls.fetch_add(1, Ordering::Relaxed);
+        self.forwarder_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Record a forwarder dispatch error (connect failure, TLS error,
+    /// read timeout, cap exceeded, ...). Says nothing about whether
+    /// the subsequent relay-path fallback recovered the request — use
+    /// `relay_failures` for that. The two metrics together let
+    /// diagnostics distinguish "fast path missed but request still
+    /// served" from "request failed end-to-end."
+    pub(crate) fn record_forwarder_error(&self) {
+        self.forwarder_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Return `Some(stripped_body)` when the SABR quality-track strip
+    /// applies to this request and actually removed bytes; `None` when
+    /// the original body should pass through untouched.
+    ///
+    /// Six gates, all of which must pass for the strip to fire:
+    ///   1. `Config::sabr_strip` is on (kill-switch from #977 testing —
+    ///      see `src/config.rs` for the full trade-off).
+    ///   2. POST method (segment fetches are POSTs in YouTube's SABR
+    ///      protocol; GETs and other methods don't carry the protobuf).
+    ///   3. Non-empty body (no body to walk → nothing to strip).
+    ///   4. URL path contains `/videoplayback` (the SABR endpoint).
+    ///   5. URL host is in `url_host_is_youtube_video_endpoint`'s set
+    ///      (`*.googlevideo.com` or `*.youtube.com`) — defends against
+    ///      an unrelated service that happens to expose the same path
+    ///      shape with a protobuf-like body.
+    ///   6. The strip itself actually removed at least one byte —
+    ///      session-init bodies (no field-2) and bodies without any
+    ///      field-3 entries return unchanged from
+    ///      `strip_sabr_quality_tracks` and we report `None` so the
+    ///      caller skips the allocation churn.
+    ///
+    /// Pulled out of `relay()` so the gate can be exercised by unit
+    /// tests without standing up a live Apps Script connection — see
+    /// `sabr_strip_off_keeps_body_unchanged` /
+    /// `sabr_strip_on_strips_segment_fetch_body`.
+    pub(crate) fn maybe_strip_sabr_body(
+        &self,
+        method: &str,
+        url: &str,
+        body: &[u8],
+    ) -> Option<Vec<u8>> {
+        if !self.sabr_strip
+            || method != "POST"
+            || body.is_empty()
+            || !url.contains("/videoplayback")
+            || !url_host_is_youtube_video_endpoint(url)
+        {
+            return None;
+        }
+        let stripped = strip_sabr_quality_tracks(body);
+        if stripped.len() == body.len() {
+            return None;
+        }
+        tracing::debug!(
+            "SABR strip: removed {} quality-track bytes from {}",
+            body.len() - stripped.len(),
+            url.split('?').next().unwrap_or(url),
+        );
+        Some(stripped)
     }
 
     /// Record one relay call toward the daily budget. Called once per
@@ -772,6 +876,9 @@ impl DomainFronter {
             h2_calls: self.h2_calls.load(Ordering::Relaxed),
             h2_fallbacks: self.h2_fallbacks.load(Ordering::Relaxed),
             h2_disabled: self.h2_disabled.load(Ordering::Relaxed),
+            forwarder_calls: self.forwarder_calls.load(Ordering::Relaxed),
+            forwarder_bytes: self.forwarder_bytes.load(Ordering::Relaxed),
+            forwarder_errors: self.forwarder_errors.load(Ordering::Relaxed),
         }
     }
 
@@ -1753,6 +1860,19 @@ impl DomainFronter {
             normalized.as_str()
         } else {
             url
+        };
+
+        // SABR quality-track strip — applied before the exit-node
+        // short-circuit so both paths benefit. The full decision +
+        // trade-off is in `maybe_strip_sabr_body` so the gate can be
+        // unit-tested without invoking the network-coupled relay path.
+        let stripped_body;
+        let body: &[u8] = match self.maybe_strip_sabr_body(method, url, body) {
+            None => body,
+            Some(stripped) => {
+                stripped_body = stripped;
+                stripped_body.as_slice()
+            }
         };
 
         // Exit-node short-circuit: route through the configured second-hop
@@ -4084,6 +4204,243 @@ fn status_reason(status: u16) -> &'static str {
     }
 }
 
+/// True if `url`'s host is one of YouTube's `/videoplayback` endpoints.
+/// Gates `strip_sabr_quality_tracks` so an unrelated service that
+/// happens to expose `/videoplayback` and serves a protobuf-shaped body
+/// with top-level fields 2 and 3 doesn't get its field-3 entries
+/// silently rewritten.
+///
+/// Two host families serve `/videoplayback`:
+///
+/// * `*.googlevideo.com` — the YouTube chunk CDN. Most segment-fetch
+///   POSTs land here on subdomains like `rrx---sn-xxx.googlevideo.com`.
+/// * `youtube.com` (and subdomains) — direct same-origin endpoints
+///   used by the YouTube web client in some client variants.
+///
+/// Match is case-insensitive and trailing-dot tolerant. Anything else
+/// returns false; the strip is a no-op.
+fn url_host_is_youtube_video_endpoint(url: &str) -> bool {
+    let host = match extract_host(url) {
+        Some(h) => h,
+        None => return false,
+    };
+    let h = host.trim_end_matches('.');
+    if h.is_empty() {
+        return false;
+    }
+    const YT_VIDEOPLAYBACK_SUFFIXES: &[&str] = &[
+        "googlevideo.com",
+        "youtube.com",
+    ];
+    YT_VIDEOPLAYBACK_SUFFIXES
+        .iter()
+        .any(|s| h == *s || h.ends_with(&format!(".{}", s)))
+}
+
+/// Strip surplus field-3 (quality-track selection) entries from a SABR
+/// segment-fetch protobuf body, keeping the first one intact.
+///
+/// YouTube's SABR (Server-Adaptive Bitrate) `videoplayback` POST bodies
+/// come in two distinct message shapes:
+///
+/// * **Segment-fetch** — carries field-2 (tag `0x12`) byte-range entries
+///   for video/audio segments. Field-3 (tag `0x1a`) entries here are
+///   quality-track selectors that ask googlevideo to return a particular
+///   quality track. When the player asks for *multiple* tracks at once
+///   (multi-track bundling), googlevideo concatenates them into a single
+///   response — easily exceeding Apps Script `UrlFetchApp`'s ~10 MB cap
+///   → 502.
+///
+/// * **Session-init** — carries field-5 (tag `0x2a`) entries and *no*
+///   field-2 entries. Field-3 here is essential session metadata
+///   (language, viewer state, ...). Stripping it corrupts the init
+///   handshake → CDN returns 403.
+///
+/// **Heuristic**:
+///
+/// 1. Body must be segment-fetch shape (≥ 1 field-2 entry). Otherwise
+///    no-op — session-init bodies must not be touched.
+/// 2. Body must carry **2 or more** field-3 entries before stripping
+///    fires. The first field-3 is always kept; only the 2nd, 3rd, ...
+///    are removed.
+///
+/// **Why keep the first field-3** (#977, unacoder testing, May 2026):
+/// the original "strip all field-3" rule produced empty googlevideo
+/// responses on single-track requests — the player asks for ONE track
+/// via a sole field-3, we strip it, and the CDN answers a request with
+/// zero tracks selected by sending nothing. The player retries
+/// indefinitely with the `rn=` retry counter incrementing, never
+/// advancing its buffer. Keeping the first field-3 means single-track
+/// requests pass through unchanged (no regression at low quality)
+/// while multi-track requests still get capped to one track (the
+/// 10 MB-blowup fix is preserved).
+///
+/// Only top-level fields are inspected; nested messages are left intact.
+/// On a malformed body (truncated tag, unknown wire type) the unparsed
+/// tail is appended verbatim so a corrupt request is never silently
+/// truncated. Originally ported from upstream
+/// `_strip_sabr_quality_tracks` (commits 9b6d03e + 33db28a); the
+/// keep-first refinement diverges from upstream based on local testing.
+pub(crate) fn strip_sabr_quality_tracks(body: &[u8]) -> Vec<u8> {
+    // Phase 1: single pass — collect (field_number, start, end) for every
+    // top-level field. We need both the segment-fetch detection (field-2
+    // present) AND the field-3 count (≥ 2 to fire) before deciding,
+    // and a two-pass walk would be wasteful.
+    let mut segments: Vec<(u32, usize, usize)> = Vec::new();
+    let mut has_field2 = false;
+    let mut field3_count: usize = 0;
+    let mut i = 0usize;
+    let n = body.len();
+    let mut tail_start = n;
+
+    'outer: while i < n {
+        let seg_start = i;
+
+        // Decode varint tag.
+        let mut tag: u64 = 0;
+        let mut shift: u32 = 0;
+        let mut tag_complete = false;
+        while i < n {
+            let b = body[i];
+            i += 1;
+            tag |= ((b & 0x7F) as u64) << shift;
+            if b & 0x80 == 0 {
+                tag_complete = true;
+                break;
+            }
+            shift += 7;
+            if shift >= 64 {
+                // Pathologically long varint — bail.
+                tail_start = seg_start;
+                break 'outer;
+            }
+        }
+        if !tag_complete {
+            tail_start = seg_start;
+            break;
+        }
+
+        let field_number = (tag >> 3) as u32;
+        let wire_type = (tag & 0x07) as u8;
+
+        // Each branch advances `i` past the field's payload. Truncation
+        // (running off the end before the payload is whole) bails out
+        // with `tail_start = seg_start` so the malformed segment and
+        // everything after it is preserved verbatim — never silently
+        // dropped, never half-stripped.
+        match wire_type {
+            0 => {
+                // varint payload: bytes with high bit set are
+                // continuation; first byte with high bit clear is the
+                // terminator. EOF before terminator = truncated.
+                let mut term = false;
+                while i < n {
+                    let b = body[i];
+                    i += 1;
+                    if b & 0x80 == 0 {
+                        term = true;
+                        break;
+                    }
+                }
+                if !term {
+                    tail_start = seg_start;
+                    break;
+                }
+            }
+            1 => {
+                // 64-bit fixed
+                if n - i < 8 {
+                    tail_start = seg_start;
+                    break;
+                }
+                i += 8;
+            }
+            2 => {
+                // length-delimited: varint length, then `val_len` bytes.
+                let mut val_len: u64 = 0;
+                let mut shift: u32 = 0;
+                let mut len_complete = false;
+                while i < n {
+                    let b = body[i];
+                    i += 1;
+                    val_len |= ((b & 0x7F) as u64) << shift;
+                    if b & 0x80 == 0 {
+                        len_complete = true;
+                        break;
+                    }
+                    shift += 7;
+                    if shift >= 64 {
+                        tail_start = seg_start;
+                        break 'outer;
+                    }
+                }
+                if !len_complete {
+                    tail_start = seg_start;
+                    break;
+                }
+                // Payload truncated: declared length runs past buffer end.
+                // Bail BEFORE recording the segment so a half-present
+                // field-3 isn't accidentally stripped from the output.
+                let val_len = val_len as usize;
+                if val_len > n - i {
+                    tail_start = seg_start;
+                    break;
+                }
+                i += val_len;
+            }
+            5 => {
+                // 32-bit fixed
+                if n - i < 4 {
+                    tail_start = seg_start;
+                    break;
+                }
+                i += 4;
+            }
+            _ => {
+                // Unknown wire type — bail, tail copied verbatim.
+                tail_start = seg_start;
+                break;
+            }
+        }
+
+        if field_number == 2 {
+            has_field2 = true;
+        } else if field_number == 3 {
+            field3_count += 1;
+        }
+        segments.push((field_number, seg_start, i));
+    }
+
+    // Phase 2: only strip when this is a segment-fetch body (has field
+    // 2) AND there are at least 2 field-3 entries — i.e. real multi-
+    // track bundling. Single-track requests (one field-3) flow through
+    // unchanged so googlevideo still has a track selected.
+    if !has_field2 || field3_count < 2 {
+        return body.to_vec();
+    }
+
+    // Keep the first field-3 entry, strip the rest. `field3_kept`
+    // flips to `true` after the first encounter so subsequent ones
+    // fall through the strip branch.
+    let mut out = Vec::with_capacity(body.len());
+    let mut field3_kept = false;
+    for (field_number, seg_start, seg_end) in segments {
+        if field_number == 3 {
+            if !field3_kept {
+                field3_kept = true;
+                out.extend_from_slice(&body[seg_start..seg_end]);
+            }
+            // else: strip
+        } else {
+            out.extend_from_slice(&body[seg_start..seg_end]);
+        }
+    }
+    if tail_start < n {
+        out.extend_from_slice(&body[tail_start..]);
+    }
+    out
+}
+
 fn extract_host(url: &str) -> Option<String> {
     let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     let authority = after_scheme.split('/').next().unwrap_or("");
@@ -4794,6 +5151,27 @@ pub struct StatsSnapshot {
     /// switch set, or peer refused h2 during ALPN). All traffic on the
     /// h1 path.
     pub h2_disabled: bool,
+    /// Successful upstream fetches by the SNI-rewrite forwarder
+    /// (b3b9220 fast path — non-`/youtubei/` paths on
+    /// `force_mitm_hosts`). Counted at upstream success, before the
+    /// downstream write to the browser, so a client-disconnect during
+    /// write still counts as "the path filter did upstream work."
+    /// Useful for diagnosing whether the path filter is firing as
+    /// expected; a near-zero ratio against `relay_calls` means the
+    /// forwarder is inert and any reported regression is elsewhere.
+    pub forwarder_calls: u64,
+    /// Response bytes successfully fetched by the forwarder from the
+    /// upstream. Same upstream-fetch-success semantic as
+    /// `forwarder_calls`.
+    pub forwarder_bytes: u64,
+    /// Forwarder dispatch errors (connect failure, TLS error, read
+    /// timeout, cap exceeded). Distinct from `relay_failures` —
+    /// `relay_failures` counts request-level failures, this counts
+    /// fast-path-only misses regardless of whether the relay-fallback
+    /// then recovered the request. Combine the two to distinguish
+    /// "fast path missed but request served" from "request failed
+    /// end-to-end".
+    pub forwarder_errors: u64,
 }
 
 impl StatsSnapshot {
@@ -4826,8 +5204,24 @@ impl StatsSnapshot {
                 )
             }
         };
+        // Forwarder segment is only emitted when the path filter has
+        // actually fired — keeps the line clean for the typical
+        // (non-AppsScript / no-pattern-hit) case. `err` is the
+        // fast-path miss count (regardless of whether relay-fallback
+        // recovered the request); `relay_failures` covers actual
+        // end-to-end request failures.
+        let fwd_seg = if self.forwarder_calls + self.forwarder_errors == 0 {
+            String::new()
+        } else {
+            format!(
+                " fwd={} ({}KB) err={}",
+                self.forwarder_calls,
+                self.forwarder_bytes / 1024,
+                self.forwarder_errors,
+            )
+        };
         format!(
-            "stats: relay={} ({}KB) failures={} coalesced={} cache={}/{} ({:.0}% hit, {}KB) scripts={}/{} active{}",
+            "stats: relay={} ({}KB) failures={} coalesced={} cache={}/{} ({:.0}% hit, {}KB) scripts={}/{} active{}{}",
             self.relay_calls,
             self.bytes_relayed / 1024,
             self.relay_failures,
@@ -4839,6 +5233,7 @@ impl StatsSnapshot {
             self.total_scripts - self.blacklisted_scripts,
             self.total_scripts,
             h2_seg,
+            fwd_seg,
         )
     }
 
@@ -4851,7 +5246,7 @@ impl StatsSnapshot {
             s.replace('\\', "\\\\").replace('"', "\\\"")
         }
         format!(
-            r#"{{"relay_calls":{},"relay_failures":{},"coalesced":{},"bytes_relayed":{},"cache_hits":{},"cache_misses":{},"cache_bytes":{},"blacklisted_scripts":{},"total_scripts":{},"today_calls":{},"today_bytes":{},"today_key":"{}","today_reset_secs":{},"h2_calls":{},"h2_fallbacks":{},"h2_disabled":{}}}"#,
+            r#"{{"relay_calls":{},"relay_failures":{},"coalesced":{},"bytes_relayed":{},"cache_hits":{},"cache_misses":{},"cache_bytes":{},"blacklisted_scripts":{},"total_scripts":{},"today_calls":{},"today_bytes":{},"today_key":"{}","today_reset_secs":{},"h2_calls":{},"h2_fallbacks":{},"h2_disabled":{},"forwarder_calls":{},"forwarder_bytes":{},"forwarder_errors":{}}}"#,
             self.relay_calls,
             self.relay_failures,
             self.coalesced,
@@ -4868,6 +5263,9 @@ impl StatsSnapshot {
             self.h2_calls,
             self.h2_fallbacks,
             self.h2_disabled,
+            self.forwarder_calls,
+            self.forwarder_bytes,
+            self.forwarder_errors,
         )
     }
 }
@@ -6550,6 +6948,14 @@ hello";
     /// `verify_ssl=true` and a placeholder `google_ip` are fine because
     /// `DomainFronter::new` doesn't touch the network.
     fn fronter_for_test(force_http1: bool) -> DomainFronter {
+        fronter_for_test_with(force_http1, true)
+    }
+
+    /// `fronter_for_test` plus a `sabr_strip` knob for the SABR
+    /// kill-switch gate tests. Lets the tests prove the runtime
+    /// behaviour at the `relay()` strip-decision branch — not just
+    /// the config-default round-trip.
+    fn fronter_for_test_with(force_http1: bool, sabr_strip: bool) -> DomainFronter {
         let json = format!(
             r#"{{
                 "mode": "apps_script",
@@ -6561,9 +6967,10 @@ hello";
                 "listen_port": 8085,
                 "log_level": "info",
                 "verify_ssl": true,
-                "force_http1": {}
+                "force_http1": {},
+                "sabr_strip": {}
             }}"#,
-            force_http1
+            force_http1, sabr_strip
         );
         let cfg: Config = serde_json::from_str(&json).unwrap();
         DomainFronter::new(&cfg).expect("test fronter must construct")
@@ -7240,5 +7647,558 @@ hello";
             Ok((_send, _dead)) => panic!("expected AlpnRefused, got Ok"),
         }
         server.await.unwrap();
+    }
+
+    // ── SABR quality-track strip (commits 9b6d03e + 33db28a) ─────────────
+
+    /// Encode a single varint at the front of a buffer.
+    fn enc_varint(out: &mut Vec<u8>, mut v: u64) {
+        while v >= 0x80 {
+            out.push((v as u8) | 0x80);
+            v >>= 7;
+        }
+        out.push(v as u8);
+    }
+
+    /// Encode a single length-delimited (wire-type 2) field.
+    fn enc_length_delim(out: &mut Vec<u8>, field: u32, payload: &[u8]) {
+        enc_varint(out, ((field as u64) << 3) | 2);
+        enc_varint(out, payload.len() as u64);
+        out.extend_from_slice(payload);
+    }
+
+    /// Encode a single varint (wire-type 0) field.
+    fn enc_varint_field(out: &mut Vec<u8>, field: u32, value: u64) {
+        // Wire-type 0 is the zero bits; explicit `| 0` would be clippy
+        // `identity_op`. The shift is the entire encoding.
+        enc_varint(out, (field as u64) << 3);
+        enc_varint(out, value);
+    }
+
+    #[test]
+    fn sabr_strip_keeps_sole_field3_unchanged() {
+        // The #977 regression case from unacoder's testing: a
+        // segment-fetch body with exactly ONE field-3 entry (the
+        // single-track request the player sends at low/medium quality).
+        // The original "strip all field-3" rule turned this into a
+        // request with zero tracks selected, which googlevideo answered
+        // with an empty body — buffer never advanced, player retried
+        // 11+ times with `rn=` incrementing. Keep-first heuristic
+        // returns the body unchanged so the player gets a valid
+        // single-track response.
+        let mut body: Vec<u8> = Vec::new();
+        enc_length_delim(&mut body, 2, b"range-descriptor");
+        enc_length_delim(&mut body, 3, b"sole-quality-track");
+        enc_varint_field(&mut body, 4, 12345);
+
+        // No transform: 1 field-3 < 2-entry threshold.
+        assert_eq!(strip_sabr_quality_tracks(&body), body);
+    }
+
+    #[test]
+    fn sabr_strip_segment_fetch_keeps_first_field3_strips_rest() {
+        // Segment-fetch shape with TWO field-3 entries (multi-track
+        // bundling). The first field-3 is kept (preserves a single
+        // track on the wire so googlevideo has something to send); the
+        // second is stripped (caps the response under 10 MB). Other
+        // fields pass through unchanged.
+        let mut body: Vec<u8> = Vec::new();
+        enc_length_delim(&mut body, 2, b"range-descriptor-1");
+        enc_length_delim(&mut body, 3, b"quality-track-selector-1");
+        enc_length_delim(&mut body, 2, b"range-descriptor-2");
+        enc_length_delim(&mut body, 3, b"quality-track-selector-2");
+        enc_varint_field(&mut body, 4, 12345); // some other field
+
+        let mut expected: Vec<u8> = Vec::new();
+        enc_length_delim(&mut expected, 2, b"range-descriptor-1");
+        enc_length_delim(&mut expected, 3, b"quality-track-selector-1"); // KEPT
+        enc_length_delim(&mut expected, 2, b"range-descriptor-2");
+        // quality-track-selector-2: STRIPPED
+        enc_varint_field(&mut expected, 4, 12345);
+
+        assert_eq!(strip_sabr_quality_tracks(&body), expected);
+    }
+
+    #[test]
+    fn sabr_strip_session_init_leaves_field3_alone() {
+        // Session-init shape: has field-5 entries and field-3, but NO
+        // field-2. Field-3 here is essential session metadata —
+        // stripping it would corrupt the handshake → CDN 403. Heuristic:
+        // require field-2 presence before stripping field-3.
+        let mut body: Vec<u8> = Vec::new();
+        enc_length_delim(&mut body, 5, b"session-context");
+        enc_length_delim(&mut body, 3, b"language-and-state-metadata");
+        enc_varint_field(&mut body, 7, 1);
+
+        let original = body.clone();
+        // Untouched.
+        assert_eq!(strip_sabr_quality_tracks(&body), original);
+    }
+
+    #[test]
+    fn sabr_strip_no_field3_is_noop() {
+        // Plain segment-fetch with only field-2 entries — nothing to strip.
+        let mut body: Vec<u8> = Vec::new();
+        enc_length_delim(&mut body, 2, b"only-range-descriptors");
+        enc_length_delim(&mut body, 2, b"more-range-descriptors");
+
+        let original = body.clone();
+        assert_eq!(strip_sabr_quality_tracks(&body), original);
+    }
+
+    #[test]
+    fn sabr_strip_empty_body_is_noop() {
+        assert_eq!(strip_sabr_quality_tracks(b""), b"");
+    }
+
+    #[test]
+    fn sabr_strip_truncated_tag_preserves_remainder_verbatim() {
+        // A field-2 entry followed by a truncated varint tag (high bit
+        // set, no continuation byte). Strip should bail at the truncated
+        // tag, copying the remaining bytes verbatim — never silently
+        // dropping the tail.
+        let mut body: Vec<u8> = Vec::new();
+        enc_length_delim(&mut body, 2, b"first-entry");
+        // Truncated: high bit set, then EOF.
+        body.push(0x80);
+
+        let result = strip_sabr_quality_tracks(&body);
+        // Body had no field-3 to strip → entire input returned.
+        assert_eq!(result, body);
+    }
+
+    #[test]
+    fn sabr_strip_truncated_tag_after_single_field3_is_noop() {
+        // field-2 + ONE field-3 (single-track request) + truncated tag.
+        // Under the keep-first heuristic, single field-3 is preserved
+        // → strip is a no-op → body returned verbatim (truncated tail
+        // included). The original behaviour was to strip the sole
+        // field-3 here, but that's exactly the regression #977
+        // identified.
+        let mut body: Vec<u8> = Vec::new();
+        enc_length_delim(&mut body, 2, b"range-desc");
+        enc_length_delim(&mut body, 3, b"quality-track");
+        body.push(0x80); // truncated tag
+
+        // No transform — single field-3 < 2-entry threshold.
+        assert_eq!(strip_sabr_quality_tracks(&body), body);
+    }
+
+    #[test]
+    fn sabr_strip_unknown_wire_type_preserves_remainder() {
+        // Wire type 6 (unused / reserved) — the strip should bail at
+        // the unknown wire type and copy the rest verbatim. Build it
+        // manually so we control the wire-type bits.
+        let mut body: Vec<u8> = Vec::new();
+        enc_length_delim(&mut body, 2, b"first-range");
+        // tag = (field 9 << 3) | wire 6 = 0x4E
+        body.push(0x4E);
+        body.extend_from_slice(b"\x01\x02\x03"); // some bytes after
+
+        // No field-3 ever seen → nothing to strip → full body returned.
+        assert_eq!(strip_sabr_quality_tracks(&body), body);
+    }
+
+    #[test]
+    fn sabr_strip_truncated_field3_payload_preserves_segment_verbatim() {
+        // field-2 (legitimate range descriptor) followed by a TRUNCATED
+        // field-3 entry: the length varint says 100 bytes but only 5 are
+        // present. The original `i.saturating_add(val_len).min(n)` would
+        // have clamped to EOF and let the segment be stripped, silently
+        // dropping the partial bytes. Correct behaviour: bail at the
+        // truncated payload and emit everything from there to EOF
+        // verbatim, untouched.
+        let mut body: Vec<u8> = Vec::new();
+        enc_length_delim(&mut body, 2, b"good-range");
+        // Manually emit a truncated field-3 length-delimited header:
+        // tag = (field 3 << 3) | 2 = 0x1A, len = 100, then only 5 bytes.
+        body.push(0x1A);
+        body.push(100); // declares 100-byte payload
+        body.extend_from_slice(b"short");
+
+        let mut expected: Vec<u8> = Vec::new();
+        enc_length_delim(&mut expected, 2, b"good-range");
+        // Truncated tail copied verbatim from where field-3 starts.
+        expected.push(0x1A);
+        expected.push(100);
+        expected.extend_from_slice(b"short");
+
+        assert_eq!(strip_sabr_quality_tracks(&body), expected);
+    }
+
+    #[test]
+    fn sabr_strip_truncated_field2_payload_preserves_segment_verbatim() {
+        // Even segment-fetch detection must not over-eagerly believe a
+        // truncated field-2 is real — the segment-fetch heuristic only
+        // fires on COMPLETE field-2 entries. Here field-2 is truncated;
+        // the parser bails at it and the malformed tail is preserved.
+        let mut body: Vec<u8> = Vec::new();
+        // Tag = field 2, wire 2 = 0x12, declared len = 50, only 3 bytes.
+        body.push(0x12);
+        body.push(50);
+        body.extend_from_slice(b"abc");
+
+        // No prior field-2 OR field-3 captured → strip is a no-op
+        // and returns the buffer unchanged.
+        assert_eq!(strip_sabr_quality_tracks(&body), body);
+    }
+
+    #[test]
+    fn sabr_strip_truncated_fixed_width_with_single_field3_is_noop() {
+        // 64-bit fixed (wire type 1) — only 3 of 8 bytes present. The
+        // bail-on-truncated-payload behaviour is unchanged; what's
+        // different from the older "strip all field-3" version is
+        // that a SOLE field-3 is now kept (keep-first heuristic),
+        // so the body comes back unchanged.
+        let mut body: Vec<u8> = Vec::new();
+        enc_length_delim(&mut body, 2, b"r");
+        enc_length_delim(&mut body, 3, b"q"); // sole field-3 → kept
+        body.push(0x21);
+        body.extend_from_slice(b"\x01\x02\x03");
+
+        assert_eq!(strip_sabr_quality_tracks(&body), body);
+    }
+
+    #[test]
+    fn sabr_strip_truncated_fixed_width_with_two_field3_strips_extras() {
+        // Same fixed-width-truncation shape, but with TWO field-3
+        // entries. Keep-first rule fires: first field-3 kept, second
+        // stripped, malformed tail verbatim.
+        let mut body: Vec<u8> = Vec::new();
+        enc_length_delim(&mut body, 2, b"r");
+        enc_length_delim(&mut body, 3, b"q1");
+        enc_length_delim(&mut body, 3, b"q2"); // stripped
+        body.push(0x21);
+        body.extend_from_slice(b"\x01\x02\x03");
+
+        let mut expected: Vec<u8> = Vec::new();
+        enc_length_delim(&mut expected, 2, b"r");
+        enc_length_delim(&mut expected, 3, b"q1"); // kept
+        expected.push(0x21);
+        expected.extend_from_slice(b"\x01\x02\x03");
+        assert_eq!(strip_sabr_quality_tracks(&body), expected);
+    }
+
+    // ── SABR host gate (defense against unrelated /videoplayback) ────────
+
+    // ── SABR kill-switch runtime gate (#977) ─────────────────────────────
+
+    /// Build a known segment-fetch body that the strip would actually
+    /// shrink — multi-track shape (field-2 + 2× field-3) so the
+    /// keep-first heuristic fires and removes the second field-3.
+    /// Used to prove the gate at runtime rather than just the
+    /// config-default round-trip.
+    fn segment_fetch_body() -> Vec<u8> {
+        let mut body: Vec<u8> = Vec::new();
+        enc_length_delim(&mut body, 2, b"range-descriptor");
+        enc_length_delim(&mut body, 3, b"quality-track-selector-1");
+        enc_length_delim(&mut body, 3, b"quality-track-selector-2");
+        body
+    }
+
+    #[test]
+    fn sabr_strip_on_strips_extra_field3_entries_via_relay_gate() {
+        // sabr_strip = true (default), multi-track segment-fetch body
+        // (the keep-first heuristic threshold). The first field-3
+        // entry must survive (so the player still has a track selected
+        // — the #977 lesson); subsequent field-3 entries must be gone
+        // (the 10 MB-blowup fix). Protects the main behaviour the
+        // kill-switch gates: if a future refactor drops the
+        // `self.sabr_strip` check, the strip still applies on `true`
+        // and the test passes; if the refactor inverts the check, this
+        // fails because no bytes are removed.
+        let fronter = fronter_for_test_with(false, true);
+        let body = segment_fetch_body();
+        let result = fronter.maybe_strip_sabr_body(
+            "POST",
+            "https://rrx---sn-xxx.googlevideo.com/videoplayback?id=42",
+            &body,
+        );
+        let stripped = result.expect("sabr_strip=true must strip a multi-track body");
+        assert!(
+            stripped.len() < body.len(),
+            "strip must remove at least one byte ({} -> {})",
+            body.len(),
+            stripped.len(),
+        );
+        // First field-3 kept (single-track preservation), second stripped.
+        assert!(
+            stripped
+                .windows(b"quality-track-selector-1".len())
+                .any(|w| w == b"quality-track-selector-1"),
+            "first field-3 payload (quality-track-selector-1) must SURVIVE the strip",
+        );
+        assert!(
+            !stripped
+                .windows(b"quality-track-selector-2".len())
+                .any(|w| w == b"quality-track-selector-2"),
+            "subsequent field-3 payload (quality-track-selector-2) must be STRIPPED",
+        );
+    }
+
+    #[test]
+    fn sabr_strip_off_keeps_body_unchanged_via_relay_gate() {
+        // sabr_strip = false: same body, same URL, gate must report
+        // None so `relay()` passes the body through verbatim. This is
+        // the regression test for the #977 kill-switch — if someone
+        // removes the `self.sabr_strip` check, this test fails.
+        let fronter = fronter_for_test_with(false, false);
+        let body = segment_fetch_body();
+        let result = fronter.maybe_strip_sabr_body(
+            "POST",
+            "https://rrx---sn-xxx.googlevideo.com/videoplayback?id=42",
+            &body,
+        );
+        assert!(
+            result.is_none(),
+            "sabr_strip=false must report None (no transformation): got {:?}",
+            result,
+        );
+    }
+
+    #[test]
+    fn sabr_strip_gate_respects_method_and_url_even_when_flag_is_on() {
+        // Other gates: only POST + /videoplayback + YT-host triggers.
+        // This protects the host-gate / method-gate / path-gate work
+        // from a refactor that conflates the kill-switch with the rest.
+        let fronter = fronter_for_test_with(false, true);
+        let body = segment_fetch_body();
+
+        // GET on the right URL: gate off (not POST).
+        assert!(fronter
+            .maybe_strip_sabr_body(
+                "GET",
+                "https://rrx---sn-xxx.googlevideo.com/videoplayback",
+                &body,
+            )
+            .is_none());
+
+        // POST on a non-YT host: gate off (host gate).
+        assert!(fronter
+            .maybe_strip_sabr_body(
+                "POST",
+                "https://api.example.com/videoplayback",
+                &body,
+            )
+            .is_none());
+
+        // POST on YT host without /videoplayback path: gate off.
+        assert!(fronter
+            .maybe_strip_sabr_body(
+                "POST",
+                "https://www.youtube.com/youtubei/v1/player",
+                &body,
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn sabr_strip_gate_returns_none_when_strip_is_a_no_op() {
+        // Body without field-3 (or without field-2) survives
+        // `strip_sabr_quality_tracks` unchanged. The gate then reports
+        // None so the caller doesn't pay for a redundant clone of an
+        // unmodified buffer.
+        let fronter = fronter_for_test_with(false, true);
+        let mut session_init: Vec<u8> = Vec::new();
+        // field-5 + field-3, no field-2 → strip is a no-op.
+        enc_length_delim(&mut session_init, 5, b"session-context");
+        enc_length_delim(&mut session_init, 3, b"essential-metadata");
+        let result = fronter.maybe_strip_sabr_body(
+            "POST",
+            "https://rrx---sn-xxx.googlevideo.com/videoplayback",
+            &session_init,
+        );
+        assert!(
+            result.is_none(),
+            "no-op strip must report None to avoid redundant alloc"
+        );
+    }
+
+    #[test]
+    fn sabr_host_gate_recognises_youtube_video_endpoints() {
+        // YouTube chunk CDN and yt itself.
+        assert!(url_host_is_youtube_video_endpoint(
+            "https://rrx---sn-xxx.googlevideo.com/videoplayback?...&itag=18"
+        ));
+        assert!(url_host_is_youtube_video_endpoint(
+            "https://googlevideo.com/videoplayback"
+        ));
+        assert!(url_host_is_youtube_video_endpoint(
+            "https://www.youtube.com/videoplayback"
+        ));
+        // Case-insensitive + trailing dot.
+        assert!(url_host_is_youtube_video_endpoint(
+            "https://GoogleVideo.com/videoplayback"
+        ));
+        assert!(url_host_is_youtube_video_endpoint(
+            "https://googlevideo.com./videoplayback"
+        ));
+    }
+
+    #[test]
+    fn sabr_host_gate_rejects_unrelated_hosts_with_videoplayback_path() {
+        // Any service that incidentally has `/videoplayback` must not
+        // be treated as YouTube SABR.
+        assert!(!url_host_is_youtube_video_endpoint(
+            "https://api.example.com/videoplayback"
+        ));
+        assert!(!url_host_is_youtube_video_endpoint(
+            "https://my-company.internal/videoplayback?id=42"
+        ));
+        // Suffix-attack: non-googlevideo hosts ending in similar bytes.
+        assert!(!url_host_is_youtube_video_endpoint(
+            "https://evilgooglevideo.com/videoplayback"
+        ));
+        assert!(!url_host_is_youtube_video_endpoint(
+            "https://notyoutube.com/videoplayback"
+        ));
+    }
+
+    #[test]
+    fn sabr_strip_truncated_varint_payload_with_single_field3_is_noop() {
+        // Wire type 0 (varint) with a continuation byte and no
+        // terminator. Sole field-3 → kept under keep-first heuristic
+        // → body returned verbatim (truncated tail included).
+        let mut body: Vec<u8> = Vec::new();
+        enc_length_delim(&mut body, 2, b"r");
+        enc_length_delim(&mut body, 3, b"q"); // sole field-3 → kept
+        body.push(0x28);
+        body.push(0x80); // continuation, then EOF
+
+        assert_eq!(strip_sabr_quality_tracks(&body), body);
+    }
+
+    // ── StatsSnapshot::fmt_line + to_json (forwarder fields) ────────────
+
+    /// Build a `StatsSnapshot` fixture for serialization tests.
+    /// All non-forwarder fields take fixed sentinels; the three
+    /// forwarder fields are caller-supplied so each test can target
+    /// the zero / non-zero branches.
+    fn snapshot_with_forwarder(
+        forwarder_calls: u64,
+        forwarder_bytes: u64,
+        forwarder_errors: u64,
+    ) -> StatsSnapshot {
+        StatsSnapshot {
+            relay_calls: 100,
+            relay_failures: 2,
+            coalesced: 5,
+            bytes_relayed: 4096,
+            cache_hits: 30,
+            cache_misses: 70,
+            cache_bytes: 8192,
+            blacklisted_scripts: 0,
+            total_scripts: 1,
+            today_calls: 100,
+            today_bytes: 4096,
+            today_key: "2026-05-10".into(),
+            today_reset_secs: 3600,
+            h2_calls: 80,
+            h2_fallbacks: 4,
+            h2_disabled: false,
+            forwarder_calls,
+            forwarder_bytes,
+            forwarder_errors,
+        }
+    }
+
+    #[test]
+    fn fmt_line_omits_forwarder_segment_when_zero() {
+        // Path filter never fired → forwarder values all zero. The
+        // CLI line must NOT carry an `fwd=0 err=0` segment, otherwise
+        // every non-AppsScript / no-pattern-hit user sees a confusing
+        // always-zero pair.
+        let s = snapshot_with_forwarder(0, 0, 0);
+        let line = s.fmt_line();
+        assert!(
+            !line.contains("fwd="),
+            "fmt_line must omit forwarder segment when all-zero: {}",
+            line
+        );
+        assert!(
+            !line.contains("err="),
+            "fmt_line must omit forwarder error count when all-zero: {}",
+            line
+        );
+    }
+
+    #[test]
+    fn fmt_line_includes_forwarder_segment_when_nonzero() {
+        // Once the path filter has fired (any of calls / errors > 0),
+        // the diagnostic segment shows up. Bytes are converted to KB
+        // (mirrors `bytes_relayed`).
+        let s = snapshot_with_forwarder(42, 1_048_576, 3);
+        let line = s.fmt_line();
+        assert!(line.contains("fwd=42"), "fmt_line missing fwd=42: {}", line);
+        // 1_048_576 / 1024 = 1024 KB
+        assert!(
+            line.contains("(1024KB)"),
+            "fmt_line missing bytes segment: {}",
+            line
+        );
+        assert!(line.contains("err=3"), "fmt_line missing err=3: {}", line);
+    }
+
+    #[test]
+    fn fmt_line_includes_forwarder_segment_when_only_errors_nonzero() {
+        // Edge: forwarder consistently failed → calls=0, errors > 0.
+        // Segment must still appear so users see the failure rate;
+        // otherwise a fully-broken fast path looks identical to one
+        // that's never been triggered.
+        let s = snapshot_with_forwarder(0, 0, 5);
+        let line = s.fmt_line();
+        assert!(line.contains("fwd=0"), "fmt_line missing fwd=0: {}", line);
+        assert!(line.contains("err=5"), "fmt_line missing err=5: {}", line);
+    }
+
+    #[test]
+    fn to_json_emits_forwarder_fields_with_zero_values() {
+        // Hand-rolled to_json must include the new fields even when
+        // zero — Android JNI consumers expect a stable schema and
+        // shouldn't have to handle "missing field" branches per
+        // version. Parse the output as JSON to also validate the
+        // hand-rolled format string is syntactically correct.
+        let s = snapshot_with_forwarder(0, 0, 0);
+        let json = s.to_json();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("to_json must produce valid JSON");
+        assert_eq!(parsed["forwarder_calls"], 0);
+        assert_eq!(parsed["forwarder_bytes"], 0);
+        assert_eq!(parsed["forwarder_errors"], 0);
+        // No `forwarder_fallbacks` key — that was the pre-rename name
+        // and shipping it would confuse JNI consumers parsing both.
+        assert!(
+            parsed.get("forwarder_fallbacks").is_none(),
+            "stale field name must not appear: {}",
+            json
+        );
+    }
+
+    #[test]
+    fn to_json_emits_forwarder_fields_with_nonzero_values() {
+        let s = snapshot_with_forwarder(42, 1_048_576, 3);
+        let json = s.to_json();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("to_json must produce valid JSON");
+        assert_eq!(parsed["forwarder_calls"], 42);
+        assert_eq!(parsed["forwarder_bytes"], 1_048_576);
+        assert_eq!(parsed["forwarder_errors"], 3);
+    }
+
+    #[test]
+    fn to_json_round_trips_existing_fields_alongside_new_ones() {
+        // Regression guard for the hand-rolled format string: adding
+        // the new forwarder fields must not have broken any of the
+        // preexisting fields. Pick a sample of each to confirm.
+        let s = snapshot_with_forwarder(7, 1024, 0);
+        let json = s.to_json();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("to_json must produce valid JSON");
+        assert_eq!(parsed["relay_calls"], 100);
+        assert_eq!(parsed["bytes_relayed"], 4096);
+        assert_eq!(parsed["h2_calls"], 80);
+        assert_eq!(parsed["h2_disabled"], false);
+        assert_eq!(parsed["today_key"], "2026-05-10");
+        assert_eq!(parsed["forwarder_calls"], 7);
     }
 }
