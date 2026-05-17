@@ -45,7 +45,7 @@
     {
       "name": "fastly",
       "ip": "151.101.128.223",
-      "sni": "pypi.org",
+      "sni": "files.pythonhosted.org",
       "domains": [
         "redd.it",
         "reddit.com",
@@ -59,10 +59,6 @@
         "redditspace.com",
         "redditstatus.com",
         "reddit.map.fastly.net",
-
-        "githubassets.com",
-        "githubusercontent.com",
-        "github.io",
 
         "fastly.com",
         "fastly-edge.com",
@@ -100,14 +96,16 @@
       ]
     },
     {
-      "name": "github-central",
-      "ip": "140.82.113.21",
-      "sni": "central.github.com",
+      "name": "github-collector",
+      "ip": "140.82.113.22",
+      "sni": "collector.github.com",
       "domains": [
         "objects-origin.githubusercontent.com",
         "api.individual.githubcopilot.com",
         "glb-db52c2cf8be544.github.com",
-        "api.githubcopilot.com"
+        "api.githubcopilot.com",
+        "collector.github.com",
+        "central.github.com"
       ]
     },
     {
@@ -122,8 +120,11 @@
     {
       "name": "github",
       "ip": "140.82.121.3",
-      "sni": "github.com",
-      "domains": ["gist.github.com"]
+      "sni": "www.github.com",
+      "domains": [
+        "gist.github.com",
+        "github.com"
+      ]
     },
     {
       "name": "pubmed",
