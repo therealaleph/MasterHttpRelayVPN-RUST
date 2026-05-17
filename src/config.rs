@@ -9,6 +9,8 @@ pub enum ConfigError {
     Read(String, #[source] std::io::Error),
     #[error("failed to parse config json: {0}")]
     Parse(#[from] serde_json::Error),
+    #[error("failed to parse config toml: {0}")]
+    ParseToml(#[from] toml::de::Error),
     #[error("invalid config: {0}")]
     Invalid(String),
 }
@@ -557,6 +559,16 @@ impl Config {
         Ok(cfg)
     }
 
+    pub fn load_toml(path: &Path) -> Result<Self, ConfigError> {
+        let data = std::fs::read_to_string(path)
+            .map_err(|e| ConfigError::Read(path.display().to_string(), e))?;
+        let toml_cfg: TomlConfig = toml::from_str(&data)
+            .map_err(ConfigError::ParseToml)?;
+        let cfg = Config::from(toml_cfg);
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         let mode = self.mode_kind()?;
         if mode == Mode::AppsScript || mode == Mode::Full {
@@ -814,6 +826,106 @@ pub struct TomlConfig {
     pub exit_node: ExitNodeConfig,
     #[serde(default)]
     pub fronting_groups: Vec<FrontingGroup>,
+}
+
+impl From<TomlConfig> for Config {
+    fn from(t: TomlConfig) -> Self {
+        Config {
+            mode: t.relay.mode,
+            google_ip: t.network.google_ip,
+            front_domain: t.network.front_domain,
+            script_id: t.relay.script_id,
+            script_ids: t.relay.script_ids,
+            auth_key: t.relay.auth_key,
+            listen_host: t.network.listen_host,
+            listen_port: t.network.listen_port,
+            socks5_port: t.network.socks5_port,
+            log_level: t.logging.log_level,
+            verify_ssl: t.network.verify_ssl,
+            hosts: t.network.hosts,
+            enable_batching: t.relay.enable_batching,
+            upstream_socks5: t.network.upstream_socks5,
+            parallel_relay: t.relay.parallel_relay,
+            coalesce_step_ms: t.relay.coalesce_step_ms,
+            coalesce_max_ms: t.relay.coalesce_max_ms,
+            sni_hosts: t.network.sni_hosts,
+            fetch_ips_from_api: t.scan.fetch_ips_from_api,
+            max_ips_to_scan: t.scan.max_ips_to_scan,
+            scan_batch_size: t.scan.scan_batch_size,
+            google_ip_validation: t.scan.google_ip_validation,
+            normalize_x_graphql: t.relay.normalize_x_graphql,
+            youtube_via_relay: t.relay.youtube_via_relay,
+            passthrough_hosts: t.network.passthrough_hosts,
+            block_stun: t.network.block_stun,
+            block_quic: t.network.block_quic,
+            disable_padding: t.relay.disable_padding,
+            force_http1: t.relay.force_http1,
+            tunnel_doh: t.network.tunnel_doh,
+            bypass_doh_hosts: t.network.bypass_doh_hosts,
+            block_doh: t.network.block_doh,
+            fronting_groups: t.fronting_groups,
+            auto_blacklist_strikes: t.relay.auto_blacklist_strikes,
+            auto_blacklist_window_secs: t.relay.auto_blacklist_window_secs,
+            auto_blacklist_cooldown_secs: t.relay.auto_blacklist_cooldown_secs,
+            request_timeout_secs: t.relay.request_timeout_secs,
+            exit_node: t.exit_node,
+        }
+    }
+}
+
+/// Used by the JSON->TOML migration write path: takes a reference so the
+/// flat Config can still be returned as Ok(config) after the TOML is written.
+impl From<&Config> for TomlConfig {
+    fn from(c: &Config) -> Self {
+        TomlConfig {
+            relay: TomlRelay {
+                mode: c.mode.clone(),
+                script_id: c.script_id.clone(),
+                script_ids: c.script_ids.clone(),
+                auth_key: c.auth_key.clone(),
+                parallel_relay: c.parallel_relay,
+                enable_batching: c.enable_batching,
+                coalesce_step_ms: c.coalesce_step_ms,
+                coalesce_max_ms: c.coalesce_max_ms,
+                youtube_via_relay: c.youtube_via_relay,
+                normalize_x_graphql: c.normalize_x_graphql,
+                disable_padding: c.disable_padding,
+                force_http1: c.force_http1,
+                auto_blacklist_strikes: c.auto_blacklist_strikes,
+                auto_blacklist_window_secs: c.auto_blacklist_window_secs,
+                auto_blacklist_cooldown_secs: c.auto_blacklist_cooldown_secs,
+                request_timeout_secs: c.request_timeout_secs,
+            },
+            network: TomlNetwork {
+                google_ip: c.google_ip.clone(),
+                front_domain: c.front_domain.clone(),
+                listen_host: c.listen_host.clone(),
+                listen_port: c.listen_port,
+                socks5_port: c.socks5_port,
+                verify_ssl: c.verify_ssl,
+                upstream_socks5: c.upstream_socks5.clone(),
+                block_quic: c.block_quic,
+                block_stun: c.block_stun,
+                sni_hosts: c.sni_hosts.clone(),
+                passthrough_hosts: c.passthrough_hosts.clone(),
+                tunnel_doh: c.tunnel_doh,
+                block_doh: c.block_doh,
+                bypass_doh_hosts: c.bypass_doh_hosts.clone(),
+                hosts: c.hosts.clone(),
+            },
+            scan: TomlScan {
+                fetch_ips_from_api: c.fetch_ips_from_api,
+                max_ips_to_scan: c.max_ips_to_scan,
+                scan_batch_size: c.scan_batch_size,
+                google_ip_validation: c.google_ip_validation,
+            },
+            logging: TomlLogging {
+                log_level: c.log_level.clone(),
+            },
+            exit_node: c.exit_node.clone(),
+            fronting_groups: c.fronting_groups.clone(),
+        }
+    }
 }
 
 #[cfg(test)]
