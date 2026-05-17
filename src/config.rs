@@ -396,6 +396,18 @@ pub struct Config {
     /// Setup walkthrough at `assets/exit_node/README.md`. Default off.
     #[serde(default)]
     pub exit_node: ExitNodeConfig,
+
+    /// TLS fingerprint profile for the relay leg's outbound TLS.
+    /// `"rustls"` (default) keeps the existing tokio-rustls path.
+    /// `"chrome"` uses a BoringSSL Chrome-shaped ClientHello, defeating
+    /// JA3/JA4 fingerprinting that tries to distinguish mhrv-rs from
+    /// real Chrome traffic to Google.
+    ///
+    /// `"chrome"` requires the binary to be built with `--features utls`.
+    /// Builds without the feature fall back to rustls with a startup
+    /// warning. Roadmap item #369 §2.
+    #[serde(default = "default_tls_fingerprint")]
+    pub tls_fingerprint: String,
 }
 
 /// Configuration for the optional second-hop exit node.
@@ -528,6 +540,7 @@ fn default_auto_blacklist_cooldown_secs() -> u64 { 120 }
 /// Default for `request_timeout_secs`: 30s, matching the historical
 /// hard-coded `BATCH_TIMEOUT` and Apps Script's typical response cliff.
 fn default_request_timeout_secs() -> u64 { 30 }
+fn default_tls_fingerprint() -> String { "rustls".into() }
 
 fn default_google_ip() -> String {
     "216.239.38.120".into()
@@ -583,6 +596,15 @@ impl Config {
             return Err(ConfigError::Invalid(
                 "scan_batch_size must be greater than 0".into(),
             ));
+        }
+        match self.tls_fingerprint.trim().to_ascii_lowercase().as_str() {
+            "rustls" | "chrome" => {}
+            other => {
+                return Err(ConfigError::Invalid(format!(
+                    "tls_fingerprint must be 'rustls' (default) or 'chrome'; got '{}'",
+                    other
+                )));
+            }
         }
         if self.socks5_port == Some(self.listen_port) {
             return Err(ConfigError::Invalid(format!(
@@ -966,4 +988,90 @@ mod rt_tests {
         assert_eq!(cfg.mode, "apps_script");
         let _ = std::fs::remove_file(&tmp);
     }
+
+    #[test]
+    fn tls_fingerprint_defaults_to_rustls() {
+        let json = r#"{
+  "mode": "apps_script",
+  "auth_key": "secretkey123",
+  "script_id": "X"
+}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.tls_fingerprint, "rustls");
+    }
+
+    #[test]
+    fn tls_fingerprint_chrome_validates() {
+        let json = r#"{
+  "mode": "apps_script",
+  "auth_key": "secretkey123",
+  "script_id": "X",
+  "tls_fingerprint": "chrome"
+}"#;
+        let tmp = std::env::temp_dir().join("mhrv-tlsfp-chrome.json");
+        std::fs::write(&tmp, json).unwrap();
+        let cfg = Config::load(&tmp).expect("chrome fingerprint must validate");
+        assert_eq!(cfg.tls_fingerprint, "chrome");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn tls_fingerprint_rustls_validates() {
+        let json = r#"{
+  "mode": "apps_script",
+  "auth_key": "secretkey123",
+  "script_id": "X",
+  "tls_fingerprint": "rustls"
+}"#;
+        let tmp = std::env::temp_dir().join("mhrv-tlsfp-rustls.json");
+        std::fs::write(&tmp, json).unwrap();
+        Config::load(&tmp).expect("explicit rustls must validate");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn tls_fingerprint_unknown_rejected() {
+        let json = r#"{
+  "mode": "apps_script",
+  "auth_key": "secretkey123",
+  "script_id": "X",
+  "tls_fingerprint": "firefox"
+}"#;
+        let tmp = std::env::temp_dir().join("mhrv-tlsfp-bad.json");
+        std::fs::write(&tmp, json).unwrap();
+        let result = Config::load(&tmp);
+        assert!(result.is_err(), "unknown profile must be rejected");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("tls_fingerprint"),
+            "error must mention tls_fingerprint: {}",
+            err
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn tls_fingerprint_case_insensitive() {
+        for value in ["Chrome", "CHROME", "  chrome  ", "RUSTLS"] {
+            let json = format!(
+                r#"{{
+  "mode": "apps_script",
+  "auth_key": "secretkey123",
+  "script_id": "X",
+  "tls_fingerprint": "{}"
+}}"#,
+                value
+            );
+            let tmp = std::env::temp_dir().join(format!(
+                "mhrv-tlsfp-case-{}.json",
+                value.trim().replace(' ', "_")
+            ));
+            std::fs::write(&tmp, &json).unwrap();
+            Config::load(&tmp).unwrap_or_else(|e| {
+                panic!("case variant '{}' must validate, got: {}", value, e)
+            });
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
 }

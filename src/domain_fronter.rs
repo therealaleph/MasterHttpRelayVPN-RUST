@@ -33,15 +33,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, Mutex};
 use tokio::time::timeout;
-use tokio_rustls::client::TlsStream;
-use tokio_rustls::TlsConnector;
-
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+use rustls::{DigitallySignedStruct, SignatureScheme};
 
 use crate::cache::{cache_key, is_cacheable_method, parse_ttl, ResponseCache};
 use crate::config::Config;
+use crate::tls_dialer::{self, AlpnPolicy, DialedStream, TlsDialer};
 
 #[derive(Debug, thiserror::Error)]
 pub enum FronterError {
@@ -93,7 +91,7 @@ impl FronterError {
     }
 }
 
-type PooledStream = TlsStream<TcpStream>;
+type PooledStream = DialedStream;
 const POOL_TTL_SECS: u64 = 60;
 const POOL_MIN: usize = 8;
 const POOL_REFILL_INTERVAL_SECS: u64 = 5;
@@ -288,6 +286,27 @@ impl From<OpenH2Error> for FronterError {
     }
 }
 
+/// Detect cert-validation failures across both TLS backends. rustls
+/// uses `UnknownIssuer` / `invalid peer certificate` / etc.; BoringSSL
+/// (utls path) uses OpenSSL-style `certificate verify failed` / `unable
+/// to get local issuer certificate` / `self signed certificate` —
+/// either set means the ISP-MITM diagnostic should fire.
+pub(crate) fn is_cert_validation_error(msg: &str) -> bool {
+    // rustls phrasing
+    msg.contains("UnknownIssuer")
+        || msg.contains("invalid peer certificate")
+        || msg.contains("CertificateExpired")
+        || msg.contains("CertNotValidYet")
+        || msg.contains("NotValidForName")
+        // BoringSSL / OpenSSL phrasing — surfaces via UtlsError::Handshake
+        || msg.contains("certificate verify failed")
+        || msg.contains("unable to get local issuer certificate")
+        || msg.contains("self signed certificate")
+        || msg.contains("self-signed certificate")
+        || msg.contains("certificate has expired")
+        || msg.contains("hostname mismatch")
+}
+
 pub struct DomainFronter {
     connect_host: String,
     /// Pool of SNI domains to rotate through per outbound connection. All of
@@ -314,17 +333,13 @@ pub struct DomainFronter {
     /// Set once we've emitted the "UnknownIssuer means ISP MITM" hint,
     /// so we don't spam it every time a cert-validation error repeats.
     cert_hint_shown: std::sync::atomic::AtomicBool,
-    /// Connector used by `open_h2`: advertises ALPN `["h2", "http/1.1"]`
-    /// when the h2 fast path is enabled, else just `["http/1.1"]`. Never
-    /// used by the h1 pool path — see `tls_connector_h1`.
-    tls_connector: TlsConnector,
-    /// Connector used by `open()` (h1 pool warm/refill/acquire). ALPN
-    /// is forced to `["http/1.1"]` so a Google edge that would have
-    /// preferred h2 still negotiates h1 here. Without this, pooled
-    /// sockets could end up speaking h2 frames after handshake, and
-    /// the `write_all(b"GET / HTTP/1.1\r\n...")` fallback would land
-    /// on a server that has no idea what we're doing.
-    tls_connector_h1: TlsConnector,
+    /// Used by `open_h2`. ALPN advertises h2 first (or h1 only when
+    /// `force_http1`).
+    dialer: TlsDialer,
+    /// Used by `open()` (h1 pool). ALPN forced to http/1.1 so a Google
+    /// edge that would otherwise prefer h2 still negotiates h1 — the
+    /// raw HTTP/1.1 fallback path can't speak h2 frames.
+    dialer_h1: TlsDialer,
     pool: Arc<Mutex<Vec<PoolEntry>>>,
     /// HTTP/2 fast path. `None` until first relay opens it; cleared on
     /// connection failure or expiry so the next call reopens. Skipped
@@ -551,43 +566,32 @@ impl DomainFronter {
         if script_ids.is_empty() {
             return Err(FronterError::Relay("no script_id configured".into()));
         }
-        // Helper that builds a fresh ClientConfig with the verifier
-        // policy from config. We need two of these so the h2-capable
-        // and h1-only paths can advertise different ALPN sets without
-        // mutating one shared config across calls.
-        let build_tls_config = || {
-            if config.verify_ssl {
-                let mut roots = rustls::RootCertStore::empty();
-                roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-                ClientConfig::builder()
-                    .with_root_certificates(roots)
-                    .with_no_client_auth()
-            } else {
-                ClientConfig::builder()
-                    .dangerous()
-                    .with_custom_certificate_verifier(Arc::new(NoVerify))
-                    .with_no_client_auth()
-            }
-        };
-
-        // Connector for `open_h2`: advertises h2 first (or just h1 if
-        // the kill switch is set, in which case both connectors end up
-        // identical — fine, just slightly redundant).
-        let mut tls_h2 = build_tls_config();
-        if !config.force_http1 {
-            tls_h2.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let alpn_primary = if config.force_http1 {
+            AlpnPolicy::Http1Only
         } else {
-            tls_h2.alpn_protocols = vec![b"http/1.1".to_vec()];
-        }
-        let tls_connector = TlsConnector::from(Arc::new(tls_h2));
+            AlpnPolicy::H2Then11
+        };
+        let (dialer, fp_fallback_h2) = tls_dialer::build_dialer(
+            &config.tls_fingerprint,
+            config.verify_ssl,
+            alpn_primary,
+        )
+        .map_err(|e| FronterError::Relay(format!("tls dialer init: {}", e)))?;
+        let (dialer_h1, fp_fallback_h1) = tls_dialer::build_dialer(
+            &config.tls_fingerprint,
+            config.verify_ssl,
+            AlpnPolicy::Http1Only,
+        )
+        .map_err(|e| FronterError::Relay(format!("tls dialer init: {}", e)))?;
 
-        // Connector for `open()` (h1 pool path). ALPN is forced to
-        // http/1.1 so a Google edge that would otherwise prefer h2
-        // still negotiates h1 here — pooled sockets always speak the
-        // protocol the fallback path expects.
-        let mut tls_h1 = build_tls_config();
-        tls_h1.alpn_protocols = vec![b"http/1.1".to_vec()];
-        let tls_connector_h1 = TlsConnector::from(Arc::new(tls_h1));
+        if (fp_fallback_h2 || fp_fallback_h1)
+            && config.tls_fingerprint.eq_ignore_ascii_case("chrome")
+        {
+            tracing::warn!(
+                "tls_fingerprint='chrome' requires a build with --features utls; \
+                 this binary was built without it, falling back to rustls."
+            );
+        }
 
         Ok(Self {
             connect_host: config.google_ip.clone(),
@@ -603,8 +607,8 @@ impl DomainFronter {
             cert_hint_shown: std::sync::atomic::AtomicBool::new(false),
             script_ids,
             script_idx: AtomicUsize::new(0),
-            tls_connector,
-            tls_connector_h1,
+            dialer,
+            dialer_h1,
             pool: Arc::new(Mutex::new(Vec::new())),
             h2_cell: Arc::new(Mutex::new(None)),
             h2_open_lock: Arc::new(Mutex::new(())),
@@ -910,11 +914,7 @@ impl DomainFronter {
     /// fill the log.
     fn log_relay_failure(&self, e: &FronterError) {
         let msg = e.to_string();
-        let is_cert_issue = msg.contains("UnknownIssuer")
-            || msg.contains("invalid peer certificate")
-            || msg.contains("CertificateExpired")
-            || msg.contains("CertNotValidYet")
-            || msg.contains("NotValidForName");
+        let is_cert_issue = is_cert_validation_error(&msg);
         if is_cert_issue
             && !self
                 .cert_hint_shown
@@ -954,13 +954,12 @@ impl DomainFronter {
             let tcp = TcpStream::connect((self.connect_host.as_str(), 443u16)).await?;
             let _ = tcp.set_nodelay(true);
             let sni = self.next_sni();
-            let name = ServerName::try_from(sni)?;
-            // Always use the h1-only connector here — the pool only holds
+            // Always use the h1-only dialer here — the pool only holds
             // sockets that the raw HTTP/1.1 fallback path can write to.
-            // Using the shared connector would let some pooled sockets
+            // Using the shared dialer would let some pooled sockets
             // negotiate h2, which would then misframe every fallback
             // request that lands on them.
-            let tls = self.tls_connector_h1.connect(name, tcp).await?;
+            let tls = self.dialer_h1.connect(&sni, tcp).await?;
             Ok::<_, FronterError>(tls)
         };
         match tokio::time::timeout(Duration::from_secs(H1_OPEN_TIMEOUT_SECS), work).await {
@@ -1323,8 +1322,7 @@ impl DomainFronter {
         let tcp = TcpStream::connect((self.connect_host.as_str(), 443u16)).await?;
         let _ = tcp.set_nodelay(true);
         let sni = self.next_sni();
-        let name = ServerName::try_from(sni)?;
-        let tls = self.tls_connector.connect(name, tcp).await?;
+        let tls = self.dialer.connect(&sni, tcp).await?;
         Self::h2_handshake_post_tls(tls).await
     }
 
@@ -1336,9 +1334,7 @@ impl DomainFronter {
         tls: PooledStream,
     ) -> Result<(h2::client::SendRequest<Bytes>, Arc<AtomicBool>), OpenH2Error> {
         let alpn_h2 = tls
-            .get_ref()
-            .1
-            .alpn_protocol()
+            .negotiated_alpn()
             .map(|p| p == b"h2")
             .unwrap_or(false);
         if !alpn_h2 {
@@ -7220,18 +7216,14 @@ hello";
             tokio::time::sleep(Duration::from_millis(50)).await;
         });
 
-        // Client side: open TLS with ALPN advertising h2 + h1.1; the
-        // server picks h1 → alpn_protocol() returns "http/1.1" not "h2".
-        let mut client_cfg = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerify))
-            .with_no_client_auth();
-        client_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
+        // Server-side ALPN is h1-only (above), client-side advertises
+        // h2 + h1.1, so server picks h1 and negotiated_alpn() != "h2".
+        // verify=false because the test cert is self-signed.
+        let (dialer, _) =
+            tls_dialer::build_dialer("rustls", false, AlpnPolicy::H2Then11).unwrap();
 
         let tcp = TcpStream::connect(addr).await.unwrap();
-        let name = rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap();
-        let tls = connector.connect(name, tcp).await.unwrap();
+        let tls = dialer.connect("127.0.0.1", tcp).await.unwrap();
 
         let result = DomainFronter::h2_handshake_post_tls(tls).await;
         match result {
@@ -7240,5 +7232,181 @@ hello";
             Ok((_send, _dead)) => panic!("expected AlpnRefused, got Ok"),
         }
         server.await.unwrap();
+    }
+
+    fn minimal_apps_script_config(tls_fingerprint: &str) -> Config {
+        let json = format!(
+            r#"{{
+  "mode": "apps_script",
+  "auth_key": "secretkey123",
+  "script_id": "X",
+  "tls_fingerprint": "{}"
+}}"#,
+            tls_fingerprint
+        );
+        let cfg: Config = serde_json::from_str(&json).unwrap();
+        cfg
+    }
+
+    #[test]
+    fn domain_fronter_new_with_rustls_fingerprint_constructs() {
+        let cfg = minimal_apps_script_config("rustls");
+        let f = DomainFronter::new(&cfg);
+        assert!(f.is_ok(), "rustls fingerprint must construct: {:?}", f.err());
+    }
+
+    #[test]
+    fn domain_fronter_new_with_chrome_fingerprint_does_not_panic() {
+        // On no-feature builds this exercises the rustls fallback path
+        // (warning logged, no error). With --features utls it builds
+        // the BoringSSL connector. Either way: must not panic, must
+        // return Ok.
+        let cfg = minimal_apps_script_config("chrome");
+        let f = DomainFronter::new(&cfg);
+        assert!(f.is_ok(), "chrome fingerprint must construct: {:?}", f.err());
+    }
+
+    #[test]
+    fn domain_fronter_new_default_threads_h2_alpn_to_main_dialer() {
+        // The h2 fast path must advertise h2-then-h1; the h1 pool must
+        // advertise h1-only. If `DomainFronter::new` accidentally swaps
+        // them, pooled sockets would negotiate h2 frames and the raw
+        // HTTP/1.1 fallback path would misframe every request.
+        let cfg = minimal_apps_script_config("rustls");
+        let f = DomainFronter::new(&cfg).unwrap();
+        assert_eq!(f.dialer.alpn_policy(), AlpnPolicy::H2Then11);
+        assert_eq!(f.dialer_h1.alpn_policy(), AlpnPolicy::Http1Only);
+    }
+
+    #[test]
+    fn domain_fronter_new_with_force_http1_pins_both_dialers_to_h1() {
+        // The kill switch in config.json (`force_http1: true`) must
+        // collapse the h2 dialer down to h1-only — otherwise the relay
+        // could still negotiate h2 on the fast path despite the user
+        // asking us not to.
+        let mut cfg = minimal_apps_script_config("rustls");
+        cfg.force_http1 = true;
+        let f = DomainFronter::new(&cfg).unwrap();
+        assert_eq!(f.dialer.alpn_policy(), AlpnPolicy::Http1Only);
+        assert_eq!(f.dialer_h1.alpn_policy(), AlpnPolicy::Http1Only);
+    }
+
+    #[test]
+    fn log_relay_failure_cert_hint_fires_for_rustls_messages() {
+        // Sanity-anchor the cert-hint matcher against the original
+        // rustls phrasing. If a future refactor narrows the matcher,
+        // this test catches the regression.
+        for phrase in [
+            "UnknownIssuer",
+            "invalid peer certificate: BadSignature",
+            "CertificateExpired",
+            "CertNotValidYet",
+            "NotValidForName",
+        ] {
+            assert!(
+                is_cert_validation_error(phrase),
+                "rustls phrase '{}' must trigger cert hint",
+                phrase
+            );
+        }
+    }
+
+    #[test]
+    fn log_relay_failure_cert_hint_fires_for_boringssl_messages() {
+        // BoringSSL surfaces cert failures via OpenSSL-style strings.
+        // Without these in the matcher, users on the chrome path get
+        // a bare "Relay failed: ..." with no MITM diagnostic — the
+        // single most useful error message in the codebase for IR
+        // users vanishes the moment they enable utls.
+        for phrase in [
+            "tls handshake error: certificate verify failed",
+            "unable to get local issuer certificate",
+            "self signed certificate",
+            "self-signed certificate in certificate chain",
+            "certificate has expired",
+            "hostname mismatch",
+        ] {
+            assert!(
+                is_cert_validation_error(phrase),
+                "boringssl phrase '{}' must trigger cert hint",
+                phrase
+            );
+        }
+    }
+
+    #[test]
+    fn log_relay_failure_cert_hint_does_not_fire_for_unrelated_errors() {
+        for phrase in [
+            "connection reset by peer",
+            "broken pipe",
+            "alpn refused h2",
+            "h2 handshake: GOAWAY",
+            "json error: missing field",
+        ] {
+            assert!(
+                !is_cert_validation_error(phrase),
+                "unrelated phrase '{}' must not trigger cert hint",
+                phrase
+            );
+        }
+    }
+
+    // -- Task #11: fallback warning emitted on chrome-without-feature ----
+    //
+    // On binaries built without `--features utls`, requesting
+    // `tls_fingerprint=chrome` silently downgrades to rustls. The user
+    // must see a WARN telling them why, otherwise they think the chrome
+    // profile is in effect when it isn't. This test only makes sense in
+    // the no-feature configuration.
+
+    #[cfg(not(feature = "utls"))]
+    #[test]
+    fn domain_fronter_new_with_chrome_warns_when_feature_disabled() {
+        use std::io::Write;
+        use std::sync::{Arc as StdArc, Mutex as StdMutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone)]
+        struct BufWriter(StdArc<StdMutex<Vec<u8>>>);
+
+        impl Write for BufWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> MakeWriter<'a> for BufWriter {
+            type Writer = BufWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = StdArc::new(StdMutex::new(Vec::new()));
+        let writer = BufWriter(buf.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let cfg = minimal_apps_script_config("chrome");
+        let _ = DomainFronter::new(&cfg).expect("must construct on fallback");
+
+        let captured = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            captured.contains("--features utls"),
+            "expected fallback warning mentioning '--features utls', got:\n{}",
+            captured
+        );
+        assert!(
+            captured.contains("chrome"),
+            "expected fallback warning mentioning 'chrome', got:\n{}",
+            captured
+        );
     }
 }

@@ -25,6 +25,11 @@ required-features = ["ui"]
 [features]
 default = []
 ui = ["dep:eframe"]
+# Opt-in: BoringSSL needs CMake + clang at build time, awkward for
+# musl-static / mipsel-softfloat / Win7-i686 release targets. When on,
+# `tls_fingerprint: "chrome"` in config.json selects a Chrome-shaped
+# ClientHello. Roadmap item #369 §2.
+utls = ["dep:rama-boring", "dep:rama-boring-tokio"]
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "signal", "sync"] }
@@ -57,6 +62,11 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # 64-bit atomically; on x86_64 / aarch64 / armv7 / etc. it compiles
 # down to the native instructions with no overhead.
 portable-atomic = { version = "1", features = ["fallback"] }
+
+# BoringSSL connector for the `utls` feature — drop-in at the
+# tokio_rustls::TlsConnector::connect API surface.
+rama-boring = { version = "0.6", optional = true }
+rama-boring-tokio = { version = "0.6", optional = true }
 
 # Optional UI dep: only pulled in when --features ui is set.
 # Both `glow` (OpenGL 2+) and `wgpu` (DX12/Vulkan/Metal) are compiled in;
