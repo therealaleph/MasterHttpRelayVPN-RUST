@@ -642,8 +642,9 @@ fn save_config(cfg: &Config) -> Result<PathBuf, String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let json = serde_json::to_string_pretty(&ConfigWire::from(cfg)).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| e.to_string())?;
+    let toml_str = toml::to_string_pretty(&mhrv_rs::config::TomlConfig::from(cfg))
+        .map_err(|e| e.to_string())?;
+    std::fs::write(&path, toml_str).map_err(|e| e.to_string())?;
     Ok(path)
 }
 

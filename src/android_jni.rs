@@ -1,7 +1,7 @@
 //! JNI entry points for the Android app.
 //!
 //! The app (Kotlin) calls `Native.setDataDir()` once, then `Native.startProxy()`
-//! with the full config.json payload and gets back a handle (u64). Later the
+//! with the full config payload (JSON or TOML string) and gets back a handle (u64). Later the
 //! app calls `stopProxy(handle)` to stop, `statsJson(handle)` to poll, or
 //! `exportCa(dest)` to copy the MITM CA cert to a path the app can hand to
 //! Android's system "install certificate" dialog.
@@ -26,7 +26,7 @@ use jni::JNIEnv;
 use tokio::runtime::Runtime;
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
-use crate::config::Config;
+use crate::config::{Config, TomlConfig};
 use crate::mitm::{MitmCertManager, CA_CERT_FILE};
 use crate::proxy_server::ProxyServer;
 
@@ -188,12 +188,15 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_startProxy(
         install_logging_once();
 
         let json = jstring_to_string(&mut env, &config_json);
-        let config: Config = match serde_json::from_str(&json) {
+        let config: Config = match serde_json::from_str::<Config>(&json) {
             Ok(c) => c,
-            Err(e) => {
-                tracing::error!("android: invalid config json: {}", e);
-                return 0i64;
-            }
+            Err(json_err) => match toml::from_str::<TomlConfig>(&json) {
+                Ok(tc) => Config::from(tc),
+                Err(_) => {
+                    tracing::error!("android: invalid config: {}", json_err);
+                    return 0;
+                }
+            },
         };
 
         // Try to build the runtime first — if allocation fails we want to
