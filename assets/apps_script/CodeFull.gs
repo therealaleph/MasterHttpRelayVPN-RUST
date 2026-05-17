@@ -395,15 +395,8 @@ function _doBatch(items) {
           }
           var fallbackReq = fetchArgs[j];
           var fallbackUrl = fallbackReq.url;
-          var fallbackOpts = {};
-          for (var key in fallbackReq) {
-            if (
-              Object.prototype.hasOwnProperty.call(fallbackReq, key) &&
-              key !== "url"
-            ) {
-              fallbackOpts[key] = fallbackReq[key];
-            }
-          }
+          var fallbackOpts = Object.assign({}, fallbackReq);
+          delete fallbackOpts.url;
           responses[j] = UrlFetchApp.fetch(fallbackUrl, fallbackOpts);
         } catch (singleErr) {
           errorMap[fetchIndex[j]] = String(singleErr);
@@ -608,12 +601,12 @@ function _edgeDnsResolve(prep, cachedReplyB64, cache, localMap) {
 function _sha256Hex(s) {
   var d = Utilities.computeDigest(
     Utilities.DigestAlgorithm.SHA_256, s, Utilities.Charset.UTF_8);
-  var hex = "";
+  var parts = [];
   for (var i = 0; i < d.length; i++) {
     var b = d[i] & 0xFF;
-    hex += (b < 16 ? "0" : "") + b.toString(16);
+    parts.push((b < 16 ? "0" : "") + b.toString(16));
   }
-  return hex;
+  return parts.join("");
 }
 
 // Single DoH GET against `url`. Returns the reply as a byte array, or null
@@ -656,13 +649,13 @@ function _dnsParseQuestion(bytes) {
     if (len > 63) return null;
     off++;
     if (off + len > bytes.length) return null;
-    var label = "";
+    var labelChars = [];
     for (var i = 0; i < len; i++) {
       var c = bytes[off + i] & 0xFF;
       if (c >= 0x41 && c <= 0x5A) c += 0x20;   // ASCII lowercase
-      label += String.fromCharCode(c);
+      labelChars.push(String.fromCharCode(c));
     }
-    labels.push(label);
+    labels.push(labelChars.join(""));
     off += len;
     nameLen += len + 1;
     if (nameLen > 255) return null;
@@ -743,8 +736,7 @@ function _dnsSkipName(bytes, off) {
 // cheap (~100 bytes for a typical DNS reply) compared to the surrounding
 // base64 encode/decode work.
 function _dnsRewriteTxid(bytes, txid) {
-  var out = [];
-  for (var i = 0; i < bytes.length; i++) out.push(bytes[i]);
+  var out = Array.prototype.slice.call(bytes);
   var hi = (txid >> 8) & 0xFF;
   var lo = txid & 0xFF;
   out[0] = hi > 127 ? hi - 256 : hi;
