@@ -552,11 +552,29 @@ fn default_verify_ssl() -> bool {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        let data = std::fs::read_to_string(path)
-            .map_err(|e| ConfigError::Read(path.display().to_string(), e))?;
-        let cfg: Config = serde_json::from_str(&data)?;
-        cfg.validate()?;
-        Ok(cfg)
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        match ext.as_str() {
+            "toml" => Self::load_toml(path),
+            "json" => Self::load_json_and_migrate(path),
+            _ => {
+                // No extension or unrecognised: try TOML first, then JSON.
+                // JSON success also triggers migration. On double failure,
+                // surface the TOML error (the format new configs expect).
+                let toml_err = match Self::load_toml(path) {
+                    Ok(cfg) => return Ok(cfg),
+                    Err(e) => e,
+                };
+                match Self::load_json_and_migrate(path) {
+                    Ok(cfg) => Ok(cfg),
+                    Err(_) => Err(toml_err),
+                }
+            }
+        }
     }
 
     pub fn load_toml(path: &Path) -> Result<Self, ConfigError> {
@@ -566,6 +584,40 @@ impl Config {
             .map_err(ConfigError::ParseToml)?;
         let cfg = Config::from(toml_cfg);
         cfg.validate()?;
+        Ok(cfg)
+    }
+
+    fn load_json_and_migrate(path: &Path) -> Result<Self, ConfigError> {
+        let data = std::fs::read_to_string(path)
+            .map_err(|e| ConfigError::Read(path.display().to_string(), e))?;
+        let cfg: Config = serde_json::from_str(&data)?;
+        cfg.validate()?;
+
+        // Write a .toml equivalent alongside the .json file. Failure is
+        // non-fatal: the in-memory Config is still valid and returned.
+        let toml_path = path.with_extension("toml");
+        match toml::to_string_pretty(&TomlConfig::from(&cfg)) {
+            Ok(toml_str) => match std::fs::write(&toml_path, &toml_str) {
+                Ok(()) => tracing::warn!(
+                    "Found legacy config.json. Translated to {} automatically. \
+                    config.json has been left in place but will no longer be read. \
+                    You can delete it.",
+                    toml_path.display()
+                ),
+                Err(e) => tracing::warn!(
+                    "Found legacy config.json but could not write {}: {}. \
+                    Continuing from the JSON config.",
+                    toml_path.display(),
+                    e
+                ),
+            },
+            Err(e) => tracing::warn!(
+                "Found legacy config.json but could not serialize to TOML: {}. \
+                Continuing from the JSON config.",
+                e
+            ),
+        }
+
         Ok(cfg)
     }
 
