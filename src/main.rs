@@ -43,7 +43,7 @@ USAGE:
     mhrv-rs test-sni [OPTIONS]         Probe each SNI name in the rotation pool against google_ip
 
 OPTIONS:
-    -c, --config PATH    Path to config.json (default: ./config.json)
+    -c, --config PATH    Path to config.toml file (default: <data-dir>/config.toml)
     --install-cert       Install the MITM CA certificate and exit
     --remove-cert        Remove the MITM CA from the OS trust store (verified by
                          name), then delete the on-disk ca/ directory and exit.

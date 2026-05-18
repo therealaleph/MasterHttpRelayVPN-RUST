@@ -311,8 +311,7 @@ fn load_form() -> (FormState, Option<String>) {
     // fails so the user isn't silently shown a blank form (issue: user reports
     // 'settings saved to file but not loaded back'). Without this signal the
     // failure is invisible — `.ok()` swallows it and the form looks fresh.
-    let path = data_dir::config_path();
-    let cwd = PathBuf::from("config.json");
+    let path = data_dir::resolve_config_path(None);
 
     let (existing, load_err): (Option<Config>, Option<String>) = if path.exists() {
         tracing::info!("config: attempting load from {}", path.display());
@@ -323,16 +322,6 @@ fn load_form() -> (FormState, Option<String>) {
             }
             Err(e) => {
                 let msg = format!("Config at {} failed to load: {}", path.display(), e);
-                tracing::warn!("{}", msg);
-                (None, Some(msg))
-            }
-        }
-    } else if cwd.exists() {
-        tracing::info!("config: attempting fallback load from {}", cwd.display());
-        match Config::load(&cwd) {
-            Ok(c) => (Some(c), None),
-            Err(e) => {
-                let msg = format!("Config at {} failed to load: {}", cwd.display(), e);
                 tracing::warn!("{}", msg);
                 (None, Some(msg))
             }
@@ -1130,7 +1119,7 @@ impl eframe::App for App {
                                 "Custom bind: {}",
                                 listen_host_snapshot
                             )).color(egui::Color32::from_rgb(220, 180, 100)));
-                            ui.small("Edit `listen_host` in config.json to change.");
+                            ui.small("Edit `listen_host` in config.toml to change.");
                         });
                     } else {
                         let mut share = was_share_on_lan;
@@ -1609,7 +1598,7 @@ impl eframe::App for App {
                      and delete the on-disk ca/ directory. NSS cleanup (Firefox/Chrome) \
                      is best-effort and logs a hint if certutil is missing or a browser \
                      has the DB locked. A fresh CA is generated the next time you start \
-                     the proxy. Your config.json and the Apps Script deployment are NOT \
+                     the proxy. Your config.toml and the Apps Script deployment are NOT \
                      touched — no need to redeploy Code.gs."
                 };
                 ui.add_enabled_ui(!proxy_active && !running && !cert_op_in_flight, |ui| {
@@ -2413,7 +2402,7 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                             push_log(&shared2, &format!("[ui] {}", outcome.summary()));
                             push_log(
                                 &shared2,
-                                "[ui] config.json and Apps Script deployment untouched",
+                                "[ui] config.toml and Apps Script deployment untouched",
                             );
                         }
                         Err(e) => {

@@ -37,8 +37,15 @@ pub fn data_dir() -> PathBuf {
     dir
 }
 
-/// Path to the config.json for this platform's data dir.
+/// Path to config.toml in the platform data dir (the canonical location
+/// for new users and post-migration installs).
 pub fn config_path() -> PathBuf {
+    data_dir().join("config.toml")
+}
+
+/// Path to the legacy config.json. Used only by resolve_config_path to
+/// detect a JSON config that needs auto-migration to TOML.
+pub fn json_config_path() -> PathBuf {
     data_dir().join("config.json")
 }
 
@@ -53,22 +60,33 @@ pub fn ca_key_path() -> PathBuf {
 }
 
 /// Resolve a config path: if the user supplied an explicit path, use it.
-/// Otherwise look in the user-data dir first, fall back to `./config.json`
-/// in the current working directory (for backward compatibility with the
-/// original CLI behavior).
+/// 
+/// Otherwise search in preference order, TOML before JSON in both the
+/// user-data dir and the current working directory. JSON hits trigger the
+/// auto-migration in Config::load so the user is upgraded transparently.
+/// 
+/// Falls back to data_dir/config.toml (non-existent) so new-user error
+/// messages and Save-config operations point to the right place.
 pub fn resolve_config_path(cli_arg: Option<&Path>) -> PathBuf {
     if let Some(p) = cli_arg {
         return p.to_path_buf();
     }
-    let user = config_path();
-    if user.exists() {
-        return user;
+    let user_toml = config_path();
+    if user_toml.exists() {
+        return user_toml;
     }
-    let cwd = PathBuf::from("config.json");
-    if cwd.exists() {
-        return cwd;
+    let user_json = json_config_path();
+    if user_json.exists() {
+        return user_json;
     }
-    // Neither exists: return the user-data path so errors point to the
-    // blessed location and commands like "Save config" write there.
-    user
+    let cwd_toml = PathBuf::from("config.toml");
+    if cwd_toml.exists() {
+        return cwd_toml;
+    }
+    let cwd_json = PathBuf::from("config.json");
+    if cwd_json.exists() {
+        return cwd_json;
+    }
+    // No config found anywhere - return the canonical new-user location.
+    user_toml
 }
