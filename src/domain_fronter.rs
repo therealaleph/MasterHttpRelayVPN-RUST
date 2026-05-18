@@ -1106,7 +1106,7 @@ impl DomainFronter {
         }
     }
 
-    /// Keep the Apps Script container warm with a periodic HEAD ping.
+    /// Keep the Apps Script container warm with a periodic lightweight GET ping.
     ///
     /// The TCP/TLS pool stays warm via `run_pool_refill`, but the V8
     /// container Apps Script runs in goes cold ~5min after the last
@@ -1122,9 +1122,8 @@ impl DomainFronter {
     /// Bypasses the response cache (`cache_key_opt = None`) and the
     /// inflight coalescer — otherwise the second iteration would just
     /// hit the cached response from the first and never reach Apps
-    /// Script. The relay payload itself is the cheapest non-error one
-    /// we can build: a HEAD against `http://example.com/` returns a few
-    /// hundred bytes, no body decode, no auth.
+    /// Script. Apps Script UrlFetchApp does not accept `head` as a method, so
+    /// the relay payload uses a GET range probe instead of HEAD.
     ///
     /// Best-effort. Failures are debug-logged so a flaky network or
     /// quota-exhausted account doesn't spam warnings every 4 minutes.
@@ -1139,8 +1138,9 @@ impl DomainFronter {
             // for the debug line. We intentionally don't use relay()
             // here because that path goes through the cache + coalesce
             // layer, which would short-circuit subsequent pings.
+            let headers = [("Range".to_string(), "bytes=0-0".to_string())];
             let _ = self
-                .relay_uncoalesced("HEAD", "http://example.com/", &[], &[], None)
+                .relay_uncoalesced("GET", "http://example.com/", &headers, &[], None)
                 .await;
             tracing::debug!(
                 "container keepalive: {}ms",
@@ -1755,6 +1755,10 @@ impl DomainFronter {
             url
         };
 
+        if method.eq_ignore_ascii_case("HEAD") {
+            return self.relay_head_via_get_probe(url, headers).await;
+        }
+
         // Exit-node short-circuit: route through the configured second-hop
         // relay (Deno Deploy / fly.io / etc.) for hosts that need a
         // non-Google exit IP. The cache + coalesce layer below is bypassed
@@ -1862,6 +1866,39 @@ impl DomainFronter {
             }
         }
 
+        self.record_site(url, false, bytes.len() as u64, t_start.elapsed().as_nanos() as u64);
+        bytes
+    }
+
+    async fn relay_head_via_get_probe(&self, url: &str, headers: &[(String, String)]) -> Vec<u8> {
+        let probe_headers = synthetic_head_probe_headers(headers);
+        let t_start = Instant::now();
+
+        let raw = if self.exit_node_matches(url) {
+            match self.relay_via_exit_node("GET", url, &probe_headers, &[]).await {
+                Ok(bytes) => bytes,
+                Err(e) if !e.is_retryable() => {
+                    self.relay_failures.fetch_add(1, Ordering::Relaxed);
+                    let inner = e.into_inner();
+                    self.record_site(url, false, 0, t_start.elapsed().as_nanos() as u64);
+                    return error_response(502, &format!("Relay error: {}", inner));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "exit node failed for synthetic HEAD probe {}: {} — falling back to direct Apps Script",
+                        url,
+                        e
+                    );
+                    self.relay_uncoalesced("GET", url, &probe_headers, &[], None)
+                        .await
+                }
+            }
+        } else {
+            self.relay_uncoalesced("GET", url, &probe_headers, &[], None)
+                .await
+        };
+
+        let bytes = synthesize_head_response_from_get_probe(&raw);
         self.record_site(url, false, bytes.len() as u64, t_start.elapsed().as_nanos() as u64);
         bytes
     }
@@ -3435,17 +3472,7 @@ fn assemble_full_200(src_headers: &[(String, String)], body: &[u8]) -> Vec<u8> {
 /// `assemble_full_200`'s header-skip rules so the two paths produce
 /// identical headers for a given probe.
 fn assemble_200_head(src_headers: &[(String, String)], declared_length: u64) -> Vec<u8> {
-    let skip = |k: &str| {
-        matches!(
-            k.to_ascii_lowercase().as_str(),
-            "content-length"
-                | "content-range"
-                | "content-encoding"
-                | "transfer-encoding"
-                | "connection"
-                | "keep-alive",
-        )
-    };
+    let skip = |k: &str| skip_synthetic_response_header(k);
     let mut out: Vec<u8> = b"HTTP/1.1 200 OK\r\n".to_vec();
     for (k, v) in src_headers {
         if skip(k) {
@@ -3458,6 +3485,77 @@ fn assemble_200_head(src_headers: &[(String, String)], declared_length: u64) -> 
     }
     out.extend_from_slice(format!("Content-Length: {}\r\n\r\n", declared_length).as_bytes());
     out
+}
+
+fn synthetic_head_probe_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = headers
+        .iter()
+        .filter(|(k, _)| {
+            !k.eq_ignore_ascii_case("range")
+                && !k.eq_ignore_ascii_case("content-length")
+                && !k.eq_ignore_ascii_case("content-type")
+        })
+        .cloned()
+        .collect();
+    out.push(("Range".to_string(), "bytes=0-0".to_string()));
+    out
+}
+
+fn synthesize_head_response_from_get_probe(raw: &[u8]) -> Vec<u8> {
+    let Some((status, headers, body)) = split_response(raw) else {
+        return raw.to_vec();
+    };
+
+    let (head_status, declared_length) = if status == 206 {
+        let len = match parse_content_range(&headers) {
+            Some(range) if range.start == 0 => range.total,
+            _ => response_content_length(&headers).unwrap_or(body.len() as u64),
+        };
+        (200, len)
+    } else {
+        (status, response_content_length(&headers).unwrap_or(body.len() as u64))
+    };
+
+    assemble_response_head(head_status, &headers, declared_length)
+}
+
+fn response_content_length(headers: &[(String, String)]) -> Option<u64> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, v)| v.trim().parse::<u64>().ok())
+}
+
+fn assemble_response_head(
+    status: u16,
+    src_headers: &[(String, String)],
+    declared_length: u64,
+) -> Vec<u8> {
+    let mut out: Vec<u8> =
+        format!("HTTP/1.1 {} {}\r\n", status, status_reason(status)).into_bytes();
+    for (k, v) in src_headers {
+        if skip_synthetic_response_header(k) {
+            continue;
+        }
+        out.extend_from_slice(k.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(v.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(format!("Content-Length: {}\r\n\r\n", declared_length).as_bytes());
+    out
+}
+
+fn skip_synthetic_response_header(k: &str) -> bool {
+    matches!(
+        k.to_ascii_lowercase().as_str(),
+        "content-length"
+            | "content-range"
+            | "content-encoding"
+            | "transfer-encoding"
+            | "connection"
+            | "keep-alive",
+    )
 }
 
 /// Apply `transform_head` to the head block of an HTTP/1.x response
@@ -5579,6 +5677,68 @@ hello";
         let sep = b"\r\n\r\n";
         let idx = full.windows(sep.len()).position(|w| w == sep).unwrap();
         assert_eq!(&full[..idx + sep.len()], head_only.as_slice());
+    }
+
+    #[test]
+    fn synthetic_head_from_range_probe_uses_total_length_and_no_body() {
+        let mut raw = b"HTTP/1.1 206 Partial Content\r\n\
+Content-Type: application/octet-stream\r\n\
+Content-Disposition: attachment; filename=test.AppImage\r\n\
+Content-Range: bytes 0-0/790340426\r\n\
+Content-Length: 1\r\n\
+Connection: keep-alive\r\n\r\n"
+            .to_vec();
+        raw.extend_from_slice(b"x");
+
+        let got = synthesize_head_response_from_get_probe(&raw);
+        let got_s = String::from_utf8_lossy(&got);
+
+        assert!(got_s.starts_with("HTTP/1.1 200 OK\r\n"), "got: {}", got_s);
+        assert!(got_s.contains("Content-Type: application/octet-stream\r\n"));
+        assert!(got_s.contains("Content-Disposition: attachment; filename=test.AppImage\r\n"));
+        assert!(got_s.contains("Content-Length: 790340426\r\n"));
+        assert!(!got_s.contains("Content-Range:"));
+        assert!(!got_s.contains("Connection:"));
+        assert!(
+            got_s.ends_with("\r\n\r\n"),
+            "HEAD response must not include a body: {}",
+            got_s
+        );
+    }
+
+    #[test]
+    fn synthetic_head_from_unknown_total_range_still_hides_probe_status() {
+        let raw = b"HTTP/1.1 206 Partial Content\r\n\
+Content-Range: bytes 0-0/*\r\n\
+Content-Length: 0\r\n\r\n";
+
+        let got = synthesize_head_response_from_get_probe(raw);
+        let got_s = String::from_utf8_lossy(&got);
+
+        assert!(got_s.starts_with("HTTP/1.1 200 OK\r\n"), "got: {}", got_s);
+        assert!(got_s.contains("Content-Length: 0\r\n"));
+        assert!(!got_s.contains("Content-Range:"));
+        assert!(got_s.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn synthetic_head_probe_headers_replace_client_range() {
+        let input = vec![
+            ("Accept".to_string(), "*/*".to_string()),
+            ("Range".to_string(), "bytes=10-20".to_string()),
+            ("User-Agent".to_string(), "curl/8".to_string()),
+        ];
+
+        let got = synthetic_head_probe_headers(&input);
+
+        assert_eq!(
+            got,
+            vec![
+                ("Accept".to_string(), "*/*".to_string()),
+                ("User-Agent".to_string(), "curl/8".to_string()),
+                ("Range".to_string(), "bytes=0-0".to_string()),
+            ]
+        );
     }
 
     #[tokio::test]
