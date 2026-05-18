@@ -1284,3 +1284,169 @@ mod rt_tests {
         let _ = std::fs::remove_file(&tmp);
     }
 }
+
+#[cfg(test)]
+mod toml_tests {
+    use super::*;
+
+    #[test]
+    fn toml_parses_minimal_relay_section() {
+        let s = r#"
+[relay]
+mode = "apps_script"
+auth_key = "MY_SECRET_KEY_123"
+script_id = "ABCDEF"
+"#;
+        let toml_cfg: TomlConfig = toml::from_str(s).unwrap();
+        let cfg = Config::from(toml_cfg);
+        assert_eq!(cfg.mode, "apps_script");
+        assert_eq!(cfg.auth_key, "MY_SECRET_KEY_123");
+        assert_eq!(cfg.script_ids_resolved(), vec!["ABCDEF".to_string()]);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn toml_network_defaults_apply_when_section_omitted() {
+        // [network] section is entirely optional — all fields have defaults.
+        let s = r#"
+[relay]
+mode = "direct"
+"#;
+        let toml_cfg: TomlConfig = toml::from_str(s).unwrap();
+        let cfg = Config::from(toml_cfg);
+        assert_eq!(cfg.google_ip, "216.239.38.120");
+        assert_eq!(cfg.listen_port, 8085);
+        assert!(cfg.verify_ssl);
+        assert!(cfg.block_doh);
+        assert!(cfg.tunnel_doh);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn toml_parses_exit_node_section() {
+        let s = r#"
+[relay]
+mode = "apps_script"
+auth_key = "SECRET"
+script_id = "X"
+
+[exit_node]
+enabled = true
+relay_url = "https://example.com"
+psk = "mypsk"
+mode = "selective"
+hosts = ["claude.ai", "chatgpt.com"]
+"#;
+        let toml_cfg: TomlConfig = toml::from_str(s).unwrap();
+        let cfg = Config::from(toml_cfg);
+        cfg.validate().unwrap();
+        assert!(cfg.exit_node.enabled);
+        assert_eq!(cfg.exit_node.relay_url, "https://example.com");
+        assert_eq!(cfg.exit_node.hosts, vec!["claude.ai", "chatgpt.com"]);
+    }
+
+    #[test]
+    fn toml_parses_fronting_groups_array_of_tables() {
+        let s = r#"
+[relay]
+mode = "direct"
+
+[[fronting_groups]]
+name = "vercel"
+ip = "76.76.21.21"
+sni = "react.dev"
+domains = ["vercel.com", "nextjs.org"]
+
+[[fronting_groups]]
+name = "fastly"
+ip = "151.101.128.223"
+sni = "pypi.org"
+domains = ["reddit.com"]
+"#;
+        let toml_cfg: TomlConfig = toml::from_str(s).unwrap();
+        let cfg = Config::from(toml_cfg);
+        cfg.validate().unwrap();
+        assert_eq!(cfg.fronting_groups.len(), 2);
+        assert_eq!(cfg.fronting_groups[0].name, "vercel");
+        assert_eq!(cfg.fronting_groups[1].name, "fastly");
+    }
+
+    #[test]
+    fn toml_parses_network_hosts_subtable() {
+        let s = r#"
+[relay]
+mode = "direct"
+
+[network.hosts]
+"example.com" = "1.2.3.4"
+"test.example.com" = "5.6.7.8"
+"#;
+        let toml_cfg: TomlConfig = toml::from_str(s).unwrap();
+        let cfg = Config::from(toml_cfg);
+        assert_eq!(cfg.hosts.get("example.com"), Some(&"1.2.3.4".to_string()));
+        assert_eq!(cfg.hosts.get("test.example.com"), Some(&"5.6.7.8".to_string()));
+    }
+
+    #[test]
+    fn toml_multi_script_id_array() {
+        let s = r#"
+[relay]
+mode = "apps_script"
+auth_key = "SECRET"
+script_id = ["A", "B", "C"]
+"#;
+        let toml_cfg: TomlConfig = toml::from_str(s).unwrap();
+        let cfg = Config::from(toml_cfg);
+        assert_eq!(cfg.script_ids_resolved(), vec!["A", "B", "C"]);
+    }
+
+    #[test]
+    fn config_load_reads_toml_file_directly() {
+        let s = r#"
+[relay]
+mode = "apps_script"
+auth_key = "MY_SECRET_KEY_123"
+script_id = "ABCDEF"
+"#;
+        let tmp = std::env::temp_dir().join("mhrv-load-toml-test.toml");
+        std::fs::write(&tmp, s).unwrap();
+        let cfg = Config::load(&tmp).expect("Config::load must handle .toml extension");
+        assert_eq!(cfg.mode, "apps_script");
+        assert_eq!(cfg.script_ids_resolved(), vec!["ABCDEF".to_string()]);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn json_migration_writes_toml_alongside_and_result_roundtrips() {
+        let json = r#"{
+  "mode": "apps_script",
+  "auth_key": "MY_SECRET_KEY_123",
+  "script_id": "ABCDEF",
+  "listen_port": 8085
+}"#;
+        let dir = std::env::temp_dir();
+        let json_path = dir.join("mhrv-migration-test.json");
+        let toml_path = dir.join("mhrv-migration-test.toml");
+        let _ = std::fs::remove_file(&json_path);
+        let _ = std::fs::remove_file(&toml_path);
+
+        std::fs::write(&json_path, json).unwrap();
+        let cfg = Config::load(&json_path)
+            .expect("JSON config must load and trigger migration");
+
+        assert!(toml_path.exists(), "migration must write config.toml alongside config.json");
+
+        // The written TOML must parse back to an equivalent Config.
+        let toml_str = std::fs::read_to_string(&toml_path).unwrap();
+        let toml_cfg: TomlConfig = toml::from_str(&toml_str)
+            .expect("migrated TOML must be valid TOML");
+        let cfg2 = Config::from(toml_cfg);
+        assert_eq!(cfg.mode, cfg2.mode);
+        assert_eq!(cfg.auth_key, cfg2.auth_key);
+        assert_eq!(cfg.script_ids_resolved(), cfg2.script_ids_resolved());
+        assert_eq!(cfg.listen_port, cfg2.listen_port);
+
+        let _ = std::fs::remove_file(&json_path);
+        let _ = std::fs::remove_file(&toml_path);
+    }
+}
