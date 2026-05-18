@@ -206,7 +206,7 @@ async fn main() -> ExitCode {
         Err(e) => {
             eprintln!("{}", e);
             eprintln!(
-                "No valid config found. Copy config.example.json to either:\n  {}\nor run with --config <path>.",
+                "No valid config found. Copy config.example.toml to either:\n  {}\nor run with --config <path>.",
                 config_path.display()
             );
             return ExitCode::FAILURE;
