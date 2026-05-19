@@ -73,7 +73,7 @@ const INFLIGHT_OPTIMIST: usize = 2;
 
 /// Maximum pipeline depth when data is actively flowing. Ramps up on
 /// data-bearing replies, drops back to IDLE after consecutive empties.
-const INFLIGHT_ACTIVE: usize = 4;
+const INFLIGHT_ACTIVE: usize = 6;
 
 /// How many consecutive empty replies before dropping from active to idle depth.
 const INFLIGHT_COOLDOWN: u32 = 3;

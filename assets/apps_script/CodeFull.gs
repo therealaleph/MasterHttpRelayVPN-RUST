@@ -201,11 +201,17 @@ function _doTunnel(req) {
 // On a 5-DNS-query batch, this collapses 5 serial cache.get round trips
 // into one cache.getAll round trip.
 function _doTunnelBatch(req) {
+  // Compressed batch: forward opaquely, skip edge-DNS inspection.
+  if (req.zops) {
+    return _doTunnelBatchForwardCompressed(req.zops);
+  }
+
   var ops = (req && req.ops) || [];
+  var zc = req && req.zc;
 
   // Feature off: byte-identical to the pre-feature behavior.
   if (!ENABLE_EDGE_DNS_CACHE) {
-    return _doTunnelBatchForward(ops);
+    return _doTunnelBatchForward(ops, zc);
   }
 
   var results = new Array(ops.length);   // sparse: filled by edge-DNS hits
@@ -272,10 +278,11 @@ function _doTunnelBatch(req) {
 
   // Nothing was served locally — forward verbatim, no splice needed.
   if (forwardOps.length === ops.length) {
-    return _doTunnelBatchForward(ops);
+    return _doTunnelBatchForward(ops, zc);
   }
 
   // Partial: forward the un-served ops and splice results back in place.
+  // Don't pass zc here — Apps Script needs to parse r[] for splicing.
   var resp = _doTunnelBatchFetch(forwardOps);
   if (resp.error) return _json({ e: resp.error });
   if (resp.r.length !== forwardOps.length) {
@@ -287,11 +294,30 @@ function _doTunnelBatch(req) {
 }
 
 // Verbatim forward: no splice, response passed through unchanged.
-function _doTunnelBatchForward(ops) {
+function _doTunnelBatchForward(ops, zc) {
+  var body = { k: TUNNEL_AUTH_KEY, ops: ops };
+  if (zc) body.zc = zc;
   var resp = UrlFetchApp.fetch(TUNNEL_SERVER_URL + "/tunnel/batch", {
     method: "post",
     contentType: "application/json",
-    payload: JSON.stringify({ k: TUNNEL_AUTH_KEY, ops: ops }),
+    payload: JSON.stringify(body),
+    muteHttpExceptions: true,
+    followRedirects: true,
+  });
+  if (resp.getResponseCode() !== 200) {
+    return _json({ e: "tunnel batch HTTP " + resp.getResponseCode() });
+  }
+  return ContentService.createTextOutput(resp.getContentText())
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// Compressed forward: zops is an opaque blob, passed to tunnel-node as-is.
+// Response is also opaque (may contain zr instead of r).
+function _doTunnelBatchForwardCompressed(zops) {
+  var resp = UrlFetchApp.fetch(TUNNEL_SERVER_URL + "/tunnel/batch", {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify({ k: TUNNEL_AUTH_KEY, zops: zops }),
     muteHttpExceptions: true,
     followRedirects: true,
   });
@@ -304,11 +330,13 @@ function _doTunnelBatchForward(ops) {
 
 // Forward + parse for the splice path. Returns { r:[...] } on success or
 // { error: "..." } on any failure.
-function _doTunnelBatchFetch(ops) {
+function _doTunnelBatchFetch(ops, zc) {
+  var body = { k: TUNNEL_AUTH_KEY, ops: ops };
+  if (zc) body.zc = zc;
   var resp = UrlFetchApp.fetch(TUNNEL_SERVER_URL + "/tunnel/batch", {
     method: "post",
     contentType: "application/json",
-    payload: JSON.stringify({ k: TUNNEL_AUTH_KEY, ops: ops }),
+    payload: JSON.stringify(body),
     muteHttpExceptions: true,
     followRedirects: true,
   });

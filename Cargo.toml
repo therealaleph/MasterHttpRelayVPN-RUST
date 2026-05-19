@@ -47,6 +47,7 @@ rand = "0.8"
 h2 = "0.4"
 http = "1"
 flate2 = "1"
+zstd = "0.13"
 directories = "5"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # 64-bit atomics on 32-bit MIPS/ARMv5 targets. Rust's std AtomicU64 is

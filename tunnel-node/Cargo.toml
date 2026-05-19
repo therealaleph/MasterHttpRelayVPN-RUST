@@ -18,6 +18,7 @@ uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 flate2 = "1"
+zstd = "0.13"
 
 [profile.release]
 panic = "abort"
