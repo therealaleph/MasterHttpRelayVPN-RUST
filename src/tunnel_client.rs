@@ -69,7 +69,7 @@ const INFLIGHT_IDLE: usize = 1;
 
 /// Optimistic starting depth — every session gets 2 in-flight polls
 /// without needing an elevation permit. Drops to IDLE on first empty.
-const INFLIGHT_OPTIMIST: usize = 1;
+const INFLIGHT_OPTIMIST: usize = 2;
 
 /// Maximum pipeline depth when data is actively flowing. Ramps up on
 /// data-bearing replies, drops back to IDLE after consecutive empties.
