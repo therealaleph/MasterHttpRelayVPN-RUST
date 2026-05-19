@@ -201,6 +201,7 @@ async fn main() -> ExitCode {
     }
 
     let config_path = mhrv_rs::data_dir::resolve_config_path(args.config_path.as_deref());
+    init_logging("warn"); // boot-time logging so migration warning is visible
     let config = match Config::load(&config_path) {
         Ok(c) => c,
         Err(e) => {
