@@ -316,7 +316,7 @@ fn load_form() -> (FormState, Option<String>) {
     let (existing, load_err): (Option<Config>, Option<String>) = if path.exists() {
         tracing::info!("config: attempting load from {}", path.display());
         match Config::load(&path) {
-            Ok(c) => {
+            Ok((c, _)) => {
                 tracing::info!("config: loaded OK from {}", path.display());
                 (Some(c), None)
             }
