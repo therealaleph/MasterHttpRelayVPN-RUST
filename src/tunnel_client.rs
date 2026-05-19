@@ -73,7 +73,7 @@ const INFLIGHT_OPTIMIST: usize = 1;
 
 /// Maximum pipeline depth when data is actively flowing. Ramps up on
 /// data-bearing replies, drops back to IDLE after consecutive empties.
-const INFLIGHT_ACTIVE: usize = 2;
+const INFLIGHT_ACTIVE: usize = 4;
 
 /// How many consecutive empty replies before dropping from active to idle depth.
 const INFLIGHT_COOLDOWN: u32 = 3;
@@ -1675,9 +1675,9 @@ async fn tunnel_loop(
         }
 
         // Can we read from the client? Yes if not closed, not eof, and
-        // we have room for more inflight ops (allow +1 extra for upload
-        // data that shouldn't wait for a slot — but not +4 which floods).
-        let can_read = !client_closed && !eof_seen && inflight.len() < max_inflight + 1;
+        // we have room for more inflight ops (+2 extra for upload data
+        // so it doesn't wait for a full pipeline drain).
+        let can_read = !client_closed && !eof_seen && inflight.len() < max_inflight + 2;
 
         tokio::select! {
             biased;
@@ -1904,8 +1904,8 @@ async fn tunnel_loop(
                             let (meta, reply_rx) = send_data_op(sid, data, &mut next_send_seq, &mut next_data_write_seq, mux);
                             consecutive_empty = 0;
                             inflight.push(wrap_reply(meta, reply_rx));
-                        } else if inflight.len() < max_inflight + 1 {
-                            // One extra slot for upload data so it doesn't
+                        } else if inflight.len() < max_inflight + 2 {
+                            // Two extra slots for upload data so it doesn't
                             // wait for a full pipeline drain.
                             let (meta, reply_rx) = send_data_op(sid, data, &mut next_send_seq, &mut next_data_write_seq, mux);
                             consecutive_empty = 0;
