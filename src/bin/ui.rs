@@ -38,7 +38,7 @@ fn main() -> eframe::Result<()> {
     // with their saved log level. Otherwise the form's log-level combobox
     // would only ever take effect via env var or after Save → restart, and
     // users on the UI binary (issue #401) reasonably expect the saved
-    // config.json `log_level` to apply at boot like it does for the CLI.
+    // config.toml `log_level` to apply at boot like it does for the CLI.
     let (form, load_err) = load_form();
     let initial_toast = load_err.map(|e| (e, Instant::now()));
 
@@ -252,36 +252,36 @@ struct FormState {
     normalize_x_graphql: bool,
     youtube_via_relay: bool,
     passthrough_hosts: Vec<String>,
-    /// Round-tripped from config.json so the UI's save path doesn't
+    /// Round-tripped from config.toml so the UI's save path doesn't
     /// drop the user's setting. Not currently exposed as a UI control;
-    /// users edit `block_quic` directly in `config.json` (Issue #213).
+    /// users edit `block_quic` directly in `config.toml` (Issue #213).
     block_quic: bool,
-    /// Round-tripped from config.json and exposed beside QUIC blocking.
+    /// Round-tripped from config.toml and exposed beside QUIC blocking.
     /// Default true to push WebRTC apps toward TCP TURN instead of slow
     /// UDP ICE retries.
     block_stun: bool,
-    /// Round-tripped from config.json. Not exposed as a UI control —
+    /// Round-tripped from config.toml. Not exposed as a UI control —
     /// users edit `disable_padding` directly when needed (Issue #391).
     /// Default false (padding active).
     disable_padding: bool,
-    /// Round-tripped from config.json. Not exposed as a UI control —
+    /// Round-tripped from config.toml. Not exposed as a UI control —
     /// users edit `force_http1` directly when needed. Default false
     /// (HTTP/2 multiplexing on the relay leg active).
     force_http1: bool,
-    /// Round-tripped from config.json. Not exposed in the UI form yet —
+    /// Round-tripped from config.toml. Not exposed in the UI form yet —
     /// the bypass-DoH default is the right answer for almost everyone
     /// (DoH already encrypts, the tunnel was just adding latency), so
     /// this is a config-only opt-out. See config.rs `tunnel_doh`.
     tunnel_doh: bool,
     /// User-supplied DoH hostnames added to the built-in default list,
-    /// round-tripped from config.json. See config.rs `bypass_doh_hosts`.
+    /// round-tripped from config.toml. See config.rs `bypass_doh_hosts`.
     bypass_doh_hosts: Vec<String>,
     /// PR #763: when true, immediately reject browser DoH CONNECTs so the
     /// browser falls back to system DNS (tun2proxy virtual DNS — instant).
-    /// Round-tripped from config.json. Desktop UI doesn't expose a toggle
+    /// Round-tripped from config.toml. Desktop UI doesn't expose a toggle
     /// yet — Android does. See config.rs `block_doh`.
     block_doh: bool,
-    /// Multi-edge fronting groups. Round-tripped from config.json so
+    /// Multi-edge fronting groups. Round-tripped from config.toml so
     /// the UI's Save doesn't drop the user's hand-edited groups —
     /// there is no UI editor for these yet, only file-edited config.
     /// See config.rs `fronting_groups`.
@@ -598,7 +598,7 @@ impl FormState {
             // tun2proxy's virtual DNS handles name lookups, saving the
             // ~1.5s tunnel round-trip per DNS query). Desktop UI doesn't
             // expose a toggle yet (Android does), so this is a config-only
-            // round-trip — we keep whatever the user has in config.json.
+            // round-trip — we keep whatever the user has in config.toml.
             block_doh: self.block_doh,
             // Multi-edge fronting groups: file-edited only for now,
             // round-tripped through the UI so Save doesn't drop them.
@@ -1082,7 +1082,7 @@ impl eframe::App for App {
                 // text field — typing `0.0.0.0` from memory is enough of
                 // a friction point that almost no one does it. Power
                 // users with a custom bind IP (specific NIC) can still
-                // edit `listen_host` directly in `config.json`; we
+                // edit `listen_host` directly in `config.toml`; we
                 // detect that case and show a "Custom bind" badge so
                 // the checkbox doesn't silently overwrite their setting
                 // on the next Save.
@@ -1112,7 +1112,7 @@ impl eframe::App for App {
                     if is_custom_bind {
                         // The user manually wrote a specific bind IP —
                         // don't let the checkbox stomp on it. Show what
-                        // they have and tell them to edit config.json
+                        // they have and tell them to edit config.toml
                         // if they want to change it.
                         ui.vertical(|ui| {
                             ui.label(egui::RichText::new(format!(
