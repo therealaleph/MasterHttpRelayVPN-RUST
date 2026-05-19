@@ -504,7 +504,7 @@ fn default_tunnel_doh() -> bool { true }
 /// Default for `block_quic`: `true`. QUIC over the TCP-based tunnel
 /// causes TCP-over-TCP meltdown (<1 Mbps). Browsers fall back to
 /// HTTPS/TCP within seconds of the silent UDP drop. Issue #793.
-fn default_block_stun() -> bool { true }
+fn default_block_stun() -> bool { false }
 fn default_block_quic() -> bool { true }
 
 /// Default for `block_doh`: `true` (browser DoH is rejected so the

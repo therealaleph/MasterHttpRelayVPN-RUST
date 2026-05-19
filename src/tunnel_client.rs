@@ -69,7 +69,7 @@ const INFLIGHT_IDLE: usize = 1;
 
 /// Optimistic starting depth — every session gets 2 in-flight polls
 /// without needing an elevation permit. Drops to IDLE on first empty.
-const INFLIGHT_OPTIMIST: usize = 2;
+const INFLIGHT_OPTIMIST: usize = 1;
 
 /// Maximum pipeline depth when data is actively flowing. Ramps up on
 /// data-bearing replies, drops back to IDLE after consecutive empties.
@@ -79,7 +79,7 @@ const INFLIGHT_ACTIVE: usize = 4;
 const INFLIGHT_COOLDOWN: u32 = 3;
 
 /// Max sessions that can run at elevated pipeline depth per deployment.
-const MAX_ELEVATED_PER_DEPLOYMENT: u64 = 30;
+const MAX_ELEVATED_PER_DEPLOYMENT: u64 = 2;
 
 /// Adaptive coalesce defaults: after each new op arrives, wait another
 /// step for more ops. Resets on every arrival, up to max from the first

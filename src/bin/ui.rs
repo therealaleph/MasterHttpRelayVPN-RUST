@@ -431,7 +431,7 @@ fn load_form() -> (FormState, Option<String>) {
             youtube_via_relay: false,
             passthrough_hosts: Vec::new(),
             block_quic: true,
-            block_stun: true,
+            block_stun: false,
             disable_padding: false,
             force_http1: false,
             tunnel_doh: true,
@@ -695,8 +695,8 @@ struct ConfigWire<'a> {
     /// emit only when the user has explicitly disabled the block.
     #[serde(skip_serializing_if = "is_true")]
     block_doh: bool,
-    /// Default true. Emit only when the user disables STUN/TURN blocking.
-    #[serde(skip_serializing_if = "is_true")]
+    /// Default false. Emit only when the user enables STUN/TURN blocking.
+    #[serde(skip_serializing_if = "is_false")]
     block_stun: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     fronting_groups: &'a Vec<FrontingGroup>,
