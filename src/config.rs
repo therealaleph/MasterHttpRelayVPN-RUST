@@ -551,7 +551,7 @@ fn default_verify_ssl() -> bool {
 }
 
 impl Config {
-    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+    pub fn load(path: &Path) -> Result<(Self, Option<String>), ConfigError> {
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
@@ -559,18 +559,18 @@ impl Config {
             .to_ascii_lowercase();
 
         match ext.as_str() {
-            "toml" => Self::load_toml(path),
+            "toml" => Self::load_toml(path).map(|c| (c, None)),
             "json" => Self::load_json_and_migrate(path),
             _ => {
                 // No extension or unrecognised: try TOML first, then JSON.
                 // JSON success also triggers migration. On double failure,
                 // surface the TOML error (the format new configs expect).
                 let toml_err = match Self::load_toml(path) {
-                    Ok(cfg) => return Ok(cfg),
+                    Ok(cfg) => return Ok((cfg, None)),
                     Err(e) => e,
                 };
                 match Self::load_json_and_migrate(path) {
-                    Ok(cfg) => Ok(cfg),
+                    Ok((cfg, msg)) => Ok((cfg, msg)),
                     Err(_) => Err(toml_err),
                 }
             }
@@ -587,7 +587,7 @@ impl Config {
         Ok(cfg)
     }
 
-    fn load_json_and_migrate(path: &Path) -> Result<Self, ConfigError> {
+    fn load_json_and_migrate(path: &Path) -> Result<(Self, Option<String>), ConfigError> {
         let data = std::fs::read_to_string(path)
             .map_err(|e| ConfigError::Read(path.display().to_string(), e))?;
         let cfg: Config = serde_json::from_str(&data)?;
@@ -596,29 +596,28 @@ impl Config {
         // Write a .toml equivalent alongside the .json file. Failure is
         // non-fatal: the in-memory Config is still valid and returned.
         let toml_path = path.with_extension("toml");
-        match toml::to_string_pretty(&TomlConfig::from(&cfg)) {
+        let msg = match toml::to_string_pretty(&TomlConfig::from(&cfg)) {
             Ok(toml_str) => match std::fs::write(&toml_path, &toml_str) {
-                Ok(()) => tracing::warn!(
+                Ok(()) => Some(format!(
                     "Found legacy config.json. Translated to {} automatically. \
                     config.json has been left in place but will no longer be read. \
                     You can delete it.",
                     toml_path.display()
-                ),
-                Err(e) => tracing::warn!(
+                )),
+                Err(e) => Some(format!(
                     "Found legacy config.json but could not write {}: {}. \
                     Continuing from the JSON config.",
-                    toml_path.display(),
-                    e
-                ),
+                    toml_path.display(), e
+                )),
             },
-            Err(e) => tracing::warn!(
+            Err(e) => Some(format!(
                 "Found legacy config.json but could not serialize to TOML: {}. \
                 Continuing from the JSON config.",
                 e
-            ),
-        }
-
-        Ok(cfg)
+            )),
+        };
+        
+    Ok((cfg, msg))
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
@@ -1216,7 +1215,7 @@ mod rt_tests {
 }"#;
         let tmp = std::env::temp_dir().join("mhrv-rt-test.json");
         std::fs::write(&tmp, json).unwrap();
-        let cfg = Config::load(&tmp).expect("config should load");
+        let cfg = Config::load(&tmp).expect("config should load").0;
         assert_eq!(cfg.mode, "apps_script");
         assert_eq!(cfg.auth_key, "testtesttest");
         assert_eq!(cfg.listen_port, 8085);
@@ -1280,7 +1279,7 @@ mod rt_tests {
 }"#;
         let tmp = std::env::temp_dir().join("mhrv-rt-min.json");
         std::fs::write(&tmp, json).unwrap();
-        let cfg = Config::load(&tmp).expect("minimal config should load");
+        let cfg = Config::load(&tmp).expect("minimal config should load").0;
         assert_eq!(cfg.mode, "apps_script");
         let _ = std::fs::remove_file(tmp.with_extension("toml"));
         let _ = std::fs::remove_file(&tmp);
@@ -1412,7 +1411,7 @@ script_id = "ABCDEF"
 "#;
         let tmp = std::env::temp_dir().join("mhrv-load-toml-test.toml");
         std::fs::write(&tmp, s).unwrap();
-        let cfg = Config::load(&tmp).expect("Config::load must handle .toml extension");
+        let cfg = Config::load(&tmp).expect("Config::load must handle .toml extension").0;
         assert_eq!(cfg.mode, "apps_script");
         assert_eq!(cfg.script_ids_resolved(), vec!["ABCDEF".to_string()]);
         let _ = std::fs::remove_file(&tmp);
@@ -1434,7 +1433,7 @@ script_id = "ABCDEF"
 
         std::fs::write(&json_path, json).unwrap();
         let cfg = Config::load(&json_path)
-            .expect("JSON config must load and trigger migration");
+            .expect("JSON config must load and trigger migration").0;
 
         assert!(toml_path.exists(), "migration must write config.toml alongside config.json");
 

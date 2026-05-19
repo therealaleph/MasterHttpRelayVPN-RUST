@@ -201,8 +201,7 @@ async fn main() -> ExitCode {
     }
 
     let config_path = mhrv_rs::data_dir::resolve_config_path(args.config_path.as_deref());
-    init_logging("warn"); // boot-time logging so migration warning is visible
-    let config = match Config::load(&config_path) {
+    let (config, migration_warn) = match Config::load(&config_path) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("{}", e);
@@ -215,6 +214,9 @@ async fn main() -> ExitCode {
     };
 
     init_logging(&config.log_level);
+    if let Some(msg) = migration_warn {
+        tracing::warn!("{}", msg);
+    }
 
     // Bump RLIMIT_NOFILE now that tracing is live — OpenWRT/Alpine hosts
     // often ship a default so low (issue #8, issue #18) that we run out
