@@ -1227,6 +1227,7 @@ mod rt_tests {
             &vec!["www.google.com".to_string(), "drive.google.com".to_string()]
         );
         assert_eq!(cfg.fetch_ips_from_api, true);
+        let _ = std::fs::remove_file(tmp.with_extension("toml"));
         let _ = std::fs::remove_file(&tmp);
     }
 
@@ -1281,6 +1282,7 @@ mod rt_tests {
         std::fs::write(&tmp, json).unwrap();
         let cfg = Config::load(&tmp).expect("minimal config should load");
         assert_eq!(cfg.mode, "apps_script");
+        let _ = std::fs::remove_file(tmp.with_extension("toml"));
         let _ = std::fs::remove_file(&tmp);
     }
 }
