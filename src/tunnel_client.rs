@@ -73,13 +73,13 @@ const INFLIGHT_OPTIMIST: usize = 1;
 
 /// Maximum pipeline depth when data is actively flowing. Ramps up on
 /// data-bearing replies, drops back to IDLE after consecutive empties.
-const INFLIGHT_ACTIVE: usize = 4;
+const INFLIGHT_ACTIVE: usize = 2;
 
 /// How many consecutive empty replies before dropping from active to idle depth.
 const INFLIGHT_COOLDOWN: u32 = 3;
 
-/// Max sessions that can run at elevated pipeline depth per deployment.
-const MAX_ELEVATED_PER_DEPLOYMENT: u64 = 2;
+/// Max sessions that can run at elevated pipeline depth (total, not per deployment).
+const MAX_ELEVATED_TOTAL: u64 = 10;
 
 /// Adaptive coalesce defaults: after each new op arrives, wait another
 /// step for more ops. Resets on every arrival, up to max from the first
@@ -442,7 +442,7 @@ impl TunnelMux {
             .batch_timeout()
             .saturating_add(REPLY_TIMEOUT_SLACK);
         pipeline_debug::set_limits(
-            MAX_ELEVATED_PER_DEPLOYMENT * unique_n as u64,
+            MAX_ELEVATED_TOTAL,
             (CONCURRENCY_PER_DEPLOYMENT * unique_n) as u64,
         );
         let (tx, rx) = mpsc::unbounded_channel();
@@ -462,7 +462,7 @@ impl TunnelMux {
             unreachable_cache: Mutex::new(HashMap::new()),
             reply_timeout,
             elevated_sessions: AtomicU64::new(0),
-            max_elevated: MAX_ELEVATED_PER_DEPLOYMENT * unique_n as u64,
+            max_elevated: MAX_ELEVATED_TOTAL,
         })
     }
 
@@ -2200,7 +2200,7 @@ mod tests {
             // `fronter.batch_timeout()` (see `TunnelMux::start`).
             reply_timeout: Duration::from_secs(35),
             elevated_sessions: AtomicU64::new(0),
-            max_elevated: MAX_ELEVATED_PER_DEPLOYMENT * num_scripts as u64,
+            max_elevated: MAX_ELEVATED_TOTAL,
         });
         (mux, rx)
     }
