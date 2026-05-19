@@ -53,7 +53,7 @@ mhrv-rs (local)
 
 The censor's DPI inspects the TLS SNI and lets `www.google.com` through. Google's edge serves both `www.google.com` and `script.google.com` from the same IP and routes by the HTTP `Host` header inside the encrypted stream.
 
-For Google-owned domains (`google.com`, `youtube.com`, `fonts.googleapis.com`, …) the same tunnel is used directly — no Apps Script relay. This bypasses the per-fetch quota and avoids the locked-in `Google-Apps-Script` User-Agent for those sites. Add more domains via the `hosts` map in `config.json`.
+For Google-owned domains (`google.com`, `youtube.com`, `fonts.googleapis.com`, …) the same tunnel is used directly — no Apps Script relay. This bypasses the per-fetch quota and avoids the locked-in `Google-Apps-Script` User-Agent for those sites. Add more domains via the `hosts` map in `config.toml`.
 
 ## Platforms and binaries
 
@@ -89,10 +89,10 @@ Config and the MITM CA live in the OS user-data dir:
 
 Inside that dir:
 
-- `config.json` — your settings (written by the UI's **Save** button or hand-edited)
+- `config.toml` — your settings (written by the UI's **Save** button or hand-edited)
 - `ca/ca.crt`, `ca/ca.key` — the MITM root certificate. Only you have the private key.
 
-The CLI also falls back to `./config.json` in the current working directory for backward compatibility.
+The CLI also falls back to `./config.toml` in the current working directory for backward compatibility.
 
 ## Apps Script deployment
 
@@ -116,31 +116,34 @@ Full setup and trade-off table in [`assets/cloudflare/README.md`](../assets/clou
 If your ISP is already blocking Google Apps Script (or all of Google), you need Step 1 to succeed *before* you have a relay. mhrv-rs ships a `direct` mode for exactly this — SNI-rewrite tunnel only, no Apps Script relay required. (Was named `google_only` before v1.9 — old name still accepted.)
 
 1. Download the binary (see [main README → Step 2](../README.md#step-2--download-mhrv-rs))
-2. Copy [`config.direct.example.json`](../config.direct.example.json) to `config.json` — no `script_id`, no `auth_key` required
+2. Copy [`config.direct.example.toml`](../config.direct.example.toml) to `config.toml` — no `script_id`, no `auth_key` required
 3. Run `mhrv-rs serve` and set browser HTTP proxy to `127.0.0.1:8085`
 4. In `direct` mode, the proxy only routes `*.google.com`, `*.youtube.com`, and other Google-edge hosts (plus any [`fronting_groups`](fronting-groups.md) you've configured) via the SNI-rewrite tunnel. Other traffic goes raw — no Apps Script relay exists yet.
 5. Now do Step 1 in your browser (the connection to `script.google.com` will be SNI-fronted). Deploy `Code.gs`, copy the Deployment ID.
-6. In the UI / Android app / by editing `config.json`, switch mode to `apps_script`, paste the Deployment ID and your auth key, and restart.
+6. In the UI / Android app / by editing `config.toml`, switch mode to `apps_script`, paste the Deployment ID and your auth key, and restart.
 
 Verify reachability before even starting the proxy: `mhrv-rs test-sni` probes `*.google.com` directly and works without any config beyond `google_ip` + `front_domain`.
 
 ## CLI reference
 
-Everything the UI does is also in the CLI. Copy `config.example.json` to `config.json` (next to the binary, or in the user-data dir):
+Everything the UI does is also in the CLI. Copy `config.example.toml` to `config.toml` (next to the binary, or in the user-data dir):
 
-```json
-{
-  "mode": "apps_script",
-  "google_ip": "216.239.38.120",
-  "front_domain": "www.google.com",
-  "script_id": "PASTE_YOUR_DEPLOYMENT_ID_HERE",
-  "auth_key": "same-secret-as-in-code-gs",
-  "listen_host": "127.0.0.1",
-  "listen_port": 8085,
-  "socks5_port": 8086,
-  "log_level": "info",
-  "verify_ssl": true
-}
+```toml
+[relay]
+mode = "apps_script"
+script_id = "PASTE_YOUR_DEPLOYMENT_ID_HERE"
+auth_key = "same-secret-as-in-code-gs"
+
+[network]
+google_ip = "216.239.38.120"
+front_domain = "www.google.com"
+listen_host = "127.0.0.1"
+listen_port = 8085
+socks5_port = 8086
+verify_ssl = true
+
+[logging]
+log_level = "info"
 ```
 
 Then:
@@ -155,7 +158,7 @@ Then:
 ./mhrv-rs --help
 ```
 
-`--remove-cert` deletes the CA from the OS trust store, deletes the on-disk `ca/` directory, and verifies the revocation by name. NSS cleanup (Firefox, Chrome on Linux) is best-effort: if `certutil` isn't on PATH or a browser holds the NSS DB open, the tool logs a manual-cleanup hint. Your `config.json` and the Apps Script deployment are untouched, so a fresh CA does not require redeploying `Code.gs`.
+`--remove-cert` deletes the CA from the OS trust store, deletes the on-disk `ca/` directory, and verifies the revocation by name. NSS cleanup (Firefox, Chrome on Linux) is best-effort: if `certutil` isn't on PATH or a browser holds the NSS DB open, the tool logs a manual-cleanup hint. Your `config.toml` and the Apps Script deployment are untouched, so a fresh CA does not require redeploying `Code.gs`.
 
 > **Upgrading from pre-v1.2.11?** Earlier versions wrote a bare `user_pref("security.enterprise_roots.enabled", true);` into each Firefox profile's `user.js` without a marker. `--remove-cert` does not strip that line — it's indistinguishable from one a user or corp policy wrote. Firefox falls back to its built-in Mozilla root store the moment the MITM CA leaves the OS trust store, so this has no functional effect. Delete by hand if it bothers you.
 
@@ -163,15 +166,14 @@ Then:
 
 ### scan-ips API mode
 
-By default, `scan-ips` uses a static list. Enable dynamic IP discovery in `config.json`:
+By default, `scan-ips` uses a static list. Enable dynamic IP discovery in `config.toml`:
 
-```json
-{
-  "fetch_ips_from_api": true,
-  "max_ips_to_scan": 100,
-  "scan_batch_size": 100,
-  "google_ip_validation": true
-}
+```toml
+[scan]
+fetch_ips_from_api = true
+max_ips_to_scan = 100
+scan_batch_size = 100
+google_ip_validation = true
 ```
 
 When enabled:
@@ -197,10 +199,9 @@ Browser   ┘                                                    └─ upstream
 
 Config fragment:
 
-```json
-{
-  "upstream_socks5": "127.0.0.1:50529"
-}
+```toml
+[network]
+upstream_socks5 = "127.0.0.1:50529"
 ```
 
 HTTP / HTTPS keeps going through Apps Script (no change), and the SNI-rewrite tunnel for `google.com` / `youtube.com` keeps bypassing both — YouTube stays as fast as before while Telegram gets a real tunnel.
@@ -247,12 +248,11 @@ More deployments = more total concurrency = lower per-session latency. Each batc
    Multi-arch (linux/amd64 + linux/arm64), runs as non-root, ~32 MB compressed. Pin a version tag (`:1.5.0`) for production. See [tunnel-node/README.md](../tunnel-node/README.md) for Cloud Run, docker-compose, and source-build alternatives.
 
 3. Set `"mode": "full"` in your config with all deployment IDs:
-   ```json
-   {
-     "mode": "full",
-     "script_id": ["id1", "id2", "id3", "id4", "id5", "id6"],
-     "auth_key": "your-secret"
-   }
+   ```toml
+   [relay]
+   mode = "full"
+   script_id = ["id1", "id2", "id3", "id4", "id5", "id6"]
+   auth_key = "your-secret"
    ```
 
 ## Exit node
@@ -297,7 +297,7 @@ The `*-linux-musl-*` archives ship a fully static CLI that runs on OpenWRT, Alpi
 # From a machine that can reach your router:
 scp mhrv-rs root@192.168.1.1:/usr/bin/mhrv-rs
 scp mhrv-rs.init root@192.168.1.1:/etc/init.d/mhrv-rs
-scp config.json root@192.168.1.1:/etc/mhrv-rs/config.json
+scp config.toml root@192.168.1.1:/etc/mhrv-rs/config.toml
 
 # On the router:
 chmod +x /usr/bin/mhrv-rs /etc/init.d/mhrv-rs
@@ -306,7 +306,7 @@ chmod +x /usr/bin/mhrv-rs /etc/init.d/mhrv-rs
 logread -e mhrv-rs -f       # tail logs
 ```
 
-LAN devices then point HTTP proxy at the router's LAN IP (default port `8085`) or SOCKS5 at `<router-ip>:8086`. Set `listen_host` to `0.0.0.0` in `/etc/mhrv-rs/config.json` so the router accepts LAN connections.
+LAN devices then point HTTP proxy at the router's LAN IP (default port `8085`) or SOCKS5 at `<router-ip>:8086`. Set `listen_host` to `0.0.0.0` in `/etc/mhrv-rs/config.toml` so the router accepts LAN connections.
 
 Memory footprint ~15–20 MB resident — fine on anything ≥128 MB RAM. No UI on musl (routers are headless).
 
@@ -324,12 +324,11 @@ By default, mhrv-rs rotates through `{www, mail, drive, docs, calendar}.google.c
 Either:
 
 - UI → **SNI pool…** → **Test all** → **Keep ✓ only** to auto-trim. Add custom names via the text field at the bottom. Save.
-- Or edit `config.json`:
+- Or edit `config.toml`:
 
-```json
-{
-  "sni_hosts": ["www.google.com", "drive.google.com", "docs.google.com"]
-}
+```toml
+[relay]
+sni_hosts = ["www.google.com", "drive.google.com", "docs.google.com"]
 ```
 
 Leaving `sni_hosts` unset gives you the default auto-pool. Run `mhrv-rs test-sni` to verify what works from your network.
@@ -405,7 +404,7 @@ These are inherent to the Apps Script + domain-fronting approach, not bugs in th
 - **Easiest (any OS):** click **Remove CA** in the UI, or:
   - macOS / Linux: `sudo ./mhrv-rs --remove-cert`
   - Windows (run as administrator): `mhrv-rs.exe --remove-cert`
-  - Removes from system trust store, NSS (Firefox / Chrome on Linux), and deletes `ca/ca.crt` + `ca/ca.key` on disk. Your `config.json` and Apps Script deployment are not touched.
+  - Removes from system trust store, NSS (Firefox / Chrome on Linux), and deletes `ca/ca.crt` + `ca/ca.key` on disk. Your `config.toml` and Apps Script deployment are not touched.
 - **Manually:** the cert's Common Name is `MasterHttpRelayVPN` (not `mhrv-rs` — that's the app name).
   - **macOS:** Keychain Access → System → search `MasterHttpRelayVPN` → delete. Then `rm -rf ~/Library/Application\ Support/mhrv-rs/ca/`
   - **Windows:** `certmgr.msc` → Trusted Root Certification Authorities → search `MasterHttpRelayVPN` → delete

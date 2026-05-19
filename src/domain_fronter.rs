@@ -930,7 +930,7 @@ impl DomainFronter {
                  (3) your system clock is way off (NTP not synced).\n\
                  Fixes (try in order): run `mhrv-rs scan-ips` to find a different Google \
                  frontend IP that isn't being MITM'd; check `date` on your host; as a \
-                 LAST RESORT set `\"verify_ssl\": false` in config.json — this lets the \
+                 LAST RESORT set `verify_ssl = false` in config.toml — this lets the \
                  relay work even through a middlebox, but your traffic is then only \
                  protected by the Apps Script relay's secret `auth_key`, not by outer TLS.",
                 e

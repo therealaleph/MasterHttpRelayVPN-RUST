@@ -224,7 +224,7 @@ pub fn install_ca(path: &Path) -> Result<(), InstallError> {
 /// profiles + Chrome/Chromium on Linux), and delete the on-disk
 /// `ca/ca.crt` + `ca/ca.key`. A fresh CA will be regenerated the next
 /// time the proxy starts — and since the Apps Script deployment lives on
-/// Google's side and `config.json` is never touched here, the user does
+/// Google's side and `config.toml` is never touched here, the user does
 /// not have to redeploy `Code.gs` or re-enter their deployment ID.
 /// Platform-specific — may require admin/sudo for system stores.
 ///

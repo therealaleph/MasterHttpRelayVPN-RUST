@@ -32,7 +32,7 @@ The repo's userbase is majority Persian-speaking. Writing in their language matt
 - Code blocks (Rust, JSON, bash, JS — all stay as-is)
 - Command-line examples (`gh issue close N`, `cargo build`, `docker run ...`)
 - Technical identifiers: `AUTH_KEY`, `TUNNEL_AUTH_KEY`, `script_id`, `parallel_concurrency`, `disable_padding`, `tunnel_doh`, `bypass_doh_hosts`, `DIAGNOSTIC_MODE`, `passthrough_hosts`, `google_ip`, `mode: "full"` / `mode: "apps_script"`
-- Filename references: `Code.gs`, `CodeFull.gs`, `config.json`, `tunnel-node`, `mhrv-rs.exe`, `MhrvVpnService.kt`, `domain_fronter.rs`
+- Filename references: `Code.gs`, `CodeFull.gs`, `config.toml`, `tunnel-node`, `mhrv-rs.exe`, `MhrvVpnService.kt`, `domain_fronter.rs`
 - URLs and links
 - The reply marker
 - Issue references like `#404`, `#313`

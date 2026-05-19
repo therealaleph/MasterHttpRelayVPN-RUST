@@ -26,7 +26,7 @@
  *   4. (Optional) Set CACHE_SPREADSHEET_ID to enable caching
  *   5. Click Deploy → New deployment
  *   6. Type: Web app  |  Execute as: Me  |  Who has access: Anyone
- *   7. Copy the Deployment ID into config.json as "script_id"
+ *   7. Copy the Deployment ID into config.toml as "script_id"
  *
  * CHANGE THE AUTH KEY BELOW TO YOUR OWN SECRET!
  */

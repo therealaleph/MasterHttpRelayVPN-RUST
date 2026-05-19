@@ -47,7 +47,7 @@ These are the constant source of user confusion. Get the names right:
 
 | Secret | Lives where | Must match | Notes |
 |--------|-------------|------------|-------|
-| `AUTH_KEY` (or `auth_key` in mhrv-rs config.json) | mhrv-rs `config.json` ↔ `Code.gs`/`CodeFull.gs` | Both ends | Per-deployment user secret; protects against random people hitting the user's deployment URL. Editing it in Code.gs without **redeploying as a new version** in Apps Script is the single most common user mistake. |
+| `AUTH_KEY` (or `auth_key` in mhrv-rs config.toml) | mhrv-rs `config.toml` ↔ `Code.gs`/`CodeFull.gs` | Both ends | Per-deployment user secret; protects against random people hitting the user's deployment URL. Editing it in Code.gs without **redeploying as a new version** in Apps Script is the single most common user mistake. |
 | `TUNNEL_AUTH_KEY` | `CodeFull.gs` ↔ tunnel-node container env var | Both ends | Full mode only. Env var name is **literally `TUNNEL_AUTH_KEY`** — uppercase, with underscores, exact string. Several users have written `MHRV_AUTH_KEY` (wrong) or `Tunnel` (wrong); the env var is case-sensitive in Linux/Docker and any deviation falls back to the default `changeme`. |
 | `DIAGNOSTIC_MODE` | `Code.gs` and `CodeFull.gs` (constant at top) | n/a — local toggle | When `false` (default), the script returns a benign HTML decoy (`"The script completed but did not return anything"`) for bad-auth requests, mimicking Apps Script's own placeholder. When `true`, returns explicit JSON `{"e":"unauthorized"}`. The decoy mode is anti-active-probing defense (#357 pattern); diagnostic mode is for setup. |
 
@@ -86,7 +86,7 @@ The TLS handshake between mhrv-rs and Apps Script does:
 
 Iran ISPs occasionally filter specific Google IPs (#313 pattern). When this happens, the user can rotate `google_ip` to another IP from `DEFAULT_GOOGLE_SNI_POOL` (the 12-entry list in `src/domain_fronter.rs`). `mhrv-rs scan-ips` is a diagnostic command that probes Google IPs from the user's network and reports which ones complete TLS handshakes.
 
-`scan_config.json` (separate from main `config.json`) is the input for `mhrv-rs scan-ips` — users sometimes confuse the two and put the scan config where the main config should be. See `issue-patterns.md`.
+`scan_config.toml` (separate from main `config.toml`) is the input for `mhrv-rs scan-ips` — users sometimes confuse the two and put the scan config where the main config should be. See `issue-patterns.md`.
 
 ## v1.8.0 anti-fingerprinting features
 
@@ -112,7 +112,7 @@ Iran ISPs occasionally filter specific Google IPs (#313 pattern). When this happ
 - `src/tunnel_client.rs` — Full mode batch client. Decoy detection + script_id-in-logs added v1.8.1; softer 6-cause message v1.8.3.
 - `src/mitm/` — MITM cert manager.
 - `src/cert_installer/` — per-OS trust store installation logic.
-- `src/config.rs` — `Config` struct + JSON serde. Default values, validation.
+- `src/config.rs` — `Config` struct + TOML/JSON serde. Default values, validation.
 - `assets/apps_script/Code.gs` and `CodeFull.gs` — server-side scripts. Edit these and tell users to redeploy as new version in Apps Script.
 - `tunnel-node/` — separate Rust crate for the Full-mode VPS container. README + README.fa.md (Persian translation).
 - `android/app/src/main/java/com/therealaleph/mhrv/` — Android Kotlin glue. `MhrvVpnService.kt` is the VPNService that calls into Rust via JNI. `ConfigStore.kt` is the form/preferences round-trip.

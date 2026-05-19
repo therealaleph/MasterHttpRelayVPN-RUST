@@ -21,7 +21,7 @@ This taxonomy is the post-mortem evolution of v1.8.0 → v1.8.1 → v1.8.2 → v
 
 **Source**: Our `Code.gs` / `CodeFull.gs` returns this when `request.k !== AUTH_KEY` and `DIAGNOSTIC_MODE = false`. It mimics Apps Script's stock placeholder for empty-return scripts.
 
-**Trigger**: User edited AUTH_KEY in Apps Script editor but didn't redeploy as new version, OR user has different AUTH_KEY in `config.json` than in `Code.gs`, OR user is using Code.gs deployment ID with `mode: full` (which expects CodeFull.gs).
+**Trigger**: User edited AUTH_KEY in Apps Script editor but didn't redeploy as new version, OR user has different AUTH_KEY in `config.toml` than in `Code.gs`, OR user is using Code.gs deployment ID with `mode: full` (which expects CodeFull.gs).
 
 **Disambiguator**: Set `DIAGNOSTIC_MODE = true` in Code.gs / CodeFull.gs + redeploy as new version. Then this case returns `{"e":"unauthorized"}` (explicit JSON) instead of the HTML. The other 5 cases are independent of DIAGNOSTIC_MODE and still return their natural body.
 
@@ -37,7 +37,7 @@ This taxonomy is the post-mortem evolution of v1.8.0 → v1.8.1 → v1.8.2 → v
 
 **Disambiguator**: With `DIAGNOSTIC_MODE = true`, AUTH_KEY mismatch (cause 1) goes away; if the placeholder body still appears for some batches, it's likely cause 2/3/4/5/6.
 
-**Fix**: Lower `parallel_concurrency` in `config.json`, retry, accept some intermittent failures.
+**Fix**: Lower `parallel_concurrency` in `config.toml`, retry, accept some intermittent failures.
 
 ### 3. Apps Script soft-quota tear
 

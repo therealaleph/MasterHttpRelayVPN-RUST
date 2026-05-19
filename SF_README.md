@@ -49,7 +49,7 @@ Click **Connect** (or **Start** on desktop). Done. Your browser, Telegram, etc. 
 ### Common issues (most people hit at least one)
 
 **YouTube videos look "restricted" or comments are missing? ([#61](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/issues/61))**
-Turn on **"Send YouTube through relay (no SNI rewrite)"** in the desktop UI's Advanced section, or set `youtube_via_relay: true` in `config.json`. YouTube then goes through the Apps Script relay instead of the direct Google tunnel, which avoids YouTube's SafeSearch-on-SNI behaviour. Trade-off: slightly slower video, and it counts against your daily quota.
+Turn on **"Send YouTube through relay (no SNI rewrite)"** in the desktop UI's Advanced section, or set `youtube_via_relay = true` in `config.toml`. YouTube then goes through the Apps Script relay instead of the direct Google tunnel, which avoids YouTube's SafeSearch-on-SNI behaviour. Trade-off: slightly slower video, and it counts against your daily quota.
 
 **"Verify you are human" loop on Cloudflare-protected sites?**
 This can't be fixed in this app. Every Apps Script request comes from a different Google datacenter IP, and Cloudflare's challenge cookie is locked to one IP — so the next request fails the check and re-challenges you. Sites that only check once per session work fine. Sites that check every page won't.
@@ -58,7 +58,7 @@ This can't be fixed in this app. Every Apps Script request comes from a differen
 Your Apps Script deployment isn't responding. Go back to <https://script.google.com>, **Deploy → Manage deployments → Edit (pencil)**, change "Version" to **New version**, click Deploy. Copy the **new** Deployment ID and paste it into the app.
 
 **Hit your daily limit?**
-Free Google accounts get **20,000 relay requests per day**. The desktop and Android apps show a "Usage today" card with how many you've used. Add multiple Deployment IDs (one per line in the UI, or a JSON array in `config.json`) — each ID has its own quota and they're rotated automatically. You can also click "View quota on Google" to see the official number on Google's dashboard.
+Free Google accounts get **20,000 relay requests per day**. The desktop and Android apps show a "Usage today" card with how many you've used. Add multiple Deployment IDs (one per line in the UI, or an array in `config.toml`) — each ID has its own quota and they're rotated automatically. You can also click "View quota on Google" to see the official number on Google's dashboard.
 
 **App says it's connected but websites don't load?**
 - Open the **SNI pool** section and click **Test all**. If everything fails, your `google_ip` value is unreachable from your network — click **Auto-detect google_ip** to fix.
@@ -120,7 +120,7 @@ This project is free and run by volunteers. If it helped you and you can spare a
 ### مشکلات رایج (اکثر کاربران حداقل یکی از این‌ها را می‌بینند)
 
 **ویدیوهای یوتیوب «محدود» نشان داده می‌شوند یا کامنت‌ها دیده نمی‌شوند؟ ([#61](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/issues/61))**
-در بخش Advanced دسکتاپ گزینهٔ **«Send YouTube through relay (no SNI rewrite)»** را روشن کنید، یا در `config.json` مقدار `youtube_via_relay: true` بگذارید. در این حالت یوتیوب از مسیر ریلهٔ Apps Script رد می‌شود و فیلتر SafeSearch-on-SNI گوگل دور می‌خورد. تریدآف: ویدیو کمی کندتر و مصرف از سهمیهٔ روزانه.
+در بخش Advanced دسکتاپ گزینهٔ **«Send YouTube through relay (no SNI rewrite)»** را روشن کنید، یا در `config.toml` مقدار `youtube_via_relay = true` بگذارید. در این حالت یوتیوب از مسیر ریلهٔ Apps Script رد می‌شود و فیلتر SafeSearch-on-SNI گوگل دور می‌خورد. تریدآف: ویدیو کمی کندتر و مصرف از سهمیهٔ روزانه.
 
 **روی سایت‌های پشت Cloudflare loop «Verify you are human» می‌خورد؟**
 این مشکل در این ابزار قابل حل نیست. هر درخواست Apps Script از یک IP متفاوت دیتاسنتر گوگل خارج می‌شود و کوکی challenge کلودفلر به یک IP خاص قفل است — درخواست بعدی از IP دیگر دوباره چالش می‌خورد. سایت‌هایی که فقط یک‌بار در ابتدای session چک می‌کنند درست کار می‌کنند. سایت‌هایی که هر صفحه چک می‌کنند، نه.
@@ -129,7 +129,7 @@ This project is free and run by volunteers. If it helped you and you can spare a
 Apps Script شما پاسخ نمی‌دهد. به <https://script.google.com> برگردید، **Deploy → Manage deployments → Edit (آیکن مداد)** را بزنید، گزینهٔ "Version" را روی **New version** بگذارید و Deploy کنید. **آی‌دی جدید** Deployment را کپی کنید و در برنامه جای‌گذاری کنید.
 
 **سهمیهٔ روزانه تمام شده؟**
-هر حساب گوگل رایگان روزانه **۲۰٬۰۰۰ درخواست ریله** دارد. کارت «مصرف امروز» در دسکتاپ و اندروید مقدار مصرف فعلی را نشان می‌دهد. می‌توانید چند Deployment ID (هر کدام در یک خط، یا به‌صورت JSON array در `config.json`) اضافه کنید — هر آی‌دی سهمیهٔ خودش را دارد و به‌صورت چرخشی استفاده می‌شوند. دکمهٔ «مشاهدهٔ سهمیه در گوگل» شما را به داشبورد رسمی گوگل می‌برد.
+هر حساب گوگل رایگان روزانه **۲۰٬۰۰۰ درخواست ریله** دارد. کارت «مصرف امروز» در دسکتاپ و اندروید مقدار مصرف فعلی را نشان می‌دهد. می‌توانید چند Deployment ID (هر کدام در یک خط، یا در `config.toml`) اضافه کنید — هر آی‌دی سهمیهٔ خودش را دارد و به‌صورت چرخشی استفاده می‌شوند. دکمهٔ «مشاهدهٔ سهمیه در گوگل» شما را به داشبورد رسمی گوگل می‌برد.
 
 **برنامه می‌گوید وصل است ولی سایت‌ها باز نمی‌شوند؟**
 - بخش **SNI pool** را باز کنید و **Test all** بزنید. اگر همه fail شدند، یعنی `google_ip` فعلی از شبکهٔ شما در دسترس نیست — روی **Auto-detect google_ip** بزنید تا اصلاح شود.

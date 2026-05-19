@@ -59,7 +59,7 @@
  *   6. Set WORKER_URL to your *.workers.dev URL (must include https://).
  *   7. Deploy → New deployment → Web app
  *      Execute as: Me   |   Who has access: Anyone
- *   8. Copy the Deployment ID into mhrv-rs config.json as "script_id".
+ *   8. Copy the Deployment ID into mhrv-rs config.toml as "script_id".
  *      mhrv-rs does not need to know about Cloudflare; it talks to
  *      Apps Script the same way it always has.
  *

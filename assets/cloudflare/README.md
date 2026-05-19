@@ -9,7 +9,7 @@ mhrv-rs ──► Apps Script (Code.cfw.gs) ──► Cloudflare Worker ──�
             ▲ thin auth + forward          ▲ outbound fetch + base64
 ```
 
-The standard backend (`assets/apps_script/Code.gs`) does the outbound fetch from inside Apps Script directly. This variant makes Apps Script a thin relay and pushes the actual fetch to Cloudflare's edge. **mhrv-rs itself is unchanged** — same JSON envelope on the wire, same `mode: "apps_script"` in `config.json`, same `script_id`. The only thing that's different is what your deployed Apps Script does after it authenticates the request.
+The standard backend (`assets/apps_script/Code.gs`) does the outbound fetch from inside Apps Script directly. This variant makes Apps Script a thin relay and pushes the actual fetch to Cloudflare's edge. **mhrv-rs itself is unchanged** — same JSON envelope on the wire, same `mode = "apps_script"` in `config.toml`, same `script_id`. The only thing that's different is what your deployed Apps Script does after it authenticates the request.
 
 Original idea: <https://github.com/denuitt1/mhr-cfw>. This copy adds an `AUTH_KEY` check on the Worker, the decoy-on-bad-auth treatment from `Code.gs`, and a hop-loop guard.
 
@@ -26,7 +26,7 @@ Original idea: <https://github.com/denuitt1/mhr-cfw>. This copy adds an `AUTH_KE
 
 ## Setup
 
-You need three matching strings: an `AUTH_KEY` shared between `worker.js`, `Code.cfw.gs`, and your `mhrv-rs` `config.json`. Pick a strong random secret once and paste it into all three.
+You need three matching strings: an `AUTH_KEY` shared between `worker.js`, `Code.cfw.gs`, and your mhrv-rs `config.toml`. Pick a strong random secret once and paste it into all three.
 
 ### 1. Deploy the Worker
 
@@ -47,14 +47,13 @@ You need three matching strings: an `AUTH_KEY` shared between `worker.js`, `Code
 
 ### 3. Point mhrv-rs at the Apps Script
 
-In `config.json` (or via the UI's config form):
+In `config.toml` (or via the UI's config form):
 
-```json
-{
-  "mode": "apps_script",
-  "script_id": "PASTE_DEPLOYMENT_ID_HERE",
-  "auth_key": "SAME_SECRET_AS_BOTH_FILES_ABOVE"
-}
+```toml
+[relay]
+mode = "apps_script"
+auth_key = "YOUR_SHARED_SECRET"
+script_ids = ["YOUR_DEPLOYMENT_ID"]
 ```
 
 That's it. mhrv-rs doesn't need to know Cloudflare exists; from its perspective, the `script_id` deployment behaves like any other. If you have multiple deployments (some plain, some CFW), `script_ids: [...]` round-robins across all of them and the parallel-relay fan-out still works.

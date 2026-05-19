@@ -48,7 +48,7 @@ OPTIONS:
     --remove-cert        Remove the MITM CA from the OS trust store (verified by
                          name), then delete the on-disk ca/ directory and exit.
                          NSS cleanup (Firefox/Chrome) is best-effort. A fresh CA
-                         is generated on next run. config.json and your Apps
+                         is generated on next run. config.toml and your Apps
                          Script deployment are untouched.
     --no-cert-check      Skip the auto-install-if-untrusted check on startup
     -h, --help           Show this message
@@ -157,7 +157,7 @@ async fn main() -> ExitCode {
     };
 
     // --remove-cert runs without a valid config — the CA files may be
-    // the only thing present in the data dir. `config.json` and the
+    // the only thing present in the data dir. `config.toml` and the
     // Apps Script deployment are intentionally untouched: the user does
     // not have to redeploy Code.gs after regenerating the CA.
     if args.remove_cert {

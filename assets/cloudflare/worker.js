@@ -57,7 +57,7 @@
  *   1. Cloudflare dashboard → Workers & Pages → Create → Hello World
  *   2. Edit code → delete the template, paste this entire file
  *   3. Change AUTH_KEY below to the same value you set in Code.cfw.gs
- *      AND in your mhrv-rs config.json (auth_key). All three must match.
+ *      AND in your mhrv-rs config.toml (auth_key). All three must match.
  *   4. Deploy. Note the *.workers.dev URL; paste it into Code.cfw.gs as
  *      WORKER_URL.
  *

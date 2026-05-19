@@ -8,11 +8,11 @@
 # Usage:
 #   ./scripts/bench-pipeline.sh [CONFIG_FILE]
 #
-# Default: config.json
+# Default: config.toml
 
 set -euo pipefail
 
-CONFIG="${1:-config.json}"
+CONFIG="${1:-config.toml}"
 RUNS=3
 SOCKS_PORT=18088
 HTTP_PORT=18087
@@ -43,7 +43,7 @@ echo "╚═══════════════════════�
 echo ""
 
 # Write a temp config with our ports
-TEMP_CONFIG="$TMPDIR_BENCH/config.json"
+TEMP_CONFIG="$TMPDIR_BENCH/config.toml"
 python3 -c "
 import json
 with open('$CONFIG') as f:

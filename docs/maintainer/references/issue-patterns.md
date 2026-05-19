@@ -10,7 +10,7 @@ The repo gets the same ~15 issues over and over with different wrappers. Recogni
 - Issue title often "502 error", "خطای 502", "ارور relay", or "no json in batch response"
 - Often combined with: "MITM mode works but Full mode doesn't" (CodeFull.gs has different AUTH_KEY than Code.gs)
 
-**Root cause**: The `AUTH_KEY` constant in `Code.gs` (or `CodeFull.gs`) on Apps Script doesn't match the `auth_key` field in mhrv-rs `config.json`. Apps Script returns the v1.8.0 decoy HTML.
+**Root cause**: The `AUTH_KEY` constant in `Code.gs` (or `CodeFull.gs`) on Apps Script doesn't match the `auth_key` field in mhrv-rs `config.toml`. Apps Script returns the v1.8.0 decoy HTML.
 
 **The hidden killer**: Apps Script does NOT auto-pickup edits to deployed scripts. Editing `const AUTH_KEY = "..."` in the Apps Script editor and clicking Save does nothing for the deployed version. The user must:
 
@@ -215,16 +215,16 @@ No confirmed cases of full Google account ban (Gmail deletion, Drive loss). Susp
 
 Architectural ceiling — can't be fixed in mhrv-rs core.
 
-## Pattern 10: Config file confusion (config.json vs scan_config.json)
+## Pattern 10: Config file confusion (config.toml vs scan_config.json)
 
 **Symptoms**:
 - "I followed instructions but it doesn't import the config"
 - User pastes a config that has `google_ips`, `max_ips_to_scan`, `scan_batch_size`, `google_ip_validation` fields
 - Says "the program doesn't pick up my config"
 
-**Root cause**: User confused `config.json` (main runtime config — `script_ids`, `auth_key`, `google_ip`, `mode`, etc.) with `scan_config.json` (input for `mhrv-rs scan-ips` diagnostic command — Google IP discovery).
+**Root cause**: User confused `config.toml` (main runtime config — `script_ids`, `auth_key`, `google_ip`, `mode`, etc.) with `scan_config.json` (input for `mhrv-rs scan-ips` diagnostic command — Google IP discovery).
 
-**Fix**: explain the two files, point at `config.example.json` in repo root for the right template.
+**Fix**: explain the two files, point at `config.example.toml` in repo root for the right template.
 
 Common related typos:
 - `script_id` (singular) instead of `script_ids` (plural array) — mhrv-rs parses as 0 deployments and falls back
@@ -239,7 +239,7 @@ Common related typos:
 
 **Root cause**: User's Windows lacks OpenGL 2.0+ AND lacks DX12/Vulkan-compatible GPU. Causes: old GPU (Intel HD 2500/3000-era), running in VM without GPU acceleration, RDP session, missing/corrupt graphics drivers.
 
-**Workaround**: use the CLI binary `mhrv-rs.exe` directly. Put `config.json` in the same folder, double-click `mhrv-rs.exe`, set browser proxy to `127.0.0.1:8086`. Same functionality, no UI.
+**Workaround**: use the CLI binary `mhrv-rs.exe` directly. Put `config.toml` in the same folder, double-click `mhrv-rs.exe`, set browser proxy to `127.0.0.1:8086`. Same functionality, no UI.
 
 v1.8.x roadmap: improve `run.bat` to auto-fallback to CLI when both UI renderers fail.
 

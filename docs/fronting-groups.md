@@ -20,28 +20,25 @@ on that edge through the same tunnel without burning Apps Script quota.
 
 ## Config shape
 
-```jsonc
-{
-  "mode": "direct",                         // or apps_script / full
-  "fronting_groups": [
-    {
-      "name":    "vercel",                  // free-form, used in logs
-      "ip":      "76.76.21.21",             // a Vercel edge IP
-      "sni":     "react.dev",               // a Vercel-hosted domain
-      "domains": [                          // hosts to route via this group
-        "vercel.com", "vercel.app",
-        "nextjs.org", "now.sh"
-      ]
-    }
-  ]
-}
+```toml
+[relay]
+mode = "direct"   # or apps_script / full
+
+[[fronting_groups]]
+name    = "vercel"          # free-form, used in logs
+ip      = "76.76.21.21"     # a Vercel edge IP
+sni     = "react.dev"       # a Vercel-hosted domain
+domains = [                 # hosts to route via this group
+  "vercel.com", "vercel.app",
+  "nextjs.org", "now.sh",
+]
 ```
 
 `domains` matches case-insensitively, exact OR dot-anchored suffix —
 `vercel.com` covers both `vercel.com` and `*.vercel.com`. First group
 in the list whose member matches wins.
 
-A working example is shipped at `config.fronting-groups.example.json`.
+A working example is shipped at `config.fronting-groups.example.toml`.
 
 ## Picking the (ip, sni) pair
 
@@ -121,7 +118,7 @@ edge directly, not through the Apps Script relay or the Google edge.
 - **No bundled domain catalog.** The upstream Xray config uses
   `geosite:vercel` / `geosite:fastly` lists from a binary geosite
   database — we don't ship that, you list domains explicitly.
-- **No UI editor.** Edit `config.json` directly. The UI's Save path
+- **No UI editor.** Edit `config.toml` directly. The UI's Save path
   preserves your `fronting_groups` block (round-tripped) — it just
   doesn't render an editor for it.
 - **Browsers only for Android non-root**, same as the Google path —

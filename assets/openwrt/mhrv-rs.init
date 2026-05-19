@@ -6,13 +6,13 @@
 #
 # Expects:
 #   /usr/bin/mhrv-rs           (the static musl binary from the release)
-#   /etc/mhrv-rs/config.json   (your config)
+#   /etc/mhrv-rs/config.toml   (your config)
 
 START=99
 USE_PROCD=1
 
 BIN=/usr/bin/mhrv-rs
-CONFIG=/etc/mhrv-rs/config.json
+CONFIG=/etc/mhrv-rs/config.toml
 
 start_service() {
     [ -x "$BIN" ] || return 1

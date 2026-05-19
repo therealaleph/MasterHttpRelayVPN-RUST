@@ -64,8 +64,8 @@ if not "%UI_EXIT%"=="0" (
         echo.
         echo     mhrv-rs.exe
         echo.
-        echo Set your config in %%APPDATA%%\mhrv-rs\config\config.json (or
-        echo place a config.json next to mhrv-rs.exe in this folder), then
+        echo Set your config in %%APPDATA%%\mhrv-rs\config\config.toml (or
+        echo place a config.toml next to mhrv-rs.exe in this folder), then
         echo point your browser proxy at 127.0.0.1:8085 (HTTP) or
         echo 127.0.0.1:8086 (SOCKS5). The CLI is the same proxy without
         echo the UI shell, so all functionality is available.

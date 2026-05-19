@@ -231,7 +231,7 @@ pub async fn run(config: &Config) -> bool {
         println!("No Google IPs reachable from this network.");
         false
     } else {
-        println!("To use the fastest, set \"google_ip\" in config.json to the top result above.");
+        println!("To use the fastest, set \"google_ip\" in config.toml to the top result above.");
         true
     }
 }

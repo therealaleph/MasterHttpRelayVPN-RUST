@@ -65,15 +65,14 @@ on any platform with a serverless-fetch runtime.
    relay.
 2. **Deploy** to your chosen host (see options below).
 3. **Copy the public URL** of the deployed handler.
-4. **In `mhrv-rs` config.json**, add an `exit_node` block:
-   ```json
-   "exit_node": {
-     "enabled": true,
-     "relay_url": "https://your-deployed-exit-node.example.com",
-     "psk": "<the same PSK you set in step 1>",
-     "mode": "selective",
-     "hosts": ["chatgpt.com", "claude.ai", "x.com", "grok.com", "openai.com"]
-   }
+4. **In `mhrv-rs` config.toml**, add an `[exit_node]` section:
+   ```toml
+   [exit_node]
+   enabled = true
+   relay_url = "https://your-deployed-exit-node.example.com"
+   psk = "<the same PSK you set in step 1>"
+   mode = "selective"
+   hosts = ["chatgpt.com", "claude.ai", "x.com", "grok.com", "openai.com"]
    ```
 5. **Restart mhrv-rs** (Disconnect + Connect, or kill + restart the
    binary).
@@ -127,7 +126,7 @@ public open proxy. Treat it like a password:
 - **Don't share publicly.** Anyone with both the URL and the PSK can
   use the deployment as their own proxy and burn your runtime quota.
 - **Rotate** if you suspect a leak. Change the PSK in the deployed
-  source, redeploy, then update `psk` in `mhrv-rs` config.json and
+  source, redeploy, then update `psk` in mhrv-rs `config.toml` and
   restart.
 
 The script also includes a **loop guard** (refuses to fetch its own
@@ -148,7 +147,7 @@ ChatGPT / Claude / Grok opt in; everyone else runs lighter.
 ## Troubleshooting
 
 **`exit node refused or errored: unauthorized`** — PSK mismatch.
-Double-check `psk` in `config.json` matches the `PSK` constant in your
+Double-check `psk` in `config.toml` matches the `PSK` constant in your
 deployed source character-for-character. Whitespace and quoting
 matter.
 
