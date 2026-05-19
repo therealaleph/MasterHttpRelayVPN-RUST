@@ -203,14 +203,6 @@ function _doSingle(req) {
     var opts = _buildOpts(req);
     var resp = UrlFetchApp.fetch(req.u, opts);
 
-    // Raw-return mode for exit-node path.
-    // r:true = return destination body verbatim so Rust gets {s,h,b} unwrapped.
-    if (req.r === true) {
-      return ContentService
-        .createTextOutput(resp.getContentText())
-        .setMimeType(ContentService.MimeType.JSON);
-    }
-
     return _json({
       s: resp.getResponseCode(),
       h: _respHeaders(resp),
@@ -316,7 +308,7 @@ function _buildOpts(req) {
   var opts = {
     method: (req.m || "GET").toLowerCase(),
     muteHttpExceptions: true,
-    followRedirects: true,          // ← always true; r flag now has different meaning
+    followRedirects: req.r !== false,
     validateHttpsCertificates: true,
     escaping: false,
   };
