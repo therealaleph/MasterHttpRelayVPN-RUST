@@ -777,15 +777,32 @@ async fn handle_batch(
         }
     };
 
+    if req.k != *state.auth_key {
+        if state.diagnostic_mode {
+            let resp = serde_json::to_vec(&BatchResponse {
+                r: vec![TunnelResponse::error("unauthorized")],
+            }).unwrap_or_default();
+            return (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], resp);
+        }
+        // Production: same nginx-404 decoy as the single-op path. See
+        // `decoy_or_unauthorized` for rationale.
+        let body = "<html>\r\n<head><title>404 Not Found</title></head>\r\n\
+                    <body>\r\n<center><h1>404 Not Found</h1></center>\r\n\
+                    <hr><center>nginx</center>\r\n</body>\r\n</html>\r\n"
+            .as_bytes()
+            .to_vec();
+        return (StatusCode::NOT_FOUND, [(header::CONTENT_TYPE, "text/html")], body);
+    }
+
     let had_zops = req.zops.is_some();
     let client_zstd = had_zops || req.zc.is_some();
     tracing::info!("batch: had_zops={} zc={:?} client_zstd={} ops_len={}", had_zops, req.zc, client_zstd, req.ops.len());
     let ops: Vec<BatchOp> = if let Some(zops_b64) = req.zops {
-        tracing::info!("zops received: len={} first_bytes={}", zops_b64.len(), &zops_b64[..zops_b64.len().min(40)]);
+        tracing::debug!("zops received: encoded_len={}", zops_b64.len());
         match B64.decode(&zops_b64) {
             Ok(compressed) => match zstd::decode_all(compressed.as_slice()) {
                 Ok(decompressed) => {
-                    tracing::info!("zops decompressed: {} bytes, content={}", decompressed.len(), String::from_utf8_lossy(&decompressed[..decompressed.len().min(200)]));
+                    tracing::debug!("zops decompressed: {} bytes", decompressed.len());
                     match serde_json::from_slice(&decompressed) {
                     Ok(v) => v,
                     Err(e) => {
@@ -812,23 +829,6 @@ async fn handle_batch(
     } else {
         req.ops
     };
-
-    if req.k != *state.auth_key {
-        if state.diagnostic_mode {
-            let resp = serde_json::to_vec(&BatchResponse {
-                r: vec![TunnelResponse::error("unauthorized")],
-            }).unwrap_or_default();
-            return (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], resp);
-        }
-        // Production: same nginx-404 decoy as the single-op path. See
-        // `decoy_or_unauthorized` for rationale.
-        let body = "<html>\r\n<head><title>404 Not Found</title></head>\r\n\
-                    <body>\r\n<center><h1>404 Not Found</h1></center>\r\n\
-                    <hr><center>nginx</center>\r\n</body>\r\n</html>\r\n"
-            .as_bytes()
-            .to_vec();
-        return (StatusCode::NOT_FOUND, [(header::CONTENT_TYPE, "text/html")], body);
-    }
 
     // Process all ops in two phases.
     //

@@ -3248,10 +3248,10 @@ impl DomainFronter {
         // credentials), and even at debug level a leaked log line ends
         // up in user-shared bug reports. Status + length are sufficient
         // for diagnosis; full body is available behind RUST_LOG=trace.
-        tracing::info!(
-            "batch response: status={} body={}",
+        tracing::debug!(
+            "batch response: status={} body_len={}",
             status,
-            &json_str[..json_str.len().min(200)]
+            json_str.len()
         );
         tracing::trace!(
             "batch response body (trace only): {}",
