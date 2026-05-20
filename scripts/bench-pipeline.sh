@@ -43,16 +43,40 @@ echo "╚═══════════════════════�
 echo ""
 
 # Write a temp config with our ports
-TEMP_CONFIG="$TMPDIR_BENCH/config.toml"
+TEMP_CONFIG="$TMPDIR_BENCH/bench.json"
 python3 -c "
-import json
-with open('$CONFIG') as f:
-    c = json.load(f)
-c['listen_port'] = $HTTP_PORT
-c['socks5_port'] = $SOCKS_PORT
+import sys, os, json
+
+config_path = '${CONFIG}'
+ext = os.path.splitext(config_path)[1].lower()
+
+if ext == '.toml':
+    if sys.version_info >= (3, 11):
+        import tomllib
+    else:
+        try:
+            import tomli as tomllib
+        except ImportError:
+            sys.exit('ERROR: Python 3.11+ or pip install tomli required to read TOML config')
+    with open(config_path, 'rb') as f:
+        t = tomllib.load(f)
+    c = {}
+    for section in ('relay', 'network', 'scan', 'logging'):
+        c.update(t.get(section, {}))
+    if 'exit_node' in t:
+        c['exit_node'] = t['exit_node']
+    if 'fronting_groups' in t:
+        c['fronting_groups'] = t['fronting_groups']
+else:
+    with open(config_path) as f:
+        c = json.load(f)
+
+c['listen_port'] = ${HTTP_PORT}
+c['socks5_port'] = ${SOCKS_PORT}
 c['log_level'] = 'warn'
-with open('$TEMP_CONFIG', 'w') as f:
-    json.dump(c, f)
+
+with open('${TEMP_CONFIG}', 'w') as f:
+    json.dump(c, f, indent=2)
 "
 
 run_test() {
