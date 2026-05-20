@@ -1,6 +1,6 @@
 [package]
 name = "mhrv-tunnel-node"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "HTTP tunnel bridge for MasterHttpRelayVPN full mode — bridges HTTP tunnel requests to real TCP connections"
 
