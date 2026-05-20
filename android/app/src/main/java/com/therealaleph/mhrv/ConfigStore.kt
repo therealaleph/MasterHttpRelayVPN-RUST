@@ -161,6 +161,23 @@ data class MhrvConfig(
      */
     val youtubeViaRelay: Boolean = false,
 
+    /**
+     * SABR quality-track strip — opt-in (Rust `sabr_strip`, default
+     * false after #977 testing). See `src/config.rs` `sabr_strip` for
+     * the full reasoning and when to flip on. Android-side is just
+     * round-trip plumbing.
+     */
+    val sabrStrip: Boolean = false,
+
+    /**
+     * Path-pinned relay routing (Rust `relay_url_patterns`).
+     * See `src/config.rs` `relay_url_patterns` for the full semantics —
+     * suppression gates, default pattern, host-overlap rules. This
+     * Android-side field is for *additional* user entries only,
+     * round-tripped so a hand-edited list survives Save.
+     */
+    val relayUrlPatterns: List<String> = emptyList(),
+
     /** UI language toggle. Non-Rust; honoured only by the Android wrapper. */
     val uiLang: UiLang = UiLang.AUTO,
 ) {
@@ -243,6 +260,21 @@ data class MhrvConfig(
             put("tunnel_doh", tunnelDoh)
             put("block_doh", blockDoh)
             if (youtubeViaRelay) put("youtube_via_relay", true)
+            // sabr_strip default is false on the Rust side (opt-in
+            // after #977); emit only when the user has explicitly
+            // enabled it so unchanged configs stay clean.
+            if (sabrStrip) put("sabr_strip", true)
+            // Trim/drop-empty/dedupe before serializing — same pattern
+            // as bypass_doh_hosts. Skip the key entirely when the user
+            // hasn't added any extras so we don't leak an empty array
+            // into otherwise-clean configs.
+            val cleanRelayUrlPatterns = relayUrlPatterns
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+                .distinct()
+            if (cleanRelayUrlPatterns.isNotEmpty()) {
+                put("relay_url_patterns", JSONArray().apply { cleanRelayUrlPatterns.forEach { put(it) } })
+            }
             // Trim/drop-empty/dedupe before serializing — symmetric with the
             // read-side normalization in loadFromJson(), so a user typing
             // " doh.foo " or accidentally adding a duplicate doesn't end up
@@ -353,12 +385,20 @@ object ConfigStore {
         if (cfg.tunnelDoh != defaults.tunnelDoh) obj.put("tunnel_doh", cfg.tunnelDoh)
         if (cfg.blockDoh != defaults.blockDoh) obj.put("block_doh", cfg.blockDoh)
         if (cfg.youtubeViaRelay != defaults.youtubeViaRelay) obj.put("youtube_via_relay", cfg.youtubeViaRelay)
+        if (cfg.sabrStrip != defaults.sabrStrip) obj.put("sabr_strip", cfg.sabrStrip)
         val cleanBypassDohHosts = cfg.bypassDohHosts
             .map { it.trim() }
             .filter { it.isNotEmpty() }
             .distinct()
         if (cleanBypassDohHosts.isNotEmpty()) {
             obj.put("bypass_doh_hosts", JSONArray().apply { cleanBypassDohHosts.forEach { put(it) } })
+        }
+        val cleanRelayUrlPatterns = cfg.relayUrlPatterns
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+        if (cleanRelayUrlPatterns.isNotEmpty()) {
+            obj.put("relay_url_patterns", JSONArray().apply { cleanRelayUrlPatterns.forEach { put(it) } })
         }
 
         // Compress with DEFLATE then base64.
@@ -461,7 +501,11 @@ object ConfigStore {
             tunnelDoh = obj.optBoolean("tunnel_doh", true),
             blockDoh = obj.optBoolean("block_doh", true),
             youtubeViaRelay = obj.optBoolean("youtube_via_relay", false),
+            sabrStrip = obj.optBoolean("sabr_strip", false),
             bypassDohHosts = obj.optJSONArray("bypass_doh_hosts")?.let { arr ->
+                buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }
+            }?.filter { it.isNotBlank() }.orEmpty(),
+            relayUrlPatterns = obj.optJSONArray("relay_url_patterns")?.let { arr ->
                 buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }
             }?.filter { it.isNotBlank() }.orEmpty(),
             connectionMode = when (obj.optString("connection_mode", "vpn_tun")) {
