@@ -1616,11 +1616,13 @@ async fn tunnel_loop(
         if inflight.is_empty() && !eof_seen {
             let all_legacy = mux.all_servers_legacy();
 
-            // After enough consecutive empties, stop polling and just
-            // wait for client data. Apps maintain their own heartbeats
-            // (MQTT PINGREQ, FCM keepalive, etc.) which trigger client
-            // writes that send data ops — those act as natural polls.
-            if (idle_tier > 1 || (all_legacy && consecutive_empty > 3)) && !client_closed {
+            // If every deployment is legacy and the session has gone
+            // idle, stop polling and just wait for client data. Apps
+            // maintain their own heartbeats (MQTT PINGREQ, FCM keepalive,
+            // etc.) which trigger client writes that send data ops — those
+            // act as natural polls. Mixed fleets must keep polling so
+            // round-robin can still land on a long-poll-capable peer.
+            if all_legacy && (idle_tier > 1 || consecutive_empty > 3) && !client_closed {
                 read_buf.reserve(65536);
                 match reader.read_buf(&mut read_buf).await {
                     Ok(0) => break,
@@ -1793,7 +1795,7 @@ async fn tunnel_loop(
                                             // Stale empty poll — don't break data streak.
                                         } else {
                                             consecutive_empty = consecutive_empty.saturating_add(1);
-                                idle_tier = idle_tier.saturating_add(1);
+                                            idle_tier = idle_tier.saturating_add(1);
                                             consecutive_data = 0;
                                         }
                                     }
@@ -1897,7 +1899,7 @@ async fn tunnel_loop(
                             meta.seq,
                         );
                         consecutive_empty = consecutive_empty.saturating_add(1);
-                                idle_tier = idle_tier.saturating_add(1);
+                        idle_tier = idle_tier.saturating_add(1);
                     }
                     ReplyOutcome::Dropped => {
                         break;
