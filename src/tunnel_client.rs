@@ -1616,13 +1616,10 @@ async fn tunnel_loop(
         if inflight.is_empty() && !eof_seen {
             let all_legacy = mux.all_servers_legacy();
 
-            // If every deployment is legacy and the session has gone
-            // idle, stop polling and just wait for client data. Apps
-            // maintain their own heartbeats (MQTT PINGREQ, FCM keepalive,
-            // etc.) which trigger client writes that send data ops — those
-            // act as natural polls. Mixed fleets must keep polling so
-            // round-robin can still land on a long-poll-capable peer.
-            if all_legacy && (idle_tier > 1 || consecutive_empty > 3) && !client_closed {
+            // Legacy-only fleets: after sustained idle, stop polling and
+            // wait for client data. Mixed fleets keep polling so
+            // round-robin can land on a long-poll-capable peer.
+            if all_legacy && (idle_tier > 4 || consecutive_empty > 3) && !client_closed {
                 read_buf.reserve(65536);
                 match reader.read_buf(&mut read_buf).await {
                     Ok(0) => break,
@@ -1638,7 +1635,6 @@ async fn tunnel_loop(
                 }
             }
 
-            // Early backoff: first few empties still poll with delay.
             let keepalive_delay = match idle_tier {
                 0 => Duration::from_millis(20),
                 1 => Duration::from_millis(80),
@@ -1748,15 +1744,10 @@ async fn tunnel_loop(
                             };
                             next_write_seq += 1;
                             if got_data {
-                                let bytes = resp.d.as_ref().map(|d| d.len() as u64 * 3 / 4).unwrap_or(0);
-                                if bytes >= 1024 {
-                                    consecutive_empty = 0;
-                                    idle_tier = idle_tier / 2;
-                                } else {
-                                    // Small response (heartbeat ACK) — don't reset idle state.
-                                    idle_tier = idle_tier.saturating_sub(1);
-                                }
+                                consecutive_empty = 0;
+                                idle_tier = 0;
                                 consecutive_data = consecutive_data.saturating_add(1);
+                                let bytes = resp.d.as_ref().map(|d| d.len() as u64 * 3 / 4).unwrap_or(0);
                                 total_download_bytes += bytes;
                             } else if meta.was_empty_poll && consecutive_data > 0 {
                                 // Stale empty-poll reply during an active data
@@ -1779,13 +1770,8 @@ async fn tunnel_loop(
                                 let buf_eof = buffered_resp.eof.unwrap_or(false);
                                 match write_tunnel_response(&mut writer, &buffered_resp).await? {
                                     WriteOutcome::Wrote => {
-                                        let buf_bytes = buffered_resp.d.as_ref().map(|d| d.len() as u64 * 3 / 4).unwrap_or(0);
-                                        if buf_bytes >= 1024 {
-                                            consecutive_empty = 0;
-                                            idle_tier = idle_tier / 2;
-                                        } else {
-                                            idle_tier = idle_tier.saturating_sub(1);
-                                        }
+                                        consecutive_empty = 0;
+                                        idle_tier = 0;
                                         consecutive_data = consecutive_data.saturating_add(1);
                                         let bytes = buffered_resp.d.as_ref().map(|d| d.len() as u64 * 3 / 4).unwrap_or(0);
                                         total_download_bytes += bytes;
