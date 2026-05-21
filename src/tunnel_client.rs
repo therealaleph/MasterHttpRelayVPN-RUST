@@ -1259,6 +1259,56 @@ pub async fn tunnel_connection(
     result
 }
 
+pub async fn tunnel_connection_with_prefix(
+    mut sock: TcpStream,
+    host: &str,
+    port: u16,
+    mux: &Arc<TunnelMux>,
+    prefix: Bytes,
+) -> std::io::Result<()> {
+    let (sid, first_resp, pending_client_data) = if mux.connect_data_unsupported() {
+        let sid = connect_plain(host, port, mux).await?;
+        (sid, None, Some(prefix))
+    } else {
+        match connect_with_initial_data(host, port, prefix.clone(), mux).await? {
+            ConnectDataOutcome::Opened { sid, response } => (sid, Some(response), None),
+            ConnectDataOutcome::Unsupported => {
+                mux.mark_connect_data_unsupported();
+                let sid = connect_plain(host, port, mux).await?;
+                (sid, None, Some(prefix))
+            }
+        }
+    };
+
+    tracing::info!("tunnel session {} opened for {}:{} (with prefix)", sid, host, port);
+    pipeline_debug::session_start(&sid);
+
+    let result = async {
+        if let Some(resp) = first_resp {
+            match write_tunnel_response(&mut sock, &resp).await? {
+                WriteOutcome::Wrote | WriteOutcome::NoData => {}
+                WriteOutcome::BadBase64 => {
+                    tracing::error!(
+                        "tunnel session {}: bad base64 in connect_data response",
+                        sid
+                    );
+                    return Ok(());
+                }
+            }
+            if resp.eof.unwrap_or(false) {
+                return Ok(());
+            }
+        }
+        tunnel_loop(&mut sock, &sid, mux, pending_client_data).await
+    }
+    .await;
+
+    mux.send(MuxMsg::Close { sid: sid.clone() }).await;
+    pipeline_debug::session_end(&sid);
+    tracing::info!("tunnel session {} closed for {}:{} (with prefix)", sid, host, port);
+    result
+}
+
 enum ConnectDataOutcome {
     Opened {
         sid: String,

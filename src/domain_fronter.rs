@@ -444,6 +444,8 @@ pub struct DomainFronter {
     /// User-configured block list. Any host matching an entry in this list
     /// is rejected immediately at the relay entrypoint.
     block_hosts: Vec<String>,
+    pub large_upload_full_route: AtomicU64,
+    pub large_upload_rejected_413: AtomicU64,
 }
 
 /// Aggregated stats for one remote host.
@@ -669,6 +671,8 @@ impl DomainFronter {
                 .collect(),
             script_ledger: Arc::new(std::sync::Mutex::new(HashMap::new())),
             block_hosts: config.block_hosts.clone(),
+            large_upload_full_route: AtomicU64::new(0),
+            large_upload_rejected_413: AtomicU64::new(0),
         })
     }
 
@@ -788,6 +792,8 @@ impl DomainFronter {
             h2_calls: self.h2_calls.load(Ordering::Relaxed),
             h2_fallbacks: self.h2_fallbacks.load(Ordering::Relaxed),
             h2_disabled: self.h2_disabled.load(Ordering::Relaxed),
+            large_upload_full_route: self.large_upload_full_route.load(Ordering::Relaxed),
+            large_upload_rejected_413: self.large_upload_rejected_413.load(Ordering::Relaxed),
         }
     }
 
@@ -1803,27 +1809,6 @@ impl DomainFronter {
                 tracing::info!("Quota Conservation: Short-circuited tracking endpoint: {}", host);
                 return b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
             }
-        }
-
-        // Upstream Payload Fragmentation Guard: Prevent heavy upload payload frames from crashing serverless instances
-        const MAX_UPSTREAM_CHUNK_SIZE: usize = 5 * 1024 * 1024; // Safe 5 MiB processing window threshold
-        if body.len() > MAX_UPSTREAM_CHUNK_SIZE {
-            tracing::info!("Upstream Fragmentation: Fragmenting large request body payload (Size: {} bytes)", body.len());
-            let chunks: Vec<&[u8]> = body.chunks(MAX_UPSTREAM_CHUNK_SIZE).collect();
-            let total_chunks = chunks.len();
-            let upload_id = format!("ul_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
-            
-            let mut final_response = Vec::new();
-            for (idx, chunk) in chunks.iter().enumerate() {
-                let mut chunk_headers = headers.to_vec();
-                chunk_headers.push(("X-MHRV-Upload-ID".to_string(), upload_id.clone()));
-                chunk_headers.push(("X-MHRV-Chunk-Index".to_string(), idx.to_string()));
-                chunk_headers.push(("X-MHRV-Chunk-Total".to_string(), total_chunks.to_string()));
-                
-                // Route fragment packets sequentially through standard transmission pipelines
-                final_response = self.relay_processed(method, url, &chunk_headers, chunk).await;
-            }
-            return final_response;
         }
 
         self.relay_processed(method, url, headers, body).await
@@ -4944,6 +4929,8 @@ pub struct StatsSnapshot {
     /// switch set, or peer refused h2 during ALPN). All traffic on the
     /// h1 path.
     pub h2_disabled: bool,
+    pub large_upload_full_route: u64,
+    pub large_upload_rejected_413: u64,
 }
 
 impl StatsSnapshot {
@@ -5001,7 +4988,7 @@ impl StatsSnapshot {
             s.replace('\\', "\\\\").replace('"', "\\\"")
         }
         format!(
-            r#"{{"relay_calls":{},"relay_failures":{},"coalesced":{},"bytes_relayed":{},"cache_hits":{},"cache_misses":{},"cache_bytes":{},"blacklisted_scripts":{},"total_scripts":{},"today_calls":{},"today_bytes":{},"today_key":"{}","today_reset_secs":{},"h2_calls":{},"h2_fallbacks":{},"h2_disabled":{}}}"#,
+            r#"{{"relay_calls":{},"relay_failures":{},"coalesced":{},"bytes_relayed":{},"cache_hits":{},"cache_misses":{},"cache_bytes":{},"blacklisted_scripts":{},"total_scripts":{},"today_calls":{},"today_bytes":{},"today_key":"{}","today_reset_secs":{},"h2_calls":{},"h2_fallbacks":{},"h2_disabled":{},"large_upload_full_route":{},"large_upload_rejected_413":{}}}"#,
             self.relay_calls,
             self.relay_failures,
             self.coalesced,
@@ -5018,6 +5005,8 @@ impl StatsSnapshot {
             self.h2_calls,
             self.h2_fallbacks,
             self.h2_disabled,
+            self.large_upload_full_route,
+            self.large_upload_rejected_413,
         )
     }
 }
@@ -7390,5 +7379,22 @@ hello";
             Ok((_send, _dead)) => panic!("expected AlpnRefused, got Ok"),
         }
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_large_upload_policy_no_unsafe_headers() {
+        let config_json = r#"{"mode":"apps_script","script_ids":["fake_id"],"auth_key":"fake_key"}"#;
+        let config: Config = serde_json::from_str(config_json).unwrap();
+        let fronter = DomainFronter::new(&config).unwrap();
+        
+        // Ensure counters are zero initialized
+        let stats = fronter.snapshot_stats();
+        assert_eq!(stats.large_upload_full_route, 0);
+        assert_eq!(stats.large_upload_rejected_413, 0);
+        
+        // Assert serialization includes our fields
+        let json_str = stats.to_json();
+        assert!(json_str.contains("\"large_upload_full_route\":0"));
+        assert!(json_str.contains("\"large_upload_rejected_413\":0"));
     }
 }

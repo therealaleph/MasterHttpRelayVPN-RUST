@@ -19,7 +19,9 @@ use tokio_rustls::{LazyConfigAcceptor, TlsAcceptor, TlsConnector};
 use crate::config::{Config, FrontingGroup, Mode};
 use crate::domain_fronter::DomainFronter;
 use crate::mitm::MitmCertManager;
-use crate::tunnel_client::{decode_udp_packets, TunnelMux};
+use crate::tunnel_client::{decode_udp_packets, TunnelMux, tunnel_connection_with_prefix};
+
+pub const APPS_SCRIPT_UPLOAD_MAX_BYTES: usize = 5 * 1024 * 1024;
 
 // Domains that are served from Google's core frontend IP pool and therefore
 // respond correctly when we connect to `google_ip` with SNI=`front_domain`
@@ -850,7 +852,7 @@ async fn handle_http_client(
         // `http://example.com` URL used to return a 502 here even
         // though `https://example.com` (CONNECT) worked fine.
         match fronter {
-            Some(f) => do_plain_http(sock, &head, &leftover, f).await,
+            Some(f) => do_plain_http(sock, &head, &leftover, f, rewrite_ctx.clone(), tunnel_mux.clone()).await,
             None => do_plain_http_passthrough(sock, &head, &leftover, &rewrite_ctx).await,
         }
     }
@@ -2429,6 +2431,43 @@ where
         None => return Ok(false),
     };
 
+    let is_mutating = method.eq_ignore_ascii_case("POST")
+        || method.eq_ignore_ascii_case("PUT")
+        || method.eq_ignore_ascii_case("PATCH");
+
+    if is_mutating {
+        let mut is_chunked = false;
+        let mut content_length = None;
+        for (k, v) in headers.iter() {
+            if k.eq_ignore_ascii_case("transfer-encoding") && v.eq_ignore_ascii_case("chunked") {
+                is_chunked = true;
+            }
+            if k.eq_ignore_ascii_case("content-length") {
+                if let Ok(len) = v.parse::<usize>() {
+                    content_length = Some(len);
+                }
+            }
+        }
+        if is_chunked || content_length.map_or(true, |len| len > APPS_SCRIPT_UPLOAD_MAX_BYTES) {
+            tracing::warn!(
+                "Mutating large/chunked upload in AppsScript MITM mode. Rejecting locally with 413. (is_chunked={}, content_length={:?})",
+                is_chunked,
+                content_length
+            );
+            fronter.large_upload_rejected_413.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 413 Payload Too Large\r\n\
+                      Connection: close\r\n\
+                      Content-Length: 47\r\n\r\n\
+                      Payload Too Large: Upload limit is 5 MiB.\n",
+                )
+                .await;
+            let _ = stream.flush().await;
+            return Ok(false);
+        }
+    }
+
     let body = read_body(stream, &leftover, &headers).await?;
 
     // ── Per-host URL fix-ups ──────────────────────────────────────────
@@ -2879,9 +2918,77 @@ async fn do_plain_http(
     head: &[u8],
     leftover: &[u8],
     fronter: Arc<DomainFronter>,
+    rewrite_ctx: Arc<RewriteCtx>,
+    tunnel_mux: Option<Arc<TunnelMux>>,
 ) -> std::io::Result<()> {
     let (method, target, _version, headers) = parse_request_head(head)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad request"))?;
+
+    let is_mutating = method.eq_ignore_ascii_case("POST")
+        || method.eq_ignore_ascii_case("PUT")
+        || method.eq_ignore_ascii_case("PATCH");
+
+    if is_mutating {
+        let mut is_chunked = false;
+        let mut content_length = None;
+        for (k, v) in headers.iter() {
+            if k.eq_ignore_ascii_case("transfer-encoding") && v.eq_ignore_ascii_case("chunked") {
+                is_chunked = true;
+            }
+            if k.eq_ignore_ascii_case("content-length") {
+                if let Ok(len) = v.parse::<usize>() {
+                    content_length = Some(len);
+                }
+            }
+        }
+        if is_chunked || content_length.map_or(true, |len| len > APPS_SCRIPT_UPLOAD_MAX_BYTES) {
+            if rewrite_ctx.mode == Mode::Full {
+                if let Some(ref mux) = tunnel_mux {
+                    let host_hdr = headers
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_default();
+                    let (target_host, target_port) = parse_host_port(&host_hdr);
+                    let target_port = if host_hdr.contains(':') { target_port } else { 80 };
+
+                    tracing::info!(
+                        "Mutating large/chunked upload on plain HTTP in Full mode. Routing via Tunnel. (Host: {}:{})",
+                        target_host,
+                        target_port
+                    );
+
+                    fronter.large_upload_full_route.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                    let mut prefix_vec = head.to_vec();
+                    prefix_vec.extend_from_slice(leftover);
+                    let prefix_bytes = Bytes::from(prefix_vec);
+
+                    if let Err(e) = tunnel_connection_with_prefix(sock, &target_host, target_port, mux, prefix_bytes).await {
+                        tracing::error!("Failed to route plain-HTTP large upload through tunnel: {}", e);
+                    }
+                    return Ok(());
+                }
+            }
+
+            tracing::warn!(
+                "Mutating large/chunked upload on plain HTTP. Rejecting locally with 413. (is_chunked={}, content_length={:?})",
+                is_chunked,
+                content_length
+            );
+            fronter.large_upload_rejected_413.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 413 Payload Too Large\r\n\
+                      Connection: close\r\n\
+                      Content-Length: 47\r\n\r\n\
+                      Payload Too Large: Upload limit is 5 MiB.\n",
+                )
+                .await;
+            let _ = sock.flush().await;
+            return Ok(());
+        }
+    }
 
     let body = read_body(&mut sock, leftover, &headers).await?;
 
@@ -3656,5 +3763,43 @@ mod tests {
             domains: vec!["x.com".into()],
         };
         assert!(FrontingGroupResolved::from_config(&bad).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_handle_mitm_request_rejects_large_mutating_requests() {
+        let (mut client, mut server) = duplex(1024);
+        
+        let config_json = r#"{"mode":"apps_script","script_ids":["fake_id"],"auth_key":"fake_key"}"#;
+        let config: Config = serde_json::from_str(config_json).unwrap();
+        let fronter = std::sync::Arc::new(DomainFronter::new(&config).unwrap());
+
+        // Write a mutating HTTP POST request that exceeds the 5 MiB ceiling
+        // Note: Content-Length: 6000000 (approx 5.7 MiB)
+        let request_bytes = b"POST /upload HTTP/1.1\r\n\
+                              Host: example.com\r\n\
+                              Content-Length: 6000000\r\n\
+                              Connection: keep-alive\r\n\r\n";
+        client.write_all(request_bytes).await.unwrap();
+
+        let fronter_clone = fronter.clone();
+        let handle_task = tokio::spawn(async move {
+            let res = handle_mitm_request(&mut server, "example.com", 443, &fronter_clone, "https").await;
+            res
+        });
+
+        // Read the response from the server on the client side
+        let mut response_buf = vec![0u8; 1024];
+        let n = client.read(&mut response_buf).await.unwrap();
+        let response_str = String::from_utf8_lossy(&response_buf[..n]);
+
+        // It should return 413 Payload Too Large locally
+        assert!(response_str.contains("HTTP/1.1 413 Payload Too Large"));
+        assert!(response_str.contains("Upload limit is 5 MiB"));
+
+        let handle_res = handle_task.await.unwrap();
+        assert_eq!(handle_res.unwrap(), false); // Connection should be terminated
+
+        // Verify rejected counter was incremented
+        assert_eq!(fronter.snapshot_stats().large_upload_rejected_413, 1);
     }
 }

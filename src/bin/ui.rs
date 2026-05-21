@@ -1381,8 +1381,13 @@ impl eframe::App for App {
             };
             section(ui, &status_title, |ui| {
                 if let Some(s) = &stats {
-                    // Compact two-column layout so 7 metrics fit in ~4 rows
+                    // Compact two-column layout so metrics fit in rows
                     // instead of a tall vertical strip.
+                    let large_upload_policy = match self.form.mode.as_str() {
+                        "full" => "Full mode (Tunnel)",
+                        "apps_script" => "Reject > 5MiB",
+                        _ => "Unknown",
+                    };
                     let rows: Vec<(&str, String)> = vec![
                         ("relay calls", s.relay_calls.to_string()),
                         ("failures", s.relay_failures.to_string()),
@@ -1406,6 +1411,9 @@ impl eframe::App for App {
                                 s.total_scripts
                             ),
                         ),
+                        ("large upload policy", large_upload_policy.to_string()),
+                        ("uploads routed", s.large_upload_full_route.to_string()),
+                        ("uploads rejected", s.large_upload_rejected_413.to_string()),
                     ];
                     egui::Grid::new("stats")
                         .num_columns(4)
