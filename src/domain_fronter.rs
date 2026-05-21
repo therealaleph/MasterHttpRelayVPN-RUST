@@ -439,6 +439,11 @@ pub struct DomainFronter {
     /// Pre-normalized (lowercased, leading-dot stripped) host list for
     /// fast O(N) match in `exit_node_matches`.
     exit_node_hosts: Vec<String>,
+    /// Thread-safe dynamic sliding queue tracking transaction history timestamps per deployment node.
+    script_ledger: Arc<std::sync::Mutex<HashMap<String, Vec<std::time::Instant>>>>,
+    /// User-configured block list. Any host matching an entry in this list
+    /// is rejected immediately at the relay entrypoint.
+    block_hosts: Vec<String>,
 }
 
 /// Aggregated stats for one remote host.
@@ -662,6 +667,8 @@ impl DomainFronter {
                 .map(|h| h.trim().trim_start_matches('.').to_ascii_lowercase())
                 .filter(|h| !h.is_empty())
                 .collect(),
+            script_ledger: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            block_hosts: config.block_hosts.clone(),
         })
     }
 
@@ -713,6 +720,9 @@ impl DomainFronter {
             *guard = today;
             self.today_calls.store(0, Ordering::Relaxed);
             self.today_bytes.store(0, Ordering::Relaxed);
+            if let Ok(mut ledger) = self.script_ledger.lock() {
+                ledger.clear();
+            }
         }
         drop(guard);
         self.today_calls.fetch_add(1, Ordering::Relaxed);
@@ -798,25 +808,59 @@ impl DomainFronter {
     }
 
     pub fn next_script_id(&self) -> String {
-        let n = self.script_ids.len();
         let mut bl = self.blacklist.lock().unwrap();
-        let now = Instant::now();
-        bl.retain(|_, until| *until > now);
+        let now_instant = std::time::Instant::now();
+        bl.retain(|_, until| *until > now_instant);
 
-        for _ in 0..n {
-            let idx = self.script_idx.fetch_add(1, Ordering::Relaxed);
-            let sid = &self.script_ids[idx % n];
-            if !bl.contains_key(sid) {
-                return sid.clone();
+        let mut chosen_sid = None;
+        let mut min_calls = usize::MAX;
+        let sliding_window = std::time::Duration::from_secs(86400); // 24-Hour Rolling Horizon Window
+
+        if let Ok(mut ledger) = self.script_ledger.lock() {
+            for sid in &self.script_ids {
+                if !bl.contains_key(sid) {
+                    // Evict expired historical entry counters relative to the current rolling window frame
+                    let entry = ledger.entry(sid.clone()).or_insert_with(Vec::new);
+                    entry.retain(|timestamp| now_instant.duration_since(*timestamp) < sliding_window);
+                    
+                    let active_calls = entry.len();
+                    if active_calls < min_calls {
+                        min_calls = active_calls;
+                        chosen_sid = Some(sid.clone());
+                    }
+                }
+            }
+            
+            if let Some(ref sid) = chosen_sid {
+                if let Some(entry) = ledger.get_mut(sid) {
+                    entry.push(now_instant);
+                }
             }
         }
+
+        if let Some(sid) = chosen_sid {
+            return sid;
+        }
+
         // All blacklisted: pick whichever comes off cooldown soonest.
         if let Some((sid, _)) = bl.iter().min_by_key(|(_, t)| **t) {
             let sid = sid.clone();
             bl.remove(&sid);
+            
+            if let Ok(mut ledger) = self.script_ledger.lock() {
+                let entry = ledger.entry(sid.clone()).or_insert_with(Vec::new);
+                entry.push(now_instant);
+            }
+            
             return sid;
         }
-        self.script_ids[0].clone()
+        
+        let sid = self.script_ids[0].clone();
+        if let Ok(mut ledger) = self.script_ledger.lock() {
+            let entry = ledger.entry(sid.clone()).or_insert_with(Vec::new);
+            entry.push(now_instant);
+        }
+        sid
     }
 
     /// Pick `want` distinct non-blacklisted script IDs for a parallel fan-out
@@ -1748,6 +1792,50 @@ impl DomainFronter {
         headers: &[(String, String)],
         body: &[u8],
     ) -> Vec<u8> {
+        // Dynamic Quota Conservation Check via Relay Gate
+        if let Some(host) = extract_host(url) {
+            let host_lower = host.to_ascii_lowercase();
+            // Validated cleanly with zero inner closure string allocation overhead
+            if self.block_hosts.iter().any(|h| {
+                let h_lower = h.to_ascii_lowercase();
+                host_lower == h_lower || host_lower.ends_with(&format!(".{}", h_lower))
+            }) {
+                tracing::info!("Quota Conservation: Short-circuited tracking endpoint: {}", host);
+                return b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
+            }
+        }
+
+        // Upstream Payload Fragmentation Guard: Prevent heavy upload payload frames from crashing serverless instances
+        const MAX_UPSTREAM_CHUNK_SIZE: usize = 5 * 1024 * 1024; // Safe 5 MiB processing window threshold
+        if body.len() > MAX_UPSTREAM_CHUNK_SIZE {
+            tracing::info!("Upstream Fragmentation: Fragmenting large request body payload (Size: {} bytes)", body.len());
+            let chunks: Vec<&[u8]> = body.chunks(MAX_UPSTREAM_CHUNK_SIZE).collect();
+            let total_chunks = chunks.len();
+            let upload_id = format!("ul_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+            
+            let mut final_response = Vec::new();
+            for (idx, chunk) in chunks.iter().enumerate() {
+                let mut chunk_headers = headers.to_vec();
+                chunk_headers.push(("X-MHRV-Upload-ID".to_string(), upload_id.clone()));
+                chunk_headers.push(("X-MHRV-Chunk-Index".to_string(), idx.to_string()));
+                chunk_headers.push(("X-MHRV-Chunk-Total".to_string(), total_chunks.to_string()));
+                
+                // Route fragment packets sequentially through standard transmission pipelines
+                final_response = self.relay_processed(method, url, &chunk_headers, chunk).await;
+            }
+            return final_response;
+        }
+
+        self.relay_processed(method, url, headers, body).await
+    }
+
+    pub async fn relay_processed(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Vec<u8> {
         // Optional URL rewrite for X/Twitter GraphQL (issue #16). Applied
         // here, at the top of relay(), so it affects BOTH the cache key
         // (so matching requests collapse into one entry) AND the URL that
@@ -2503,9 +2591,17 @@ impl DomainFronter {
                         .chars()
                         .take(200)
                         .collect::<String>();
-                    if should_blacklist(status, &body_txt) {
+                    
+                    if status == 429 {
+                        // Critical Quota Overflow: Trigger aggressive cooling to allow Google side token bucket refill
+                        self.blacklist_script_for(&script_id, Duration::from_secs(3600), "Critical Quota Overflow (429)");
+                    } else if status == 401 || status == 403 {
+                        // Auth Failure: Deployment likely deleted or PSK changed. Mark for long-term quarantine.
+                        self.blacklist_script_for(&script_id, Duration::from_secs(14400), "Auth/Deployment Error (401/403)");
+                    } else if should_blacklist(status, &body_txt) {
                         self.blacklist_script(&script_id, &format!("HTTP {}", status));
                     }
+
                     return Err(FronterError::Relay(format!(
                         "Apps Script HTTP {}: {}",
                         status, body_txt
@@ -2514,7 +2610,8 @@ impl DomainFronter {
                 return parse_relay_json(&resp_body).map_err(|e| {
                     if let FronterError::Relay(ref msg) = e {
                         if looks_like_quota_error(msg) {
-                            self.blacklist_script(&script_id, msg);
+                            // User-perceived quota overflow in JSON body: medium cooldown
+                            self.blacklist_script_for(&script_id, Duration::from_secs(1800), msg);
                         }
                     }
                     e
@@ -2612,9 +2709,15 @@ impl DomainFronter {
                             .chars()
                             .take(200)
                             .collect::<String>();
-                        if should_blacklist(status, &body_txt) {
+                        
+                        if status == 429 {
+                            self.blacklist_script_for(&script_id, Duration::from_secs(3600), "Critical Quota Overflow (429)");
+                        } else if status == 401 || status == 403 {
+                            self.blacklist_script_for(&script_id, Duration::from_secs(14400), "Auth/Deployment Error (401/403)");
+                        } else if should_blacklist(status, &body_txt) {
                             self.blacklist_script(&script_id, &format!("HTTP {}", status));
                         }
+
                         return Err(FronterError::Relay(format!(
                             "Apps Script HTTP {}: {}",
                             status, body_txt
@@ -3022,7 +3125,12 @@ impl DomainFronter {
                 .chars()
                 .take(200)
                 .collect::<String>();
-            if should_blacklist(status, &body_txt) {
+            
+            if status == 429 {
+                self.blacklist_script_for(script_id, Duration::from_secs(3600), "Critical Quota Overflow (429)");
+            } else if status == 401 || status == 403 {
+                self.blacklist_script_for(script_id, Duration::from_secs(14400), "Auth/Deployment Error (401/403)");
+            } else if should_blacklist(status, &body_txt) {
                 self.blacklist_script(script_id, &format!("HTTP {}", status));
             }
             return Err(FronterError::Relay(format!(
@@ -3212,7 +3320,12 @@ impl DomainFronter {
                 .chars()
                 .take(200)
                 .collect::<String>();
-            if should_blacklist(status, &body_txt) {
+            
+            if status == 429 {
+                self.blacklist_script_for(script_id, Duration::from_secs(3600), "Critical Quota Overflow (429)");
+            } else if status == 401 || status == 403 {
+                self.blacklist_script_for(script_id, Duration::from_secs(14400), "Auth/Deployment Error (401/403)");
+            } else if should_blacklist(status, &body_txt) {
                 self.blacklist_script(script_id, &format!("HTTP {}", status));
             }
             return Err(FronterError::Relay(format!(

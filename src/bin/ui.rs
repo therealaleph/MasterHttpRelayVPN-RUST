@@ -24,11 +24,20 @@ const WIN_HEIGHT: f32 = 680.0;
 const LOG_MAX: usize = 200;
 
 fn main() -> eframe::Result<()> {
+    // Install default rustls crypto provider (ring).
     let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Re-point HOME at the invoking user if this binary was launched
     // under sudo (see cert_installer::reconcile_sudo_environment). Must
     // run before any data_dir / firefox_profile_dirs call.
     reconcile_sudo_environment();
+
+    #[cfg(target_os = "windows")]
+    {
+        // Boot-up Initialization Proxy State Flush
+        sync_wininet_proxy(false, 0);
+    }
+
     mhrv_rs::rlimit::raise_nofile_limit_best_effort();
 
     let shared = Arc::new(Shared::default());
@@ -95,7 +104,17 @@ fn main() -> eframe::Result<()> {
         "mhrv-rs",
         options,
         Box::new(move |cc| {
-            cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            let mut premium_visuals = egui::Visuals::dark();
+            premium_visuals.panel_fill = egui::Color32::from_rgb(18, 20, 24);     // Deep Obsidian Canvas
+            premium_visuals.window_fill = egui::Color32::from_rgb(26, 29, 36);    // Slate Card Surface
+            premium_visuals.widgets.active.bg_fill = egui::Color32::from_rgb(59, 130, 246);  // Accent Cobalt
+            premium_visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(37, 99, 235);
+            premium_visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(31, 41, 55);
+            premium_visuals.widgets.active.rounding = egui::Rounding::same(10.0);
+            premium_visuals.widgets.hovered.rounding = egui::Rounding::same(10.0);
+            premium_visuals.widgets.inactive.rounding = egui::Rounding::same(10.0);
+            cc.egui_ctx.set_visuals(premium_visuals);
+
             Ok(Box::new(App {
                 shared,
                 cmd_tx,
@@ -154,6 +173,8 @@ struct UiState {
     /// One-line status of the most recent download (Ok(path) or Err(msg)).
     last_download: Option<Result<std::path::PathBuf, String>>,
     last_download_at: Option<Instant>,
+    /// Stashed configuration used to start the current proxy session.
+    last_config: Option<Config>,
 }
 
 #[derive(Clone, Debug)]
@@ -232,6 +253,7 @@ struct FormState {
     socks5_port: String,
     log_level: String,
     verify_ssl: bool,
+    auto_system_proxy: bool,
     upstream_socks5: String,
     parallel_relay: u8,
     show_auth_key: bool,
@@ -252,6 +274,7 @@ struct FormState {
     normalize_x_graphql: bool,
     youtube_via_relay: bool,
     passthrough_hosts: Vec<String>,
+    block_hosts: Vec<String>,
     /// Round-tripped from config.json so the UI's save path doesn't
     /// drop the user's setting. Not currently exposed as a UI control;
     /// users edit `block_quic` directly in `config.json` (Issue #213).
@@ -548,6 +571,7 @@ impl FormState {
             socks5_port,
             log_level: self.log_level.trim().to_string(),
             verify_ssl: self.verify_ssl,
+            auto_system_proxy: self.auto_system_proxy,
             hosts: std::collections::HashMap::new(),
             enable_batching: false,
             upstream_socks5: {
@@ -589,6 +613,7 @@ impl FormState {
             // Similarly config-only for now; round-trips through the
             // file so the UI doesn't drop the user's entries on save.
             passthrough_hosts: self.passthrough_hosts.clone(),
+            block_hosts: self.block_hosts.clone(),
             // Issue #213: block_quic is config-only for now (no UI
             // control yet). Round-trip through the file so save
             // doesn't drop a user-set true.
@@ -814,17 +839,17 @@ const ERR_RED: egui::Color32 = egui::Color32::from_rgb(220, 110, 110);
 fn section(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
     ui.add_space(6.0);
     ui.label(
-        egui::RichText::new(title)
-            .size(12.0)
-            .color(egui::Color32::from_gray(180))
+        egui::RichText::new(title.to_ascii_uppercase())
+            .size(11.0)
+            .color(egui::Color32::from_rgb(59, 130, 246)) // Cobalt Section Typography Header
             .strong(),
     );
     ui.add_space(2.0);
     let frame = egui::Frame::none()
-        .fill(egui::Color32::from_rgb(28, 30, 34))
+        .fill(egui::Color32::from_rgb(26, 29, 36))
         .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 54, 60)))
-        .rounding(6.0)
-        .inner_margin(egui::Margin::same(10.0));
+        .rounding(10.0) // Softened Layout Corner Context
+        .inner_margin(egui::Margin::same(12.0));
     frame.show(ui, body);
 }
 
@@ -899,14 +924,19 @@ impl eframe::App for App {
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let (fill, dot, label) = if running {
+                        // Request immediate repaint on next loop pass to ensure uniform pulsing animation execution
+                        ui.ctx().request_repaint();
+
+                        let time = ui.ctx().input(|i| i.time);
+                        let alpha = ((time * 3.0).sin() * 0.3 + 0.7) as f32; // Organic Status Shimmer loop
                         (
-                            egui::Color32::from_rgb(30, 60, 40),
-                            OK_GREEN,
-                            "running",
+                            egui::Color32::from_rgb(20, 35, 25),
+                            egui::Color32::from_rgba_unmultiplied(80, 180, 100, (alpha * 255.0) as u8),
+                            "connected",
                         )
                     } else {
                         (
-                            egui::Color32::from_rgb(60, 35, 35),
+                            egui::Color32::from_rgb(45, 25, 25),
                             ERR_RED,
                             "stopped",
                         )
@@ -924,7 +954,7 @@ impl eframe::App for App {
                                 ui.painter().circle_filled(rect.center(), 4.0, dot);
                                 ui.label(
                                     egui::RichText::new(label)
-                                        .color(dot)
+                                        .color(egui::Color32::from_rgb(80, 180, 100))
                                         .monospace()
                                         .strong(),
                                 );
@@ -1224,6 +1254,15 @@ impl eframe::App for App {
                         .labelled_by(label_id);
                     });
 
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.form.auto_system_proxy, "Auto-toggle system proxy (Windows)");
+                        if self.form.auto_system_proxy {
+                            ui.label(egui::RichText::new("⚠ Automated WinINet Integration Active").color(egui::Color32::from_rgb(59, 130, 246)).size(10.0));
+                        }
+                    });
+                    ui.add_space(4.0);
+
                     form_row(ui, "Parallel dispatch", Some(
                         "Fire N Apps Script IDs in parallel per request and take the first \
                          response. 0/1 = off. 2-3 kills long-tail latency at N× quota cost. \
@@ -1415,12 +1454,18 @@ impl eframe::App for App {
             if let Some(s) = &stats {
                 ui.add_space(2.0);
                 section(ui, "Usage today (estimated)", |ui| {
-                    // Free-tier Apps Script UrlFetchApp quota. Workspace /
-                    // paid accounts get 100k but most users are on free.
                     const FREE_QUOTA_PER_DAY: u64 = 20_000;
                     let pct = if FREE_QUOTA_PER_DAY > 0 {
                         (s.today_calls as f64 / FREE_QUOTA_PER_DAY as f64) * 100.0
                     } else { 0.0 };
+
+                    ui.add_space(4.0);
+                    let progress_ratio = (s.today_calls as f32 / FREE_QUOTA_PER_DAY as f32).min(1.0);
+                    ui.add(egui::ProgressBar::new(progress_ratio)
+                        .text(format!("{:.1}% pool quota consumed", pct))
+                        .animate(running));
+                    ui.add_space(6.0);
+
                     let reset = s.today_reset_secs;
                     let reset_str = format!(
                         "{}h {}m",
@@ -1762,6 +1807,9 @@ impl eframe::App for App {
                             egui::RichText::new("CA appears trusted on this machine.")
                                 .color(OK_GREEN),
                         );
+                        ui.collapsing("🛈 Local Trust Isolation Details", |ui| {
+                            ui.small("Your intercept certificate is securely generated locally and mapped unique to this runtime build. It decodes TLS metadata elements entirely inside your machine's loopback memory spaces before proxying payload packets over remote channels.");
+                        });
                     }
                     Some(false) => {
                         ui.small(
@@ -2130,6 +2178,40 @@ fn fmt_bytes(b: u64) -> String {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn sync_wininet_proxy(enabled: bool, port: u16) {
+    use winreg::enums::*;
+    use winreg::RegKey;
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    if let Ok(sub_key) = hkcu.open_subkey_with_flags(
+        r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+        KEY_WRITE,
+    ) {
+        if enabled {
+            let proxy_str = format!("http=127.0.0.1:{};https=127.0.0.1:{}", port, port);
+            let _ = sub_key.set_value("ProxyEnable", &1u32);
+            let _ = sub_key.set_value("ProxyServer", &proxy_str);
+        } else {
+            let _ = sub_key.set_value("ProxyEnable", &0u32);
+            let _ = sub_key.set_value("ProxyServer", &"");
+        }
+    }
+
+    // Broadcast system update instantly via native InternetSetOptionW Win32 calls
+    unsafe {
+        extern "system" {
+            fn InternetSetOptionW(
+                h: *mut std::ffi::c_void,
+                o: u32,
+                b: *mut std::ffi::c_void,
+                bl: u32,
+            ) -> i32;
+        }
+        InternetSetOptionW(std::ptr::null_mut(), 39, std::ptr::null_mut(), 0); // INTERNET_OPTION_SETTINGS_CHANGED
+        InternetSetOptionW(std::ptr::null_mut(), 37, std::ptr::null_mut(), 0); // INTERNET_OPTION_REFRESH
+    }
+}
+
 // ---------- Background thread: owns the tokio runtime + proxy lifecycle ----------
 
 fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
@@ -2141,8 +2223,35 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
         tokio::sync::oneshot::Sender<()>,
     )> = None;
 
+    let mut last_wininet_state: Option<(bool, u16)> = None;
+
     loop {
         match rx.recv_timeout(Duration::from_millis(250)) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Periodic health check / state sync loop
+                #[cfg(target_os = "windows")]
+                {
+                    let (running, auto_proxy, port) = {
+                        let st = shared.state.lock().unwrap();
+                        (st.proxy_active, st.last_config.as_ref().map(|c| c.auto_system_proxy).unwrap_or(false), st.last_config.as_ref().map(|c| c.listen_port).unwrap_or(8085))
+                    };
+
+                    let desired_state = if running && auto_proxy {
+                        Some((true, port))
+                    } else if auto_proxy {
+                        Some((false, port))
+                    } else {
+                        None
+                    };
+
+                    if desired_state != last_wininet_state {
+                        if let Some((enabled, p)) = desired_state {
+                            sync_wininet_proxy(enabled, p);
+                        }
+                        last_wininet_state = desired_state;
+                    }
+                }
+            }
             Ok(Cmd::PollStats) => {
                 if let Some((_, fronter_slot, _)) = &active {
                     let slot = fronter_slot.clone();
@@ -2168,7 +2277,11 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                 // Flip proxy_active synchronously so a `Remove CA` click
                 // queued in the same frame as Start is rejected before
                 // the MITM manager begins loading.
-                shared.state.lock().unwrap().proxy_active = true;
+                {
+                    let mut st = shared.state.lock().unwrap();
+                    st.proxy_active = true;
+                    st.last_config = Some(cfg.clone());
+                }
                 let shared2 = shared.clone();
                 let fronter_slot: Arc<AsyncMutex<Option<Arc<DomainFronter>>>> =
                     Arc::new(AsyncMutex::new(None));
@@ -2260,6 +2373,7 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                     st.running = false;
                     st.started_at = None;
                     st.proxy_active = false;
+                    st.last_config = None;
                 }
             }
 

@@ -15,6 +15,34 @@ use mhrv_rs::{scan_ips, scan_sni, test_cmd};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+#[cfg(target_os = "windows")]
+fn flush_windows_system_proxy() {
+    use winreg::enums::*;
+    use winreg::RegKey;
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    if let Ok(sub_key) = hkcu.open_subkey_with_flags(
+        r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+        KEY_WRITE,
+    ) {
+        let _ = sub_key.set_value("ProxyEnable", &0u32);
+        let _ = sub_key.set_value("ProxyServer", &"");
+    }
+
+    // Broadcast system update to ensure settings apply instantly
+    unsafe {
+        extern "system" {
+            fn InternetSetOptionW(
+                h: *mut std::ffi::c_void,
+                o: u32,
+                b: *mut std::ffi::c_void,
+                bl: u32,
+            ) -> i32;
+        }
+        InternetSetOptionW(std::ptr::null_mut(), 39, std::ptr::null_mut(), 0); // INTERNET_OPTION_SETTINGS_CHANGED
+        InternetSetOptionW(std::ptr::null_mut(), 37, std::ptr::null_mut(), 0); // INTERNET_OPTION_REFRESH
+    }
+}
+
 struct Args {
     config_path: Option<PathBuf>,
     install_cert: bool,
@@ -146,6 +174,18 @@ async fn main() -> ExitCode {
     // operated against root's home. No-op on Windows and for non-sudo
     // invocations.
     reconcile_sudo_environment();
+
+    #[cfg(target_os = "windows")]
+    {
+        // Register Root Panic Watchdog Recovery Hook
+        std::panic::set_hook(Box::new(|panic_info| {
+            eprintln!("Critical Exception Caught: {}", panic_info);
+            flush_windows_system_proxy();
+        }));
+
+        // Boot-up Initialization Proxy State Flush
+        flush_windows_system_proxy();
+    }
 
     let args = match parse_args() {
         Ok(a) => a,

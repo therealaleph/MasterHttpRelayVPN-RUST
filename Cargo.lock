@@ -2654,6 +2654,7 @@ dependencies = [
  "tun2proxy",
  "url",
  "webpki-roots 0.26.11",
+ "winreg",
  "x509-parser",
  "zstd",
 ]

@@ -81,6 +81,8 @@ pub struct Config {
     #[serde(default = "default_verify_ssl")]
     pub verify_ssl: bool,
     #[serde(default)]
+    pub auto_system_proxy: bool,
+    #[serde(default)]
     pub hosts: HashMap<String, String>,
     #[serde(default)]
     pub enable_batching: bool,
@@ -177,6 +179,11 @@ pub struct Config {
     /// Issues #39, #127.
     #[serde(default)]
     pub passthrough_hosts: Vec<String>,
+
+    /// Dynamic local block list. Hosts matching any entry are intercepted
+    /// and short-circuited immediately at the proxy edge boundary.
+    #[serde(default)]
+    pub block_hosts: Vec<String>,
 
     /// Block outbound QUIC (UDP/443) at the SOCKS5 listener.
     ///

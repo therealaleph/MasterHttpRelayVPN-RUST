@@ -237,6 +237,7 @@ pub struct RewriteCtx {
     /// and pass through as plain TCP (optionally via upstream_socks5).
     /// See config.rs `passthrough_hosts` for matching rules. Issues #39, #127.
     pub passthrough_hosts: Vec<String>,
+    pub block_hosts: Vec<String>,
     /// If true, drop SOCKS5 UDP datagrams destined for port 443 so
     /// callers fall back to TCP/HTTPS. See config.rs `block_quic` for
     /// the trade-off. Issue #213.
@@ -507,6 +508,7 @@ impl ProxyServer {
             mode,
             youtube_via_relay: config.youtube_via_relay,
             passthrough_hosts: config.passthrough_hosts.clone(),
+            block_hosts: config.block_hosts.clone(),
             block_quic: config.block_quic,
             block_stun: config.block_stun,
             bypass_doh: !config.tunnel_doh,
@@ -1627,6 +1629,13 @@ async fn dispatch_tunnel(
     rewrite_ctx: Arc<RewriteCtx>,
     tunnel_mux: Option<Arc<TunnelMux>>,
 ) -> std::io::Result<()> {
+    // 0. Early Quota Conservation Gate: Short-circuit blacklisted hosts before remote socket allocation
+    if matches_passthrough(&host, &rewrite_ctx.block_hosts) {
+        tracing::info!("Quota Conservation: Intercepted and terminated connection to blocked host: {}:{}", host, port);
+        drop(sock);
+        return Ok(());
+    }
+
     // 0. User-configured passthrough list wins over every other path.
     //    If the host matches `passthrough_hosts`, we raw-TCP it (through
     //    upstream_socks5 if set) and never touch Apps Script, SNI-rewrite,
