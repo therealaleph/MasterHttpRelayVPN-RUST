@@ -142,6 +142,13 @@ dependencies {
 
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
+
+    // Local JVM unit tests (Robolectric so we can use Android Context
+    // without standing up an emulator). Used by ProfileStoreTest to
+    // verify the storage invariants documented in ProfileStore.kt.
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.robolectric:robolectric:4.13")
+    testImplementation("androidx.test:core:1.6.1")
 }
 
 // --------------------------------------------------------------------------

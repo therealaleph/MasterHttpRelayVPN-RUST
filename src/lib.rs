@@ -7,6 +7,7 @@ pub mod data_dir;
 pub mod domain_fronter;
 pub mod lan_utils;
 pub mod mitm;
+pub mod profiles;
 pub mod proxy_server;
 pub mod rlimit;
 pub mod tunnel_client;

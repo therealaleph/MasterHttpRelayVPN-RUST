@@ -95,6 +95,41 @@
     <string name="btn_view_quota_on_google">مشاهدهٔ سهمیه در گوگل ←</string>
     <string name="usage_today_note">تخمینی — این همان چیزی است که از این دستگاه رد شده. عدد دقیق در داشبورد گوگل قابل مشاهده است.</string>
 
+    <!-- Profile bar — جابه‌جایی بین تنظیمات ذخیره‌شده بدون تایپ مجدد ID و auth_key -->
+    <string name="profile_label">پروفایل</string>
+    <string name="profile_none">(هیچ‌کدام)</string>
+    <string name="profile_active_prefix">پروفایل:</string>
+    <string name="profile_no_saved">هنوز پروفایلی ذخیره نشده</string>
+    <string name="btn_save_as_profile">ذخیره به‌عنوان پروفایل</string>
+    <string name="btn_manage_profiles">مدیریت پروفایل‌ها…</string>
+    <string name="dialog_save_profile_title">ذخیره به‌عنوان پروفایل</string>
+    <string name="dialog_manage_profiles_title">مدیریت پروفایل‌ها</string>
+    <string name="field_profile_name">نام پروفایل</string>
+    <string name="placeholder_profile_name">مثلاً Apps Script (خانه)، Full (کار)</string>
+    <string name="profile_overwrite_warning">پروفایلی به نام \'%1$s\' از قبل وجود دارد. روی «جایگزینی» بزنید تا روی آن نوشته شود.</string>
+    <string name="btn_overwrite">جایگزینی</string>
+    <string name="btn_save">ذخیره</string>
+    <string name="btn_close">بستن</string>
+    <string name="btn_rename">تغییر نام</string>
+    <string name="btn_duplicate">تکثیر</string>
+    <string name="btn_delete">حذف</string>
+    <string name="btn_confirm_delete">تأیید حذف</string>
+    <string name="confirm_delete_profile">\'%1$s\' حذف شود؟</string>
+    <string name="btn_ok">تأیید</string>
+    <string name="profile_err_save_failed">ذخیرهٔ پروفایل ممکن نشد</string>
+    <string name="profile_err_rename_failed">تغییر نام ممکن نشد — نام تکراری یا خالی است</string>
+    <string name="profile_err_duplicate_failed">تکثیر ممکن نشد</string>
+    <string name="profile_err_delete_failed">حذف ممکن نشد</string>
+    <string name="snack_profile_switched">به پروفایل \'%1$s\' جابه‌جا شد</string>
+    <string name="snack_profile_switched_partial">به \'%1$s\' جابه‌جا شد (پیکربندی زنده به‌روزرسانی شد)، اما ذخیرهٔ نشانگر فعال ناموفق بود — با راه‌اندازی مجدد، نشانگر از دست می‌رود.</string>
+    <string name="snack_profile_switch_failed">جابه‌جایی به \'%1$s\' ناموفق</string>
+    <string name="snack_profile_saved">پروفایل \'%1$s\' ذخیره شد</string>
+    <string name="snack_profile_switch_blocked_running">ابتدا قطع کنید — جابه‌جایی پروفایل فقط در اتصال بعدی اعمال می‌شود</string>
+    <string name="snack_config_save_failed">ذخیرهٔ config.json ممکن نشد — تغییر شما فقط در حافظه است و با راه‌اندازی مجدد از دست می‌رود</string>
+    <string name="profile_active_marker_cd">پروفایل فعال</string>
+    <string name="profile_err_corrupt_on_disk">فایل profiles.json روی دیسک خراب به نظر می‌رسد؛ از بازنویسی خودداری شد. در صورت نیاز نداشتن آن را کنار بگذارید و دوباره تلاش کنید.</string>
+    <string name="profile_err_partial_config_only">پیکربندی زنده ذخیره شد، اما ورودی پروفایل ذخیره نشد. برای ذخیرهٔ پروفایل دوباره تلاش کنید.</string>
+
     <!-- "How to use" guide body. Localized — EN copy lives in values. -->
     <string name="help_how_to_use">۱. یک یا چند آدرس deployment از Apps Script (یا فقط ID خام) و همراه آن auth_key خود را جای‌گذاری کنید.\n۲. روی «نصب گواهی MITM» بزنید و پیام تأیید را قبول کنید — گواهی در Downloads/mhrv-ca.crt ذخیره می‌شود و برنامهٔ Settings باز می‌شود. داخل Settings از نوار جست‌وجو «CA certificate» را پیدا کنید و روی همان نتیجه بزنید (نه «VPN &amp; app user certificate» و نه «Wi-Fi»)، سپس mhrv-ca.crt را از Downloads انتخاب کنید. اگر قفل صفحه ندارید، اندروید می‌خواهد یکی تنظیم کنید (الزام سیستم).\n۳. قبل از Start، بخش «مجموعهٔ SNI + تستر» را باز کنید و «تست همه» را بزنید. اگر همه تایم‌اوت شدند یعنی google_ip در دسترس نیست — آن را با یک IP جایگزین کنید که روی شبکهٔ سالم resolve می‌شود (مثلاً `nslookup www.google.com` روی هر دستگاه سالم).\n۴. Start را بزنید و درخواست VPN را تأیید کنید. پل TUN کامل، تمام برنامه‌های دستگاه را خودکار از پروکسی رد می‌کند — نیاز به تنظیم per-app نیست.\n۵. اگر Chrome پیام «504 Relay timeout» نشان داد: deployment شما پاسخ نمی‌دهد. اسکریپت را دوباره deploy کنید، URL جدید /exec را بگیرید و بالا جای‌گذاری کنید. در «لاگ زنده» ببینید خطا از نوع «Relay timeout» است یا «connect:» — نوع خطا مشخص می‌کند کدام لایه مقصر است.\n\nمحدودیت شناخته‌شده — Cloudflare Turnstile («Verify you are human») روی اکثر سایت‌های پشت Cloudflare به‌طور بی‌پایان loop می‌زند. هر درخواست Apps Script از یک IP خروجی چرخشی دیتاسنتر گوگل + یک User-Agent ثابت «Google-Apps-Script» + اثرانگشت TLS گوگل عبور می‌کند. کوکی cf_clearance به tuple (IP, UA, JA3) مربوط به زمان حل چالش گره خورده است، پس درخواست بعدی — از یک IP خروجی متفاوت — دوباره چالش می‌خورد. این مسئله در این برنامه قابل‌حل نیست؛ ذات رلهٔ Apps Script است. سایت‌هایی که فقط بارگذاری اولیه را gate می‌کنند (نه هر درخواست) بعد از یک بار حل، کار خواهند کرد.</string>
 </resources>
