@@ -321,6 +321,9 @@ struct FormState {
     /// claude.ai / grok.com / x.com). Config-only — no UI editor yet.
     /// See `assets/exit_node/` for the generic exit-node handler.
     exit_node: mhrv_rs::config::ExitNodeConfig,
+    inbound_username: String,
+    inbound_password: String,
+    show_inbound_password: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -426,6 +429,9 @@ fn load_form() -> (FormState, Option<String>) {
             auto_blacklist_cooldown_secs: c.auto_blacklist_cooldown_secs,
             request_timeout_secs: c.request_timeout_secs,
             exit_node: c.exit_node.clone(),
+            inbound_username: c.inbound_username,
+            inbound_password: c.inbound_password,
+            show_inbound_password: false,
         }
     } else {
         FormState {
@@ -468,6 +474,9 @@ fn load_form() -> (FormState, Option<String>) {
             auto_blacklist_cooldown_secs: 120,
             request_timeout_secs: 30,
             exit_node: mhrv_rs::config::ExitNodeConfig::default(),
+            inbound_username: String::new(),
+            inbound_password: String::new(),
+            show_inbound_password: false,
         }
     };
     (form, load_err)
@@ -658,7 +667,11 @@ impl FormState {
             // / grok.com / x.com). Round-trip through FormState — config-only
             // editing for now, UI editor planned for v1.9.x desktop UI batch.
             exit_node: self.exit_node.clone(),
-        })
+            inbound_username: self.inbound_username.trim().to_string(),
+            inbound_password: self.inbound_password.trim().to_string(),
+        };
+        cfg.validate().map_err(|e| e.to_string())?;
+        Ok(cfg)
     }
 }
 
@@ -749,6 +762,10 @@ struct ConfigWire<'a> {
     /// Save preserves user-edited values.
     #[serde(skip_serializing_if = "is_default_exit_node")]
     exit_node: &'a mhrv_rs::config::ExitNodeConfig,
+    #[serde(skip_serializing_if = "is_empty_str")]
+    inbound_username: &'a str,
+    #[serde(skip_serializing_if = "is_empty_str")]
+    inbound_password: &'a str,
 }
 
 fn is_default_strikes(v: &u32) -> bool { *v == 3 }
@@ -761,6 +778,10 @@ fn is_default_exit_node(en: &&mhrv_rs::config::ExitNodeConfig) -> bool {
         && en.psk.is_empty()
         && en.hosts.is_empty()
         && (en.mode.is_empty() || en.mode == "selective")
+}
+
+fn is_empty_str(s: &&str) -> bool {
+    s.is_empty()
 }
 
 fn is_false(b: &bool) -> bool {
@@ -824,6 +845,8 @@ impl<'a> From<&'a Config> for ConfigWire<'a> {
             request_timeout_secs: c.request_timeout_secs,
             force_http1: c.force_http1,
             exit_node: &c.exit_node,
+            inbound_username: c.inbound_username.as_str(),
+            inbound_password: c.inbound_password.as_str(),
         }
     }
 }
@@ -1223,6 +1246,142 @@ impl eframe::App for App {
                     ui.add(egui::TextEdit::singleline(&mut self.form.socks5_port)
                         .desired_width(70.0))
                     .labelled_by(socks_label.id);
+                });
+            });
+
+            // ── Section: Inbound Access Control ───────────────────────────
+            section(ui, "Inbound Access Control", |ui| {
+                // Binding Status & Badges
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [120.0, 20.0],
+                        egui::Label::new(egui::RichText::new("Binding Security").color(egui::Color32::from_gray(200))),
+                    );
+                    
+                    let listen_host_snapshot = self.form.listen_host.trim();
+                    let is_loopback = mhrv_rs::lan_utils::is_loopback_only(listen_host_snapshot)
+                        || listen_host_snapshot.parse::<std::net::IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
+                        || (listen_host_snapshot.starts_with('[') && listen_host_snapshot.ends_with(']')
+                            && listen_host_snapshot[1..listen_host_snapshot.len()-1].parse::<std::net::IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false));
+                    
+                    if is_loopback {
+                        // Green Local Only badge
+                        egui::Frame::none()
+                            .fill(OK_GREEN)
+                            .rounding(4.0)
+                            .inner_margin(egui::Margin {
+                                left: 6.0,
+                                right: 6.0,
+                                top: 2.0,
+                                bottom: 2.0,
+                            })
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new("Local Only").color(egui::Color32::BLACK).strong().size(10.0));
+                            });
+                    } else {
+                        // Orange LAN Exposed badge
+                        egui::Frame::none()
+                            .fill(egui::Color32::from_rgb(230, 160, 50))
+                            .rounding(4.0)
+                            .inner_margin(egui::Margin {
+                                left: 6.0,
+                                right: 6.0,
+                                top: 2.0,
+                                bottom: 2.0,
+                            })
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new("LAN Exposed").color(egui::Color32::BLACK).strong().size(10.0));
+                            });
+                    }
+                });
+
+                // Display warning if LAN Exposed
+                let listen_host_snapshot = self.form.listen_host.trim();
+                let is_loopback = mhrv_rs::lan_utils::is_loopback_only(listen_host_snapshot)
+                    || listen_host_snapshot.parse::<std::net::IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
+                    || (listen_host_snapshot.starts_with('[') && listen_host_snapshot.ends_with(']')
+                        && listen_host_snapshot[1..listen_host_snapshot.len()-1].parse::<std::net::IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false));
+                
+                if !is_loopback {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(120.0 + 8.0);
+                        ui.vertical(|ui| {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(230, 160, 50),
+                                "⚠ WARNING: Binding to a non-loopback address exposes this proxy on your network. \
+                                Anyone on your LAN can connect, consume your Apps Script execution quota, and access local network resources. \
+                                Secure inbound credentials are required to start the server.",
+                            );
+                        });
+                    });
+                } else {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(120.0 + 8.0);
+                        ui.vertical(|ui| {
+                            ui.colored_label(
+                                egui::Color32::from_gray(140),
+                                "Proxy is bound to loopback. Secure from external network access.",
+                            );
+                        });
+                    });
+                }
+
+                ui.add_space(6.0);
+
+                // Username input
+                form_row(ui, "Inbound User", Some("Username required for client authentication when LAN sharing is enabled."), |ui, label_id| {
+                    ui.add(egui::TextEdit::singleline(&mut self.form.inbound_username)
+                        .hint_text("Optional on loopback; required on LAN")
+                        .desired_width(f32::INFINITY))
+                    .labelled_by(label_id);
+                });
+
+                ui.add_space(4.0);
+
+                // Password input
+                form_row(ui, "Inbound Pass", Some("Password required for client authentication when LAN sharing is enabled."), |ui, label_id| {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut self.form.inbound_password)
+                            .password(!self.form.show_inbound_password)
+                            .desired_width(ui.available_width() - 80.0))
+                        .labelled_by(label_id);
+
+                        if ui.button(if self.form.show_inbound_password { "Hide" } else { "Show" }).clicked() {
+                            self.form.show_inbound_password = !self.form.show_inbound_password;
+                        }
+                    });
+                });
+
+                ui.add_space(6.0);
+
+                // Random credentials generator button
+                ui.horizontal(|ui| {
+                    ui.add_space(120.0 + 8.0);
+                    let gen_btn = egui::Button::new(
+                        egui::RichText::new("🎲 Generate Random Credentials")
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(egui::Color32::from_rgb(50, 54, 60))
+                    .rounding(4.0);
+                    
+                    if ui.add(gen_btn).on_hover_text("Generate a strong secure username and password automatically.").clicked() {
+                        let (uname, passwd) = {
+                            use rand::Rng;
+                            let mut rng = rand::thread_rng();
+                            let u: String = (0..8)
+                                .map(|_| rng.sample(rand::distributions::Alphanumeric) as char)
+                                .collect();
+                            let p: String = (0..16)
+                                .map(|_| rng.sample(rand::distributions::Alphanumeric) as char)
+                                .collect();
+                            (u.to_ascii_lowercase(), p)
+                        };
+                        self.form.inbound_username = uname;
+                        self.form.inbound_password = passwd;
+                        self.toast = Some(("Generated secure credentials. Don't forget to save config!".into(), Instant::now()));
+                    }
                 });
             });
 

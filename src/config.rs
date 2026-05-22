@@ -57,7 +57,7 @@ impl ScriptId {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Config {
     pub mode: String,
     #[serde(default = "default_google_ip")]
@@ -84,6 +84,10 @@ pub struct Config {
     pub auto_system_proxy: bool,
     #[serde(default)]
     pub hosts: HashMap<String, String>,
+    #[serde(default)]
+    pub inbound_username: String,
+    #[serde(default)]
+    pub inbound_password: String,
     #[serde(default)]
     pub enable_batching: bool,
     /// Optional upstream SOCKS5 proxy for non-HTTP / raw-TCP traffic
@@ -405,6 +409,55 @@ pub struct Config {
     pub exit_node: ExitNodeConfig,
 }
 
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("mode", &self.mode)
+            .field("google_ip", &self.google_ip)
+            .field("front_domain", &self.front_domain)
+            .field("script_id", &self.script_id)
+            .field("script_ids", &self.script_ids)
+            .field("auth_key", &self.auth_key)
+            .field("listen_host", &self.listen_host)
+            .field("listen_port", &self.listen_port)
+            .field("socks5_port", &self.socks5_port)
+            .field("log_level", &self.log_level)
+            .field("verify_ssl", &self.verify_ssl)
+            .field("auto_system_proxy", &self.auto_system_proxy)
+            .field("hosts", &self.hosts)
+            .field("enable_batching", &self.enable_batching)
+            .field("upstream_socks5", &self.upstream_socks5)
+            .field("parallel_relay", &self.parallel_relay)
+            .field("coalesce_step_ms", &self.coalesce_step_ms)
+            .field("coalesce_max_ms", &self.coalesce_max_ms)
+            .field("sni_hosts", &self.sni_hosts)
+            .field("fetch_ips_from_api", &self.fetch_ips_from_api)
+            .field("max_ips_to_scan", &self.max_ips_to_scan)
+            .field("scan_batch_size", &self.scan_batch_size)
+            .field("google_ip_validation", &self.google_ip_validation)
+            .field("normalize_x_graphql", &self.normalize_x_graphql)
+            .field("youtube_via_relay", &self.youtube_via_relay)
+            .field("passthrough_hosts", &self.passthrough_hosts)
+            .field("block_hosts", &self.block_hosts)
+            .field("block_stun", &self.block_stun)
+            .field("block_quic", &self.block_quic)
+            .field("disable_padding", &self.disable_padding)
+            .field("force_http1", &self.force_http1)
+            .field("tunnel_doh", &self.tunnel_doh)
+            .field("bypass_doh_hosts", &self.bypass_doh_hosts)
+            .field("block_doh", &self.block_doh)
+            .field("fronting_groups", &self.fronting_groups)
+            .field("auto_blacklist_strikes", &self.auto_blacklist_strikes)
+            .field("auto_blacklist_window_secs", &self.auto_blacklist_window_secs)
+            .field("auto_blacklist_cooldown_secs", &self.auto_blacklist_cooldown_secs)
+            .field("request_timeout_secs", &self.request_timeout_secs)
+            .field("exit_node", &self.exit_node)
+            .field("inbound_username", &self.inbound_username)
+            .field("inbound_password", &if self.inbound_password.is_empty() { "" } else { "[REDACTED]" })
+            .finish()
+    }
+}
+
 /// Configuration for the optional second-hop exit node.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ExitNodeConfig {
@@ -511,7 +564,7 @@ fn default_tunnel_doh() -> bool { true }
 /// Default for `block_quic`: `true`. QUIC over the TCP-based tunnel
 /// causes TCP-over-TCP meltdown (<1 Mbps). Browsers fall back to
 /// HTTPS/TCP within seconds of the silent UDP drop. Issue #793.
-fn default_block_stun() -> bool { false }
+fn default_block_stun() -> bool { true }
 fn default_block_quic() -> bool { true }
 
 /// Default for `block_doh`: `true` (browser DoH is rejected so the
@@ -543,7 +596,7 @@ fn default_front_domain() -> String {
     "www.google.com".into()
 }
 fn default_listen_host() -> String {
-    "0.0.0.0".into()
+    "127.0.0.1".into()
 }
 fn default_listen_port() -> u16 {
     8085
@@ -564,7 +617,24 @@ impl Config {
         Ok(cfg)
     }
 
-    fn validate(&self) -> Result<(), ConfigError> {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        // Safety guard: non-loopback bind requires active inbound credentials
+        let is_loopback = crate::lan_utils::is_loopback_only(&self.listen_host)
+            || self.listen_host.trim().parse::<std::net::IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
+            || (self.listen_host.trim().starts_with('[') && self.listen_host.trim().ends_with(']')
+                && self.listen_host.trim()[1..self.listen_host.trim().len()-1].parse::<std::net::IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false));
+
+        if !is_loopback {
+            if self.inbound_username.trim().is_empty() || self.inbound_password.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "Non-loopback bind exposes the proxy to the local network (LAN) or public internet. \
+                     For security, this setup is blocked unless you configure 'inbound_username' and 'inbound_password' \
+                     in your settings to prevent unauthorized usage and quota theft. Alternatively, bind to loopback (127.0.0.1)."
+                        .into(),
+                ));
+            }
+        }
+
         let mode = self.mode_kind()?;
         if mode == Mode::AppsScript || mode == Mode::Full {
             if self.auth_key.trim().is_empty() || self.auth_key == "CHANGE_ME_TO_A_STRONG_SECRET" {
@@ -800,6 +870,51 @@ mod tests {
         let cfg: Config = serde_json::from_str(s).unwrap();
         assert!(cfg.validate().is_err());
     }
+
+    #[test]
+    fn test_non_loopback_bind_requires_credentials() {
+        // 1. Loopback bind works fine without credentials
+        let s1 = r#"{
+            "mode": "direct",
+            "listen_host": "127.0.0.1"
+        }"#;
+        let cfg1: Config = serde_json::from_str(s1).unwrap();
+        cfg1.validate().expect("loopback 127.0.0.1 should validate without inbound credentials");
+
+        // IPv6 loopback
+        let s2 = r#"{
+            "mode": "direct",
+            "listen_host": "::1"
+        }"#;
+        let cfg2: Config = serde_json::from_str(s2).unwrap();
+        cfg2.validate().expect("loopback ::1 should validate without inbound credentials");
+
+        let s2_bracket = r#"{
+            "mode": "direct",
+            "listen_host": "[::1]"
+        }"#;
+        let cfg2_b: Config = serde_json::from_str(s2_bracket).unwrap();
+        cfg2_b.validate().expect("loopback [::1] should validate without inbound credentials");
+
+        // 2. Non-loopback wildcard 0.0.0.0 fails validation without credentials
+        let s3 = r#"{
+            "mode": "direct",
+            "listen_host": "0.0.0.0"
+        }"#;
+        let cfg3: Config = serde_json::from_str(s3).unwrap();
+        assert!(cfg3.validate().is_err(), "wildcard 0.0.0.0 bind should fail without inbound credentials");
+
+        // 3. Non-loopback wildcard 0.0.0.0 succeeds validation with credentials
+        let s4 = r#"{
+            "mode": "direct",
+            "listen_host": "0.0.0.0",
+            "inbound_username": "admin",
+            "inbound_password": "password123"
+        }"#;
+        let cfg4: Config = serde_json::from_str(s4).unwrap();
+        cfg4.validate().expect("wildcard 0.0.0.0 bind should succeed with inbound credentials");
+    }
+
 
     #[test]
     fn fronting_groups_parse_and_validate() {

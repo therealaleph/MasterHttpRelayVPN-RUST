@@ -265,6 +265,8 @@ pub struct RewriteCtx {
     /// domains used only for matching). Empty = feature off (only
     /// the built-in Google edge SNI-rewrite is active).
     pub fronting_groups: Vec<Arc<FrontingGroupResolved>>,
+    pub inbound_username: String,
+    pub inbound_password: String,
 }
 
 /// True if `host` matches a known DoH endpoint — either the built-in
@@ -517,6 +519,8 @@ impl ProxyServer {
             block_doh: config.block_doh,
             bypass_doh_hosts: config.bypass_doh_hosts.clone(),
             fronting_groups,
+            inbound_username: config.inbound_username.clone(),
+            inbound_password: config.inbound_password.clone(),
         });
 
         let socks5_port = config.socks5_port.unwrap_or(config.listen_port + 1);
@@ -814,8 +818,42 @@ async fn handle_http_client(
         }
     };
 
-    let (method, target, _version, _headers) = parse_request_head(&head)
+    let (method, target, _version, headers) = parse_request_head(&head)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad request"))?;
+
+    if !rewrite_ctx.inbound_username.is_empty() && !rewrite_ctx.inbound_password.is_empty() {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine;
+
+        let mut authenticated = false;
+        if let Some((_, auth_value)) = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("proxy-authorization")) {
+            let val_trimmed = auth_value.trim();
+            if val_trimmed.len() > 6 && val_trimmed[..6].eq_ignore_ascii_case("basic ") {
+                let encoded = &val_trimmed[6..];
+                if let Ok(decoded_bytes) = B64.decode(encoded.trim()) {
+                    if let Ok(decoded_str) = String::from_utf8(decoded_bytes) {
+                        if let Some((uname, passwd)) = decoded_str.split_once(':') {
+                            if uname == rewrite_ctx.inbound_username && passwd == rewrite_ctx.inbound_password {
+                                authenticated = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !authenticated {
+            tracing::warn!("HTTP inbound proxy authentication failed/missing for target {}", target);
+            sock.write_all(
+                b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+                  Proxy-Authenticate: Basic realm=\"mhrv-rs\"\r\n\
+                  Connection: close\r\n\
+                  Content-Length: 0\r\n\r\n"
+            ).await?;
+            sock.flush().await?;
+            return Ok(());
+        }
+    }
 
     if method.eq_ignore_ascii_case("CONNECT") {
         let (host, port) = parse_host_port(&target);
@@ -876,12 +914,52 @@ async fn handle_socks5_client(
     let nmethods = hdr[1] as usize;
     let mut methods = vec![0u8; nmethods];
     sock.read_exact(&mut methods).await?;
-    // Only "no auth" (0x00) is supported.
-    if !methods.contains(&0x00) {
-        sock.write_all(&[0x05, 0xff]).await?;
-        return Ok(());
+
+    let has_auth = !rewrite_ctx.inbound_username.is_empty() && !rewrite_ctx.inbound_password.is_empty();
+    if has_auth {
+        if !methods.contains(&0x02) {
+            sock.write_all(&[0x05, 0xff]).await?;
+            return Ok(());
+        }
+        sock.write_all(&[0x05, 0x02]).await?;
+
+        // Perform RFC 1929 subnegotiation:
+        // Read subnegotiation VER and ULEN
+        let mut sub_hdr = [0u8; 2];
+        sock.read_exact(&mut sub_hdr).await?;
+        let sub_ver = sub_hdr[0];
+        if sub_ver != 0x01 {
+            sock.write_all(&[0x01, 0x01]).await?;
+            return Ok(());
+        }
+        let ulen = sub_hdr[1] as usize;
+        let mut uname_bytes = vec![0u8; ulen];
+        sock.read_exact(&mut uname_bytes).await?;
+        
+        let mut plen_byte = [0u8; 1];
+        sock.read_exact(&mut plen_byte).await?;
+        let plen = plen_byte[0] as usize;
+        let mut passwd_bytes = vec![0u8; plen];
+        sock.read_exact(&mut passwd_bytes).await?;
+
+        let client_username = String::from_utf8_lossy(&uname_bytes);
+        let client_password = String::from_utf8_lossy(&passwd_bytes);
+
+        if client_username == rewrite_ctx.inbound_username && client_password == rewrite_ctx.inbound_password {
+            // Success
+            sock.write_all(&[0x01, 0x00]).await?;
+        } else {
+            // Failure
+            sock.write_all(&[0x01, 0x01]).await?;
+            return Ok(());
+        }
+    } else {
+        if !methods.contains(&0x00) {
+            sock.write_all(&[0x05, 0xff]).await?;
+            return Ok(());
+        }
+        sock.write_all(&[0x05, 0x00]).await?;
     }
-    sock.write_all(&[0x05, 0x00]).await?;
 
     // Request: VER=5, CMD, RSV=0, ATYP, DST.ADDR, DST.PORT
     let mut req = [0u8; 4];
@@ -3802,4 +3880,184 @@ mod tests {
         // Verify rejected counter was incremented
         assert_eq!(fronter.snapshot_stats().large_upload_rejected_413, 1);
     }
+
+    fn tempdir() -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        let n: u64 = rand::random();
+        p.push(format!("mhrv-test-ps-{:x}", n));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[tokio::test]
+    async fn test_handle_http_client_auth() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let tmp = tempdir();
+        let mitm = Arc::new(tokio::sync::Mutex::new(MitmCertManager::new_in(&tmp).unwrap()));
+        
+        let mut config: Config = serde_json::from_str(r#"{"mode":"direct"}"#).unwrap();
+        config.inbound_username = "user".to_string();
+        config.inbound_password = "pass".to_string();
+
+        let proxy_server = ProxyServer::new(&config, mitm.clone()).unwrap();
+        let rewrite_ctx = proxy_server.rewrite_ctx.clone();
+
+        let rewrite_ctx_clone = rewrite_ctx.clone();
+        let mitm_clone = mitm.clone();
+        tokio::spawn(async move {
+            if let Ok((sock, _)) = listener.accept().await {
+                let _ = handle_http_client(sock, None, mitm_clone, rewrite_ctx_clone, None).await;
+            }
+        });
+
+        // 1. Client connects and sends request with no auth
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client.write_all(b"GET / HTTP/1.1\r\nHost: google.com\r\n\r\n").await.unwrap();
+        let mut resp = vec![0u8; 1024];
+        let n = client.read(&mut resp).await.unwrap();
+        let resp_str = String::from_utf8_lossy(&resp[..n]);
+        assert!(resp_str.contains("HTTP/1.1 407 Proxy Authentication Required"));
+
+        // 2. Client connects and sends request with wrong auth
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let rewrite_ctx_clone = rewrite_ctx.clone();
+        let mitm_clone = mitm.clone();
+        tokio::spawn(async move {
+            if let Ok((sock, _)) = listener.accept().await {
+                let _ = handle_http_client(sock, None, mitm_clone, rewrite_ctx_clone, None).await;
+            }
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Send wrong auth ("user:wrong" -> "dXNlcjp3cm9uZw==")
+        client.write_all(b"GET / HTTP/1.1\r\nHost: google.com\r\nProxy-Authorization: Basic dXNlcjp3cm9uZw==\r\n\r\n").await.unwrap();
+        let mut resp = vec![0u8; 1024];
+        let n = client.read(&mut resp).await.unwrap();
+        let resp_str = String::from_utf8_lossy(&resp[..n]);
+        assert!(resp_str.contains("HTTP/1.1 407 Proxy Authentication Required"));
+
+        // 3. Client connects and sends request with correct auth
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let rewrite_ctx_clone = rewrite_ctx.clone();
+        let mitm_clone = mitm.clone();
+        tokio::spawn(async move {
+            if let Ok((sock, _)) = listener.accept().await {
+                let _ = handle_http_client(sock, None, mitm_clone, rewrite_ctx_clone, None).await;
+            }
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Send correct auth ("user:pass" -> "dXNlcjpwYXNz")
+        client.write_all(b"GET / HTTP/1.1\r\nHost: google.com\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n").await.unwrap();
+        let mut resp = vec![0u8; 1024];
+        let n = client.read(&mut resp).await.unwrap();
+        let resp_str = String::from_utf8_lossy(&resp[..n]);
+        assert!(!resp_str.contains("407 Proxy Authentication Required"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_handle_socks5_client_auth() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let tmp = tempdir();
+        let mitm = Arc::new(tokio::sync::Mutex::new(MitmCertManager::new_in(&tmp).unwrap()));
+        
+        let mut config: Config = serde_json::from_str(r#"{"mode":"direct"}"#).unwrap();
+        config.inbound_username = "socksuser".to_string();
+        config.inbound_password = "sockspassword".to_string();
+
+        let proxy_server = ProxyServer::new(&config, mitm.clone()).unwrap();
+        let rewrite_ctx = proxy_server.rewrite_ctx.clone();
+
+        // Test case 1: Client does not support auth methods we require
+        let rewrite_ctx_clone = rewrite_ctx.clone();
+        let mitm_clone = mitm.clone();
+        let listener_clone = listener;
+        let server_task = tokio::spawn(async move {
+            if let Ok((sock, _)) = listener_clone.accept().await {
+                let _ = handle_socks5_client(sock, None, mitm_clone, rewrite_ctx_clone, None).await;
+            }
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Client sends VER=5, NMETHODS=1, METHODS=[0x00] (No authentication)
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
+        // Server must reply with NO ACCEPTABLE METHODS (0xff)
+        assert_eq!(resp, [0x05, 0xff]);
+        server_task.await.unwrap();
+
+        // Test case 2: Client sends wrong credentials
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let rewrite_ctx_clone = rewrite_ctx.clone();
+        let mitm_clone = mitm.clone();
+        let server_task = tokio::spawn(async move {
+            if let Ok((sock, _)) = listener.accept().await {
+                let _ = handle_socks5_client(sock, None, mitm_clone, rewrite_ctx_clone, None).await;
+            }
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Client sends VER=5, NMETHODS=1, METHODS=[0x02] (Username/Password)
+        client.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp, [0x05, 0x02]);
+
+        // Client sends RFC 1929 subnegotiation: VER=1, ULEN=5, UNAME="wrong", PLEN=5, PASSWD="wrong"
+        client.write_all(&[0x01, 0x05]).await.unwrap();
+        client.write_all(b"wrong").await.unwrap();
+        client.write_all(&[0x05]).await.unwrap();
+        client.write_all(b"wrong").await.unwrap();
+
+        let mut sub_resp = [0u8; 2];
+        client.read_exact(&mut sub_resp).await.unwrap();
+        // Server replies subnegotiation status VER=1, STATUS=0x01 (Failure)
+        assert_eq!(sub_resp, [0x01, 0x01]);
+        server_task.await.unwrap();
+
+        // Test case 3: Client sends correct credentials
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let rewrite_ctx_clone = rewrite_ctx.clone();
+        let mitm_clone = mitm.clone();
+        let server_task = tokio::spawn(async move {
+            if let Ok((sock, _)) = listener.accept().await {
+                let _ = handle_socks5_client(sock, None, mitm_clone, rewrite_ctx_clone, None).await;
+            }
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Client sends VER=5, NMETHODS=1, METHODS=[0x02] (Username/Password)
+        client.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp, [0x05, 0x02]);
+
+        // Client sends correct: UNAME="socksuser", PASSWD="sockspassword"
+        client.write_all(&[0x01, 0x09]).await.unwrap();
+        client.write_all(b"socksuser").await.unwrap();
+        client.write_all(&[13]).await.unwrap();
+        client.write_all(b"sockspassword").await.unwrap();
+
+        let mut sub_resp = [0u8; 2];
+        client.read_exact(&mut sub_resp).await.unwrap();
+        // Server replies VER=1, STATUS=0x00 (Success)
+        assert_eq!(sub_resp, [0x01, 0x00]);
+
+        // Clean up
+        server_task.abort();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
 }
+
