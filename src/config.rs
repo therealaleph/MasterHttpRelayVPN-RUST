@@ -398,6 +398,21 @@ pub struct Config {
     /// Setup walkthrough at `assets/exit_node/README.md`. Default off.
     #[serde(default)]
     pub exit_node: ExitNodeConfig,
+
+    /// Daily request quota per account bucket. Each configured script_id is
+    /// treated as one separate account. Default 20_000 matches the free-tier
+    /// Apps Script UrlFetchApp limit. Set to 100_000 for Workspace accounts.
+    #[serde(default = "default_quota_daily_limit")]
+    pub quota_daily_limit: u64,
+
+    /// Per-account safety buffer. An account is considered effectively
+    /// exhausted when its remaining requests for the current 24-hour window
+    /// drop below this value. The reserve intentionally keeps calls away from
+    /// Google's hard quota edge to avoid triggering anti-abuse heuristics.
+    /// Aggregate hard-stop reserve = account_count × quota_safety_buffer.
+    /// Default 500.
+    #[serde(default = "default_quota_safety_buffer")]
+    pub quota_safety_buffer: u64,
 }
 
 /// Configuration for the optional second-hop exit node.
@@ -526,6 +541,8 @@ fn default_block_doh() -> bool { true }
 fn default_auto_blacklist_strikes() -> u32 { 3 }
 fn default_auto_blacklist_window_secs() -> u64 { 30 }
 fn default_auto_blacklist_cooldown_secs() -> u64 { 120 }
+fn default_quota_daily_limit() -> u64 { 20_000 }
+fn default_quota_safety_buffer() -> u64 { 500 }
 
 /// Default for `request_timeout_secs`: 30s, matching the historical
 /// hard-coded `BATCH_TIMEOUT` and Apps Script's typical response cliff.
@@ -920,6 +937,8 @@ impl From<TomlConfig> for Config {
             auto_blacklist_cooldown_secs: t.relay.auto_blacklist_cooldown_secs,
             request_timeout_secs: t.relay.request_timeout_secs,
             exit_node: t.exit_node,
+            quota_daily_limit: default_quota_daily_limit(),
+            quota_safety_buffer: default_quota_safety_buffer(),
         }
     }
 }

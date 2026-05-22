@@ -298,6 +298,9 @@ struct FormState {
     /// claude.ai / grok.com / x.com). Config-only — no UI editor yet.
     /// See `assets/exit_node/` for the generic exit-node handler.
     exit_node: mhrv_rs::config::ExitNodeConfig,
+    /// Quota config — config-only round-trip fields. No UI editor yet.
+    quota_daily_limit: u64,
+    quota_safety_buffer: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -392,6 +395,8 @@ fn load_form() -> (FormState, Option<String>) {
             auto_blacklist_cooldown_secs: c.auto_blacklist_cooldown_secs,
             request_timeout_secs: c.request_timeout_secs,
             exit_node: c.exit_node.clone(),
+            quota_daily_limit: c.quota_daily_limit,
+            quota_safety_buffer: c.quota_safety_buffer,
         }
     } else {
         FormState {
@@ -434,6 +439,8 @@ fn load_form() -> (FormState, Option<String>) {
             auto_blacklist_cooldown_secs: 120,
             request_timeout_secs: 30,
             exit_node: mhrv_rs::config::ExitNodeConfig::default(),
+            quota_daily_limit: 20_000,
+            quota_safety_buffer: 500,
         }
     };
     (form, load_err)
@@ -622,6 +629,10 @@ impl FormState {
             // / grok.com / x.com). Round-trip through FormState — config-only
             // editing for now, UI editor planned for v1.9.x desktop UI batch.
             exit_node: self.exit_node.clone(),
+            // Quota limits: config-only for now, round-tripped through FormState
+            // so Save doesn't drop hand-edited values.
+            quota_daily_limit: self.quota_daily_limit,
+            quota_safety_buffer: self.quota_safety_buffer,
         })
     }
 }
