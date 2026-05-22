@@ -533,6 +533,14 @@ impl ProxyServer {
     pub fn fronter(&self) -> Option<Arc<DomainFronter>> {
         self.fronter.clone()
     }
+    /// Returns a formatted quota startup summary for logging, or None in
+    /// Direct mode (no fronter / no quota to report).
+    pub fn quota_startup_summary(&self) -> Option<String> {
+        self.fronter
+            .as_ref()
+            .map(|f| f.quota_tracker().startup_summary())
+    }
+
     pub async fn run(
         mut self,
         mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
@@ -617,6 +625,26 @@ impl ProxyServer {
                     if s.relay_calls > 0 || s.cache_hits > 0 {
                         tracing::info!("{}", s.fmt_line());
                     }
+                    // Log quota warnings and flush persisted state.
+                    let q = &s.quota;
+                    if q.global_hard_stop {
+                        tracing::error!(
+                            "[quota] GLOBAL HARD STOP — all {} account(s) exhausted",
+                            q.account_count
+                        );
+                    } else if q.exhausted_count > 0 {
+                        tracing::warn!(
+                            "[quota] {}/{} account(s) exhausted  used={}/{}  remaining={}",
+                            q.exhausted_count,
+                            q.account_count,
+                            q.requests_used_total,
+                            q.daily_capacity_total,
+                            q.requests_remaining_total,
+                        );
+                    }
+                    // Periodic flush so quota state survives a crash between
+                    // the every-50-requests auto-saves in record_attempt.
+                    stats_fronter.quota_tracker().save_if_needed();
                 }
             })
         } else {

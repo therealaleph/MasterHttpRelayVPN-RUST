@@ -357,6 +357,11 @@ async fn main() -> ExitCode {
         }
     };
 
+    // Log quota state on startup so the user knows where their daily budget stands.
+    if let Some(summary) = server.quota_startup_summary() {
+        tracing::info!("{}", summary);
+    }
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
     let run = server.run(shutdown_rx);
