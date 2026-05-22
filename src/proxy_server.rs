@@ -1818,7 +1818,7 @@ async fn dispatch_tunnel(
             host,
             port
         );
-        run_mitm_then_relay(sock, &host, port, mitm, &fronter, &rewrite_ctx.tls_connector, rewrite_ctx.upstream_socks5.as_deref()).await;
+        run_mitm_then_relay(sock, &host, port, mitm, &fronter).await;
         return Ok(());
     }
 
@@ -1832,7 +1832,7 @@ async fn dispatch_tunnel(
             port,
             scheme
         );
-        relay_http_stream_raw(sock, &host, port, scheme, &fronter, &rewrite_ctx.tls_connector, rewrite_ctx.upstream_socks5.as_deref()).await;
+        relay_http_stream_raw(sock, &host, port, scheme, &fronter).await;
         return Ok(());
     }
 
@@ -2115,8 +2115,6 @@ async fn run_mitm_then_relay(
     port: u16,
     mitm: Arc<Mutex<MitmCertManager>>,
     fronter: &DomainFronter,
-    tls_connector: &TlsConnector,
-    upstream_socks5: Option<&str>,
 ) {
     // Peek the TLS ClientHello BEFORE minting the MITM cert. When the client
     // resolves the hostname itself (DoH in Chrome/Firefox) and hands us a raw
@@ -2178,7 +2176,7 @@ async fn run_mitm_then_relay(
     // latter would produce an IP-in-Host request that Cloudflare/etc. reject
     // outright.
     loop {
-        match handle_mitm_request(&mut tls, &effective_host, port, fronter, "https", tls_connector, upstream_socks5).await {
+        match handle_mitm_request(&mut tls, &effective_host, port, fronter, "https").await {
             Ok(true) => continue,
             Ok(false) => break,
             Err(e) => {
@@ -2187,6 +2185,12 @@ async fn run_mitm_then_relay(
             }
         }
     }
+    // Always send TLS close_notify so the client gets a clean EOF.
+    // Without this, dropping `tls` mid-stream (e.g. after a partial
+    // range-parallel response) causes wget/curl to report
+    // "TLS connection was non-properly terminated" rather than a
+    // clean truncation they can resume from.
+    let _ = tls.shutdown().await;
 }
 
 /// True if `s` parses as an IPv4 or IPv6 literal. Used to decide whether
@@ -2205,11 +2209,9 @@ async fn relay_http_stream_raw(
     port: u16,
     scheme: &str,
     fronter: &DomainFronter,
-    tls_connector: &TlsConnector,
-    upstream_socks5: Option<&str>,
 ) {
     loop {
-        match handle_mitm_request(&mut sock, host, port, fronter, scheme, tls_connector, upstream_socks5).await {
+        match handle_mitm_request(&mut sock, host, port, fronter, scheme).await {
             Ok(true) => continue,
             Ok(false) => break,
             Err(e) => {
@@ -2381,139 +2383,12 @@ fn parse_host_port(target: &str) -> (String, u16) {
     }
 }
 
-/// Serialise a parsed request back to wire bytes so it can be forwarded to
-/// the real upstream server during WebSocket passthrough. Forwards all headers
-/// except hop-by-hop proxy headers (`Proxy-Connection`, `Proxy-Authorization`).
-fn rebuild_request_bytes(method: &str, path: &str, version: &str, headers: &[(String, String)]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(512);
-    out.extend_from_slice(method.as_bytes());
-    out.push(b' ');
-    out.extend_from_slice(path.as_bytes());
-    out.push(b' ');
-    out.extend_from_slice(version.as_bytes());
-    out.extend_from_slice(b"\r\n");
-    for (k, v) in headers {
-        let kl = k.to_ascii_lowercase();
-        if kl == "proxy-connection" || kl == "proxy-authorization" {
-            continue;
-        }
-        out.extend_from_slice(k.as_bytes());
-        out.extend_from_slice(b": ");
-        out.extend_from_slice(v.as_bytes());
-        out.extend_from_slice(b"\r\n");
-    }
-    out.extend_from_slice(b"\r\n");
-    out
-}
-
-/// After a WebSocket upgrade is detected inside the MITM TLS session, this
-/// helper connects directly to the real `host:port` (optionally via SOCKS5),
-/// performs a TLS handshake, forwards the upgrade request, relays the 101
-/// response back to the client, then splices both directions until one side
-/// closes. Apps Script cannot hold persistent WebSocket connections, so this
-/// bypasses the relay entirely.
-async fn ws_tls_passthrough<S>(
-    client: &mut S,
-    host: &str,
-    port: u16,
-    upgrade_request: &[u8],
-    tls_connector: &TlsConnector,
-    upstream_socks5: Option<&str>,
-) -> std::io::Result<()>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    let connect_timeout = std::time::Duration::from_secs(15);
-
-    let tcp = if let Some(proxy) = upstream_socks5 {
-        match socks5_connect_via(proxy, host, port).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("ws passthrough: socks5 {} -> {}:{} failed: {}", proxy, host, port, e);
-                client.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
-                return Ok(());
-            }
-        }
-    } else {
-        match tokio::time::timeout(connect_timeout, TcpStream::connect((host, port))).await {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                tracing::warn!("ws passthrough: direct connect to {}:{} failed: {}", host, port, e);
-                client.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
-                return Ok(());
-            }
-            Err(_) => {
-                tracing::warn!("ws passthrough: connect to {}:{} timed out", host, port);
-                client.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
-                return Ok(());
-            }
-        }
-    };
-
-    let server_name = match ServerName::try_from(host.to_string()) {
-        Ok(sn) => sn,
-        Err(_) => {
-            tracing::warn!("ws passthrough: invalid server name {}", host);
-            client.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
-            return Ok(());
-        }
-    };
-
-    let mut server = match tls_connector.connect(server_name, tcp).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!("ws passthrough: TLS to {}:{} failed: {}", host, port, e);
-            client.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
-            return Ok(());
-        }
-    };
-
-    // Forward the upgrade request to the real server.
-    server.write_all(upgrade_request).await?;
-    server.flush().await?;
-
-    // Read the server's response headers (up to \r\n\r\n) and forward to client.
-    let mut resp_buf = Vec::with_capacity(512);
-    let mut tmp = [0u8; 1];
-    loop {
-        server.read_exact(&mut tmp).await?;
-        resp_buf.push(tmp[0]);
-        if resp_buf.ends_with(b"\r\n\r\n") {
-            break;
-        }
-        if resp_buf.len() > 8192 {
-            tracing::warn!("ws passthrough: server response headers too large from {}:{}", host, port);
-            return Ok(());
-        }
-    }
-
-    // Check the server actually agreed to the upgrade.
-    let resp_str = String::from_utf8_lossy(&resp_buf);
-    let status_line = resp_str.lines().next().unwrap_or("");
-    if !status_line.contains("101") {
-        tracing::warn!("ws passthrough: {}:{} refused upgrade ({})", host, port, status_line.trim());
-        client.write_all(&resp_buf).await?;
-        client.flush().await?;
-        return Ok(());
-    }
-
-    client.write_all(&resp_buf).await?;
-    client.flush().await?;
-
-    // Both sides agreed: splice raw bytes bidirectionally.
-    tracing::info!("ws passthrough: splicing {}:{}", host, port);
-    let _ = tokio::io::copy_bidirectional(client, &mut server).await;
-    Ok(())
-}
-
 async fn handle_mitm_request<S>(
     stream: &mut S,
     host: &str,
     port: u16,
     fronter: &DomainFronter,
     scheme: &str,
-    tls_connector: &TlsConnector,
-    upstream_socks5: Option<&str>,
 ) -> std::io::Result<bool>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -2546,23 +2421,10 @@ where
         }
     };
 
-    let (method, path, version, headers) = match parse_request_head(&head) {
+    let (method, path, _version, headers) = match parse_request_head(&head) {
         Some(v) => v,
         None => return Ok(false),
     };
-
-    // WebSocket upgrade: Apps Script cannot relay persistent connections.
-    // Detect before read_body (upgrade requests have no body) and splice
-    // directly to the real server instead.
-    let is_ws_upgrade =
-        header_value(&headers, "connection").map(|v| v.to_ascii_lowercase().contains("upgrade")).unwrap_or(false)
-        && header_value(&headers, "upgrade").map(|v| v.eq_ignore_ascii_case("websocket")).unwrap_or(false);
-    if is_ws_upgrade {
-        tracing::info!("WebSocket upgrade for {}:{} — bypassing Apps Script relay", host, port);
-        let raw_request = rebuild_request_bytes(&method, &path, &version, &headers);
-        ws_tls_passthrough(stream, host, port, &raw_request, tls_connector, upstream_socks5).await?;
-        return Ok(false);
-    }
 
     let body = read_body(stream, &leftover, &headers).await?;
 
