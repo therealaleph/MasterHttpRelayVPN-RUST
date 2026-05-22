@@ -154,6 +154,11 @@ struct UiState {
     /// One-line status of the most recent download (Ok(path) or Err(msg)).
     last_download: Option<Result<std::path::PathBuf, String>>,
     last_download_at: Option<Instant>,
+    /// Quota state from the most recent PollStats snapshot. None until the
+    /// first poll completes. Used by the quota display and hard-stop indicator.
+    /// TODO(quota-dashboard): feed this into a dedicated QuotaWidget once
+    /// the UI is remodeled.
+    quota: Option<mhrv_rs::quota_tracker::QuotaSummary>,
 }
 
 #[derive(Clone, Debug)]
@@ -1167,7 +1172,7 @@ impl eframe::App for App {
             ui.add_space(8.0);
 
             // ── Status + stats card ────────────────────────────────────────
-            let (running, started_at, stats, ca_trusted, last_test_msg, per_site) = {
+            let (running, started_at, stats, ca_trusted, last_test_msg, per_site, quota_state) = {
                 let s = self.shared.state.lock().unwrap();
                 (
                     s.running,
@@ -1176,6 +1181,7 @@ impl eframe::App for App {
                     s.ca_trusted,
                     s.last_test_msg.clone(),
                     s.last_per_site.clone(),
+                    s.quota.clone(),
                 )
             };
 
@@ -1251,66 +1257,200 @@ impl eframe::App for App {
             });
 
             // ── Usage today (estimated) — daily budget tracker ───────────────
-            // Client-side estimate from our own atomic counters. Counts only
-            // successful relay calls this process saw since 00:00 UTC. Google's
-            // actual quota bucket is per-Apps-Script-project and per-Google
-            // account — if multiple devices share the same deployment, each
-            // client only sees its own share. We link to the Google dashboard
-            // for the authoritative number.
+            // TODO(quota-dashboard): Replace this inline grid with a dedicated
+            // QuotaWidget / QuotaDashboard when the UI is remodeled. The quota
+            // state is already wired through UiState.quota and StatsSnapshot.quota.
             if let Some(s) = &stats {
                 ui.add_space(2.0);
-                section(ui, "Usage today (estimated)", |ui| {
-                    // Free-tier Apps Script UrlFetchApp quota. Workspace /
-                    // paid accounts get 100k but most users are on free.
-                    const FREE_QUOTA_PER_DAY: u64 = 20_000;
-                    let pct = if FREE_QUOTA_PER_DAY > 0 {
-                        (s.today_calls as f64 / FREE_QUOTA_PER_DAY as f64) * 100.0
-                    } else { 0.0 };
-                    let reset = s.today_reset_secs;
-                    let reset_str = format!(
-                        "{}h {}m",
-                        reset / 3600,
-                        (reset / 60) % 60,
-                    );
-                    let rows: Vec<(&str, String)> = vec![
-                        (
-                            "calls today",
+
+                // Show a red hard-stop banner when all accounts are exhausted.
+                if let Some(q) = &quota_state {
+                    if q.global_hard_stop {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 80, 80),
+                            "⚠  All account quota exhausted — Apps Script relay hard-stopped",
+                        );
+                        // TODO(quota-dashboard): disable the Start button here once
+                        // the button state wiring supports conditional disabling.
+                        ui.add_space(4.0);
+                    } else if q.exhausted_count > 0 {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 170, 80),
                             format!(
-                                "{} / {}  ({:.1}%)",
-                                s.today_calls, FREE_QUOTA_PER_DAY, pct
+                                "⚠  {}/{} account(s) exhausted — routing to remaining accounts",
+                                q.exhausted_count, q.account_count
                             ),
-                        ),
-                        ("bytes today", fmt_bytes(s.today_bytes)),
-                        ("PT day", s.today_key.clone()),
-                        ("resets in", reset_str),
-                    ];
+                        );
+                        ui.add_space(2.0);
+                    }
+                }
+
+                section(ui, "Usage today (estimated)", |ui| {
+                    // Use quota-tracked daily capacity when available, fall back to
+                    // the free-tier default for display purposes.
+                    let (quota_cap, quota_used, quota_remaining, any_exhausted, global_stop) =
+                        if let Some(q) = &quota_state {
+                            (
+                                q.daily_capacity_total.max(1),
+                                q.requests_used_total,
+                                q.requests_remaining_total,
+                                q.exhausted_count > 0,
+                                q.global_hard_stop,
+                            )
+                        } else {
+                            (20_000u64, s.today_calls, 20_000u64.saturating_sub(s.today_calls), false, false)
+                        };
+
+                    let pct = (quota_used as f64 / quota_cap as f64) * 100.0;
+                    let alert = any_exhausted || global_stop;
+
+                    // calls today — turns red when any account is exhausted
+                    let calls_str = format!("{} / {}  ({:.1}%)", quota_used, quota_cap, pct);
+                    let calls_text = if alert {
+                        egui::RichText::new(&calls_str)
+                            .monospace()
+                            .color(egui::Color32::from_rgb(220, 80, 80))
+                    } else {
+                        egui::RichText::new(&calls_str).monospace()
+                    };
+
+                    // quota remaining — same red treatment
+                    let remaining_str = quota_remaining.to_string();
+                    let remaining_text = if alert {
+                        egui::RichText::new(&remaining_str)
+                            .monospace()
+                            .color(egui::Color32::from_rgb(220, 80, 80))
+                    } else {
+                        egui::RichText::new(&remaining_str).monospace()
+                    };
+
+                    // Next reset from the quota tracker's rolling window, or PT midnight
+                    let reset_str = if let Some(q) = &quota_state {
+                        if let Some(next_reset) = q.next_reset_at {
+                            use std::time::{SystemTime, UNIX_EPOCH};
+                            let now = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            let secs = next_reset.saturating_sub(now);
+                            format!("{}h {}m (rolling)", secs / 3600, (secs / 60) % 60)
+                        } else {
+                            let reset = s.today_reset_secs;
+                            format!("{}h {}m (PT midnight)", reset / 3600, (reset / 60) % 60)
+                        }
+                    } else {
+                        let reset = s.today_reset_secs;
+                        format!("{}h {}m", reset / 3600, (reset / 60) % 60)
+                    };
+
                     egui::Grid::new("usage_today")
                         .num_columns(4)
                         .spacing([16.0, 4.0])
                         .show(ui, |ui| {
-                            for chunk in rows.chunks(2) {
-                                for (label, value) in chunk.iter() {
-                                    ui.add_sized(
-                                        [110.0, 18.0],
-                                        egui::Label::new(
-                                            egui::RichText::new(*label)
-                                                .color(egui::Color32::from_gray(150)),
-                                        ),
-                                    );
-                                    ui.add_sized(
-                                        [140.0, 18.0],
-                                        egui::Label::new(
-                                            egui::RichText::new(value).monospace(),
-                                        ),
-                                    );
-                                }
-                                if chunk.len() == 1 {
-                                    ui.label("");
-                                    ui.label("");
-                                }
-                                ui.end_row();
+                            // Row 1: calls today | bytes today
+                            ui.add_sized(
+                                [110.0, 18.0],
+                                egui::Label::new(
+                                    egui::RichText::new("calls today")
+                                        .color(egui::Color32::from_gray(150)),
+                                ),
+                            );
+                            ui.add_sized(
+                                [140.0, 18.0],
+                                egui::Label::new(calls_text),
+                            );
+                            ui.add_sized(
+                                [110.0, 18.0],
+                                egui::Label::new(
+                                    egui::RichText::new("bytes today")
+                                        .color(egui::Color32::from_gray(150)),
+                                ),
+                            );
+                            ui.add_sized(
+                                [140.0, 18.0],
+                                egui::Label::new(
+                                    egui::RichText::new(fmt_bytes(s.today_bytes)).monospace(),
+                                ),
+                            );
+                            ui.end_row();
+
+                            // Row 2: quota remaining | next reset
+                            ui.add_sized(
+                                [110.0, 18.0],
+                                egui::Label::new(
+                                    egui::RichText::new("remaining")
+                                        .color(egui::Color32::from_gray(150)),
+                                ),
+                            );
+                            ui.add_sized(
+                                [140.0, 18.0],
+                                egui::Label::new(remaining_text),
+                            );
+                            ui.add_sized(
+                                [110.0, 18.0],
+                                egui::Label::new(
+                                    egui::RichText::new("resets in")
+                                        .color(egui::Color32::from_gray(150)),
+                                ),
+                            );
+                            ui.add_sized(
+                                [140.0, 18.0],
+                                egui::Label::new(
+                                    egui::RichText::new(&reset_str).monospace(),
+                                ),
+                            );
+                            ui.end_row();
+
+                            // Row 3: PT day | accounts (if quota available)
+                            ui.add_sized(
+                                [110.0, 18.0],
+                                egui::Label::new(
+                                    egui::RichText::new("PT day")
+                                        .color(egui::Color32::from_gray(150)),
+                                ),
+                            );
+                            ui.add_sized(
+                                [140.0, 18.0],
+                                egui::Label::new(
+                                    egui::RichText::new(&s.today_key).monospace(),
+                                ),
+                            );
+                            if let Some(q) = &quota_state {
+                                ui.add_sized(
+                                    [110.0, 18.0],
+                                    egui::Label::new(
+                                        egui::RichText::new("accounts")
+                                            .color(egui::Color32::from_gray(150)),
+                                    ),
+                                );
+                                let acct_str = if q.exhausted_count > 0 {
+                                    format!(
+                                        "{}/{} ({} exhausted)",
+                                        q.account_count - q.exhausted_count,
+                                        q.account_count,
+                                        q.exhausted_count,
+                                    )
+                                } else {
+                                    format!("{}/{} active", q.account_count, q.account_count)
+                                };
+                                let acct_text = if q.exhausted_count > 0 {
+                                    egui::RichText::new(&acct_str)
+                                        .monospace()
+                                        .color(egui::Color32::from_rgb(220, 170, 80))
+                                } else {
+                                    egui::RichText::new(&acct_str).monospace()
+                                };
+                                ui.add_sized(
+                                    [140.0, 18.0],
+                                    egui::Label::new(acct_text),
+                                );
+                            } else {
+                                ui.label("");
+                                ui.label("");
                             }
+                            ui.end_row();
                         });
+
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         ui.hyperlink_to(
@@ -1997,9 +2137,11 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                         if let Some(fronter) = f.as_ref() {
                             let s = fronter.snapshot_stats();
                             let per_site = fronter.snapshot_per_site();
+                            let quota = s.quota.clone();
                             let mut st = shared.state.lock().unwrap();
                             st.last_stats = Some(s);
                             st.last_per_site = per_site;
+                            st.quota = Some(quota);
                         }
                     });
                 }
