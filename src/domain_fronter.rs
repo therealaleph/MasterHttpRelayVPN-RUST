@@ -423,7 +423,12 @@ pub struct DomainFronter {
     /// Per-batch HTTP timeout. Mirrors `Config::request_timeout_secs`
     /// (#430, masterking32 PR #25). Read by `tunnel_client::fire_batch`
     /// so a single config field tunes the timeout used everywhere.
+    /// Applies to connection establishment and response header arrival only.
     batch_timeout: Duration,
+    /// Per-chunk body streaming idle timeout. Mirrors `Config::stream_timeout_secs`.
+    /// Applied per-iteration of the body drain loop so large responses
+    /// through Apps Script are not killed mid-transfer by `batch_timeout`.
+    stream_timeout: Duration,
     /// Optional second-hop exit node (Deno Deploy / fly.io / etc.)
     /// to bypass CF-anti-bot blocks on sites that flag Google datacenter
     /// IPs (chatgpt.com, claude.ai, grok.com, x.com). Mirrors
@@ -642,6 +647,9 @@ impl DomainFronter {
             batch_timeout: Duration::from_secs(
                 config.request_timeout_secs.clamp(5, 300),
             ),
+            stream_timeout: Duration::from_secs(
+                config.stream_timeout_secs.clamp(10, 3600),
+            ),
             exit_node_enabled: config.exit_node.enabled
                 && !config.exit_node.relay_url.is_empty()
                 && !config.exit_node.psk.is_empty(),
@@ -695,6 +703,11 @@ impl DomainFronter {
     /// change. Clamped to `[5s, 300s]` at construction.
     pub(crate) fn batch_timeout(&self) -> Duration {
         self.batch_timeout
+    }
+
+    /// Per-chunk body streaming idle timeout. Clamped to `[10s, 3600s]`.
+    pub(crate) fn stream_timeout(&self) -> Duration {
+        self.stream_timeout
     }
 
     /// Record one relay call toward the daily budget. Called once per
@@ -1533,18 +1546,17 @@ impl DomainFronter {
             })?;
         }
 
-        // Phase 2: response headers + body drain. Bounded by the
-        // caller's deadline. Errors and timeout here are
-        // `RequestSent::Maybe` — the request is on the wire and may
-        // already have side effects.
-        let response_phase = async {
+        // Phase 2a: wait for response headers. Bounded by the caller's
+        // deadline (`batch_timeout` / `request_timeout_secs`). A timeout
+        // here means the relay never responded — safe to retry.
+        let header_phase = async {
             let response = response_fut.await.map_err(|e| {
                 (
                     FronterError::Relay(format!("h2 response: {}", e)),
                     RequestSent::Maybe,
                 )
             })?;
-            let (parts, mut body) = response.into_parts();
+            let (parts, body) = response.into_parts();
             let status = parts.status.as_u16();
 
             // Convert headers to the (String, String) Vec the rest of
@@ -1557,27 +1569,12 @@ impl DomainFronter {
                     headers.push((name.as_str().to_string(), v.to_string()));
                 }
             }
-
-            // Drain body. Release flow-control credit per chunk so
-            // large responses don't stall after the initial 4 MB window.
-            let mut buf: Vec<u8> = Vec::new();
-            while let Some(chunk) = body.data().await {
-                let chunk = chunk.map_err(|e| {
-                    (
-                        FronterError::Relay(format!("h2 body chunk: {}", e)),
-                        RequestSent::Maybe,
-                    )
-                })?;
-                let n = chunk.len();
-                buf.extend_from_slice(&chunk);
-                let _ = body.flow_control().release_capacity(n);
-            }
-            Ok::<_, (FronterError, RequestSent)>((status, headers, buf))
+            Ok::<_, (FronterError, RequestSent)>((status, headers, body))
         };
 
-        let (status, headers, mut buf) = match tokio::time::timeout(
+        let (status, headers, mut body) = match tokio::time::timeout(
             response_deadline,
-            response_phase,
+            header_phase,
         )
         .await
         {
@@ -1585,6 +1582,32 @@ impl DomainFronter {
             Ok(Err(e)) => return Err(e),
             Err(_) => return Err((FronterError::Timeout, RequestSent::Maybe)),
         };
+
+        // Phase 2b: drain body. Each chunk is individually bounded by
+        // `stream_timeout` (default 300s) so large responses routed
+        // through Apps Script (where a 256 KB range chunk can take 30-90s
+        // of wall-clock time) are not killed by the tighter `batch_timeout`.
+        // Release flow-control credit per chunk so large responses don't
+        // stall after the initial 4 MB window.
+        let stream_timeout = self.stream_timeout();
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            match tokio::time::timeout(stream_timeout, body.data()).await {
+                Ok(None) => break,
+                Ok(Some(Ok(chunk))) => {
+                    let n = chunk.len();
+                    buf.extend_from_slice(&chunk);
+                    let _ = body.flow_control().release_capacity(n);
+                }
+                Ok(Some(Err(e))) => {
+                    return Err((
+                        FronterError::Relay(format!("h2 body chunk: {}", e)),
+                        RequestSent::Maybe,
+                    ));
+                }
+                Err(_) => return Err((FronterError::Timeout, RequestSent::Maybe)),
+            }
+        }
 
         // Mirror `read_http_response`: if the server gzipped the body
         // (we asked for it via accept-encoding), decompress before
