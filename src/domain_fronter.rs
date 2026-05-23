@@ -471,7 +471,30 @@ impl HostStat {
     }
 }
 
-const BLACKLIST_COOLDOWN_SECS: u64 = 600;
+const TRANSIENT_SCRIPT_COOLDOWN_SECS: u64 = 600;
+const HARD_SCRIPT_QUARANTINE_SECS: u64 = 24 * 60 * 60;
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum ScriptQuarantine {
+    Hard,
+    Transient,
+}
+
+impl ScriptQuarantine {
+    fn cooldown(self) -> Duration {
+        match self {
+            ScriptQuarantine::Hard => Duration::from_secs(HARD_SCRIPT_QUARANTINE_SECS),
+            ScriptQuarantine::Transient => Duration::from_secs(TRANSIENT_SCRIPT_COOLDOWN_SECS),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            ScriptQuarantine::Hard => "hard quota/account quarantine",
+            ScriptQuarantine::Transient => "transient relay cooldown",
+        }
+    }
+}
 
 /// Auto-blacklist defaults are now per-instance fields on `DomainFronter`,
 /// driven by `Config::auto_blacklist_strikes` / `_window_secs` /
@@ -893,11 +916,11 @@ impl DomainFronter {
         picked
     }
 
-    fn blacklist_script(&self, script_id: &str, reason: &str) {
+    fn quarantine_script(&self, script_id: &str, quarantine: ScriptQuarantine, reason: &str) {
         self.blacklist_script_for(
             script_id,
-            Duration::from_secs(BLACKLIST_COOLDOWN_SECS),
-            reason,
+            quarantine.cooldown(),
+            &format!("{}: {}", quarantine.label(), reason),
         );
     }
 
@@ -2547,8 +2570,12 @@ impl DomainFronter {
                         .chars()
                         .take(200)
                         .collect::<String>();
-                    if should_blacklist(status, &body_txt) {
-                        self.blacklist_script(&script_id, &format!("HTTP {}", status));
+                    if let Some(quarantine) = classify_script_failure(status, &body_txt) {
+                        self.quarantine_script(
+                            &script_id,
+                            quarantine,
+                            &format!("HTTP {}", status),
+                        );
                     }
                     return Err(FronterError::Relay(format!(
                         "Apps Script HTTP {}: {}",
@@ -2558,7 +2585,7 @@ impl DomainFronter {
                 return parse_relay_json(&resp_body).map_err(|e| {
                     if let FronterError::Relay(ref msg) = e {
                         if looks_like_quota_error(msg) {
-                            self.blacklist_script(&script_id, msg);
+                            self.quarantine_script(&script_id, ScriptQuarantine::Hard, msg);
                         }
                     }
                     e
@@ -2656,8 +2683,12 @@ impl DomainFronter {
                             .chars()
                             .take(200)
                             .collect::<String>();
-                        if should_blacklist(status, &body_txt) {
-                            self.blacklist_script(&script_id, &format!("HTTP {}", status));
+                        if let Some(quarantine) = classify_script_failure(status, &body_txt) {
+                            self.quarantine_script(
+                                &script_id,
+                                quarantine,
+                                &format!("HTTP {}", status),
+                            );
                         }
                         return Err(FronterError::Relay(format!(
                             "Apps Script HTTP {}: {}",
@@ -2669,7 +2700,11 @@ impl DomainFronter {
                         Err(e) => {
                             if let FronterError::Relay(ref msg) = e {
                                 if looks_like_quota_error(msg) {
-                                    self.blacklist_script(&script_id, msg);
+                                    self.quarantine_script(
+                                        &script_id,
+                                        ScriptQuarantine::Hard,
+                                        msg,
+                                    );
                                 }
                             }
                             Err(e)
@@ -3066,8 +3101,8 @@ impl DomainFronter {
                 .chars()
                 .take(200)
                 .collect::<String>();
-            if should_blacklist(status, &body_txt) {
-                self.blacklist_script(script_id, &format!("HTTP {}", status));
+            if let Some(quarantine) = classify_script_failure(status, &body_txt) {
+                self.quarantine_script(script_id, quarantine, &format!("HTTP {}", status));
             }
             return Err(FronterError::Relay(format!(
                 "tunnel HTTP {}: {}",
@@ -3256,8 +3291,8 @@ impl DomainFronter {
                 .chars()
                 .take(200)
                 .collect::<String>();
-            if should_blacklist(status, &body_txt) {
-                self.blacklist_script(script_id, &format!("HTTP {}", status));
+            if let Some(quarantine) = classify_script_failure(status, &body_txt) {
+                self.quarantine_script(script_id, quarantine, &format!("HTTP {}", status));
             }
             return Err(FronterError::Relay(format!(
                 "batch tunnel HTTP {}: {}",
@@ -4987,11 +5022,17 @@ impl StatsSnapshot {
     }
 }
 
-fn should_blacklist(status: u16, body: &str) -> bool {
+fn classify_script_failure(status: u16, body: &str) -> Option<ScriptQuarantine> {
     if status == 429 || status == 403 {
-        return true;
+        return Some(ScriptQuarantine::Hard);
     }
-    looks_like_quota_error(body)
+    if looks_like_quota_error(body) {
+        return Some(ScriptQuarantine::Hard);
+    }
+    if matches!(status, 500 | 502 | 503 | 504) && looks_like_transient_script_error(body) {
+        return Some(ScriptQuarantine::Transient);
+    }
+    None
 }
 
 fn looks_like_quota_error(msg: &str) -> bool {
@@ -5006,6 +5047,20 @@ fn looks_like_quota_error(msg: &str) -> bool {
         || lower.contains("datenübertragungsrate")
         || lower.contains("transfer rate")
         || lower.contains("limit exceeded")
+}
+
+fn looks_like_transient_script_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("google")
+        || lower.contains("apps script")
+        || lower.contains("script.google")
+        || lower.contains("googleusercontent")
+        || lower.contains("gfe")
+        || lower.contains("backend error")
+        || lower.contains("service unavailable")
+        || lower.contains("temporary")
+        || lower.contains("timeout")
+        || lower.contains("timed out")
 }
 
 fn mask_script_id(id: &str) -> String {
@@ -6447,16 +6502,38 @@ hello";
 
     #[test]
     fn blacklist_heuristics() {
-        assert!(should_blacklist(429, ""));
-        assert!(should_blacklist(403, "quota"));
-        assert!(should_blacklist(500, "Service invoked too many times per day: urlfetch"));
-        assert!(!should_blacklist(200, ""));
-        assert!(!should_blacklist(502, "bad gateway"));
+        assert_eq!(classify_script_failure(429, ""), Some(ScriptQuarantine::Hard));
+        assert_eq!(
+            classify_script_failure(403, "quota"),
+            Some(ScriptQuarantine::Hard)
+        );
+        assert_eq!(
+            classify_script_failure(500, "Service invoked too many times per day: urlfetch"),
+            Some(ScriptQuarantine::Hard)
+        );
+        assert_eq!(classify_script_failure(502, "bad gateway"), None);
+        assert_eq!(
+            classify_script_failure(502, "Google backend error"),
+            Some(ScriptQuarantine::Transient)
+        );
+        assert_eq!(classify_script_failure(200, ""), None);
         assert!(looks_like_quota_error("Exception: Service invoked too many times per day"));
         assert!(looks_like_quota_error(
             "Exception: Bandbreitenkontingent überschritten: https://example.com. Verringern Sie die Datenübertragungsrate."
         ));
         assert!(!looks_like_quota_error("bad url"));
+    }
+
+    #[test]
+    fn script_quarantine_durations_match_failure_class() {
+        assert_eq!(
+            ScriptQuarantine::Hard.cooldown(),
+            Duration::from_secs(HARD_SCRIPT_QUARANTINE_SECS)
+        );
+        assert_eq!(
+            ScriptQuarantine::Transient.cooldown(),
+            Duration::from_secs(TRANSIENT_SCRIPT_COOLDOWN_SECS)
+        );
     }
 
     #[test]

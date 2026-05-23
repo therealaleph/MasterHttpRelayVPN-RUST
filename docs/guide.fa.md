@@ -350,7 +350,7 @@ sni_hosts = ["www.google.com", "drive.google.com", "docs.google.com"]
 | Connection pool | TTL ۴۵ ثانیه، حداکثر ۲۰ idle |
 | رمزگشایی gzip | اتوماتیک |
 | چند اسکریپت | چرخش round-robin |
-| Blacklist خودکار | روی خطای 429 / quota، با cooldown ۱۰ دقیقه |
+| قرنطینهٔ خودکار اسکریپت | خطاهای quota/account برای ۲۴ ساعت؛ خطاهای گذرای relay با cooldown کوتاه |
 | کش پاسخ | ۵۰ مگابایت، FIFO + TTL، آگاه از `Cache-Control: max-age`، heuristic برای static asset |
 | Coalescing | GETهای یکسان همزمان یک fetch upstream را به اشتراک می‌گذارند |
 | تونل بازنویسی SNI | مستقیم به لبهٔ گوگل (بدون رله) برای `google.com`، `youtube.com`، `youtu.be`، `youtube-nocookie.com`، `fonts.googleapis.com` — دامنه‌های اضافی از فیلد `hosts` |

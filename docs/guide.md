@@ -346,7 +346,7 @@ This port focuses on the **`apps_script` mode** — the only one that reliably w
 - [x] Connection pooling (45 s TTL, max 20 idle)
 - [x] Gzip response decoding
 - [x] Multi-script round-robin
-- [x] Auto-blacklist failing scripts on 429 / quota errors (10 min cooldown)
+- [x] Auto-quarantine failing scripts: quota/account failures for 24 h, transient relay failures for a short cooldown
 - [x] Response cache (50 MB, FIFO + TTL, `Cache-Control: max-age` aware, heuristics for static assets)
 - [x] Request coalescing: concurrent identical GETs share one upstream fetch
 - [x] SNI-rewrite tunnels for `google.com`, `youtube.com`, `youtu.be`, `youtube-nocookie.com`, `fonts.googleapis.com`, configurable via `hosts` map
