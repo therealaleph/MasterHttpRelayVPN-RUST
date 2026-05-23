@@ -564,6 +564,9 @@ impl ProxyServer {
             "Listening SOCKS5 on {} — xray / Telegram / app-level SOCKS5 clients use this.",
             socks_addr
         );
+        if let Some(summary) = self.quota_startup_summary() {
+            tracing::info!("{}", summary);
+        }
         // Pre-warm the outbound connection pool so the user's first request
         // doesn't pay a fresh TLS handshake to Google edge. Best-effort;
         // failures are logged and ignored. Skipped in `direct` mode —
@@ -616,22 +619,25 @@ impl ProxyServer {
 
         let stats_task = if let Some(stats_fronter) = self.fronter.clone() {
             tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                ticker.tick().await;
+                let mut was_hard_stopped = false;
                 loop {
                     ticker.tick().await;
                     let s = stats_fronter.snapshot_stats();
                     if s.relay_calls > 0 || s.cache_hits > 0 {
                         tracing::info!("{}", s.fmt_line());
                     }
-                    // Log quota warnings and flush persisted state.
                     let q = &s.quota;
                     if q.global_hard_stop {
                         tracing::error!(
                             "[quota] GLOBAL HARD STOP — all {} account(s) exhausted",
                             q.account_count
                         );
+                        // Log per-account reasons only on the first tick after transition.
+                        if !was_hard_stopped {
+                            stats_fronter.quota_tracker().log_exhaustion_details();
+                        }
                     } else if q.exhausted_count > 0 {
                         tracing::warn!(
                             "[quota] {}/{} account(s) exhausted  used={}/{}  remaining={}",
@@ -642,13 +648,29 @@ impl ProxyServer {
                             q.requests_remaining_total,
                         );
                     }
+                    was_hard_stopped = q.global_hard_stop;
                     // Roll any expired 24-hour windows so idle accounts come
                     // back online even without inbound traffic.
                     stats_fronter.quota_tracker().roll_expired_windows();
-                    // Always flush so the file is up-to-date even when idle.
-                    // save_if_needed() skips the write when dirty_count == 0,
-                    // which means zero-traffic sessions never update the file.
-                    stats_fronter.quota_tracker().save();
+                    // Safety-net flush for idle sessions (1s save task handles
+                    // active-traffic saves; this covers the zero-traffic case).
+                    stats_fronter.quota_tracker().save_if_needed();
+                }
+            })
+        } else {
+            tokio::spawn(async move { std::future::pending::<()>().await })
+        };
+
+        // Flush quota state to disk every second so the JSON file stays within
+        // ~1s of in-memory state. The Mutex-backed in-memory state is always
+        // real-time; this just keeps the on-disk snapshot current.
+        let save_task = if let Some(save_fronter) = self.fronter.clone() {
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    ticker.tick().await;
+                    save_fronter.quota_tracker().save_if_needed();
                 }
             })
         } else {
@@ -744,6 +766,7 @@ impl ProxyServer {
             biased;
             _ = &mut shutdown_rx => {
                 tracing::info!("Shutdown signal received, stopping listeners");
+                save_task.abort();
                 stats_task.abort();
                 keepalive_task.abort();
                 refill_task.abort();

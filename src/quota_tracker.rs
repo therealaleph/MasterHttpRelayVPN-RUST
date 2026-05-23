@@ -487,6 +487,19 @@ impl QuotaTracker {
     }
 
     /// Build a human-readable startup summary line.
+    /// Log the masked ID and exhaustion reason for every hard-stopped bucket.
+    /// Called once when global hard stop transitions from false to true.
+    pub fn log_exhaustion_details(&self) {
+        let st = self.state.lock().unwrap();
+        for sid in &self.script_ids {
+            let Some(b) = st.buckets.get(sid) else { continue };
+            if b.hard_stopped {
+                let reason = b.exhaustion_reason.as_deref().unwrap_or("no reason recorded");
+                tracing::warn!("[quota]   {} exhausted: {}", b.masked_id, reason);
+            }
+        }
+    }
+
     pub fn startup_summary(&self) -> String {
         let s = self.summary();
         let now = now_unix();
@@ -494,14 +507,28 @@ impl QuotaTracker {
             let secs = r.saturating_sub(now);
             format!("  next_reset=in {}h {}m", secs / 3600, (secs / 60) % 60)
         }).unwrap_or_default();
+        let stop_suffix = if s.global_hard_stop {
+            format!("  exhausted={}/{} HARD-STOP", s.exhausted_count, s.account_count)
+        } else if s.exhausted_count > 0 {
+            format!("  exhausted={}/{}", s.exhausted_count, s.account_count)
+        } else {
+            String::new()
+        };
 
         format!(
-            "[quota] {} account(s)  capacity={}/day  used={}  remaining={}{}",
+            "[quota] {} account(s)  capacity={}/day  used={}  remaining={}{}{}",
             s.account_count,
             s.daily_capacity_total,
             s.requests_used_total,
             s.requests_remaining_total,
             reset_str,
+            stop_suffix,
         )
+    }
+}
+
+impl Drop for QuotaTracker {
+    fn drop(&mut self) {
+        self.save();
     }
 }

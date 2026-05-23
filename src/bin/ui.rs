@@ -1224,17 +1224,19 @@ impl eframe::App for App {
 
                     // Use quota-tracked daily capacity when available, fall back to
                     // the free-tier default for display purposes.
+                    // quota_used: total relay() calls (exit node + Apps Script combined)
+                    // so "fetches today" reflects all proxied traffic, not just Apps Script.
                     let (quota_cap, quota_used, _quota_remaining, any_exhausted, global_stop) =
                         if let Some(q) = &quota_state {
                             (
                                 q.daily_capacity_total.max(1),
-                                q.requests_used_total,
+                                s.total_relay_calls,
                                 q.requests_remaining_total,
                                 q.exhausted_count > 0,
                                 q.global_hard_stop,
                             )
                         } else {
-                            (20_000u64, s.today_calls, 20_000u64.saturating_sub(s.today_calls), false, false)
+                            (20_000u64, s.total_relay_calls, 20_000u64.saturating_sub(s.total_relay_calls), false, false)
                         };
 
                     let pct = (quota_used as f64 / quota_cap as f64) * 100.0;

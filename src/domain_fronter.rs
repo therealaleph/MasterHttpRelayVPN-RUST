@@ -365,6 +365,11 @@ pub struct DomainFronter {
     /// strike state is per-deployment health bookkeeping, not the
     /// permanent ban list.
     script_timeouts: Arc<std::sync::Mutex<HashMap<String, (Instant, u32)>>>,
+    /// Every call to `relay()` increments this — exit node AND Apps Script.
+    /// Use this for UI "fetches today" display. Distinct from `relay_calls`
+    /// (Apps-Script-direct only) and from the quota tracker's `requests_used`
+    /// (also Apps-Script-only).
+    total_relay_calls: AtomicU64,
     relay_calls: AtomicU64,
     relay_failures: AtomicU64,
     bytes_relayed: AtomicU64,
@@ -633,6 +638,7 @@ impl DomainFronter {
             coalesced: AtomicU64::new(0),
             blacklist: Arc::new(std::sync::Mutex::new(HashMap::new())),
             script_timeouts: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            total_relay_calls: AtomicU64::new(0),
             relay_calls: AtomicU64::new(0),
             relay_failures: AtomicU64::new(0),
             bytes_relayed: AtomicU64::new(0),
@@ -775,6 +781,7 @@ impl DomainFronter {
             guard.clone()
         };
         StatsSnapshot {
+            total_relay_calls: self.total_relay_calls.load(Ordering::Relaxed),
             relay_calls: self.relay_calls.load(Ordering::Relaxed),
             relay_failures: self.relay_failures.load(Ordering::Relaxed),
             coalesced: self.coalesced.load(Ordering::Relaxed),
@@ -1784,6 +1791,23 @@ impl DomainFronter {
         headers: &[(String, String)],
         body: &[u8],
     ) -> Vec<u8> {
+        self.total_relay_calls.fetch_add(1, Ordering::Relaxed);
+
+        // Block ALL relay paths (exit node + Apps Script) when every account
+        // bucket is quota-exhausted. Checked here so the exit node short-circuit
+        // below can't bypass the global hard stop.
+        if self.quota_tracker.is_globally_hard_stopped() {
+            self.relay_failures.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                "[quota] global hard stop active — all Apps Script account buckets exhausted"
+            );
+            return error_response(
+                502,
+                "All Apps Script accounts quota exhausted; hard stop active. \
+                 Quota resets on a rolling 24-hour window per account.",
+            );
+        }
+
         // Optional URL rewrite for X/Twitter GraphQL (issue #16). Applied
         // here, at the top of relay(), so it affects BOTH the cache key
         // (so matching requests collapse into one entry) AND the URL that
@@ -4907,6 +4931,9 @@ fn decode_js_string_escapes(s: &str) -> Option<String> {
 
 #[derive(Debug, Clone)]
 pub struct StatsSnapshot {
+    /// Total calls to `relay()` — all traffic through this fronter including
+    /// exit node and Apps Script. Use for "fetches today" display.
+    pub total_relay_calls: u64,
     pub relay_calls: u64,
     pub relay_failures: u64,
     pub coalesced: u64,
