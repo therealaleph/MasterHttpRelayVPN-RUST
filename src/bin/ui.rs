@@ -13,7 +13,7 @@ use mhrv_rs::cert_installer::{install_ca, reconcile_sudo_environment, remove_ca}
 use mhrv_rs::config::{Config, FrontingGroup, ScriptId};
 use mhrv_rs::data_dir;
 use mhrv_rs::domain_fronter::{DomainFronter, DEFAULT_GOOGLE_SNI_POOL};
-use mhrv_rs::lan_utils::{detect_lan_ip, is_share_on_lan};
+use mhrv_rs::lan_utils::is_share_on_lan;
 use mhrv_rs::mitm::{MitmCertManager, CA_CERT_FILE};
 use mhrv_rs::proxy_server::ProxyServer;
 use mhrv_rs::{scan_ips, scan_sni, test_cmd};
@@ -919,98 +919,60 @@ impl eframe::App for App {
                     .labelled_by(label_id);
                 });
 
-                // Network sharing: phones, tablets, other laptops on the
-                // same Wi-Fi can use this proxy when the bind address is
-                // 0.0.0.0 instead of 127.0.0.1. We expose this as a
-                // single-checkbox UI rather than the raw `listen_host`
-                // text field — typing `0.0.0.0` from memory is enough of
-                // a friction point that almost no one does it. Power
-                // users with a custom bind IP (specific NIC) can still
-                // edit `listen_host` directly in `config.toml`; we
-                // detect that case and show a "Custom bind" badge so
-                // the checkbox doesn't silently overwrite their setting
-                // on the next Save.
+                // Network sharing is disabled until inbound proxy auth
+                // exists. The config validator rejects non-loopback binds;
+                // keep the form aligned so Save never writes a value that
+                // the next startup will fail closed.
                 //
                 // Snapshot the relevant flags before entering form_row's
-                // closure — we need to mutate `self.form.listen_host`
-                // inside the closure when the checkbox toggles, so we
-                // can't hold a borrow on it through the closure.
+                // closure — we may reset `self.form.listen_host` inside
+                // the closure, so avoid holding a borrow through it.
                 let listen_host_snapshot = self.form.listen_host.trim().to_string();
-                let listen_port_snapshot = self.form.listen_port.trim().to_string();
-                let socks5_port_snapshot = self.form.socks5_port.trim().to_string();
                 let was_share_on_lan = is_share_on_lan(&listen_host_snapshot);
                 let lower_snapshot = listen_host_snapshot.to_ascii_lowercase();
                 let is_custom_bind = !listen_host_snapshot.is_empty()
                     && !was_share_on_lan
                     && lower_snapshot != "127.0.0.1"
                     && lower_snapshot != "localhost";
-                let mut new_listen_host: Option<String> = None;
                 form_row(ui, "Network", Some(
-                    "By default the proxy is reachable only from this computer. \
-                     Turn this on to let phones, tablets, and other laptops on the \
-                     same Wi-Fi (or a hotspot you're sharing) use it too. The \
-                     other devices then point their HTTP / SOCKS5 proxy at the \
-                     LAN IP shown below. Make sure your firewall lets in the proxy \
-                     port — macOS pops up a Firewall prompt the first time."
+                    "The proxy is reachable only from this computer. Non-loopback \
+                     binds are rejected until HTTP/SOCKS inbound authentication is \
+                     implemented, which prevents accidental open-proxy exposure on \
+                     shared Wi-Fi or hotspots."
                 ), |ui, _label_id| {
-                    if is_custom_bind {
-                        // The user manually wrote a specific bind IP —
-                        // don't let the checkbox stomp on it. Show what
-                        // they have and tell them to edit config.toml
-                        // if they want to change it.
+                    if was_share_on_lan || is_custom_bind {
                         ui.vertical(|ui| {
                             ui.label(egui::RichText::new(format!(
-                                "Custom bind: {}",
+                                "Unsafe bind configured: {}",
                                 listen_host_snapshot
-                            )).color(egui::Color32::from_rgb(220, 180, 100)));
-                            ui.small("Edit `listen_host` in config.toml to change.");
+                            )).color(ERR_RED));
+                            ui.small(
+                                "Current builds reject non-loopback binds. Set \
+                                 listen_host to 127.0.0.1 in config.toml."
+                            );
+                            if ui.small_button("Reset to loopback").clicked() {
+                                self.form.listen_host = "127.0.0.1".to_string();
+                            }
                         });
                     } else {
-                        let mut share = was_share_on_lan;
-                        if ui.checkbox(&mut share, "Share with other devices on my Wi-Fi / network").changed() {
-                            new_listen_host = Some(if share {
-                                "0.0.0.0".to_string()
-                            } else {
-                                "127.0.0.1".to_string()
-                            });
-                        }
-                        if share {
-                            // detect_lan_ip() opens a UDP socket and
-                            // asks the kernel which interface a packet
-                            // to a public IP would use. Cheap (no
-                            // syscall does network I/O) and accurate
-                            // (it's the same selection any outbound
-                            // connection would make).
-                            match detect_lan_ip() {
-                                Some(ip) => {
-                                    let port = if listen_port_snapshot.is_empty() {
-                                        "8085"
-                                    } else {
-                                        listen_port_snapshot.as_str()
-                                    };
-                                    let socks_port = if socks5_port_snapshot.is_empty() {
-                                        "8086"
-                                    } else {
-                                        socks5_port_snapshot.as_str()
-                                    };
-                                    ui.small(egui::RichText::new(format!(
-                                        "Other devices: HTTP {}:{}  ·  SOCKS5 {}:{}",
-                                        ip, port, ip, socks_port,
-                                    )).color(egui::Color32::from_rgb(120, 200, 140)));
-                                }
-                                None => {
-                                    ui.small(egui::RichText::new(
-                                        "Couldn't detect your LAN IP. Find it in System Settings \
-                                         → Network → Wi-Fi → Details (macOS) or `ipconfig` (Windows)."
-                                    ).color(egui::Color32::from_rgb(220, 180, 100)));
-                                }
-                            }
-                        }
+                        self.form.listen_host = "127.0.0.1".to_string();
+                        let mut share = false;
+                        ui.add_enabled(
+                            false,
+                            egui::Checkbox::new(
+                                &mut share,
+                                "Share with other devices on my Wi-Fi / network",
+                            ),
+                        )
+                        .on_disabled_hover_text(
+                            "LAN sharing will return after inbound proxy authentication is available.",
+                        );
+                        ui.small(
+                            egui::RichText::new("Loopback only: HTTP/SOCKS accept local connections.")
+                                .color(egui::Color32::from_rgb(120, 200, 140)),
+                        );
                     }
                 });
-                if let Some(updated) = new_listen_host {
-                    self.form.listen_host = updated;
-                }
 
                 ui.horizontal(|ui| {
                     ui.add_sized(
