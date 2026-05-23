@@ -53,8 +53,11 @@ impl ResponseCache {
         let mut inner = self.inner.lock().unwrap();
         if let Some(entry) = inner.entries.get(key) {
             if entry.expires > now {
+                let bytes = entry.bytes.clone();
+                inner.order.retain(|k| k != key);
+                inner.order.push_back(key.to_string());
                 self.hits.fetch_add(1, Ordering::Relaxed);
-                return Some(entry.bytes.clone());
+                return Some(bytes);
             }
             let size = entry.bytes.len();
             inner.entries.remove(key);
@@ -215,15 +218,17 @@ mod tests {
     }
 
     #[test]
-    fn fifo_eviction_when_full() {
+    fn least_recently_used_entry_is_evicted_when_full() {
         let c = ResponseCache::new(1000);
         c.put("a".into(), vec![0u8; 200], Duration::from_secs(60));
         c.put("b".into(), vec![0u8; 200], Duration::from_secs(60));
         c.put("c".into(), vec![0u8; 200], Duration::from_secs(60));
         c.put("d".into(), vec![0u8; 200], Duration::from_secs(60));
         c.put("e".into(), vec![0u8; 200], Duration::from_secs(60));
+        assert!(c.get("a").is_some());
         c.put("f".into(), vec![0u8; 200], Duration::from_secs(60));
-        assert!(c.get("a").is_none());
+        assert!(c.get("a").is_some());
+        assert!(c.get("b").is_none());
         assert!(c.get("f").is_some());
     }
 
