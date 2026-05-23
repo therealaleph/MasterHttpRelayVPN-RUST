@@ -2512,6 +2512,16 @@ impl DomainFronter {
         headers: &[(String, String)],
         body: &[u8],
     ) -> Result<Vec<u8>, FronterError> {
+        // Defense-in-depth: if next_script_id's last-resort fallback handed us
+        // a hard-stopped account (all exhausted, none in the blacklist), refuse
+        // here before building the payload or touching the network.
+        if self.quota_tracker.is_hard_stopped(&script_id) {
+            return Err(FronterError::Relay(format!(
+                "account {} is quota-hard-stopped; skipping dispatch",
+                mask_script_id(&script_id),
+            )));
+        }
+
         let payload: Bytes = Bytes::from(self.build_payload_json(method, url, headers, body)?);
         let bytes_up = payload.len() as u64;
 
@@ -2543,6 +2553,15 @@ impl DomainFronter {
                 }
             }
         }
+
+        tracing::debug!(
+            "[quota] {} dispatch result: {}",
+            mask_script_id(&script_id),
+            match &result {
+                Ok(_) => "Ok".to_string(),
+                Err(e) => format!("Err({})", e),
+            },
+        );
 
         result
     }

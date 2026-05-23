@@ -642,9 +642,13 @@ impl ProxyServer {
                             q.requests_remaining_total,
                         );
                     }
-                    // Periodic flush so quota state survives a crash between
-                    // the every-50-requests auto-saves in record_attempt.
-                    stats_fronter.quota_tracker().save_if_needed();
+                    // Roll any expired 24-hour windows so idle accounts come
+                    // back online even without inbound traffic.
+                    stats_fronter.quota_tracker().roll_expired_windows();
+                    // Always flush so the file is up-to-date even when idle.
+                    // save_if_needed() skips the write when dirty_count == 0,
+                    // which means zero-traffic sessions never update the file.
+                    stats_fronter.quota_tracker().save();
                 }
             })
         } else {

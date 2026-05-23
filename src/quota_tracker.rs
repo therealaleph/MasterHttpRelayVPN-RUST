@@ -88,6 +88,10 @@ pub struct QuotaSummary {
     pub global_hard_stop: bool,
     /// Unix timestamp of the soonest window reset across all non-exhausted buckets.
     pub next_reset_at: Option<u64>,
+    /// Unix timestamp of the soonest window reset across ALL buckets, including
+    /// hard-stopped ones. Used by the UI to show a meaningful reset time even
+    /// when all accounts are exhausted.
+    pub next_reset_at_any: Option<u64>,
 }
 
 // ── Disk state wrapper ────────────────────────────────────────────────────────
@@ -119,6 +123,26 @@ pub struct QuotaTracker {
 
 fn quota_state_path() -> PathBuf {
     data_dir::data_dir().join("quota_state.json")
+}
+
+/// Mark any bucket that is already past the safety buffer as hard-stopped.
+/// Called at load time so accounts near the limit are blocked before the
+/// first request arrives, not after it fires.
+fn check_all_safety_buffers(qs: &mut QuotaState, daily_limit: u64, safety_buffer: u64) {
+    for bucket in qs.buckets.values_mut() {
+        if bucket.hard_stopped {
+            continue;
+        }
+        let remaining = daily_limit.saturating_sub(bucket.requests_used);
+        if remaining < safety_buffer {
+            bucket.exhausted = true;
+            bucket.hard_stopped = true;
+            bucket.exhaustion_reason = Some(format!(
+                "safety buffer crossed on load: {}/{} requests used (limit {}, buffer {})",
+                bucket.requests_used, daily_limit, daily_limit, safety_buffer,
+            ));
+        }
+    }
 }
 
 fn mask_id(id: &str) -> String {
@@ -157,14 +181,24 @@ impl QuotaTracker {
             });
         }
 
-        Self {
+        // Pre-check safety buffers on loaded state so accounts that are already
+        // near the limit are marked hard_stopped before the first request arrives,
+        // not after it fires.
+        check_all_safety_buffers(&mut qs, daily_limit, safety_buffer);
+
+        let tracker = Self {
             state: Mutex::new(qs),
             script_ids: script_ids.to_vec(),
             daily_limit,
             safety_buffer,
             dirty_count: AtomicU64::new(0),
             state_path,
-        }
+        };
+        // Always write on startup so the file exists and reflects current state
+        // before any relay traffic arrives. Without this, the file is only created
+        // after the first dirty_count increment (i.e. after real traffic).
+        tracker.save();
+        tracker
     }
 
     // ── Recording ────────────────────────────────────────────────────────────
@@ -206,22 +240,16 @@ impl QuotaTracker {
             bucket.next_reset_at = Some(now + 86_400);
         }
 
-        bucket.requests_used += 1;
-        bucket.bytes_up += bytes_up;
-        bucket.bytes_total += bytes_up;
-        bucket.last_request_at = Some(now);
-
-        // Check if the safety buffer threshold is crossed (soft exhaustion).
-        // This is separate from mark_exhausted which is called on quota error
-        // signals; this handles the case where the counter itself reaches the
-        // limit without a quota error message being returned yet.
-        let remaining = self.daily_limit.saturating_sub(bucket.requests_used);
+        // Check safety buffer BEFORE incrementing so the account is stopped on
+        // the request that would exceed the limit, not the one after it.
+        let next_used = bucket.requests_used + 1;
+        let remaining = self.daily_limit.saturating_sub(next_used);
         if !bucket.hard_stopped && remaining < self.safety_buffer {
             bucket.exhausted = true;
             bucket.hard_stopped = true;
             bucket.exhaustion_reason = Some(format!(
                 "safety buffer crossed: {}/{} requests used (limit {}, buffer {})",
-                bucket.requests_used, self.daily_limit,
+                next_used, self.daily_limit,
                 self.daily_limit, self.safety_buffer,
             ));
             tracing::warn!(
@@ -229,6 +257,11 @@ impl QuotaTracker {
                 bucket.masked_id, remaining, self.safety_buffer,
             );
         }
+
+        bucket.requests_used = next_used;
+        bucket.bytes_up += bytes_up;
+        bucket.bytes_total += bytes_up;
+        bucket.last_request_at = Some(now);
 
         drop(st);
         let n = self.dirty_count.fetch_add(1, Ordering::Relaxed);
@@ -343,6 +376,7 @@ impl QuotaTracker {
         let mut exhausted = 0usize;
         let mut hard_stopped = 0usize;
         let mut next_reset: Option<u64> = None;
+        let mut next_reset_any: Option<u64> = None;
 
         for sid in &self.script_ids {
             let Some(b) = st.buckets.get(sid) else { continue };
@@ -353,8 +387,13 @@ impl QuotaTracker {
             bytes_total += b.bytes_total;
             if b.exhausted { exhausted += 1; }
             if b.hard_stopped { hard_stopped += 1; }
-            if !b.hard_stopped {
-                if let Some(r) = b.next_reset_at {
+            if let Some(r) = b.next_reset_at {
+                // next_reset_any covers all accounts including stopped ones.
+                next_reset_any = Some(match next_reset_any {
+                    None => r,
+                    Some(prev) => prev.min(r),
+                });
+                if !b.hard_stopped {
                     next_reset = Some(match next_reset {
                         None => r,
                         Some(prev) => prev.min(r),
@@ -382,6 +421,7 @@ impl QuotaTracker {
             hard_stopped_count: hard_stopped,
             global_hard_stop: global_stop,
             next_reset_at: next_reset,
+            next_reset_at_any: next_reset_any,
         }
     }
 
@@ -409,6 +449,40 @@ impl QuotaTracker {
             self.save();
             // Reset after save so next call knows it's clean.
             self.dirty_count.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Roll any expired 24-hour windows for all tracked buckets.
+    /// Called from the 60-second stats task so windows reset even when the
+    /// proxy is idle and no new requests arrive to trigger record_attempt.
+    pub fn roll_expired_windows(&self) {
+        let now = now_unix();
+        let mut st = self.state.lock().unwrap();
+        let mut rolled = false;
+        for bucket in st.buckets.values_mut() {
+            if let Some(reset_at) = bucket.next_reset_at {
+                if now >= reset_at {
+                    bucket.requests_used = 0;
+                    bucket.failed_requests = 0;
+                    bucket.bytes_up = 0;
+                    bucket.bytes_down = 0;
+                    bucket.bytes_total = 0;
+                    bucket.next_reset_at = Some(now + 86_400);
+                    bucket.exhausted = false;
+                    bucket.hard_stopped = false;
+                    bucket.exhaustion_reason = None;
+                    bucket.quota_error_count = 0;
+                    rolled = true;
+                    tracing::info!(
+                        "[quota] account {} window rolled (idle expiry) — quota reset",
+                        bucket.masked_id,
+                    );
+                }
+            }
+        }
+        drop(st);
+        if rolled {
+            self.dirty_count.fetch_add(1, Ordering::Relaxed);
         }
     }
 
