@@ -206,6 +206,17 @@ upstream_socks5 = "127.0.0.1:50529"
 
 HTTP / HTTPS مثل قبل از Apps Script می‌رود (تغییری نمی‌کند)، تونل بازنویسی SNI برای `google.com` / `youtube.com` همچنان از هر دو دور می‌زند — یوتیوب به سرعت قبل می‌ماند و تلگرام هم تونل واقعی پیدا می‌کند.
 
+## مسدودسازی محلی host
+
+برای مقصدهایی که نباید سهمیهٔ Apps Script، ظرفیت tunnel-node، یا ترافیک SOCKS5 upstream مصرف کنند، از `block_hosts` استفاده کن. entryهای دقیق فقط همان hostname را match می‌کنند؛ entryهایی که با `.` شروع می‌شوند هم parent suffix و هم subdomainها را match می‌کنند.
+
+```toml
+[network]
+block_hosts = ["ads.example.com", ".tracker.example"]
+```
+
+درخواست‌های HTTP و HTTP CONNECT مسدودشده پاسخ محلی `204 No Content` می‌گیرند. درخواست‌های SOCKS5 CONNECT قبل از باز شدن هر اتصال خروجی، reply خطای ruleset می‌گیرند.
+
 ## حالت تونل کامل
 
 `"mode": "full"` **تمام** ترافیک را end-to-end از Apps Script و یک [tunnel-node](../tunnel-node/) راه دور رد می‌کند — بدون نیاز به نصب گواهی MITM. TCP به‌صورت سشن‌های پایدار تونل، و UDP از کلاینت‌های اندروید / TUN از طریق SOCKS5 `UDP ASSOCIATE` به tunnel-node که UDP واقعی را از سمت سرور منتشر می‌کند. مبادله: تأخیر بیشتر هر درخواست (هر بایت Apps Script → tunnel-node → مقصد می‌رود)، اما برای هر پروتکل و هر برنامه‌ای بدون نصب CA کار می‌کند.
@@ -360,6 +371,7 @@ sni_hosts = ["www.google.com", "drive.google.com", "docs.google.com"]
 | ماسک Script ID | به‌صورت `prefix…suffix` در لاگ، تا Deployment ID افشا نشود |
 | UI دسکتاپ | egui — کراس‌پلتفرم، بدون bundler |
 | چِین SOCKS5 upstream | اختیاری برای ترافیک غیر-HTTP (MTProto تلگرام، IMAP، SSH …) |
+| مسدودسازی محلی `block_hosts` | short-circuit قبل از relay، tunnel، بازنویسی SNI، یا SOCKS5 upstream |
 | Pre-warm pool | اولین درخواست TLS handshake به لبهٔ گوگل را skip می‌کند |
 | چرخش SNI per-connection | بین `{www, mail, drive, docs, calendar}.google.com` |
 | Parallel relay | اختیاری: fan-out به N اسکریپت همزمان، اولین موفقیت برمی‌گردد |

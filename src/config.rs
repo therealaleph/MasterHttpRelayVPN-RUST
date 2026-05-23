@@ -180,6 +180,17 @@ pub struct Config {
     #[serde(default)]
     pub passthrough_hosts: Vec<String>,
 
+    /// Local block list evaluated before any relay, SNI rewrite, upstream
+    /// SOCKS5, or Full Tunnel dispatch. Matching follows the same convention
+    /// as `passthrough_hosts`: exact hostnames match only themselves, and
+    /// leading-dot entries match the bare suffix plus subdomains.
+    ///
+    /// This is intentionally local-only. It saves Apps Script quota and
+    /// tunnel latency for hosts the user does not want to contact at all,
+    /// without changing the remote Apps Script or tunnel-node data planes.
+    #[serde(default)]
+    pub block_hosts: Vec<String>,
+
     /// Block outbound QUIC (UDP/443) at the SOCKS5 listener.
     ///
     /// QUIC is HTTP/3-over-UDP. In `apps_script` mode it's hopeless —
@@ -793,6 +804,8 @@ pub struct TomlNetwork {
     pub sni_hosts: Option<Vec<String>>,
     #[serde(default)]
     pub passthrough_hosts: Vec<String>,
+    #[serde(default)]
+    pub block_hosts: Vec<String>,
     #[serde(default = "default_tunnel_doh")]
     pub tunnel_doh: bool,
     #[serde(default = "default_block_doh")]
@@ -817,6 +830,7 @@ impl Default for TomlNetwork {
             block_stun: default_block_stun(),
             sni_hosts: None,
             passthrough_hosts: Vec::new(),
+            block_hosts: Vec::new(),
             tunnel_doh: default_tunnel_doh(),
             block_doh: default_block_doh(),
             bypass_doh_hosts: Vec::new(),
@@ -907,6 +921,7 @@ impl From<TomlConfig> for Config {
             normalize_x_graphql: t.relay.normalize_x_graphql,
             youtube_via_relay: t.relay.youtube_via_relay,
             passthrough_hosts: t.network.passthrough_hosts,
+            block_hosts: t.network.block_hosts,
             block_stun: t.network.block_stun,
             block_quic: t.network.block_quic,
             disable_padding: t.relay.disable_padding,
@@ -959,6 +974,7 @@ impl From<&Config> for TomlConfig {
                 block_stun: c.block_stun,
                 sni_hosts: c.sni_hosts.clone(),
                 passthrough_hosts: c.passthrough_hosts.clone(),
+                block_hosts: c.block_hosts.clone(),
                 tunnel_doh: c.tunnel_doh,
                 block_doh: c.block_doh,
                 bypass_doh_hosts: c.bypass_doh_hosts.clone(),
@@ -1389,6 +1405,29 @@ mode = "direct"
     }
 
     #[test]
+    fn toml_parses_block_hosts_and_roundtrips_through_config() {
+        let s = r#"
+[relay]
+mode = "direct"
+
+[network]
+block_hosts = ["ads.example.com", ".tracker.example"]
+"#;
+        let toml_cfg: TomlConfig = toml::from_str(s).unwrap();
+        let cfg = Config::from(toml_cfg);
+        assert_eq!(
+            cfg.block_hosts,
+            vec!["ads.example.com".to_string(), ".tracker.example".to_string()]
+        );
+
+        let toml_again = TomlConfig::from(&cfg);
+        assert_eq!(
+            toml_again.network.block_hosts,
+            vec!["ads.example.com".to_string(), ".tracker.example".to_string()]
+        );
+    }
+
+    #[test]
     fn toml_multi_script_id_array() {
         let s = r#"
 [relay]
@@ -1423,7 +1462,8 @@ script_id = "ABCDEF"
   "mode": "apps_script",
   "auth_key": "MY_SECRET_KEY_123",
   "script_id": "ABCDEF",
-  "listen_port": 8085
+  "listen_port": 8085,
+  "block_hosts": ["ads.example.com", ".tracker.example"]
 }"#;
         let dir = std::env::temp_dir();
         let json_path = dir.join("mhrv-migration-test.json");
@@ -1446,6 +1486,11 @@ script_id = "ABCDEF"
         assert_eq!(cfg.auth_key, cfg2.auth_key);
         assert_eq!(cfg.script_ids_resolved(), cfg2.script_ids_resolved());
         assert_eq!(cfg.listen_port, cfg2.listen_port);
+        assert_eq!(cfg.block_hosts, cfg2.block_hosts);
+        assert_eq!(
+            cfg2.block_hosts,
+            vec!["ads.example.com".to_string(), ".tracker.example".to_string()]
+        );
 
         let _ = std::fs::remove_file(&json_path);
         let _ = std::fs::remove_file(&toml_path);
