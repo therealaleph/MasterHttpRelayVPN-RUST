@@ -206,6 +206,8 @@ upstream_socks5 = "127.0.0.1:50529"
 
 HTTP / HTTPS مثل قبل از Apps Script می‌رود (تغییری نمی‌کند)، تونل بازنویسی SNI برای `google.com` / `youtube.com` همچنان از هر دو دور می‌زند — یوتیوب به سرعت قبل می‌ماند و تلگرام هم تونل واقعی پیدا می‌کند.
 
+هدف‌های دامنه‌ای SOCKS5 معنای remote-DNS را حفظ می‌کنند: اگر پروکسی برای TCP خام مجبور شود hostname را محلی resolve کند و نه Full Tunnel و نه `upstream_socks5` در دسترس باشد، به‌جای نشت DNS plaintext، اتصال را fail-closed می‌کند.
+
 ## حالت تونل کامل
 
 `"mode": "full"` **تمام** ترافیک را end-to-end از Apps Script و یک [tunnel-node](../tunnel-node/) راه دور رد می‌کند — بدون نیاز به نصب گواهی MITM. TCP به‌صورت سشن‌های پایدار تونل، و UDP از کلاینت‌های اندروید / TUN از طریق SOCKS5 `UDP ASSOCIATE` به tunnel-node که UDP واقعی را از سمت سرور منتشر می‌کند. مبادله: تأخیر بیشتر هر درخواست (هر بایت Apps Script → tunnel-node → مقصد می‌رود)، اما برای هر پروتکل و هر برنامه‌ای بدون نصب CA کار می‌کند.

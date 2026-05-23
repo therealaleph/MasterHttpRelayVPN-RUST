@@ -832,7 +832,17 @@ async fn handle_http_client(
         sock.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
         sock.flush().await?;
-        dispatch_tunnel(sock, host, port, fronter, mitm, rewrite_ctx, tunnel_mux).await
+        dispatch_tunnel(
+            sock,
+            host,
+            port,
+            fronter,
+            mitm,
+            rewrite_ctx,
+            tunnel_mux,
+            false,
+        )
+        .await
     } else {
         // Plain HTTP proxy request (e.g. `GET http://…`).
         //
@@ -960,7 +970,18 @@ async fn handle_socks5_client(
         .await?;
     sock.flush().await?;
 
-    dispatch_tunnel(sock, host, port, fronter, mitm, rewrite_ctx, tunnel_mux).await
+    let require_remote_dns = atyp == 0x03;
+    dispatch_tunnel(
+        sock,
+        host,
+        port,
+        fronter,
+        mitm,
+        rewrite_ctx,
+        tunnel_mux,
+        require_remote_dns,
+    )
+    .await
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -1626,6 +1647,7 @@ async fn dispatch_tunnel(
     mitm: Arc<Mutex<MitmCertManager>>,
     rewrite_ctx: Arc<RewriteCtx>,
     tunnel_mux: Option<Arc<TunnelMux>>,
+    require_remote_dns: bool,
 ) -> std::io::Result<()> {
     // 0. User-configured passthrough list wins over every other path.
     //    If the host matches `passthrough_hosts`, we raw-TCP it (through
@@ -1641,7 +1663,7 @@ async fn dispatch_tunnel(
             port,
             via.unwrap_or("direct")
         );
-        plain_tcp_passthrough(sock, &host, port, via).await;
+        plain_tcp_passthrough(sock, &host, port, via, require_remote_dns).await;
         return Ok(());
     }
 
@@ -1675,7 +1697,7 @@ async fn dispatch_tunnel(
             port,
             via.unwrap_or("direct")
         );
-        plain_tcp_passthrough(sock, &host, port, via).await;
+        plain_tcp_passthrough(sock, &host, port, via, require_remote_dns).await;
         return Ok(());
     }
 
@@ -1761,7 +1783,7 @@ async fn dispatch_tunnel(
             port,
             via.unwrap_or("direct")
         );
-        plain_tcp_passthrough(sock, &host, port, via).await;
+        plain_tcp_passthrough(sock, &host, port, via, require_remote_dns).await;
         return Ok(());
     }
 
@@ -1776,7 +1798,14 @@ async fn dispatch_tunnel(
                 host,
                 port
             );
-            plain_tcp_passthrough(sock, &host, port, rewrite_ctx.upstream_socks5.as_deref()).await;
+            plain_tcp_passthrough(
+                sock,
+                &host,
+                port,
+                rewrite_ctx.upstream_socks5.as_deref(),
+                require_remote_dns,
+            )
+            .await;
             return Ok(());
         }
     };
@@ -1802,7 +1831,7 @@ async fn dispatch_tunnel(
                 port,
                 via.unwrap_or("direct")
             );
-            plain_tcp_passthrough(sock, &host, port, via).await;
+            plain_tcp_passthrough(sock, &host, port, via, require_remote_dns).await;
             return Ok(());
         }
     };
@@ -1843,7 +1872,7 @@ async fn dispatch_tunnel(
         port,
         via.unwrap_or("direct")
     );
-    plain_tcp_passthrough(sock, &host, port, via).await;
+    plain_tcp_passthrough(sock, &host, port, via, require_remote_dns).await;
     Ok(())
 }
 
@@ -1854,8 +1883,18 @@ async fn plain_tcp_passthrough(
     host: &str,
     port: u16,
     upstream_socks5: Option<&str>,
+    require_remote_dns: bool,
 ) {
     let target_host = host.trim_start_matches('[').trim_end_matches(']');
+    let target_is_ip = looks_like_ip(target_host);
+    if should_refuse_local_dns_fallback(require_remote_dns, target_host, upstream_socks5) {
+        tracing::warn!(
+            "refusing raw-tcp direct fallback for SOCKS5 domain target {}:{} to avoid local DNS resolution",
+            host,
+            port
+        );
+        return;
+    }
     // Shorter connect timeout for IP literals (4s vs 10s for hostnames).
     // Ported from upstream Python 7b1812c: when the target is an IP (i.e.
     // a raw Telegram DC, or an IP someone hardcoded), and that route is
@@ -1867,7 +1906,7 @@ async fn plain_tcp_passthrough(
     // Hostnames still get 10s because DNS + first-hop TCP genuinely can
     // take that long on flaky links, and the resolver fallbacks already
     // trim the worst case.
-    let connect_timeout = if looks_like_ip(target_host) {
+    let connect_timeout = if target_is_ip {
         std::time::Duration::from_secs(4)
     } else {
         std::time::Duration::from_secs(10)
@@ -1879,6 +1918,16 @@ async fn plain_tcp_passthrough(
                 s
             }
             Err(e) => {
+                if require_remote_dns && !target_is_ip {
+                    tracing::warn!(
+                        "upstream-socks5 {} -> {}:{} failed: {}; refusing local DNS fallback",
+                        proxy,
+                        host,
+                        port,
+                        e
+                    );
+                    return;
+                }
                 tracing::warn!(
                     "upstream-socks5 {} -> {}:{} failed: {} (falling back to direct)",
                     proxy,
@@ -1926,6 +1975,14 @@ async fn plain_tcp_passthrough(
         _ = t1 => {}
         _ = t2 => {}
     }
+}
+
+fn should_refuse_local_dns_fallback(
+    require_remote_dns: bool,
+    target_host: &str,
+    upstream_socks5: Option<&str>,
+) -> bool {
+    require_remote_dns && upstream_socks5.is_none() && !looks_like_ip(target_host)
 }
 
 /// Open a TCP stream to `(host, port)` through an upstream SOCKS5 proxy
@@ -3226,6 +3283,40 @@ mod tests {
         assert_eq!(target.port, 443);
         assert_eq!(payload, b"q");
         assert_eq!(build_socks5_udp_packet(&target, payload), raw);
+    }
+
+    #[test]
+    fn socks5_remote_dns_refuses_direct_hostname_fallback() {
+        assert!(should_refuse_local_dns_fallback(
+            true,
+            "example.com",
+            None
+        ));
+        assert!(should_refuse_local_dns_fallback(
+            true,
+            "sub.example.com",
+            None
+        ));
+    }
+
+    #[test]
+    fn socks5_remote_dns_allows_paths_that_do_not_need_local_dns() {
+        assert!(!should_refuse_local_dns_fallback(true, "1.2.3.4", None));
+        assert!(!should_refuse_local_dns_fallback(
+            true,
+            "2001:db8::1",
+            None
+        ));
+        assert!(!should_refuse_local_dns_fallback(
+            true,
+            "example.com",
+            Some("127.0.0.1:9050")
+        ));
+        assert!(!should_refuse_local_dns_fallback(
+            false,
+            "example.com",
+            None
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
