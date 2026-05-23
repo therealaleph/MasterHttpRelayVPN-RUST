@@ -118,6 +118,11 @@ const YOUTUBE_RELAY_HOSTS: &[&str] = &[
     "youtubei.googleapis.com",
 ];
 
+/// Apps Script request bodies are materialized server-side before user code can
+/// inspect them. Keep the client-side ceiling conservative so mutating uploads
+/// fail locally instead of risking relay corruption or V8 heap pressure.
+pub const APPS_SCRIPT_UPLOAD_MAX_BYTES: usize = 5 * 1024 * 1024;
+
 /// Built-in list of DNS-over-HTTPS endpoints. CONNECTs to these (when
 /// `tunnel_doh` is left at the default of `false`, i.e. bypass enabled)
 /// skip the Apps Script tunnel and exit via plain TCP. Mix of the
@@ -848,7 +853,7 @@ async fn handle_http_client(
         // `http://example.com` URL used to return a 502 here even
         // though `https://example.com` (CONNECT) worked fine.
         match fronter {
-            Some(f) => do_plain_http(sock, &head, &leftover, f).await,
+            Some(f) => do_plain_http(sock, &head, &leftover, f, rewrite_ctx.mode).await,
             None => do_plain_http_passthrough(sock, &head, &leftover, &rewrite_ctx).await,
         }
     }
@@ -2420,6 +2425,18 @@ where
         None => return Ok(false),
     };
 
+    if let Some(reason) = apps_script_upload_rejection_reason(&method, &headers) {
+        tracing::warn!(
+            "rejecting {} upload to {}:{} before Apps Script relay: {}",
+            method,
+            host,
+            port,
+            reason
+        );
+        write_payload_too_large(stream).await?;
+        return Ok(false);
+    }
+
     let body = read_body(stream, &leftover, &headers).await?;
 
     // ── Per-host URL fix-ups ──────────────────────────────────────────
@@ -2711,6 +2728,64 @@ fn invalid_body(msg: impl Into<String>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg.into())
 }
 
+fn is_mutating_upload_method(method: &str) -> bool {
+    method.eq_ignore_ascii_case("POST")
+        || method.eq_ignore_ascii_case("PUT")
+        || method.eq_ignore_ascii_case("PATCH")
+}
+
+fn apps_script_upload_rejection_reason(
+    method: &str,
+    headers: &[(String, String)],
+) -> Option<&'static str> {
+    if !is_mutating_upload_method(method) {
+        return None;
+    }
+
+    let transfer_encoding = header_value(headers, "transfer-encoding");
+    if transfer_encoding
+        .map(|v| {
+            v.split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("chunked"))
+        })
+        .unwrap_or(false)
+    {
+        return Some("chunked mutating upload has no safe Apps Script size bound");
+    }
+
+    let Some(content_length) = header_value(headers, "content-length") else {
+        return Some("mutating upload is missing Content-Length");
+    };
+
+    let Ok(content_length) = content_length.parse::<usize>() else {
+        return None;
+    };
+
+    if content_length > APPS_SCRIPT_UPLOAD_MAX_BYTES {
+        return Some("mutating upload exceeds Apps Script payload ceiling");
+    }
+
+    None
+}
+
+async fn write_payload_too_large<S>(stream: &mut S) -> std::io::Result<()>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    const BODY: &str =
+        "Payload Too Large: Apps Script mode supports request bodies up to 5 MiB.\n";
+    let response = format!(
+        "HTTP/1.1 413 Payload Too Large\r\n\
+         Connection: close\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\
+         Content-Length: {}\r\n\r\n{}",
+        BODY.len(),
+        BODY
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await
+}
+
 async fn read_body<S>(
     stream: &mut S,
     leftover: &[u8],
@@ -2870,9 +2945,23 @@ async fn do_plain_http(
     head: &[u8],
     leftover: &[u8],
     fronter: Arc<DomainFronter>,
+    mode: Mode,
 ) -> std::io::Result<()> {
     let (method, target, _version, headers) = parse_request_head(head)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad request"))?;
+
+    if mode == Mode::AppsScript {
+        if let Some(reason) = apps_script_upload_rejection_reason(&method, &headers) {
+            tracing::warn!(
+                "rejecting {} upload to {} before Apps Script relay: {}",
+                method,
+                target,
+                reason
+            );
+            write_payload_too_large(&mut sock).await?;
+            return Ok(());
+        }
+    }
 
     let body = read_body(&mut sock, leftover, &headers).await?;
 
@@ -3093,6 +3182,85 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    fn apps_script_test_fronter() -> DomainFronter {
+        let toml = r#"
+[relay]
+mode = "apps_script"
+auth_key = "MY_SECRET_KEY_123"
+script_id = "TEST_DEPLOYMENT"
+"#;
+        let cfg = Config::from(toml::from_str::<crate::config::TomlConfig>(toml).unwrap());
+        DomainFronter::new(&cfg).unwrap()
+    }
+
+    #[test]
+    fn apps_script_upload_guard_allows_small_mutating_request() {
+        assert!(apps_script_upload_rejection_reason(
+            "POST",
+            &headers(&[("Content-Length", "1024")]),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn apps_script_upload_guard_ignores_non_mutating_request() {
+        assert!(apps_script_upload_rejection_reason("GET", &headers(&[])).is_none());
+    }
+
+    #[test]
+    fn apps_script_upload_guard_rejects_large_mutating_request() {
+        let oversized = (APPS_SCRIPT_UPLOAD_MAX_BYTES + 1).to_string();
+        assert!(apps_script_upload_rejection_reason(
+            "PUT",
+            &headers(&[("Content-Length", oversized.as_str())]),
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn apps_script_upload_guard_rejects_chunked_mutating_request() {
+        assert!(apps_script_upload_rejection_reason(
+            "PATCH",
+            &headers(&[("Transfer-Encoding", "chunked")]),
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn apps_script_upload_guard_rejects_unknown_length_mutating_request() {
+        assert!(apps_script_upload_rejection_reason("POST", &headers(&[])).is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mitm_large_upload_returns_413_before_reading_body() {
+        let fronter = apps_script_test_fronter();
+        let (mut client, mut server) = duplex(4096);
+
+        client
+            .write_all(
+                format!(
+                    "POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: {}\r\n\r\n",
+                    APPS_SCRIPT_UPLOAD_MAX_BYTES + 1
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        let keep_alive =
+            handle_mitm_request(&mut server, "example.com", 443, &fronter, "https")
+                .await
+                .unwrap();
+
+        let mut response = vec![0u8; 256];
+        let n = client.read(&mut response).await.unwrap();
+        let response = String::from_utf8_lossy(&response[..n]);
+
+        assert!(!keep_alive);
+        assert!(response.starts_with("HTTP/1.1 413 Payload Too Large"));
+        assert!(response.contains("Apps Script mode supports request bodies up to 5 MiB"));
     }
 
     #[test]

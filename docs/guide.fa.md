@@ -392,6 +392,8 @@ sni_hosts = ["www.google.com", "drive.google.com", "docs.google.com"]
 
 HTML یوتیوب سریع می‌آید (از تونل بازنویسی SNI)، اما chunkهای ویدیو از `googlevideo.com` از Apps Script رد می‌شوند. سهمیهٔ رایگان: ~۲۰٬۰۰۰ `UrlFetchApp` در روز، سقف بدنهٔ ۵۰ مگابایت per fetch.
 
+**آپلودهای بزرگ در حالت Apps Script محلی fail می‌شوند.** در حالت `apps_script`، درخواست‌های دارای بدنه (`POST`، `PUT`، `PATCH`) اگر بزرگ‌تر از ۵ MiB باشند، `Transfer-Encoding: chunked` داشته باشند، یا `Content-Length` مشخص نداشته باشند، با `HTTP 413` توسط proxy محلی رد می‌شوند. Apps Script بدنهٔ درخواست را قبل از اینکه کد اسکریپت بتواند آن را stream یا validate کند در حافظه materialize می‌کند، پس کلاینت fail-closed می‌شود.
+
 برای مرور متنی خوب است، برای ۱۰۸۰p دردناک. چند `script_id` بچرخان برای هد روم بیشتر، یا VPN واقعی برای ویدیو.
 
 ### Brotli حذف می‌شود
