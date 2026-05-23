@@ -225,7 +225,7 @@ max_concurrent = 30 × number_of_deployment_ids
 | 6 | 180 | Recommended for heavy use |
 | 12 | 360 | Multi-account power setup |
 
-More deployments = more total concurrency = lower per-session latency. Each batch round-robins across your IDs, spreading load and reducing the chance of hitting any single deployment's quota ceiling.
+More deployments = more total concurrency = lower per-session latency. Each batch is selected from the configured IDs with a local rolling 24-hour ledger, spreading load and steering away from deployments this client has already driven near the free-tier request budget.
 
 **Resource guards:**
 - **50 ops max** per batch — if more sessions are active, the mux splits into multiple batches
