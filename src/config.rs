@@ -538,7 +538,7 @@ fn default_front_domain() -> String {
     "www.google.com".into()
 }
 fn default_listen_host() -> String {
-    "0.0.0.0".into()
+    "127.0.0.1".into()
 }
 fn default_listen_port() -> u16 {
     8085
@@ -548,6 +548,22 @@ fn default_log_level() -> String {
 }
 fn default_verify_ssl() -> bool {
     true
+}
+
+fn is_loopback_listen_host(host: &str) -> bool {
+    let host = host.trim();
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
 }
 
 impl Config {
@@ -652,6 +668,14 @@ impl Config {
                 "listen_port and socks5_port must differ on the same host \
                  (both set to {} on {}). Change one of them in config.toml.",
                 self.listen_port, self.listen_host
+            )));
+        }
+        if !is_loopback_listen_host(&self.listen_host) {
+            return Err(ConfigError::Invalid(format!(
+                "listen_host '{}' is not loopback. Non-loopback proxy binds \
+                 are disabled until inbound HTTP/SOCKS authentication is \
+                 configured; use 127.0.0.1 or ::1 in config.toml.",
+                self.listen_host
             )));
         }
         for (i, g) in self.fronting_groups.iter().enumerate() {
@@ -1184,6 +1208,56 @@ mod tests {
         let cfg: Config = serde_json::from_str(s).unwrap();
         assert!(cfg.validate().is_err());
     }
+
+    #[test]
+    fn defaults_listen_host_to_loopback() {
+        let s = r#"{
+            "mode": "direct"
+        }"#;
+        let cfg: Config = serde_json::from_str(s).unwrap();
+        assert_eq!(cfg.listen_host, "127.0.0.1");
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_accepts_loopback_listen_hosts() {
+        for host in ["127.0.0.1", "::1", "[::1]", "localhost"] {
+            let s = format!(
+                r#"{{
+                    "mode": "direct",
+                    "listen_host": "{}"
+                }}"#,
+                host
+            );
+            let cfg: Config = serde_json::from_str(&s).unwrap();
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("expected loopback host '{}' to validate: {}", host, e));
+        }
+    }
+
+    #[test]
+    fn validate_rejects_non_loopback_listen_hosts() {
+        for host in ["0.0.0.0", "::", "[::]", "192.168.1.10", "example.com"] {
+            let s = format!(
+                r#"{{
+                    "mode": "direct",
+                    "listen_host": "{}"
+                }}"#,
+                host
+            );
+            let cfg: Config = serde_json::from_str(&s).unwrap();
+            let err = cfg
+                .validate()
+                .expect_err(&format!("expected non-loopback host '{}' to fail", host));
+            let msg = format!("{}", err);
+            assert!(
+                msg.contains("not loopback") && msg.contains("inbound HTTP/SOCKS authentication"),
+                "error should explain unsafe bind gate for '{}': {}",
+                host,
+                msg
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1316,6 +1390,7 @@ mode = "direct"
         let toml_cfg: TomlConfig = toml::from_str(s).unwrap();
         let cfg = Config::from(toml_cfg);
         assert_eq!(cfg.google_ip, "216.239.38.120");
+        assert_eq!(cfg.listen_host, "127.0.0.1");
         assert_eq!(cfg.listen_port, 8085);
         assert!(cfg.verify_ssl);
         assert!(cfg.block_doh);
@@ -1445,6 +1520,8 @@ script_id = "ABCDEF"
         assert_eq!(cfg.mode, cfg2.mode);
         assert_eq!(cfg.auth_key, cfg2.auth_key);
         assert_eq!(cfg.script_ids_resolved(), cfg2.script_ids_resolved());
+        assert_eq!(cfg.listen_host, "127.0.0.1");
+        assert_eq!(cfg.listen_host, cfg2.listen_host);
         assert_eq!(cfg.listen_port, cfg2.listen_port);
 
         let _ = std::fs::remove_file(&json_path);

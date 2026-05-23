@@ -4,6 +4,7 @@ mode = "direct"
 [network]
 google_ip = "216.239.38.120"
 front_domain = "www.google.com"
+# Non-loopback binds such as 0.0.0.0 are rejected until inbound proxy authentication is implemented.
 listen_host = "127.0.0.1"
 listen_port = 8085
 socks5_port = 8086

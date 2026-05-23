@@ -269,7 +269,9 @@ The destination sees the exit node's IP, not Google's, so the anti-bot heuristic
 
 ## Sharing via hotspot
 
-mhrv-rs listens on `0.0.0.0` by default, so any device on the same network can use it. Common scenario: share the tunnel from an Android phone to an iPhone, iPad, or laptop over hotspot:
+mhrv-rs listens on `127.0.0.1` by default and rejects non-loopback proxy binds until inbound HTTP/SOCKS authentication is implemented. This prevents accidental open-proxy exposure and Apps Script quota theft on shared Wi-Fi or hotspots.
+
+Hotspot/LAN sharing will return as an explicit authenticated mode in a later release. On current builds, do not change `listen_host` to `0.0.0.0`; startup validation will fail closed. The old sharing workflow was:
 
 1. **Android:** enable mobile hotspot + start the app
 2. **Other device:** connect to the Android hotspot Wi-Fi
@@ -287,7 +289,7 @@ For full device-wide coverage on iOS, use [Shadowrocket](https://apps.apple.com/
 
 Set system HTTP proxy to `192.168.43.1:8080`, or per-app SOCKS5 to `192.168.43.1:1081`.
 
-> If `listen_host` is `127.0.0.1` in your config, change to `0.0.0.0` to allow other devices.
+> Current safety gate: non-loopback values such as `0.0.0.0`, `::`, or a LAN IP are rejected until proxy authentication is available.
 
 ## Running on OpenWRT
 
@@ -306,7 +308,7 @@ chmod +x /usr/bin/mhrv-rs /etc/init.d/mhrv-rs
 logread -e mhrv-rs -f       # tail logs
 ```
 
-LAN devices then point HTTP proxy at the router's LAN IP (default port `8085`) or SOCKS5 at `<router-ip>:8086`. Set `listen_host` to `0.0.0.0` in `/etc/mhrv-rs/config.toml` so the router accepts LAN connections.
+Current builds listen on loopback only. Running the CLI on OpenWRT for local diagnostics still works, but using the router as a LAN-wide proxy requires the upcoming authenticated LAN-sharing mode. Do not set `listen_host` to `0.0.0.0` in `/etc/mhrv-rs/config.toml` on this version; config validation will reject the unsafe bind.
 
 Memory footprint ~15–20 MB resident — fine on anything ≥128 MB RAM. No UI on musl (routers are headless).
 
