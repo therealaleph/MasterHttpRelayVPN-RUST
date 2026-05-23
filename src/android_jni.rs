@@ -70,6 +70,8 @@ extern "C" {
 
 const ANDROID_LOG_INFO: i32 = 4;
 const LOG_RING_CAP: usize = 500;
+const ANDROID_RUNTIME_MIN_WORKERS: usize = 2;
+const ANDROID_RUNTIME_MAX_WORKERS: usize = 4;
 
 fn log_ring() -> &'static Mutex<VecDeque<String>> {
     static RING: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
@@ -158,6 +160,13 @@ fn safe<F: FnOnce() -> R + std::panic::UnwindSafe, R>(default: R, f: F) -> R {
     std::panic::catch_unwind(f).unwrap_or(default)
 }
 
+fn android_runtime_worker_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(ANDROID_RUNTIME_MIN_WORKERS)
+        .clamp(ANDROID_RUNTIME_MIN_WORKERS, ANDROID_RUNTIME_MAX_WORKERS)
+}
+
 /// Build a throwaway tokio runtime for one-shot blocking calls from JNI.
 /// Small, single-worker — sufficient for probes and cert ops.
 fn one_shot_runtime() -> Option<Runtime> {
@@ -210,8 +219,9 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_startProxy(
 
         // Try to build the runtime first — if allocation fails we want to
         // know before spinning up anything stateful.
+        let worker_threads = android_runtime_worker_threads();
         let rt = match tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
+            .worker_threads(worker_threads)
             .enable_all()
             .thread_name("mhrv-worker")
             .build()
@@ -222,6 +232,7 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_startProxy(
                 return 0i64;
             }
         };
+        tracing::info!("android: tokio runtime worker_threads={}", worker_threads);
 
         let base = crate::data_dir::data_dir();
         let mitm = match MitmCertManager::new_in(&base) {
