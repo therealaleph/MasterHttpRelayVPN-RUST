@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -27,6 +27,7 @@ pub const CERT_NAME: &str = "MasterHttpRelayVPN";
 pub const CA_DIR: &str = "ca";
 pub const CA_KEY_FILE: &str = "ca/ca.key";
 pub const CA_CERT_FILE: &str = "ca/ca.crt";
+const DEFAULT_LEAF_CACHE_CAPACITY: usize = 512;
 
 pub struct MitmCertManager {
     /// The CA certificate bytes as they appear on disk.
@@ -41,6 +42,8 @@ pub struct MitmCertManager {
     /// re-made), but that's fine — we never send this cert to browsers.
     ca_cert: Certificate,
     cache: HashMap<String, Arc<ServerConfig>>,
+    cache_order: VecDeque<String>,
+    cache_capacity: usize,
 }
 
 impl MitmCertManager {
@@ -88,6 +91,8 @@ impl MitmCertManager {
             ca_key_pair: key_pair,
             ca_cert,
             cache: HashMap::new(),
+            cache_order: VecDeque::new(),
+            cache_capacity: DEFAULT_LEAF_CACHE_CAPACITY,
         })
     }
 
@@ -127,6 +132,8 @@ impl MitmCertManager {
             ca_key_pair: key_pair,
             ca_cert,
             cache: HashMap::new(),
+            cache_order: VecDeque::new(),
+            cache_capacity: DEFAULT_LEAF_CACHE_CAPACITY,
         })
     }
 
@@ -136,8 +143,9 @@ impl MitmCertManager {
 
     /// Return a rustls ServerConfig for the given domain, ALPN ["http/1.1"].
     pub fn get_server_config(&mut self, domain: &str) -> Result<Arc<ServerConfig>, MitmError> {
-        if let Some(cfg) = self.cache.get(domain) {
-            return Ok(cfg.clone());
+        if let Some(cfg) = self.cache.get(domain).cloned() {
+            self.touch_cached_domain(domain);
+            return Ok(cfg);
         }
         let (leaf_der, leaf_key_der) = self.issue_leaf(domain)?;
 
@@ -149,8 +157,33 @@ impl MitmCertManager {
             .with_single_cert(chain, key)?;
         cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
         let arc = Arc::new(cfg);
-        self.cache.insert(domain.to_string(), arc.clone());
+        self.insert_cached_config(domain.to_string(), arc.clone());
         Ok(arc)
+    }
+
+    fn touch_cached_domain(&mut self, domain: &str) {
+        self.cache_order.retain(|cached| cached != domain);
+        self.cache_order.push_back(domain.to_string());
+    }
+
+    fn insert_cached_config(&mut self, domain: String, cfg: Arc<ServerConfig>) {
+        if self.cache_capacity == 0 {
+            return;
+        }
+
+        if self.cache.remove(&domain).is_some() {
+            self.cache_order.retain(|cached| cached != &domain);
+        }
+
+        while self.cache.len() >= self.cache_capacity {
+            let Some(evicted_domain) = self.cache_order.pop_front() else {
+                break;
+            };
+            self.cache.remove(&evicted_domain);
+        }
+
+        self.cache.insert(domain.clone(), cfg);
+        self.cache_order.push_back(domain);
     }
 
     fn issue_leaf(&self, domain: &str) -> Result<(CertificateDer<'static>, Vec<u8>), MitmError> {
@@ -265,6 +298,44 @@ mod tests {
         let _ = m.get_server_config("a.example.com").unwrap();
         let _ = m.get_server_config("b.example.com").unwrap();
         assert_eq!(m.cache.len(), 2);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn leaf_cache_is_capacity_bounded() {
+        init_crypto();
+        let tmp = tempdir();
+        let mut m = MitmCertManager::new_in(&tmp).unwrap();
+        m.cache_capacity = 2;
+
+        let _ = m.get_server_config("a.example.com").unwrap();
+        let _ = m.get_server_config("b.example.com").unwrap();
+        let _ = m.get_server_config("c.example.com").unwrap();
+
+        assert_eq!(m.cache.len(), 2);
+        assert!(!m.cache.contains_key("a.example.com"));
+        assert!(m.cache.contains_key("b.example.com"));
+        assert!(m.cache.contains_key("c.example.com"));
+        assert_eq!(m.cache_order.len(), 2);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn leaf_cache_hit_refreshes_eviction_order() {
+        init_crypto();
+        let tmp = tempdir();
+        let mut m = MitmCertManager::new_in(&tmp).unwrap();
+        m.cache_capacity = 2;
+
+        let _ = m.get_server_config("a.example.com").unwrap();
+        let _ = m.get_server_config("b.example.com").unwrap();
+        let _ = m.get_server_config("a.example.com").unwrap();
+        let _ = m.get_server_config("c.example.com").unwrap();
+
+        assert_eq!(m.cache.len(), 2);
+        assert!(m.cache.contains_key("a.example.com"));
+        assert!(!m.cache.contains_key("b.example.com"));
+        assert!(m.cache.contains_key("c.example.com"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
