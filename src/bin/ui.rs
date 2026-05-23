@@ -1185,110 +1185,46 @@ impl eframe::App for App {
                 )
             };
 
-            let status_title = if running {
-                let up = started_at.map(|t| t.elapsed()).unwrap_or_default();
-                format!("Traffic  ·  uptime {}", fmt_duration(up))
-            } else {
-                "Traffic  ·  (not running)".to_string()
-            };
-            section(ui, &status_title, |ui| {
-                if let Some(s) = &stats {
-                    // Compact two-column layout so 7 metrics fit in ~4 rows
-                    // instead of a tall vertical strip.
-                    let rows: Vec<(&str, String)> = vec![
-                        ("relay calls", s.relay_calls.to_string()),
-                        ("failures", s.relay_failures.to_string()),
-                        ("coalesced", s.coalesced.to_string()),
-                        (
-                            "cache hits",
-                            format!(
-                                "{} / {}  ({:.0}%)",
-                                s.cache_hits,
-                                s.cache_hits + s.cache_misses,
-                                s.hit_rate()
-                            ),
-                        ),
-                        ("cache size", format!("{} KB", s.cache_bytes / 1024)),
-                        ("bytes relayed", fmt_bytes(s.bytes_relayed)),
-                        (
-                            "active scripts",
-                            format!(
-                                "{} / {}",
-                                s.total_scripts - s.blacklisted_scripts,
-                                s.total_scripts
-                            ),
-                        ),
-                    ];
-                    egui::Grid::new("stats")
-                        .num_columns(4)
-                        .spacing([16.0, 4.0])
-                        .show(ui, |ui| {
-                            for chunk in rows.chunks(2) {
-                                for (label, value) in chunk.iter() {
-                                    ui.add_sized(
-                                        [110.0, 18.0],
-                                        egui::Label::new(
-                                            egui::RichText::new(*label)
-                                                .color(egui::Color32::from_gray(150)),
-                                        ),
-                                    );
-                                    ui.add_sized(
-                                        [140.0, 18.0],
-                                        egui::Label::new(
-                                            egui::RichText::new(value).monospace(),
-                                        ),
-                                    );
-                                }
-                                // Pad the final short row so grid columns stay aligned.
-                                if chunk.len() == 1 {
-                                    ui.label("");
-                                    ui.label("");
-                                }
-                                ui.end_row();
-                            }
-                        });
-                } else {
-                    ui.label(
-                        egui::RichText::new("No traffic yet — click Start and send a request.")
-                            .color(egui::Color32::from_gray(150))
-                            .italics(),
-                    );
-                }
-            });
-
-            // ── Usage today (estimated) — daily budget tracker ───────────────
+            // ── Usage today — daily budget tracker + traffic stats ───────────
             // TODO(quota-dashboard): Replace this inline grid with a dedicated
             // QuotaWidget / QuotaDashboard when the UI is remodeled. The quota
             // state is already wired through UiState.quota and StatsSnapshot.quota.
             if let Some(s) = &stats {
                 ui.add_space(2.0);
 
-                // Show a red hard-stop banner when all accounts are exhausted.
-                if let Some(q) = &quota_state {
-                    if q.global_hard_stop {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(220, 80, 80),
-                            "⚠  All account quota exhausted — Apps Script relay hard-stopped",
-                        );
-                        // TODO(quota-dashboard): disable the Start button here once
-                        // the button state wiring supports conditional disabling.
-                        ui.add_space(4.0);
-                    } else if q.exhausted_count > 0 {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(220, 170, 80),
-                            format!(
-                                "⚠  {}/{} account(s) exhausted — routing to remaining accounts",
-                                q.exhausted_count, q.account_count
-                            ),
-                        );
-                        ui.add_space(2.0);
-                    }
-                }
+                let usage_title = if running {
+                    let up = started_at.map(|t| t.elapsed()).unwrap_or_default();
+                    format!("Usage today  ·  uptime {}", fmt_duration(up))
+                } else {
+                    "Usage today  ·  (not running)".to_string()
+                };
 
-                section(ui, "Usage today (estimated)", |ui| {
+                section(ui, &usage_title, |ui| {
+                    // Hard-stop / exhaustion banners at the top of the section.
+                    if let Some(q) = &quota_state {
+                        if q.global_hard_stop {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(220, 80, 80),
+                                "⚠  All account quota exhausted — Apps Script relay hard-stopped",
+                            );
+                            // TODO(quota-dashboard): disable the Start button here once
+                            // the button state wiring supports conditional disabling.
+                            ui.add_space(4.0);
+                        } else if q.exhausted_count > 0 {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(220, 170, 80),
+                                format!(
+                                    "⚠  {}/{} account(s) exhausted — routing to remaining accounts",
+                                    q.exhausted_count, q.account_count
+                                ),
+                            );
+                            ui.add_space(2.0);
+                        }
+                    }
+
                     // Use quota-tracked daily capacity when available, fall back to
                     // the free-tier default for display purposes.
-                    let (quota_cap, quota_used, quota_remaining, any_exhausted, global_stop) =
+                    let (quota_cap, quota_used, _quota_remaining, any_exhausted, global_stop) =
                         if let Some(q) = &quota_state {
                             (
                                 q.daily_capacity_total.max(1),
@@ -1304,7 +1240,7 @@ impl eframe::App for App {
                     let pct = (quota_used as f64 / quota_cap as f64) * 100.0;
                     let alert = any_exhausted || global_stop;
 
-                    // calls today — turns red when any account is exhausted
+                    // fetches today — turns red when any account is exhausted
                     let calls_str = format!("{} / {}  ({:.1}%)", quota_used, quota_cap, pct);
                     let calls_text = if alert {
                         egui::RichText::new(&calls_str)
@@ -1314,25 +1250,18 @@ impl eframe::App for App {
                         egui::RichText::new(&calls_str).monospace()
                     };
 
-                    // quota remaining — same red treatment
-                    let remaining_str = quota_remaining.to_string();
-                    let remaining_text = if alert {
-                        egui::RichText::new(&remaining_str)
-                            .monospace()
-                            .color(egui::Color32::from_rgb(220, 80, 80))
-                    } else {
-                        egui::RichText::new(&remaining_str).monospace()
-                    };
-
-                    // Next reset from the quota tracker's rolling window, or PT midnight
+                    // Next reset: use rolling window from active accounts, fall back to
+                    // soonest reset across ALL accounts (including stopped ones) when all
+                    // are exhausted, then finally PT midnight as last resort.
                     let reset_str = if let Some(q) = &quota_state {
-                        if let Some(next_reset) = q.next_reset_at {
-                            use std::time::{SystemTime, UNIX_EPOCH};
-                            let now = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0);
-                            let secs = next_reset.saturating_sub(now);
+                        use std::time::{SystemTime, UNIX_EPOCH};
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let reset_ts = q.next_reset_at.or(q.next_reset_at_any);
+                        if let Some(ts) = reset_ts {
+                            let secs = ts.saturating_sub(now);
                             format!("{}h {}m (rolling)", secs / 3600, (secs / 60) % 60)
                         } else {
                             let reset = s.today_reset_secs;
@@ -1347,11 +1276,11 @@ impl eframe::App for App {
                         .num_columns(4)
                         .spacing([16.0, 4.0])
                         .show(ui, |ui| {
-                            // Row 1: calls today | bytes today
+                            // Row 1: fetches today | bytes relayed
                             ui.add_sized(
                                 [110.0, 18.0],
                                 egui::Label::new(
-                                    egui::RichText::new("calls today")
+                                    egui::RichText::new("fetches today")
                                         .color(egui::Color32::from_gray(150)),
                                 ),
                             );
@@ -1362,30 +1291,19 @@ impl eframe::App for App {
                             ui.add_sized(
                                 [110.0, 18.0],
                                 egui::Label::new(
-                                    egui::RichText::new("bytes today")
+                                    egui::RichText::new("bytes relayed")
                                         .color(egui::Color32::from_gray(150)),
                                 ),
                             );
                             ui.add_sized(
                                 [140.0, 18.0],
                                 egui::Label::new(
-                                    egui::RichText::new(fmt_bytes(s.today_bytes)).monospace(),
+                                    egui::RichText::new(fmt_bytes(s.bytes_relayed)).monospace(),
                                 ),
                             );
                             ui.end_row();
 
-                            // Row 2: quota remaining | next reset
-                            ui.add_sized(
-                                [110.0, 18.0],
-                                egui::Label::new(
-                                    egui::RichText::new("remaining")
-                                        .color(egui::Color32::from_gray(150)),
-                                ),
-                            );
-                            ui.add_sized(
-                                [140.0, 18.0],
-                                egui::Label::new(remaining_text),
-                            );
+                            // Row 2: next reset (remaining removed — already shown in fetches today X/Y)
                             ui.add_sized(
                                 [110.0, 18.0],
                                 egui::Label::new(
@@ -1399,9 +1317,47 @@ impl eframe::App for App {
                                     egui::RichText::new(&reset_str).monospace(),
                                 ),
                             );
+                            ui.label("");
+                            ui.label("");
                             ui.end_row();
 
-                            // Row 3: PT day | accounts (if quota available)
+                            // Row 3: relay calls+failures | cache
+                            let relay_str = if s.relay_failures > 0 {
+                                format!("{} ({} failed)", s.relay_calls, s.relay_failures)
+                            } else {
+                                s.relay_calls.to_string()
+                            };
+                            ui.add_sized(
+                                [110.0, 18.0],
+                                egui::Label::new(
+                                    egui::RichText::new("relay calls")
+                                        .color(egui::Color32::from_gray(150)),
+                                ),
+                            );
+                            ui.add_sized(
+                                [140.0, 18.0],
+                                egui::Label::new(egui::RichText::new(&relay_str).monospace()),
+                            );
+                            let cache_total = s.cache_hits + s.cache_misses;
+                            let cache_str = if cache_total > 0 {
+                                format!("{}/{} ({:.0}% hit)", s.cache_hits, cache_total, s.hit_rate())
+                            } else {
+                                "—".to_string()
+                            };
+                            ui.add_sized(
+                                [110.0, 18.0],
+                                egui::Label::new(
+                                    egui::RichText::new("cache")
+                                        .color(egui::Color32::from_gray(150)),
+                                ),
+                            );
+                            ui.add_sized(
+                                [140.0, 18.0],
+                                egui::Label::new(egui::RichText::new(&cache_str).monospace()),
+                            );
+                            ui.end_row();
+
+                            // Row 4: PT day | accounts (if quota available)
                             ui.add_sized(
                                 [110.0, 18.0],
                                 egui::Label::new(
@@ -1449,7 +1405,40 @@ impl eframe::App for App {
                                 ui.label("");
                             }
                             ui.end_row();
-                        });
+
+                            // Row 5: data transferred with estimated daily total
+                            if let Some(q) = &quota_state {
+                                if q.bytes_total > 0 {
+                                    let data_str = if q.requests_used_total > 0 {
+                                        let avg = q.bytes_total as f64 / q.requests_used_total as f64;
+                                        let est = (avg * q.daily_capacity_total as f64) as u64;
+                                        format!(
+                                            "{} / {} (est.)",
+                                            fmt_bytes_approx(q.bytes_total),
+                                            fmt_bytes_approx(est),
+                                        )
+                                    } else {
+                                        fmt_bytes_approx(q.bytes_total)
+                                    };
+                                    ui.add_sized(
+                                        [110.0, 18.0],
+                                        egui::Label::new(
+                                            egui::RichText::new("data transferred")
+                                                .color(egui::Color32::from_gray(150)),
+                                        ),
+                                    );
+                                    ui.add_sized(
+                                        [140.0, 18.0],
+                                        egui::Label::new(
+                                            egui::RichText::new(&data_str).monospace(),
+                                        ),
+                                    );
+                                    ui.label("");
+                                    ui.label("");
+                                    ui.end_row();
+                                }
+                            }
+                        }); // end egui::Grid "usage_today"
 
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
@@ -2113,6 +2102,12 @@ fn fmt_bytes(b: u64) -> String {
     } else {
         format!("{} B", b)
     }
+}
+
+/// Approximate bytes display with a `~` prefix, used for quota tracker totals
+/// where the value is an estimate (bytes_up + bytes_down from relay payloads).
+fn fmt_bytes_approx(b: u64) -> String {
+    format!("~{}", fmt_bytes(b))
 }
 
 // ---------- Background thread: owns the tokio runtime + proxy lifecycle ----------
