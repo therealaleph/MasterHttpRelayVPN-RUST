@@ -8,6 +8,7 @@ listen_host = "127.0.0.1"
 listen_port = 8085
 socks5_port = 8086
 verify_ssl = true
+block_hosts = []
 
 [network.hosts]
 

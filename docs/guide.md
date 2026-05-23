@@ -206,6 +206,17 @@ upstream_socks5 = "127.0.0.1:50529"
 
 HTTP / HTTPS keeps going through Apps Script (no change), and the SNI-rewrite tunnel for `google.com` / `youtube.com` keeps bypassing both — YouTube stays as fast as before while Telegram gets a real tunnel.
 
+## Local host blocking
+
+Use `block_hosts` for destinations that should be answered locally instead of spending Apps Script quota, tunnel-node capacity, or upstream SOCKS5 traffic. Exact entries match only that hostname; entries that start with `.` match the parent suffix and its subdomains.
+
+```toml
+[network]
+block_hosts = ["ads.example.com", ".tracker.example"]
+```
+
+Blocked HTTP and HTTP CONNECT requests receive a local `204 No Content` response. SOCKS5 CONNECT requests receive a ruleset failure reply before any outbound connection is opened.
+
 ## Full Tunnel mode
 
 `"mode": "full"` routes **all** traffic end-to-end through Apps Script and a remote [tunnel-node](../tunnel-node/) — no MITM certificate needed. TCP carried as persistent tunnel sessions, UDP from Android / TUN clients via SOCKS5 `UDP ASSOCIATE` to the tunnel-node which emits real UDP server-side. Trade-off: higher per-request latency (every byte goes Apps Script → tunnel-node → destination), but works for any protocol and any app, no CA install required.
@@ -356,6 +367,7 @@ This port focuses on the **`apps_script` mode** — the only one that reliably w
 - [x] Script IDs masked in logs (`prefix…suffix`) so logs don't leak deployment IDs
 - [x] Desktop UI (egui) — cross-platform, no bundler needed
 - [x] Optional upstream SOCKS5 chaining for non-HTTP traffic (Telegram MTProto, IMAP, SSH…)
+- [x] Local `block_hosts` short-circuit before relay, tunnel, SNI rewrite, or upstream SOCKS5 dispatch
 - [x] Connection pool pre-warm on startup
 - [x] Per-connection SNI rotation across `{www, mail, drive, docs, calendar}.google.com`
 - [x] Optional parallel script-ID dispatch (`parallel_relay`): fan-out to N script instances, return first success
