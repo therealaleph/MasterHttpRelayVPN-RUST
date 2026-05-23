@@ -22,6 +22,12 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const WIN_WIDTH: f32 = 520.0;
 const WIN_HEIGHT: f32 = 680.0;
 const LOG_MAX: usize = 200;
+const UI_STATS_POLL_EVERY: Duration = Duration::from_millis(700);
+const UI_ACTIVE_REPAINT_AFTER: Duration = Duration::from_millis(500);
+const UI_IDLE_REPAINT_AFTER: Duration = Duration::from_secs(2);
+const UI_TRANSIENT_TTL: Duration = Duration::from_secs(10);
+const UI_TOAST_TTL: Duration = Duration::from_secs(5);
+const UI_LOAD_ERROR_TOAST_TTL: Duration = Duration::from_secs(30);
 
 fn main() -> eframe::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -213,6 +219,50 @@ struct App {
     form: FormState,
     last_poll: Instant,
     toast: Option<(String, Instant)>,
+}
+
+impl App {
+    fn ui_needs_active_repaint(&self) -> bool {
+        let state = self.shared.state.lock().unwrap();
+        state.needs_active_repaint() || self.toast_is_visible()
+    }
+
+    fn toast_is_visible(&self) -> bool {
+        self.toast.as_ref().map_or(false, |(msg, created_at)| {
+            let ttl = if msg.contains("failed to load") {
+                UI_LOAD_ERROR_TOAST_TTL
+            } else {
+                UI_TOAST_TTL
+            };
+            created_at.elapsed() < ttl
+        })
+    }
+}
+
+impl UiState {
+    fn needs_active_repaint(&self) -> bool {
+        self.running
+            || self.proxy_active
+            || self.cert_op_in_progress
+            || self.download_in_progress
+            || self
+                .last_test_msg_at
+                .map_or(false, |t| t.elapsed() < UI_TRANSIENT_TTL)
+            || self
+                .ca_trusted_at
+                .map_or(false, |t| t.elapsed() < UI_TRANSIENT_TTL)
+            || self
+                .last_update_check_at
+                .map_or(false, |t| t.elapsed() < UI_TRANSIENT_TTL)
+            || self
+                .last_download_at
+                .map_or(false, |t| t.elapsed() < UI_TRANSIENT_TTL)
+            || matches!(self.last_update_check, Some(UpdateProbeState::InFlight))
+            || self
+                .sni_probe
+                .values()
+                .any(|probe| matches!(probe, SniProbeState::InFlight))
+    }
 }
 
 #[derive(Clone)]
@@ -698,11 +748,16 @@ fn form_row(
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
-        if self.last_poll.elapsed() > Duration::from_millis(700) {
+        let needs_active_repaint = self.ui_needs_active_repaint();
+        if needs_active_repaint && self.last_poll.elapsed() > UI_STATS_POLL_EVERY {
             let _ = self.cmd_tx.send(Cmd::PollStats);
             self.last_poll = Instant::now();
         }
-        ctx.request_repaint_after(Duration::from_millis(500));
+        ctx.request_repaint_after(if needs_active_repaint {
+            UI_ACTIVE_REPAINT_AFTER
+        } else {
+            UI_IDLE_REPAINT_AFTER
+        });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.style_mut().spacing.item_spacing = egui::vec2(8.0, 6.0);
@@ -1477,18 +1532,17 @@ impl eframe::App for App {
             // stale messages don't keep pushing the log panel off-screen.
             // Priority: update-check in flight > fresh test msg > fresh CA
             // result > update-check result. Old/expired entries are dropped.
-            const TRANSIENT_TTL: Duration = Duration::from_secs(10);
             let (test_msg_fresh, ca_trusted_fresh, update_check_fresh, download_fresh) = {
                 let s = self.shared.state.lock().unwrap();
                 (
                     s.last_test_msg_at
-                        .map_or(false, |t| t.elapsed() < TRANSIENT_TTL),
+                        .map_or(false, |t| t.elapsed() < UI_TRANSIENT_TTL),
                     s.ca_trusted_at
-                        .map_or(false, |t| t.elapsed() < TRANSIENT_TTL),
+                        .map_or(false, |t| t.elapsed() < UI_TRANSIENT_TTL),
                     s.last_update_check_at
-                        .map_or(false, |t| t.elapsed() < TRANSIENT_TTL),
+                        .map_or(false, |t| t.elapsed() < UI_TRANSIENT_TTL),
                     s.last_download_at
-                        .map_or(false, |t| t.elapsed() < TRANSIENT_TTL),
+                        .map_or(false, |t| t.elapsed() < UI_TRANSIENT_TTL),
                 )
             };
 
@@ -1693,9 +1747,9 @@ impl eframe::App for App {
             // 30s instead of 5 because they explain why the form looks empty.
             if let Some((msg, t)) = &self.toast {
                 let ttl = if msg.contains("failed to load") {
-                    Duration::from_secs(30)
+                    UI_LOAD_ERROR_TOAST_TTL
                 } else {
-                    Duration::from_secs(5)
+                    UI_TOAST_TTL
                 };
                 if t.elapsed() < ttl {
                     ui.add_space(4.0);
@@ -1961,6 +2015,41 @@ fn fmt_bytes(b: u64) -> String {
         format!("{:.1} KB", b as f64 / K as f64)
     } else {
         format!("{} B", b)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_ui_does_not_request_active_repaint() {
+        let state = UiState::default();
+        assert!(!state.needs_active_repaint());
+    }
+
+    #[test]
+    fn running_proxy_requests_active_repaint() {
+        let mut state = UiState::default();
+        state.running = true;
+        assert!(state.needs_active_repaint());
+    }
+
+    #[test]
+    fn inflight_probe_requests_active_repaint() {
+        let mut state = UiState::default();
+        state
+            .sni_probe
+            .insert("docs.google.com".into(), SniProbeState::InFlight);
+        assert!(state.needs_active_repaint());
+    }
+
+    #[test]
+    fn expired_transient_state_does_not_keep_ui_active() {
+        let mut state = UiState::default();
+        state.last_test_msg_at =
+            Some(Instant::now() - UI_TRANSIENT_TTL - Duration::from_millis(1));
+        assert!(!state.needs_active_repaint());
     }
 }
 
