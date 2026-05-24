@@ -317,6 +317,8 @@ Memory footprint ~15–20 MB resident — fine on anything ≥128 MB RAM. No UI 
 - **`mhrv-rs test-sni`** — parallel TLS probe of every SNI name in your rotation pool against `google_ip`. Tells you which front-domain names pass through your ISP's DPI. UI has same thing in **SNI pool…** window with checkboxes, per-row **Test** buttons, and **Keep ✓ only** to auto-trim.
 - **Periodic stats** logged every 60 s at `info` level (relay calls, cache hit rate, bytes relayed, active vs blacklisted scripts). UI shows live.
 
+When `block_quic = true`, the SOCKS5 UDP relay drops UDP/443 datagrams and answers DNS HTTPS/SVCB (type 65/64) questions with an empty successful response. Browsers then skip HTTP/3 advertisement and fall back to TCP/HTTPS sooner, without forwarding those QUIC discovery packets through the relay.
+
 ### SNI pool editor
 
 By default, mhrv-rs rotates through `{www, mail, drive, docs, calendar}.google.com` on outbound TLS to your `google_ip`, to avoid fingerprinting one name too heavily. Some may be locally blocked (e.g. `mail.google.com` has been targeted in Iran at various times).

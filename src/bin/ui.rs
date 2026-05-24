@@ -1193,6 +1193,11 @@ impl eframe::App for App {
                         ),
                         ("cache size", format!("{} KB", s.cache_bytes / 1024)),
                         ("bytes relayed", fmt_bytes(s.bytes_relayed)),
+                        ("QUIC drops", s.policy_quic_udp_drops.to_string()),
+                        (
+                            "HTTPS RR",
+                            s.policy_https_rr_suppressed.to_string(),
+                        ),
                         (
                             "active scripts",
                             format!(

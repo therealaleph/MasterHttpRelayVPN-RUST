@@ -10,6 +10,8 @@ listen_host = "127.0.0.1"
 listen_port = 8085
 socks5_port = 8086
 verify_ssl = true
+# Suppress QUIC UDP/443 and DNS HTTPS/SVCB hints so browsers fall back to TCP.
+block_quic = true
 
 [network.hosts]
 
