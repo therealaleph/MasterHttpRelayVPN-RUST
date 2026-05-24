@@ -29,6 +29,13 @@ pub const CA_KEY_FILE: &str = "ca/ca.key";
 pub const CA_CERT_FILE: &str = "ca/ca.crt";
 const DEFAULT_LEAF_CACHE_CAPACITY: usize = 512;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MitmCacheStats {
+    pub leaf_entries: usize,
+    pub leaf_capacity: usize,
+    pub leaf_evictions: u64,
+}
+
 pub struct MitmCertManager {
     /// The CA certificate bytes as they appear on disk.
     /// This is what we chain onto leaves so browsers validate against
@@ -44,6 +51,7 @@ pub struct MitmCertManager {
     cache: HashMap<String, Arc<ServerConfig>>,
     cache_order: VecDeque<String>,
     cache_capacity: usize,
+    cache_evictions: u64,
 }
 
 impl MitmCertManager {
@@ -93,6 +101,7 @@ impl MitmCertManager {
             cache: HashMap::new(),
             cache_order: VecDeque::new(),
             cache_capacity: DEFAULT_LEAF_CACHE_CAPACITY,
+            cache_evictions: 0,
         })
     }
 
@@ -134,6 +143,7 @@ impl MitmCertManager {
             cache: HashMap::new(),
             cache_order: VecDeque::new(),
             cache_capacity: DEFAULT_LEAF_CACHE_CAPACITY,
+            cache_evictions: 0,
         })
     }
 
@@ -161,6 +171,14 @@ impl MitmCertManager {
         Ok(arc)
     }
 
+    pub fn cache_stats(&self) -> MitmCacheStats {
+        MitmCacheStats {
+            leaf_entries: self.cache.len(),
+            leaf_capacity: self.cache_capacity,
+            leaf_evictions: self.cache_evictions,
+        }
+    }
+
     fn touch_cached_domain(&mut self, domain: &str) {
         self.cache_order.retain(|cached| cached != domain);
         self.cache_order.push_back(domain.to_string());
@@ -179,7 +197,9 @@ impl MitmCertManager {
             let Some(evicted_domain) = self.cache_order.pop_front() else {
                 break;
             };
-            self.cache.remove(&evicted_domain);
+            if self.cache.remove(&evicted_domain).is_some() {
+                self.cache_evictions = self.cache_evictions.saturating_add(1);
+            }
         }
 
         self.cache.insert(domain.clone(), cfg);
@@ -317,6 +337,14 @@ mod tests {
         assert!(m.cache.contains_key("b.example.com"));
         assert!(m.cache.contains_key("c.example.com"));
         assert_eq!(m.cache_order.len(), 2);
+        assert_eq!(
+            m.cache_stats(),
+            MitmCacheStats {
+                leaf_entries: 2,
+                leaf_capacity: 2,
+                leaf_evictions: 1,
+            }
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -336,6 +364,36 @@ mod tests {
         assert!(m.cache.contains_key("a.example.com"));
         assert!(!m.cache.contains_key("b.example.com"));
         assert!(m.cache.contains_key("c.example.com"));
+        assert_eq!(m.cache_stats().leaf_evictions, 1);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn cache_stats_reports_leaf_cache_capacity_and_evictions() {
+        init_crypto();
+        let tmp = tempdir();
+        let mut m = MitmCertManager::new_in(&tmp).unwrap();
+        m.cache_capacity = 1;
+
+        let _ = m.get_server_config("a.example.com").unwrap();
+        assert_eq!(
+            m.cache_stats(),
+            MitmCacheStats {
+                leaf_entries: 1,
+                leaf_capacity: 1,
+                leaf_evictions: 0,
+            }
+        );
+
+        let _ = m.get_server_config("b.example.com").unwrap();
+        assert_eq!(
+            m.cache_stats(),
+            MitmCacheStats {
+                leaf_entries: 1,
+                leaf_capacity: 1,
+                leaf_evictions: 1,
+            }
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

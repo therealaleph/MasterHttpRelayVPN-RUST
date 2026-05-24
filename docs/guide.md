@@ -339,7 +339,7 @@ This port focuses on the **`apps_script` mode** — the only one that reliably w
 
 - [x] Local HTTP proxy (CONNECT for HTTPS, plain forwarding for HTTP)
 - [x] Local SOCKS5 with smart TLS / HTTP / raw-TCP dispatch (Telegram, xray, etc.)
-- [x] MITM with on-the-fly per-domain certs via `rcgen`
+- [x] MITM with on-the-fly per-domain certs via `rcgen`; generated leaf configs are held in a bounded LRU cache
 - [x] CA generation + auto-install on macOS / Linux / Windows
 - [x] Firefox NSS cert install (best-effort via `certutil`)
 - [x] Apps Script JSON relay protocol-compatible with `Code.gs`
@@ -347,7 +347,7 @@ This port focuses on the **`apps_script` mode** — the only one that reliably w
 - [x] Gzip response decoding
 - [x] Multi-script round-robin
 - [x] Auto-blacklist failing scripts on 429 / quota errors (10 min cooldown)
-- [x] Response cache (50 MB, FIFO + TTL, `Cache-Control: max-age` aware, heuristics for static assets)
+- [x] Response cache (50 MB, LRU + TTL, `Cache-Control: max-age` aware, heuristics for static assets)
 - [x] Request coalescing: concurrent identical GETs share one upstream fetch
 - [x] SNI-rewrite tunnels for `google.com`, `youtube.com`, `youtu.be`, `youtube-nocookie.com`, `fonts.googleapis.com`, configurable via `hosts` map
 - [x] Automatic redirect handling on the relay (`/exec` → `googleusercontent.com`)
