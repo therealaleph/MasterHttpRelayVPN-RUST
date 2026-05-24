@@ -230,7 +230,8 @@ More deployments = more total concurrency = lower per-session latency. Each batc
 **Resource guards:**
 - **50 ops max** per batch — if more sessions are active, the mux splits into multiple batches
 - **4 MB payload cap** per batch — well under Apps Script's 50 MB limit
-- **30 s timeout** per batch — slow / dead targets can't block other sessions forever
+- **30 s header/connect timeout** per batch — slow / dead targets can't block other sessions forever
+- **300 s per-chunk stream timeout** after headers arrive — slow large downloads can keep moving without being killed by the shorter header budget
 
 ### Full mode quick start
 
@@ -253,6 +254,8 @@ More deployments = more total concurrency = lower per-session latency. Each batc
    mode = "full"
    script_id = ["id1", "id2", "id3", "id4", "id5", "id6"]
    auth_key = "your-secret"
+   request_timeout_secs = 30
+   stream_timeout_secs = 300
    ```
 
 ## Exit node
@@ -364,12 +367,13 @@ This port focuses on the **`apps_script` mode** — the only one that reliably w
 - [x] OpenWRT / Alpine / musl builds — static binaries, procd init script included
 - [x] **Exit node** support for Cloudflare-fronted sites (v1.9.4+)
 - [x] **Goog.script.init iframe unwrap** — defense-in-depth against deployments that return HtmlService-wrapped responses (v1.9.6+)
+- [x] Range-aware large download streaming with resume support for `Range: bytes=N-` requests
+- [x] Separate relay header/connect timeout and per-chunk body idle timeout
 
 Intentionally **not** implemented:
 
 - **HTTP/2 multiplexing** — `h2` crate state machine has too many subtle hang cases; coalescing + 20-conn pool gets most of the benefit
 - **Request batching (`q:[...]` mode in apps_script mode)** — connection pool + tokio async already parallelizes well; batching adds ~200 lines of state for unclear gain
-- **Range-based parallel download** — edge cases real (non-Range servers, chunked mid-stream); YouTube already bypasses Apps Script via SNI-rewrite tunnel
 - **Other modes** (`domain_fronting`, `google_fronting`, `custom_domain`) — Cloudflare killed generic domain fronting in 2024; Cloud Run needs a paid plan
 
 ## Known limitations
@@ -378,6 +382,7 @@ These are inherent to the Apps Script + domain-fronting approach, not bugs in th
 
 - **User-Agent fixed to `Google-Apps-Script`** for traffic through the relay. `UrlFetchApp.fetch()` doesn't allow override. Sites that detect bots (Google search, some CAPTCHAs) serve degraded / no-JS pages. Workaround: add the affected domain to the `hosts` map so it's routed through the SNI-rewrite tunnel with your real browser's UA. `google.com`, `youtube.com`, `fonts.googleapis.com` are already there.
 - **Video playback slow and quota-limited** for anything through the relay. YouTube HTML loads fast (SNI-rewrite tunnel), but `googlevideo.com` chunks go through Apps Script. Free tier: ~20k `UrlFetchApp` calls / day, 50 MB body cap per fetch. Fine for text browsing, painful for 1080p. Rotate multiple `script_id`s for headroom, or use a real VPN for video.
+- **Large downloads still consume Apps Script calls.** The relay can stream range-capable responses in chunks and resume cleanly when clients retry with `Range: bytes=N-`, but every chunk is still a `UrlFetchApp` invocation. `request_timeout_secs` controls connection/headers; `stream_timeout_secs` controls idle time between body chunks.
 - **Brotli stripped** from forwarded `Accept-Encoding`. Apps Script can decompress gzip but not `br`; forwarding `br` would garble responses. Minor size overhead.
 - **WebSockets don't work** through the relay — it's request / response JSON. Sites that upgrade to WS fail (ChatGPT streaming, Discord voice, etc.).
 - **HSTS-preloaded / hard-pinned sites** reject the MITM cert. Most sites are fine; a handful aren't.

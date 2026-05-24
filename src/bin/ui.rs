@@ -286,14 +286,16 @@ struct FormState {
     /// there is no UI editor for these yet, only file-edited config.
     /// See config.rs `fronting_groups`.
     fronting_groups: Vec<FrontingGroup>,
-    /// Auto-blacklist tuning + per-batch timeout. Config-only knobs (no UI
+    /// Auto-blacklist tuning + relay timeouts. Config-only knobs (no UI
     /// fields yet — power-user file edit). Round-tripped through FormState
     /// so Save preserves the user's hand-edited values. See config.rs
-    /// `auto_blacklist_*` and `request_timeout_secs`.
+    /// `auto_blacklist_*`, `request_timeout_secs`, and
+    /// `stream_timeout_secs`.
     auto_blacklist_strikes: u32,
     auto_blacklist_window_secs: u64,
     auto_blacklist_cooldown_secs: u64,
     request_timeout_secs: u64,
+    stream_timeout_secs: u64,
     /// Optional second-hop exit node for CF-anti-bot bypass (chatgpt.com /
     /// claude.ai / grok.com / x.com). Config-only — no UI editor yet.
     /// See `assets/exit_node/` for the generic exit-node handler.
@@ -391,6 +393,7 @@ fn load_form() -> (FormState, Option<String>) {
             auto_blacklist_window_secs: c.auto_blacklist_window_secs,
             auto_blacklist_cooldown_secs: c.auto_blacklist_cooldown_secs,
             request_timeout_secs: c.request_timeout_secs,
+            stream_timeout_secs: c.stream_timeout_secs,
             exit_node: c.exit_node.clone(),
         }
     } else {
@@ -427,12 +430,14 @@ fn load_form() -> (FormState, Option<String>) {
             bypass_doh_hosts: Vec::new(),
             block_doh: true,
             fronting_groups: Vec::new(),
-            // Defaults match `default_auto_blacklist_*` and
-            // `default_request_timeout_secs` in src/config.rs.
+            // Defaults match `default_auto_blacklist_*`,
+            // `default_request_timeout_secs`, and
+            // `default_stream_timeout_secs` in src/config.rs.
             auto_blacklist_strikes: 3,
             auto_blacklist_window_secs: 30,
             auto_blacklist_cooldown_secs: 120,
             request_timeout_secs: 30,
+            stream_timeout_secs: 300,
             exit_node: mhrv_rs::config::ExitNodeConfig::default(),
         }
     };
@@ -610,7 +615,7 @@ impl FormState {
             // batch alongside the system-proxy toggle (#432).
             coalesce_step_ms: 0,
             coalesce_max_ms: 0,
-            // Auto-blacklist + batch timeout: config-only knobs (#391,
+            // Auto-blacklist + relay timeouts: config-only knobs (#391,
             // #444, #430). Round-trip through FormState so Save doesn't
             // drop hand-edited values. UI editor planned alongside the
             // v1.8.x desktop UI batch.
@@ -618,6 +623,7 @@ impl FormState {
             auto_blacklist_window_secs: self.auto_blacklist_window_secs,
             auto_blacklist_cooldown_secs: self.auto_blacklist_cooldown_secs,
             request_timeout_secs: self.request_timeout_secs,
+            stream_timeout_secs: self.stream_timeout_secs,
             // Exit-node config (CF-anti-bot bypass for chatgpt.com / claude.ai
             // / grok.com / x.com). Round-trip through FormState — config-only
             // editing for now, UI editor planned for v1.9.x desktop UI batch.

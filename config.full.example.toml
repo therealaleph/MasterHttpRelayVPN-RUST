@@ -2,6 +2,11 @@
 mode = "full"
 script_id = "YOUR_APPS_SCRIPT_DEPLOYMENT_ID"
 auth_key = "CHANGE_ME_TO_A_STRONG_SECRET"
+# Response header/connect timeout for each relay request.
+request_timeout_secs = 30
+# Per-body-chunk idle timeout after headers arrive. Keep this larger than
+# request_timeout_secs so slow large downloads can continue streaming.
+stream_timeout_secs = 300
 
 [network]
 google_ip = "216.239.38.120"

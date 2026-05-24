@@ -230,7 +230,8 @@ HTTP / HTTPS مثل قبل از Apps Script می‌رود (تغییری نمی�
 **محافظ‌های منابع:**
 - **حداکثر ۵۰ op** در هر بَچ — اگر سشن‌های فعال بیشتر باشند، مالتی‌پلکسر چند بَچ می‌فرستد
 - **سقف payload ۴ مگابایت** در هر بَچ — خیلی کمتر از ۵۰ مگابایت Apps Script
-- **timeout ۳۰ ثانیه** هر بَچ — مقصد کند / مرده نمی‌تواند سایر سشن‌ها را گیر بیاندازد
+- **timeout ۳۰ ثانیه برای اتصال و هدرها** در هر بَچ — مقصد کند / مرده نمی‌تواند سایر سشن‌ها را گیر بیاندازد
+- **timeout ۳۰۰ ثانیه برای هر chunk بدنه** بعد از رسیدن هدرها — دانلودهای بزرگ و کند با بودجهٔ کوتاه هدر قطع نمی‌شوند
 
 ### راه‌اندازی سریع حالت full
 
@@ -253,6 +254,8 @@ HTTP / HTTPS مثل قبل از Apps Script می‌رود (تغییری نمی�
    mode = "full"
    script_id = ["id1", "id2", "id3", "id4", "id5", "id6"]
    auth_key = "your-secret"
+   request_timeout_secs = 30
+   stream_timeout_secs = 300
    ```
 
 ## Exit node
@@ -368,6 +371,8 @@ sni_hosts = ["www.google.com", "drive.google.com", "docs.google.com"]
 | بیلد musl | OpenWRT / Alpine / محیط‌های بدون libc — باینری استاتیک، با procd init |
 | **Exit node** | برای سایت‌های پشت Cloudflare (v1.9.4+) |
 | **Unwrap goog.script.init** | دفاع‌در‌عمق در مقابل Deploymentهایی که پاسخ HtmlService-wrapped می‌فرستند (v1.9.6+) |
+| دانلود بزرگ Range-aware | استریم chunk شده و resume برای درخواست‌های `Range: bytes=N-` |
+| timeout جدا برای رله | `request_timeout_secs` برای اتصال/هدر و `stream_timeout_secs` برای idle هر chunk بدنه |
 
 ### عمداً پیاده نشده
 
@@ -375,7 +380,6 @@ sni_hosts = ["www.google.com", "drive.google.com", "docs.google.com"]
 |---|---|
 | HTTP/2 multiplexing | state machine کریت `h2` (stream IDs، flow control، GOAWAY) موارد hang ظریف زیادی دارد؛ coalescing + pool ۲۰-conn بیشتر فایده را می‌گیرد |
 | Batch (`q:[...]` در apps_script) | connection pool + tokio async از قبل خوب موازی‌سازی می‌کند؛ batch ~۲۰۰ خط مدیریت state اضافه می‌کند با سود نامشخص |
-| Range-based parallel download | edge case‌های واقعی (سرورهای بدون Range، chunked وسط stream)؛ ویدیوی یوتیوب از قبل با تونل بازنویسی SNI، Apps Script را دور می‌زند |
 | حالت‌های `domain_fronting` / `google_fronting` / `custom_domain` | Cloudflare در ۲۰۲۴ domain fronting عمومی را کشت؛ Cloud Run پلن پولی می‌خواهد |
 
 ## محدودیت‌های شناخته‌شده
@@ -393,6 +397,10 @@ sni_hosts = ["www.google.com", "drive.google.com", "docs.google.com"]
 HTML یوتیوب سریع می‌آید (از تونل بازنویسی SNI)، اما chunkهای ویدیو از `googlevideo.com` از Apps Script رد می‌شوند. سهمیهٔ رایگان: ~۲۰٬۰۰۰ `UrlFetchApp` در روز، سقف بدنهٔ ۵۰ مگابایت per fetch.
 
 برای مرور متنی خوب است، برای ۱۰۸۰p دردناک. چند `script_id` بچرخان برای هد روم بیشتر، یا VPN واقعی برای ویدیو.
+
+### دانلودهای بزرگ هنوز سهمیه مصرف می‌کنند
+
+رله می‌تواند پاسخ‌های Range-capable را chunk شده استریم کند و وقتی کلاینت با `Range: bytes=N-` ادامه می‌دهد، resume تمیز داشته باشد. اما هر chunk هنوز یک اجرای `UrlFetchApp` است. `request_timeout_secs` فقط اتصال و رسیدن هدرها را کنترل می‌کند؛ `stream_timeout_secs` سکوت بین chunkهای بدنه را.
 
 ### Brotli حذف می‌شود
 

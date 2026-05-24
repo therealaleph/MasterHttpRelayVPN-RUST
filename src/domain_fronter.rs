@@ -5804,6 +5804,47 @@ Content-Length: 45812\r\n\r\n"
     }
 
     #[test]
+    fn parse_range_start_accepts_resume_ranges() {
+        assert_eq!(parse_range_start("bytes=123-"), Some(123));
+        assert_eq!(parse_range_start("bytes=123-456"), Some(123));
+        assert_eq!(parse_range_start(" bytes=0-999 "), Some(0));
+        assert_eq!(parse_range_start("items=123-456"), None);
+        assert_eq!(parse_range_start("bytes=-500"), None);
+    }
+
+    #[test]
+    fn validate_probe_range_at_offset_accepts_exact_resume_probe() {
+        let headers = vec![(
+            "Content-Range".to_string(),
+            "bytes 262144-524287/1048576".to_string(),
+        )];
+        let body = vec![0u8; 262144];
+        let range = validate_probe_range_at_offset(206, &headers, &body, 262144, 524287)
+            .expect("exact resume probe must validate");
+
+        assert_eq!(
+            range,
+            ContentRange {
+                start: 262144,
+                end: 524287,
+                total: 1048576,
+            }
+        );
+    }
+
+    #[test]
+    fn validate_probe_range_at_offset_rejects_wrong_start_or_body_len() {
+        let headers = vec![(
+            "Content-Range".to_string(),
+            "bytes 262144-524287/1048576".to_string(),
+        )];
+        let body = vec![0u8; 262144];
+
+        assert!(validate_probe_range_at_offset(206, &headers, &body, 0, 524287).is_none());
+        assert!(validate_probe_range_at_offset(206, &headers, b"short", 262144, 524287).is_none());
+    }
+
+    #[test]
     fn extract_exact_range_body_rejects_body_length_mismatch() {
         let raw = b"HTTP/1.1 206 Partial Content\r\n\
 Content-Range: bytes 5-9/20\r\n\

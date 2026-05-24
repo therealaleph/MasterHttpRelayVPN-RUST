@@ -1232,7 +1232,9 @@ mod rt_tests {
   "fetch_ips_from_api": true,
   "max_ips_to_scan": 50,
   "scan_batch_size": 100,
-  "google_ip_validation": true
+  "google_ip_validation": true,
+  "request_timeout_secs": 45,
+  "stream_timeout_secs": 600
 }"#;
         let tmp = std::env::temp_dir().join("mhrv-rt-test.json");
         std::fs::write(&tmp, json).unwrap();
@@ -1242,6 +1244,8 @@ mod rt_tests {
         assert_eq!(cfg.listen_port, 8085);
         assert_eq!(cfg.upstream_socks5.as_deref(), Some("127.0.0.1:50529"));
         assert_eq!(cfg.parallel_relay, 2);
+        assert_eq!(cfg.request_timeout_secs, 45);
+        assert_eq!(cfg.stream_timeout_secs, 600);
         assert_eq!(
             cfg.sni_hosts.as_ref().unwrap(),
             &vec!["www.google.com".to_string(), "drive.google.com".to_string()]
@@ -1365,6 +1369,38 @@ hosts = ["claude.ai", "chatgpt.com"]
         assert!(cfg.exit_node.enabled);
         assert_eq!(cfg.exit_node.relay_url, "https://example.com");
         assert_eq!(cfg.exit_node.hosts, vec!["claude.ai", "chatgpt.com"]);
+    }
+
+    #[test]
+    fn toml_parses_separate_header_and_stream_timeouts() {
+        let s = r#"
+[relay]
+mode = "apps_script"
+auth_key = "SECRET"
+script_id = "X"
+request_timeout_secs = 45
+stream_timeout_secs = 900
+"#;
+        let toml_cfg: TomlConfig = toml::from_str(s).unwrap();
+        let cfg = Config::from(toml_cfg);
+        assert_eq!(cfg.request_timeout_secs, 45);
+        assert_eq!(cfg.stream_timeout_secs, 900);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn toml_defaults_stream_timeout_when_omitted() {
+        let s = r#"
+[relay]
+mode = "apps_script"
+auth_key = "SECRET"
+script_id = "X"
+"#;
+        let toml_cfg: TomlConfig = toml::from_str(s).unwrap();
+        let cfg = Config::from(toml_cfg);
+        assert_eq!(cfg.request_timeout_secs, 30);
+        assert_eq!(cfg.stream_timeout_secs, 300);
+        cfg.validate().unwrap();
     }
 
     #[test]
