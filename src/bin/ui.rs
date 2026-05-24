@@ -1278,7 +1278,7 @@ impl eframe::App for App {
                         .num_columns(4)
                         .spacing([16.0, 4.0])
                         .show(ui, |ui| {
-                            // Row 1: fetches today | bytes relayed
+                            // Row 1: fetches today | resets in
                             ui.add_sized(
                                 [110.0, 18.0],
                                 egui::Label::new(
@@ -1293,22 +1293,6 @@ impl eframe::App for App {
                             ui.add_sized(
                                 [110.0, 18.0],
                                 egui::Label::new(
-                                    egui::RichText::new("bytes relayed")
-                                        .color(egui::Color32::from_gray(150)),
-                                ),
-                            );
-                            ui.add_sized(
-                                [140.0, 18.0],
-                                egui::Label::new(
-                                    egui::RichText::new(fmt_bytes(s.bytes_relayed)).monospace(),
-                                ),
-                            );
-                            ui.end_row();
-
-                            // Row 2: next reset (remaining removed — already shown in fetches today X/Y)
-                            ui.add_sized(
-                                [110.0, 18.0],
-                                egui::Label::new(
                                     egui::RichText::new("resets in")
                                         .color(egui::Color32::from_gray(150)),
                                 ),
@@ -1319,8 +1303,6 @@ impl eframe::App for App {
                                     egui::RichText::new(&reset_str).monospace(),
                                 ),
                             );
-                            ui.label("");
-                            ui.label("");
                             ui.end_row();
 
                             // Row 3: relay calls+failures | cache
@@ -1408,19 +1390,23 @@ impl eframe::App for App {
                             }
                             ui.end_row();
 
-                            // Row 5: data transferred with estimated daily total
+                            // Row 5: data transferred with stable estimated daily total.
+                            // Uses bytes_relayed (all relay paths: exit node + Apps Script).
+                            // Estimate clamps avg bytes/call to 50 KB–500 KB so early sparse
+                            // samples don't make the projection swing wildly.
                             if let Some(q) = &quota_state {
-                                if q.bytes_total > 0 {
-                                    let data_str = if q.requests_used_total > 0 {
-                                        let avg = q.bytes_total as f64 / q.requests_used_total as f64;
+                                if s.bytes_relayed > 0 {
+                                    let data_str = if s.total_relay_calls >= 5 {
+                                        let raw_avg = s.bytes_relayed as f64 / s.total_relay_calls as f64;
+                                        let avg = raw_avg.clamp(50_000.0, 500_000.0);
                                         let est = (avg * q.daily_capacity_total as f64) as u64;
                                         format!(
                                             "{} / {} (est.)",
-                                            fmt_bytes_approx(q.bytes_total),
+                                            fmt_bytes_approx(s.bytes_relayed),
                                             fmt_bytes_approx(est),
                                         )
                                     } else {
-                                        fmt_bytes_approx(q.bytes_total)
+                                        fmt_bytes_approx(s.bytes_relayed)
                                     };
                                     ui.add_sized(
                                         [110.0, 18.0],

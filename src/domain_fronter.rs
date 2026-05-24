@@ -365,11 +365,6 @@ pub struct DomainFronter {
     /// strike state is per-deployment health bookkeeping, not the
     /// permanent ban list.
     script_timeouts: Arc<std::sync::Mutex<HashMap<String, (Instant, u32)>>>,
-    /// Every call to `relay()` increments this — exit node AND Apps Script.
-    /// Use this for UI "fetches today" display. Distinct from `relay_calls`
-    /// (Apps-Script-direct only) and from the quota tracker's `requests_used`
-    /// (also Apps-Script-only).
-    total_relay_calls: AtomicU64,
     relay_calls: AtomicU64,
     relay_failures: AtomicU64,
     bytes_relayed: AtomicU64,
@@ -638,7 +633,6 @@ impl DomainFronter {
             coalesced: AtomicU64::new(0),
             blacklist: Arc::new(std::sync::Mutex::new(HashMap::new())),
             script_timeouts: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            total_relay_calls: AtomicU64::new(0),
             relay_calls: AtomicU64::new(0),
             relay_failures: AtomicU64::new(0),
             bytes_relayed: AtomicU64::new(0),
@@ -780,8 +774,9 @@ impl DomainFronter {
             }
             guard.clone()
         };
+        let quota = self.quota_tracker.summary();
         StatsSnapshot {
-            total_relay_calls: self.total_relay_calls.load(Ordering::Relaxed),
+            total_relay_calls: quota.total_relay_calls,
             relay_calls: self.relay_calls.load(Ordering::Relaxed),
             relay_failures: self.relay_failures.load(Ordering::Relaxed),
             coalesced: self.coalesced.load(Ordering::Relaxed),
@@ -798,7 +793,7 @@ impl DomainFronter {
             h2_calls: self.h2_calls.load(Ordering::Relaxed),
             h2_fallbacks: self.h2_fallbacks.load(Ordering::Relaxed),
             h2_disabled: self.h2_disabled.load(Ordering::Relaxed),
-            quota: self.quota_tracker.summary(),
+            quota,
         }
     }
 
@@ -1791,7 +1786,7 @@ impl DomainFronter {
         headers: &[(String, String)],
         body: &[u8],
     ) -> Vec<u8> {
-        self.total_relay_calls.fetch_add(1, Ordering::Relaxed);
+        self.quota_tracker.record_relay();
 
         // Block ALL relay paths (exit node + Apps Script) when every account
         // bucket is quota-exhausted. Checked here so the exit node short-circuit
@@ -1841,6 +1836,10 @@ impl DomainFronter {
                         false,
                         bytes.len() as u64,
                         t0.elapsed().as_nanos() as u64,
+                    );
+                    self.bytes_relayed.fetch_add(
+                        (body.len() + bytes.len()) as u64,
+                        Ordering::Relaxed,
                     );
                     return bytes;
                 }
@@ -4931,8 +4930,8 @@ fn decode_js_string_escapes(s: &str) -> Option<String> {
 
 #[derive(Debug, Clone)]
 pub struct StatsSnapshot {
-    /// Total calls to `relay()` — all traffic through this fronter including
-    /// exit node and Apps Script. Use for "fetches today" display.
+    /// Total relay() calls today (exit node + Apps Script). Sourced from the
+    /// persisted quota tracker so this survives proxy restarts.
     pub total_relay_calls: u64,
     pub relay_calls: u64,
     pub relay_failures: u64,

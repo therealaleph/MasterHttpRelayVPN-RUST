@@ -92,6 +92,9 @@ pub struct QuotaSummary {
     /// hard-stopped ones. Used by the UI to show a meaningful reset time even
     /// when all accounts are exhausted.
     pub next_reset_at_any: Option<u64>,
+    /// Total relay() calls today (all paths). Persisted across restarts.
+    /// Resets at UTC midnight.
+    pub total_relay_calls: u64,
 }
 
 // ── Disk state wrapper ────────────────────────────────────────────────────────
@@ -99,6 +102,14 @@ pub struct QuotaSummary {
 #[derive(Serialize, Deserialize, Default)]
 struct QuotaState {
     buckets: HashMap<String, AccountBucket>,
+    /// Total relay() calls today across all paths (exit node + Apps Script).
+    /// Persisted so restarts don't reset the "fetches today" counter.
+    #[serde(default)]
+    total_relay_calls: u64,
+    /// UTC day number (unix_secs / 86400) when total_relay_calls was last reset.
+    /// When the day changes, total_relay_calls is zeroed on the next record_relay().
+    #[serde(default)]
+    relay_today_day: u64,
 }
 
 // ── Tracker ───────────────────────────────────────────────────────────────────
@@ -377,6 +388,7 @@ impl QuotaTracker {
         let mut hard_stopped = 0usize;
         let mut next_reset: Option<u64> = None;
         let mut next_reset_any: Option<u64> = None;
+        let total_relay_calls = st.total_relay_calls;
 
         for sid in &self.script_ids {
             let Some(b) = st.buckets.get(sid) else { continue };
@@ -422,6 +434,7 @@ impl QuotaTracker {
             global_hard_stop: global_stop,
             next_reset_at: next_reset,
             next_reset_at_any: next_reset_any,
+            total_relay_calls,
         }
     }
 
@@ -443,7 +456,7 @@ impl QuotaTracker {
     }
 
     /// Save if any mutations have occurred since the last flush.
-    /// Called from the periodic 60-second stats task.
+    /// Called from the 1-second save task and periodic stats task.
     pub fn save_if_needed(&self) {
         if self.dirty_count.load(Ordering::Relaxed) > 0 {
             self.save();
@@ -453,7 +466,7 @@ impl QuotaTracker {
     }
 
     /// Roll any expired 24-hour windows for all tracked buckets.
-    /// Called from the 60-second stats task so windows reset even when the
+    /// Called from the periodic stats task so windows reset even when the
     /// proxy is idle and no new requests arrive to trigger record_attempt.
     pub fn roll_expired_windows(&self) {
         let now = now_unix();
@@ -486,7 +499,20 @@ impl QuotaTracker {
         }
     }
 
-    /// Build a human-readable startup summary line.
+    /// Record one call to relay() — all paths (exit node + Apps Script).
+    /// Persisted so "fetches today" survives proxy restarts. Resets at UTC midnight.
+    pub fn record_relay(&self) {
+        let today = now_unix() / 86_400;
+        let mut st = self.state.lock().unwrap();
+        if st.relay_today_day != today {
+            st.relay_today_day = today;
+            st.total_relay_calls = 0;
+        }
+        st.total_relay_calls += 1;
+        drop(st);
+        self.dirty_count.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Log the masked ID and exhaustion reason for every hard-stopped bucket.
     /// Called once when global hard stop transitions from false to true.
     pub fn log_exhaustion_details(&self) {
@@ -500,6 +526,7 @@ impl QuotaTracker {
         }
     }
 
+    /// Build a human-readable startup summary line.
     pub fn startup_summary(&self) -> String {
         let s = self.summary();
         let now = now_unix();
