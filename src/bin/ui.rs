@@ -2018,7 +2018,7 @@ fn fmt_bytes(b: u64) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+mod runtime_tests {
     use super::*;
 
     #[test]
