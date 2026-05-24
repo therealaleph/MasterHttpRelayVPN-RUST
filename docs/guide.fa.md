@@ -373,7 +373,7 @@ sni_hosts = ["www.google.com", "drive.google.com", "docs.google.com"]
 
 | ویژگی | چرا نه |
 |---|---|
-| HTTP/2 multiplexing | state machine کریت `h2` (stream IDs، flow control، GOAWAY) موارد hang ظریف زیادی دارد؛ coalescing + pool ۲۰-conn بیشتر فایده را می‌گیرد |
+| HTTP/2 multiplexing | مسیر سریع `h2` وقتی استفاده می‌شود که edge گوگل آن را با ALPN قبول کند. کلاینت تنظیمات explicit و browser-scale برای flow-control سطح stream و connection می‌فرستد و اگر ALPN آن را رد کند، connection گیر کند، یا deployment وضعیت ناسازگاری fronting برگرداند، به pool گرم HTTP/1.1 برمی‌گردد. |
 | Batch (`q:[...]` در apps_script) | connection pool + tokio async از قبل خوب موازی‌سازی می‌کند؛ batch ~۲۰۰ خط مدیریت state اضافه می‌کند با سود نامشخص |
 | Range-based parallel download | edge case‌های واقعی (سرورهای بدون Range، chunked وسط stream)؛ ویدیوی یوتیوب از قبل با تونل بازنویسی SNI، Apps Script را دور می‌زند |
 | حالت‌های `domain_fronting` / `google_fronting` / `custom_domain` | Cloudflare در ۲۰۲۴ domain fronting عمومی را کشت؛ Cloud Run پلن پولی می‌خواهد |

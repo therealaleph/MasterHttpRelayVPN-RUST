@@ -134,6 +134,19 @@ const H2_OPEN_TIMEOUT_SECS: u64 = 8;
 /// long. Prevents every concurrent caller during an h2 outage from
 /// paying its own full handshake-timeout cost in turn.
 const H2_OPEN_FAILURE_BACKOFF_SECS: u64 = 15;
+/// Client-side HTTP/2 flow-control profile for the Apps Script h2 fast path.
+///
+/// These values are intentionally browser-scale rather than the small h2 crate
+/// defaults. Larger windows avoid frequent WINDOW_UPDATE churn while draining
+/// Apps Script envelopes, and the explicit max-frame / stream-concurrency
+/// settings keep the initial client SETTINGS frame stable across refactors.
+/// This reduces anomalous h2 startup behavior without claiming byte-for-byte
+/// browser fingerprint parity; TLS record packing and peer behavior still
+/// affect the final wire shape.
+const H2_CLIENT_INITIAL_STREAM_WINDOW_BYTES: u32 = 6 * 1024 * 1024;
+const H2_CLIENT_INITIAL_CONNECTION_WINDOW_BYTES: u32 = 15 * 1024 * 1024;
+const H2_CLIENT_MAX_FRAME_BYTES: u32 = 16 * 1024;
+const H2_CLIENT_MAX_CONCURRENT_STREAMS: u32 = 1_000;
 /// Same idea as `H2_OPEN_TIMEOUT_SECS` but for the legacy h1 socket
 /// path. Without this, a stuck TCP connect or TLS handshake to a
 /// blackholed `connect_host:443` would block `acquire()` (and the
@@ -286,6 +299,16 @@ impl From<OpenH2Error> for FronterError {
             OpenH2Error::Handshake(m) => FronterError::Relay(format!("h2 handshake: {}", m)),
         }
     }
+}
+
+fn configured_h2_client_builder() -> h2::client::Builder {
+    let mut builder = h2::client::Builder::new();
+    builder
+        .initial_window_size(H2_CLIENT_INITIAL_STREAM_WINDOW_BYTES)
+        .initial_connection_window_size(H2_CLIENT_INITIAL_CONNECTION_WINDOW_BYTES)
+        .max_frame_size(H2_CLIENT_MAX_FRAME_BYTES)
+        .max_concurrent_streams(H2_CLIENT_MAX_CONCURRENT_STREAMS);
+    builder
 }
 
 pub struct DomainFronter {
@@ -1350,14 +1373,7 @@ impl DomainFronter {
         if !alpn_h2 {
             return Err(OpenH2Error::AlpnRefused);
         }
-        // Larger initial windows mean we don't have to call
-        // `release_capacity` on every chunk for typical Apps Script
-        // payloads (usually < 1 MB; range chunks are 256 KB). We still
-        // release capacity in the body-read loop for safety on larger
-        // bodies.
-        let (send, conn) = h2::client::Builder::new()
-            .initial_window_size(4 * 1024 * 1024)
-            .initial_connection_window_size(8 * 1024 * 1024)
+        let (send, conn) = configured_h2_client_builder()
             .handshake(tls)
             .await
             .map_err(|e| OpenH2Error::Handshake(e.to_string()))?;
@@ -7221,6 +7237,19 @@ hello";
                 s
             );
         }
+    }
+
+    #[test]
+    fn h2_client_profile_uses_explicit_browser_scale_flow_control() {
+        assert_eq!(H2_CLIENT_INITIAL_STREAM_WINDOW_BYTES, 6 * 1024 * 1024);
+        assert_eq!(
+            H2_CLIENT_INITIAL_CONNECTION_WINDOW_BYTES,
+            15 * 1024 * 1024
+        );
+        assert_eq!(H2_CLIENT_MAX_FRAME_BYTES, 16 * 1024);
+        assert_eq!(H2_CLIENT_MAX_CONCURRENT_STREAMS, 1_000);
+
+        let _builder = configured_h2_client_builder();
     }
 
     #[tokio::test(flavor = "current_thread")]
