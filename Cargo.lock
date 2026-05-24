@@ -2655,6 +2655,7 @@ dependencies = [
  "tun2proxy",
  "url",
  "webpki-roots 0.26.11",
+ "winreg 0.56.0",
  "x509-parser",
  "zstd",
 ]
@@ -5695,6 +5696,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "winreg"
+version = "0.56.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d6f32a0ff4a9f6f01231eb2059cc85479330739333e0e58cadf03b6af2cca10"
+dependencies = [
+ "cfg-if",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "wintun-bindings"
 version = "0.7.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5707,7 +5718,7 @@ dependencies = [
  "log",
  "thiserror 2.0.18",
  "windows-sys 0.61.2",
- "winreg",
+ "winreg 0.55.0",
 ]
 
 [[package]]
