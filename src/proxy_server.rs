@@ -3,8 +3,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use bytes::Bytes;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinSet;
@@ -16,7 +18,7 @@ use tokio_rustls::rustls::server::Acceptor;
 use tokio_rustls::rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use tokio_rustls::{LazyConfigAcceptor, TlsAcceptor, TlsConnector};
 
-use crate::config::{Config, FrontingGroup, Mode};
+use crate::config::{Config, FrontingGroup, Mode, ProxyAuth};
 use crate::domain_fronter::DomainFronter;
 use crate::mitm::MitmCertManager;
 use crate::tunnel_client::{decode_udp_packets, TunnelMux};
@@ -262,6 +264,7 @@ pub struct RewriteCtx {
     /// domains used only for matching). Empty = feature off (only
     /// the built-in Google edge SNI-rewrite is active).
     pub fronting_groups: Vec<Arc<FrontingGroupResolved>>,
+    pub inbound_auth: Option<ProxyAuth>,
 }
 
 /// True if `host` matches a known DoH endpoint — either the built-in
@@ -513,6 +516,11 @@ impl ProxyServer {
             block_doh: config.block_doh,
             bypass_doh_hosts: config.bypass_doh_hosts.clone(),
             fronting_groups,
+            inbound_auth: if config.allow_unauthenticated_lan {
+                None
+            } else {
+                config.proxy_auth.clone()
+            },
         });
 
         let socks5_port = config.socks5_port.unwrap_or(config.listen_port + 1);
@@ -810,8 +818,22 @@ async fn handle_http_client(
         }
     };
 
-    let (method, target, _version, _headers) = parse_request_head(&head)
+    let (method, target, _version, headers) = parse_request_head(&head)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad request"))?;
+
+    if !http_proxy_auth_ok(&headers, rewrite_ctx.inbound_auth.as_ref()) {
+        tracing::warn!("HTTP proxy auth failed");
+        let _ = sock
+            .write_all(
+                b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+                  Proxy-Authenticate: Basic realm=\"mhrv-rs\"\r\n\
+                  Content-Length: 0\r\n\
+                  Connection: close\r\n\r\n",
+            )
+            .await;
+        let _ = sock.flush().await;
+        return Ok(());
+    }
 
     if method.eq_ignore_ascii_case("CONNECT") {
         let (host, port) = parse_host_port(&target);
@@ -856,6 +878,26 @@ async fn handle_http_client(
 
 // ---------- SOCKS5 ----------
 
+fn http_proxy_auth_ok(headers: &[(String, String)], auth: Option<&ProxyAuth>) -> bool {
+    let Some(auth) = auth else {
+        return true;
+    };
+    let expected = format!("{}:{}", auth.username, auth.password);
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("proxy-authorization"))
+        .and_then(|(_, v)| {
+            let value = v.trim();
+            value
+                .get(..6)
+                .filter(|prefix| prefix.eq_ignore_ascii_case("Basic "))
+                .and_then(|_| value.get(6..))
+        })
+        .and_then(|b64| B64.decode(b64.trim()).ok())
+        .and_then(|raw| String::from_utf8(raw).ok())
+        .map_or(false, |actual| actual == expected)
+}
+
 async fn handle_socks5_client(
     mut sock: TcpStream,
     fronter: Option<Arc<DomainFronter>>,
@@ -872,12 +914,22 @@ async fn handle_socks5_client(
     let nmethods = hdr[1] as usize;
     let mut methods = vec![0u8; nmethods];
     sock.read_exact(&mut methods).await?;
-    // Only "no auth" (0x00) is supported.
-    if !methods.contains(&0x00) {
+    if let Some(auth) = rewrite_ctx.inbound_auth.as_ref() {
+        if !methods.contains(&0x02) {
+            sock.write_all(&[0x05, 0xff]).await?;
+            return Ok(());
+        }
+        sock.write_all(&[0x05, 0x02]).await?;
+        if !socks5_username_password_auth(&mut sock, auth).await? {
+            tracing::warn!("SOCKS5 proxy auth failed");
+            return Ok(());
+        }
+    } else if methods.contains(&0x00) {
+        sock.write_all(&[0x05, 0x00]).await?;
+    } else {
         sock.write_all(&[0x05, 0xff]).await?;
         return Ok(());
     }
-    sock.write_all(&[0x05, 0x00]).await?;
 
     // Request: VER=5, CMD, RSV=0, ATYP, DST.ADDR, DST.PORT
     let mut req = [0u8; 4];
@@ -961,6 +1013,29 @@ async fn handle_socks5_client(
     sock.flush().await?;
 
     dispatch_tunnel(sock, host, port, fronter, mitm, rewrite_ctx, tunnel_mux).await
+}
+
+async fn socks5_username_password_auth(
+    sock: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    auth: &ProxyAuth,
+) -> std::io::Result<bool> {
+    let mut head = [0u8; 2];
+    sock.read_exact(&mut head).await?;
+    if head[0] != 0x01 {
+        sock.write_all(&[0x01, 0x01]).await?;
+        return Ok(false);
+    }
+    let mut uname = vec![0u8; head[1] as usize];
+    sock.read_exact(&mut uname).await?;
+    let mut plen = [0u8; 1];
+    sock.read_exact(&mut plen).await?;
+    let mut passwd = vec![0u8; plen[0] as usize];
+    sock.read_exact(&mut passwd).await?;
+
+    let ok = uname == auth.username.as_bytes() && passwd == auth.password.as_bytes();
+    sock.write_all(&[0x01, if ok { 0x00 } else { 0x01 }]).await?;
+    sock.flush().await?;
+    Ok(ok)
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -3226,6 +3301,105 @@ mod tests {
         assert_eq!(target.port, 443);
         assert_eq!(payload, b"q");
         assert_eq!(build_socks5_udp_packet(&target, payload), raw);
+    }
+
+    #[test]
+    fn http_proxy_auth_allows_requests_when_auth_is_not_configured() {
+        assert!(http_proxy_auth_ok(&headers(&[]), None));
+    }
+
+    #[test]
+    fn http_proxy_auth_accepts_valid_basic_credentials() {
+        let auth = ProxyAuth {
+            username: "home".into(),
+            password: "lan-secret".into(),
+        };
+        let encoded = B64.encode("home:lan-secret");
+        assert!(http_proxy_auth_ok(
+            &headers(&[("Proxy-Authorization", &format!("Basic {}", encoded))]),
+            Some(&auth),
+        ));
+        assert!(http_proxy_auth_ok(
+            &headers(&[("proxy-authorization", &format!("basic {}", encoded))]),
+            Some(&auth),
+        ));
+    }
+
+    #[test]
+    fn http_proxy_auth_rejects_missing_bad_or_malformed_credentials() {
+        let auth = ProxyAuth {
+            username: "home".into(),
+            password: "lan-secret".into(),
+        };
+        let wrong = B64.encode("home:wrong");
+        assert!(!http_proxy_auth_ok(&headers(&[]), Some(&auth)));
+        assert!(!http_proxy_auth_ok(
+            &headers(&[("Proxy-Authorization", &format!("Basic {}", wrong))]),
+            Some(&auth),
+        ));
+        assert!(!http_proxy_auth_ok(
+            &headers(&[("Proxy-Authorization", "Basic !!!")]),
+            Some(&auth),
+        ));
+        assert!(!http_proxy_auth_ok(
+            &headers(&[("Authorization", &format!("Basic {}", B64.encode("home:lan-secret")))]),
+            Some(&auth),
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn socks5_username_password_auth_accepts_matching_credentials() {
+        let auth = ProxyAuth {
+            username: "home".into(),
+            password: "lan-secret".into(),
+        };
+        let (mut client, mut server) = duplex(128);
+        let client_task = tokio::spawn(async move {
+            client
+                .write_all(&[
+                    0x01, 0x04, b'h', b'o', b'm', b'e', 0x0a, b'l', b'a', b'n', b'-', b's',
+                    b'e', b'c', b'r', b'e', b't',
+                ])
+                .await
+                .unwrap();
+            let mut status = [0u8; 2];
+            client.read_exact(&mut status).await.unwrap();
+            status
+        });
+
+        assert!(
+            socks5_username_password_auth(&mut server, &auth)
+                .await
+                .unwrap()
+        );
+        assert_eq!(client_task.await.unwrap(), [0x01, 0x00]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn socks5_username_password_auth_rejects_wrong_credentials() {
+        let auth = ProxyAuth {
+            username: "home".into(),
+            password: "lan-secret".into(),
+        };
+        let (mut client, mut server) = duplex(128);
+        let client_task = tokio::spawn(async move {
+            client
+                .write_all(&[
+                    0x01, 0x04, b'h', b'o', b'm', b'e', 0x05, b'w', b'r', b'o', b'n', b'g',
+                ])
+                .await
+                .unwrap();
+            let mut status = [0u8; 2];
+            client.read_exact(&mut status).await.unwrap();
+            status
+        });
+
+        assert!(
+            !socks5_username_password_auth(&mut server, &auth)
+                .await
+                .unwrap()
+        );
+        assert_eq!(client_task.await.unwrap(), [0x01, 0x01]);
     }
 
     #[tokio::test(flavor = "current_thread")]

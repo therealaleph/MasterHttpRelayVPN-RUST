@@ -4,11 +4,18 @@ mode = "direct"
 [network]
 google_ip = "216.239.38.120"
 front_domain = "www.google.com"
-# Non-loopback binds such as 0.0.0.0 are rejected until inbound proxy authentication is implemented.
+# Local-only by default. For LAN sharing, set listen_host = "0.0.0.0" and
+# either configure [network.proxy_auth] or set allow_unauthenticated_lan = true
+# for a trusted home LAN/personal hotspot.
 listen_host = "127.0.0.1"
+allow_unauthenticated_lan = false
 listen_port = 8085
 socks5_port = 8086
 verify_ssl = true
+
+# [network.proxy_auth]
+# username = "mhrv"
+# password = "CHANGE_ME"
 
 [network.hosts]
 

@@ -59,6 +59,20 @@ impl ScriptId {
     }
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ProxyAuth {
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+}
+
+impl ProxyAuth {
+    pub fn is_configured(&self) -> bool {
+        !self.username.trim().is_empty() && !self.password.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub mode: String,
@@ -72,6 +86,10 @@ pub struct Config {
     pub script_ids: Option<ScriptId>,
     #[serde(default)]
     pub auth_key: String,
+    #[serde(default)]
+    pub proxy_auth: Option<ProxyAuth>,
+    #[serde(default)]
+    pub allow_unauthenticated_lan: bool,
     #[serde(default = "default_listen_host")]
     pub listen_host: String,
     #[serde(default = "default_listen_port")]
@@ -670,11 +688,22 @@ impl Config {
                 self.listen_port, self.listen_host
             )));
         }
-        if !is_loopback_listen_host(&self.listen_host) {
+        if let Some(auth) = &self.proxy_auth {
+            if auth.username.trim().is_empty() != auth.password.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "proxy_auth requires both username and password".into(),
+                ));
+            }
+        }
+        if !is_loopback_listen_host(&self.listen_host)
+            && !self.allow_unauthenticated_lan
+            && !self.proxy_auth.as_ref().map_or(false, ProxyAuth::is_configured)
+        {
             return Err(ConfigError::Invalid(format!(
                 "listen_host '{}' is not loopback. Non-loopback proxy binds \
-                 are disabled until inbound HTTP/SOCKS authentication is \
-                 configured; use 127.0.0.1 or ::1 in config.toml.",
+                 require proxy_auth.username/password or \
+                 allow_unauthenticated_lan = true; use 127.0.0.1 or ::1 \
+                 for local-only proxy access.",
                 self.listen_host
             )));
         }
@@ -809,6 +838,10 @@ pub struct TomlNetwork {
     pub verify_ssl: bool,
     #[serde(default)]
     pub upstream_socks5: Option<String>,
+    #[serde(default)]
+    pub proxy_auth: Option<ProxyAuth>,
+    #[serde(default)]
+    pub allow_unauthenticated_lan: bool,
     #[serde(default = "default_block_quic")]
     pub block_quic: bool,
     #[serde(default = "default_block_stun")]
@@ -837,6 +870,8 @@ impl Default for TomlNetwork {
             socks5_port: None,
             verify_ssl: default_verify_ssl(),
             upstream_socks5: None,
+            proxy_auth: None,
+            allow_unauthenticated_lan: false,
             block_quic: default_block_quic(),
             block_stun: default_block_stun(),
             sni_hosts: None,
@@ -912,6 +947,8 @@ impl From<TomlConfig> for Config {
             script_id: t.relay.script_id,
             script_ids: t.relay.script_ids,
             auth_key: t.relay.auth_key,
+            proxy_auth: t.network.proxy_auth,
+            allow_unauthenticated_lan: t.network.allow_unauthenticated_lan,
             listen_host: t.network.listen_host,
             listen_port: t.network.listen_port,
             socks5_port: t.network.socks5_port,
@@ -979,6 +1016,8 @@ impl From<&Config> for TomlConfig {
                 socks5_port: c.socks5_port,
                 verify_ssl: c.verify_ssl,
                 upstream_socks5: c.upstream_socks5.clone(),
+                proxy_auth: c.proxy_auth.clone(),
+                allow_unauthenticated_lan: c.allow_unauthenticated_lan,
                 block_quic: c.block_quic,
                 block_stun: c.block_stun,
                 sni_hosts: c.sni_hosts.clone(),
@@ -1251,10 +1290,65 @@ mod tests {
                 .expect_err(&format!("expected non-loopback host '{}' to fail", host));
             let msg = format!("{}", err);
             assert!(
-                msg.contains("not loopback") && msg.contains("inbound HTTP/SOCKS authentication"),
+                msg.contains("not loopback")
+                    && msg.contains("proxy_auth")
+                    && msg.contains("allow_unauthenticated_lan"),
                 "error should explain unsafe bind gate for '{}': {}",
                 host,
                 msg
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_non_loopback_with_proxy_auth() {
+        let s = r#"{
+            "mode": "direct",
+            "listen_host": "0.0.0.0",
+            "proxy_auth": {
+                "username": "home",
+                "password": "lan-secret"
+            }
+        }"#;
+        let cfg: Config = serde_json::from_str(s).unwrap();
+        cfg.validate()
+            .expect("authenticated LAN bind should validate");
+    }
+
+    #[test]
+    fn validate_accepts_explicit_unauthenticated_lan_opt_in() {
+        let s = r#"{
+            "mode": "direct",
+            "listen_host": "0.0.0.0",
+            "allow_unauthenticated_lan": true
+        }"#;
+        let cfg: Config = serde_json::from_str(s).unwrap();
+        cfg.validate()
+            .expect("explicit open LAN opt-in should validate");
+    }
+
+    #[test]
+    fn validate_rejects_partial_proxy_auth() {
+        for auth in [
+            r#""proxy_auth": { "username": "home", "password": "" }"#,
+            r#""proxy_auth": { "username": "", "password": "lan-secret" }"#,
+        ] {
+            let s = format!(
+                r#"{{
+                    "mode": "direct",
+                    "listen_host": "0.0.0.0",
+                    {}
+                }}"#,
+                auth
+            );
+            let cfg: Config = serde_json::from_str(&s).unwrap();
+            let err = cfg
+                .validate()
+                .expect_err("partial proxy_auth must fail validation");
+            assert!(
+                format!("{}", err).contains("proxy_auth requires both username and password"),
+                "unexpected validation error: {}",
+                err
             );
         }
     }
@@ -1461,6 +1555,50 @@ mode = "direct"
         let cfg = Config::from(toml_cfg);
         assert_eq!(cfg.hosts.get("example.com"), Some(&"1.2.3.4".to_string()));
         assert_eq!(cfg.hosts.get("test.example.com"), Some(&"5.6.7.8".to_string()));
+    }
+
+    #[test]
+    fn toml_parses_authenticated_lan_bind() {
+        let s = r#"
+[relay]
+mode = "direct"
+
+[network]
+listen_host = "0.0.0.0"
+allow_unauthenticated_lan = false
+
+[network.proxy_auth]
+username = "home"
+password = "lan-secret"
+"#;
+        let toml_cfg: TomlConfig = toml::from_str(s).unwrap();
+        let cfg = Config::from(toml_cfg);
+        cfg.validate().unwrap();
+        assert_eq!(cfg.listen_host, "0.0.0.0");
+        assert!(!cfg.allow_unauthenticated_lan);
+        assert_eq!(
+            cfg.proxy_auth
+                .as_ref()
+                .map(|a| (a.username.as_str(), a.password.as_str())),
+            Some(("home", "lan-secret"))
+        );
+    }
+
+    #[test]
+    fn toml_parses_explicit_open_lan_bind() {
+        let s = r#"
+[relay]
+mode = "direct"
+
+[network]
+listen_host = "0.0.0.0"
+allow_unauthenticated_lan = true
+"#;
+        let toml_cfg: TomlConfig = toml::from_str(s).unwrap();
+        let cfg = Config::from(toml_cfg);
+        cfg.validate().unwrap();
+        assert!(cfg.allow_unauthenticated_lan);
+        assert!(cfg.proxy_auth.is_none());
     }
 
     #[test]
