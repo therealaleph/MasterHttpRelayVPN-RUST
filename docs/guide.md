@@ -227,6 +227,8 @@ max_concurrent = 30 × number_of_deployment_ids
 
 More deployments = more total concurrency = lower per-session latency. Each batch is selected from the configured IDs with a local rolling 24-hour ledger, spreading load and steering away from deployments this client has already driven near the free-tier request budget.
 
+The desktop **Script health** panel shows this local state without changing routing behavior: masked deployment ID, locally observed calls inside the rolling 24-hour window, whether the local free-tier steering threshold is saturated, any remaining cooldown, the failure class/reason that set that cooldown, and the current timeout-strike count. Treat it as client-side telemetry only; Google may also count requests from other devices using the same deployment.
+
 **Resource guards:**
 - **50 ops max** per batch — if more sessions are active, the mux splits into multiple batches
 - **4 MB payload cap** per batch — well under Apps Script's 50 MB limit
