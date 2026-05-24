@@ -363,6 +363,10 @@ pub struct DomainFronter {
     inflight: Arc<Mutex<HashMap<String, broadcast::Sender<Vec<u8>>>>>,
     coalesced: AtomicU64,
     blacklist: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+    /// Human-readable cooldown reason keyed by script ID. Kept separate
+    /// from `blacklist` so the selection hot path still only checks the
+    /// timestamp map while diagnostics can explain the active cooldown.
+    script_cooldown_reasons: Arc<std::sync::Mutex<HashMap<String, String>>>,
     /// Per-deployment local call ledger used by `next_script_id` /
     /// `next_script_ids` to avoid selecting an already saturated deployment
     /// while another configured script still has locally-observed capacity.
@@ -654,6 +658,7 @@ impl DomainFronter {
             inflight: Arc::new(Mutex::new(HashMap::new())),
             coalesced: AtomicU64::new(0),
             blacklist: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            script_cooldown_reasons: Arc::new(std::sync::Mutex::new(HashMap::new())),
             script_quota_ledger: Arc::new(std::sync::Mutex::new(HashMap::new())),
             script_timeouts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             relay_calls: AtomicU64::new(0),
@@ -816,6 +821,43 @@ impl DomainFronter {
         }
     }
 
+    pub fn snapshot_script_health(&self) -> Vec<ScriptHealthSnapshot> {
+        let now = Instant::now();
+        let bl = self.blacklist.lock().unwrap();
+        let reasons = self.script_cooldown_reasons.lock().unwrap();
+        let quota = self.script_quota_ledger.lock().unwrap();
+        let timeouts = self.script_timeouts.lock().unwrap();
+
+        self.script_ids
+            .iter()
+            .map(|sid| {
+                let quota_used = quota
+                    .get(sid)
+                    .map(|calls| {
+                        calls
+                            .iter()
+                            .filter(|at| now.saturating_duration_since(**at) < SCRIPT_QUOTA_WINDOW)
+                            .count()
+                    })
+                    .unwrap_or(0);
+                let cooldown_secs = bl
+                    .get(sid)
+                    .map(|until| until.saturating_duration_since(now).as_secs())
+                    .filter(|secs| *secs > 0);
+                let timeout_strikes = timeouts.get(sid).map(|(_, strikes)| *strikes).unwrap_or(0);
+                ScriptHealthSnapshot {
+                    script_id: mask_script_id(sid),
+                    quota_used,
+                    quota_limit: SCRIPT_QUOTA_FREE_TIER_CALLS,
+                    quota_saturated: quota_used >= SCRIPT_QUOTA_FREE_TIER_CALLS,
+                    cooldown_secs,
+                    cooldown_reason: reasons.get(sid).cloned(),
+                    timeout_strikes,
+                }
+            })
+            .collect()
+    }
+
     pub fn num_scripts(&self) -> usize {
         self.script_ids.len()
     }
@@ -837,6 +879,10 @@ impl DomainFronter {
         let mut bl = self.blacklist.lock().unwrap();
         let now = Instant::now();
         bl.retain(|_, until| *until > now);
+        self.script_cooldown_reasons
+            .lock()
+            .unwrap()
+            .retain(|sid, _| bl.contains_key(sid));
         let mut quota = self.script_quota_ledger.lock().unwrap();
         prune_script_quota_ledger(&mut quota, now);
 
@@ -864,6 +910,7 @@ impl DomainFronter {
         if let Some((sid, _)) = bl.iter().min_by_key(|(_, t)| **t) {
             let sid = sid.clone();
             bl.remove(&sid);
+            self.script_cooldown_reasons.lock().unwrap().remove(&sid);
             record_script_quota_call_locked(&mut quota, &sid, now);
             return sid;
         }
@@ -884,6 +931,10 @@ impl DomainFronter {
         let mut bl = self.blacklist.lock().unwrap();
         let now = Instant::now();
         bl.retain(|_, until| *until > now);
+        self.script_cooldown_reasons
+            .lock()
+            .unwrap()
+            .retain(|sid, _| bl.contains_key(sid));
         let mut quota = self.script_quota_ledger.lock().unwrap();
         prune_script_quota_ledger(&mut quota, now);
 
@@ -928,6 +979,10 @@ impl DomainFronter {
         let until = Instant::now() + cooldown;
         let mut bl = self.blacklist.lock().unwrap();
         bl.insert(script_id.to_string(), until);
+        self.script_cooldown_reasons
+            .lock()
+            .unwrap()
+            .insert(script_id.to_string(), reason.to_string());
         tracing::warn!(
             "blacklisted script {} for {}s: {}",
             mask_script_id(script_id),
@@ -4946,6 +5001,24 @@ pub struct StatsSnapshot {
     pub h2_disabled: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptHealthSnapshot {
+    /// Masked deployment ID (`prefix...suffix`) safe to render in logs/UI.
+    pub script_id: String,
+    /// Locally observed calls inside the rolling 24-hour steering window.
+    pub quota_used: usize,
+    /// Local free-tier steering threshold. This is not an authoritative
+    /// Google-side quota read; it is the client-side selection guard.
+    pub quota_limit: usize,
+    pub quota_saturated: bool,
+    /// Remaining local cooldown, if the deployment is currently sidelined.
+    pub cooldown_secs: Option<u64>,
+    /// Human-readable failure class/reason used when the cooldown was set.
+    pub cooldown_reason: Option<String>,
+    /// Current timeout strikes inside the auto-blacklist rolling window.
+    pub timeout_strikes: u32,
+}
+
 impl StatsSnapshot {
     pub fn hit_rate(&self) -> f64 {
         let total = self.cache_hits + self.cache_misses;
@@ -5182,6 +5255,15 @@ mod tests {
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use tokio::io::{duplex, AsyncRead, AsyncWriteExt, ReadBuf};
+
+    fn find_script_health<'a>(
+        rows: &'a [ScriptHealthSnapshot],
+        masked_script_id: &str,
+    ) -> &'a ScriptHealthSnapshot {
+        rows.iter()
+            .find(|row| row.script_id == masked_script_id)
+            .expect("script health row must exist")
+    }
 
     // Test fixture for ungraceful TLS close: emit a fixed prefix of bytes
     // then return io::ErrorKind::UnexpectedEof on the next read. Mirrors
@@ -6534,6 +6616,51 @@ hello";
             ScriptQuarantine::Transient.cooldown(),
             Duration::from_secs(TRANSIENT_SCRIPT_COOLDOWN_SECS)
         );
+    }
+
+    #[test]
+    fn script_health_snapshot_exposes_quota_and_cooldown_state() {
+        let fronter = fronter_for_script_ids(&["SCRIPT_A", "SCRIPT_B"]);
+        let now = Instant::now();
+        seed_script_quota(&fronter, "SCRIPT_A", 3, now);
+        fronter.blacklist_script_for(
+            "SCRIPT_A",
+            Duration::from_secs(600),
+            "transient relay cooldown: HTTP 502",
+        );
+        fronter.record_timeout_strike("SCRIPT_B");
+
+        let rows = fronter.snapshot_script_health();
+        let a = find_script_health(&rows, "SCRI...PT_A");
+        let b = find_script_health(&rows, "SCRI...PT_B");
+
+        assert_eq!(a.quota_used, 3);
+        assert_eq!(a.quota_limit, SCRIPT_QUOTA_FREE_TIER_CALLS);
+        assert!(!a.quota_saturated);
+        assert!(a.cooldown_secs.is_some_and(|secs| secs <= 600 && secs > 0));
+        assert_eq!(
+            a.cooldown_reason.as_deref(),
+            Some("transient relay cooldown: HTTP 502")
+        );
+        assert_eq!(b.timeout_strikes, 1);
+        assert!(b.cooldown_secs.is_none());
+    }
+
+    #[test]
+    fn script_health_snapshot_marks_local_quota_saturation() {
+        let fronter = fronter_for_script_ids(&["SCRIPT_A"]);
+        seed_script_quota(
+            &fronter,
+            "SCRIPT_A",
+            SCRIPT_QUOTA_FREE_TIER_CALLS,
+            Instant::now(),
+        );
+
+        let rows = fronter.snapshot_script_health();
+        let row = find_script_health(&rows, "SCRI...PT_A");
+
+        assert_eq!(row.quota_used, SCRIPT_QUOTA_FREE_TIER_CALLS);
+        assert!(row.quota_saturated);
     }
 
     #[test]
