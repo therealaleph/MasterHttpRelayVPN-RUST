@@ -215,7 +215,9 @@ HTTP / HTTPS مثل قبل از Apps Script می‌رود (تغییری نمی�
 block_hosts = ["ads.example.com", ".tracker.example"]
 ```
 
-درخواست‌های HTTP و HTTP CONNECT مسدودشده پاسخ محلی `204 No Content` می‌گیرند. درخواست‌های SOCKS5 CONNECT قبل از باز شدن هر اتصال خروجی، reply خطای ruleset می‌گیرند.
+همین لیست از UI دسکتاپ هم قابل ویرایش است: **Advanced → Block hosts**. هر خط یک hostname است و هنگام Save دوباره در `network.block_hosts` ذخیره می‌شود؛ قوانین exact-match و suffix-match دقیقاً مثل تنظیم TOML باقی می‌ماند.
+
+درخواست‌های HTTP و HTTP CONNECT مسدودشده پاسخ محلی `204 No Content` می‌گیرند. درخواست‌های SOCKS5 CONNECT قبل از باز شدن هر اتصال خروجی، reply خطای ruleset می‌گیرند. پنل Traffic در UI دسکتاپ و خروجی JSON آمار، مقدار `blocked_requests` را نشان می‌دهند؛ یعنی تعداد hitهای block-list که قبل از relay، tunnel-node، بازنویسی SNI، یا SOCKS5 upstream متوقف شده‌اند.
 
 ## حالت تونل کامل
 

@@ -215,7 +215,9 @@ Use `block_hosts` for destinations that should be answered locally instead of sp
 block_hosts = ["ads.example.com", ".tracker.example"]
 ```
 
-Blocked HTTP and HTTP CONNECT requests receive a local `204 No Content` response. SOCKS5 CONNECT requests receive a ruleset failure reply before any outbound connection is opened.
+You can edit the same list in the desktop UI under **Advanced → Block hosts**. The editor saves one hostname per line back to `network.block_hosts`, preserving the same exact-match and suffix-match behavior as the TOML field.
+
+Blocked HTTP and HTTP CONNECT requests receive a local `204 No Content` response. SOCKS5 CONNECT requests receive a ruleset failure reply before any outbound connection is opened. The desktop traffic panel and stats JSON expose `blocked_requests`, which counts local block-list hits that avoided relay, tunnel-node, SNI rewrite, and upstream SOCKS5 dispatch.
 
 ## Full Tunnel mode
 
