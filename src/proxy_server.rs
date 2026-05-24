@@ -3600,6 +3600,13 @@ mod tests {
         q
     }
 
+    fn dns_query_with_class(qtype: u16, qclass: u16) -> Vec<u8> {
+        let mut q = dns_query(qtype);
+        let n = q.len();
+        q[n - 2..n].copy_from_slice(&qclass.to_be_bytes());
+        q
+    }
+
     #[test]
     fn dns_https_question_gets_empty_success_response() {
         let query = dns_query(DNS_TYPE_HTTPS);
@@ -3610,6 +3617,20 @@ mod tests {
         assert_eq!(&response[4..6], &[0x00, 0x01]);
         assert_eq!(&response[6..12], &[0, 0, 0, 0, 0, 0]);
         assert_eq!(&response[12..], &query[12..]);
+    }
+
+    #[test]
+    fn dns_https_response_preserves_rd_and_clears_additional_records() {
+        let mut query = dns_query(DNS_TYPE_HTTPS);
+        // Pretend the client included one additional record after the
+        // question. The local policy answer must not echo that section.
+        query[11] = 1;
+        query.extend_from_slice(&[0, 0, 41, 16, 0, 0, 0, 0, 0, 0, 0]);
+
+        let response = dns_empty_response_for_https_or_svcb(&query).unwrap();
+        assert_eq!(response[2] & 0x01, 0x01);
+        assert_eq!(&response[10..12], &[0, 0]);
+        assert!(response.len() < query.len());
     }
 
     #[test]
@@ -3628,6 +3649,24 @@ mod tests {
     fn dns_multi_question_query_is_not_suppressed() {
         let mut query = dns_query(DNS_TYPE_HTTPS);
         query[5] = 2;
+        assert!(dns_empty_response_for_https_or_svcb(&query).is_none());
+    }
+
+    #[test]
+    fn dns_compressed_question_name_is_not_suppressed() {
+        let mut query = Vec::new();
+        query.extend_from_slice(&[0x12, 0x34, 0x01, 0x00]);
+        query.extend_from_slice(&[0x00, 0x01, 0x00, 0x00]);
+        query.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        query.extend_from_slice(&[0xc0, 0x0c]);
+        query.extend_from_slice(&DNS_TYPE_HTTPS.to_be_bytes());
+        query.extend_from_slice(&1u16.to_be_bytes());
+        assert!(dns_empty_response_for_https_or_svcb(&query).is_none());
+    }
+
+    #[test]
+    fn dns_non_in_question_is_not_suppressed() {
+        let query = dns_query_with_class(DNS_TYPE_HTTPS, 3);
         assert!(dns_empty_response_for_https_or_svcb(&query).is_none());
     }
 
