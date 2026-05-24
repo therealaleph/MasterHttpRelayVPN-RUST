@@ -232,6 +232,8 @@ More deployments = more total concurrency = lower per-session latency. Each batc
 - **4 MB payload cap** per batch — well under Apps Script's 50 MB limit
 - **30 s timeout** per batch — slow / dead targets can't block other sessions forever
 
+Opening/data-bearing tunnel operations bypass the short coalescing wait; empty polls and close notices stay batch-friendly.
+
 ### Full mode quick start
 
 1. Deploy [`CodeFull.gs`](../assets/apps_script/CodeFull.gs) as a Web App on **each Google account** (same steps as `Code.gs`, but use the full-mode script that forwards to your tunnel-node). One deployment per account — the 30-concurrent limit is per account, so multiple deployments on one account share the pool. To scale, use more accounts:
