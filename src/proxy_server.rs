@@ -924,7 +924,7 @@ async fn handle_socks5_client(
 
     if cmd == 0x03 {
         tracing::info!("SOCKS5 UDP ASSOCIATE requested for {}:{}", host, port);
-        return handle_socks5_udp_associate(sock, rewrite_ctx, tunnel_mux).await;
+        return handle_socks5_udp_associate(sock, fronter, rewrite_ctx, tunnel_mux).await;
     }
 
     // Negative-cache short-circuit: if the tunnel-node just failed to reach
@@ -1095,6 +1095,7 @@ const MAX_UDP_PAYLOAD_BYTES: usize = 9 * 1024;
 
 async fn handle_socks5_udp_associate(
     mut control: TcpStream,
+    fronter: Option<Arc<DomainFronter>>,
     rewrite_ctx: Arc<RewriteCtx>,
     tunnel_mux: Option<Arc<TunnelMux>>,
 ) -> std::io::Result<()> {
@@ -1190,6 +1191,23 @@ async fn handle_socks5_udp_associate(
                 };
                 let payload_slice = &recv_buf[payload_off..n];
 
+                if rewrite_ctx.block_quic && target.port == 53 {
+                    if let Some(response) = dns_empty_response_for_https_or_svcb(payload_slice) {
+                        if let Some(f) = &fronter {
+                            f.record_https_rr_suppressed();
+                        }
+                        let framed = build_socks5_udp_packet(&target, &response);
+                        if let Err(e) = udp.send_to(&framed, peer).await {
+                            tracing::debug!(
+                                "udp DNS HTTPS/SVCB suppression reply to {} failed: {}",
+                                peer,
+                                e
+                            );
+                        }
+                        continue;
+                    }
+                }
+
                 // Issue #213: client-side QUIC block. UDP/443 is
                 // HTTP/3 — drop the datagram silently so the client
                 // stack retries a couple of times and then falls back
@@ -1207,6 +1225,9 @@ async fn handle_socks5_udp_associate(
                 // a "no response → fall back" timeout, so silent drop
                 // is the contractually correct shape.
                 if rewrite_ctx.block_quic && target.port == 443 {
+                    if let Some(f) = &fronter {
+                        f.record_quic_udp_drop();
+                    }
                     tracing::debug!(
                         "udp dropped: block_quic=true, target {}:443",
                         target.host
@@ -1594,6 +1615,69 @@ fn build_socks5_udp_packet(target: &SocksUdpTarget, payload: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&target.port.to_be_bytes());
     out.extend_from_slice(payload);
     out
+}
+
+const DNS_TYPE_SVCB: u16 = 64;
+const DNS_TYPE_HTTPS: u16 = 65;
+
+fn dns_empty_response_for_https_or_svcb(query: &[u8]) -> Option<Vec<u8>> {
+    let question_end = dns_single_question_https_or_svcb_end(query)?;
+    let mut out = Vec::with_capacity(question_end);
+    out.extend_from_slice(&query[..question_end]);
+    // QR=1, opcode copied, AA=0, TC=0, RD copied, RA=0, Z=0, RCODE=0.
+    out[2] = (query[2] & 0x78) | 0x80 | (query[2] & 0x01);
+    out[3] = 0x00;
+    // QDCOUNT stays 1. ANCOUNT, NSCOUNT, ARCOUNT become 0.
+    out[6] = 0;
+    out[7] = 0;
+    out[8] = 0;
+    out[9] = 0;
+    out[10] = 0;
+    out[11] = 0;
+    Some(out)
+}
+
+fn dns_single_question_https_or_svcb_end(query: &[u8]) -> Option<usize> {
+    if query.len() < 12 {
+        return None;
+    }
+    let qdcount = u16::from_be_bytes([query[4], query[5]]);
+    if qdcount != 1 {
+        return None;
+    }
+    if query[2] & 0x80 != 0 {
+        return None;
+    }
+
+    let mut pos = 12usize;
+    loop {
+        let len = *query.get(pos)?;
+        pos += 1;
+        if len == 0 {
+            break;
+        }
+        if len & 0xc0 != 0 {
+            return None;
+        }
+        let label_len = len as usize;
+        if label_len > 63 || pos.checked_add(label_len)? > query.len() {
+            return None;
+        }
+        pos += label_len;
+    }
+    if pos.checked_add(4)? > query.len() {
+        return None;
+    }
+    let qtype = u16::from_be_bytes([query[pos], query[pos + 1]]);
+    let qclass = u16::from_be_bytes([query[pos + 2], query[pos + 3]]);
+    if qclass != 1 {
+        return None;
+    }
+    if qtype == DNS_TYPE_SVCB || qtype == DNS_TYPE_HTTPS {
+        Some(pos + 4)
+    } else {
+        None
+    }
 }
 
 // ---------- Smart dispatch (used by both HTTP CONNECT and SOCKS5) ----------
@@ -3499,6 +3583,52 @@ mod tests {
         let list = vec!["example.com.".to_string()];
         assert!(matches_passthrough("example.com", &list));
         assert!(matches_passthrough("example.com.", &list));
+    }
+
+    fn dns_query(qtype: u16) -> Vec<u8> {
+        let mut q = Vec::new();
+        q.extend_from_slice(&[0x12, 0x34, 0x01, 0x00]);
+        q.extend_from_slice(&[0x00, 0x01, 0x00, 0x00]);
+        q.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        for label in ["www", "example", "com"] {
+            q.push(label.len() as u8);
+            q.extend_from_slice(label.as_bytes());
+        }
+        q.push(0);
+        q.extend_from_slice(&qtype.to_be_bytes());
+        q.extend_from_slice(&1u16.to_be_bytes());
+        q
+    }
+
+    #[test]
+    fn dns_https_question_gets_empty_success_response() {
+        let query = dns_query(DNS_TYPE_HTTPS);
+        let response = dns_empty_response_for_https_or_svcb(&query).unwrap();
+        assert_eq!(&response[0..2], &[0x12, 0x34]);
+        assert_eq!(response[2] & 0x80, 0x80);
+        assert_eq!(response[3] & 0x0f, 0);
+        assert_eq!(&response[4..6], &[0x00, 0x01]);
+        assert_eq!(&response[6..12], &[0, 0, 0, 0, 0, 0]);
+        assert_eq!(&response[12..], &query[12..]);
+    }
+
+    #[test]
+    fn dns_svcb_question_gets_empty_success_response() {
+        let query = dns_query(DNS_TYPE_SVCB);
+        assert!(dns_empty_response_for_https_or_svcb(&query).is_some());
+    }
+
+    #[test]
+    fn dns_a_question_is_not_suppressed() {
+        let query = dns_query(1);
+        assert!(dns_empty_response_for_https_or_svcb(&query).is_none());
+    }
+
+    #[test]
+    fn dns_multi_question_query_is_not_suppressed() {
+        let mut query = dns_query(DNS_TYPE_HTTPS);
+        query[5] = 2;
+        assert!(dns_empty_response_for_https_or_svcb(&query).is_none());
     }
 
     #[test]

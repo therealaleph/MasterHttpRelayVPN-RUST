@@ -390,6 +390,8 @@ pub struct DomainFronter {
     /// h2_fallbacks)` ratio indicates an unhealthy h2 conn or a flaky
     /// middlebox eating h2 frames; consider `force_http1: true`.
     h2_fallbacks: AtomicU64,
+    policy_quic_udp_drops: AtomicU64,
+    policy_https_rr_suppressed: AtomicU64,
     /// Per-host breakdown of traffic going through this fronter. Keyed by
     /// the host of the URL (e.g. "api.x.com"). Read-mostly; only touched
     /// on the slow path (once per relayed request), so a plain Mutex is
@@ -626,6 +628,8 @@ impl DomainFronter {
             bytes_relayed: AtomicU64::new(0),
             h2_calls: AtomicU64::new(0),
             h2_fallbacks: AtomicU64::new(0),
+            policy_quic_udp_drops: AtomicU64::new(0),
+            policy_https_rr_suppressed: AtomicU64::new(0),
             per_site: Arc::new(std::sync::Mutex::new(HashMap::new())),
             today_calls: AtomicU64::new(0),
             today_bytes: AtomicU64::new(0),
@@ -778,7 +782,20 @@ impl DomainFronter {
             h2_calls: self.h2_calls.load(Ordering::Relaxed),
             h2_fallbacks: self.h2_fallbacks.load(Ordering::Relaxed),
             h2_disabled: self.h2_disabled.load(Ordering::Relaxed),
+            policy_quic_udp_drops: self.policy_quic_udp_drops.load(Ordering::Relaxed),
+            policy_https_rr_suppressed: self
+                .policy_https_rr_suppressed
+                .load(Ordering::Relaxed),
         }
+    }
+
+    pub fn record_quic_udp_drop(&self) {
+        self.policy_quic_udp_drops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_https_rr_suppressed(&self) {
+        self.policy_https_rr_suppressed
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn num_scripts(&self) -> usize {
@@ -4831,6 +4848,11 @@ pub struct StatsSnapshot {
     /// switch set, or peer refused h2 during ALPN). All traffic on the
     /// h1 path.
     pub h2_disabled: bool,
+    /// UDP/443 datagrams dropped locally while `block_quic` is enabled.
+    pub policy_quic_udp_drops: u64,
+    /// DNS SVCB/HTTPS questions answered locally with an empty response
+    /// while `block_quic` is enabled.
+    pub policy_https_rr_suppressed: u64,
 }
 
 impl StatsSnapshot {
@@ -4864,7 +4886,7 @@ impl StatsSnapshot {
             }
         };
         format!(
-            "stats: relay={} ({}KB) failures={} coalesced={} cache={}/{} ({:.0}% hit, {}KB) scripts={}/{} active{}",
+            "stats: relay={} ({}KB) failures={} coalesced={} cache={}/{} ({:.0}% hit, {}KB) scripts={}/{} active{} policy=quic-drops:{} https-rr:{}",
             self.relay_calls,
             self.bytes_relayed / 1024,
             self.relay_failures,
@@ -4876,6 +4898,8 @@ impl StatsSnapshot {
             self.total_scripts - self.blacklisted_scripts,
             self.total_scripts,
             h2_seg,
+            self.policy_quic_udp_drops,
+            self.policy_https_rr_suppressed,
         )
     }
 
@@ -4888,7 +4912,7 @@ impl StatsSnapshot {
             s.replace('\\', "\\\\").replace('"', "\\\"")
         }
         format!(
-            r#"{{"relay_calls":{},"relay_failures":{},"coalesced":{},"bytes_relayed":{},"cache_hits":{},"cache_misses":{},"cache_bytes":{},"blacklisted_scripts":{},"total_scripts":{},"today_calls":{},"today_bytes":{},"today_key":"{}","today_reset_secs":{},"h2_calls":{},"h2_fallbacks":{},"h2_disabled":{}}}"#,
+            r#"{{"relay_calls":{},"relay_failures":{},"coalesced":{},"bytes_relayed":{},"cache_hits":{},"cache_misses":{},"cache_bytes":{},"blacklisted_scripts":{},"total_scripts":{},"today_calls":{},"today_bytes":{},"today_key":"{}","today_reset_secs":{},"h2_calls":{},"h2_fallbacks":{},"h2_disabled":{},"policy_quic_udp_drops":{},"policy_https_rr_suppressed":{}}}"#,
             self.relay_calls,
             self.relay_failures,
             self.coalesced,
@@ -4905,6 +4929,8 @@ impl StatsSnapshot {
             self.h2_calls,
             self.h2_fallbacks,
             self.h2_disabled,
+            self.policy_quic_udp_drops,
+            self.policy_https_rr_suppressed,
         )
     }
 }
