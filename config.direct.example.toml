@@ -8,6 +8,8 @@ listen_host = "127.0.0.1"
 listen_port = 8085
 socks5_port = 8086
 verify_ssl = true
+# Local block-list rules answered before relay/tunnel dispatch.
+# Exact hostnames match only themselves; leading-dot entries also match subdomains.
 block_hosts = []
 
 [network.hosts]

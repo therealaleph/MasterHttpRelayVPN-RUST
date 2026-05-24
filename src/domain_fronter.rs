@@ -367,6 +367,11 @@ pub struct DomainFronter {
     relay_calls: AtomicU64,
     relay_failures: AtomicU64,
     bytes_relayed: AtomicU64,
+    /// Requests rejected locally by the proxy `block_hosts` gate before any
+    /// Apps Script, tunnel-node, SNI rewrite, or upstream SOCKS5 dispatch.
+    /// Shared with `ProxyServer` so the short-circuit path can account for
+    /// quota savings where the decision actually happens.
+    blocked_requests: Arc<AtomicU64>,
     /// Relay calls that successfully completed over the h2 fast path,
     /// across **all** entry points: Apps-Script direct relays,
     /// exit-node outer calls, full-mode tunnel single ops, and
@@ -624,6 +629,7 @@ impl DomainFronter {
             relay_calls: AtomicU64::new(0),
             relay_failures: AtomicU64::new(0),
             bytes_relayed: AtomicU64::new(0),
+            blocked_requests: Arc::new(AtomicU64::new(0)),
             h2_calls: AtomicU64::new(0),
             h2_fallbacks: AtomicU64::new(0),
             per_site: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -766,6 +772,7 @@ impl DomainFronter {
             relay_failures: self.relay_failures.load(Ordering::Relaxed),
             coalesced: self.coalesced.load(Ordering::Relaxed),
             bytes_relayed: self.bytes_relayed.load(Ordering::Relaxed),
+            blocked_requests: self.blocked_requests.load(Ordering::Relaxed),
             cache_hits: self.cache.hits(),
             cache_misses: self.cache.misses(),
             cache_bytes: self.cache.size(),
@@ -791,6 +798,10 @@ impl DomainFronter {
 
     pub fn cache(&self) -> &ResponseCache {
         &self.cache
+    }
+
+    pub(crate) fn blocked_requests_counter(&self) -> Arc<AtomicU64> {
+        self.blocked_requests.clone()
     }
 
     pub fn coalesced_count(&self) -> u64 {
@@ -4796,6 +4807,9 @@ pub struct StatsSnapshot {
     pub relay_failures: u64,
     pub coalesced: u64,
     pub bytes_relayed: u64,
+    /// Local block-list hits rejected before a relay, tunnel-node, SNI
+    /// rewrite, or upstream SOCKS5 connection is opened.
+    pub blocked_requests: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
     pub cache_bytes: usize,
@@ -4864,11 +4878,12 @@ impl StatsSnapshot {
             }
         };
         format!(
-            "stats: relay={} ({}KB) failures={} coalesced={} cache={}/{} ({:.0}% hit, {}KB) scripts={}/{} active{}",
+            "stats: relay={} ({}KB) failures={} coalesced={} blocked={} cache={}/{} ({:.0}% hit, {}KB) scripts={}/{} active{}",
             self.relay_calls,
             self.bytes_relayed / 1024,
             self.relay_failures,
             self.coalesced,
+            self.blocked_requests,
             self.cache_hits,
             self.cache_hits + self.cache_misses,
             self.hit_rate(),
@@ -4888,11 +4903,12 @@ impl StatsSnapshot {
             s.replace('\\', "\\\\").replace('"', "\\\"")
         }
         format!(
-            r#"{{"relay_calls":{},"relay_failures":{},"coalesced":{},"bytes_relayed":{},"cache_hits":{},"cache_misses":{},"cache_bytes":{},"blacklisted_scripts":{},"total_scripts":{},"today_calls":{},"today_bytes":{},"today_key":"{}","today_reset_secs":{},"h2_calls":{},"h2_fallbacks":{},"h2_disabled":{}}}"#,
+            r#"{{"relay_calls":{},"relay_failures":{},"coalesced":{},"bytes_relayed":{},"blocked_requests":{},"cache_hits":{},"cache_misses":{},"cache_bytes":{},"blacklisted_scripts":{},"total_scripts":{},"today_calls":{},"today_bytes":{},"today_key":"{}","today_reset_secs":{},"h2_calls":{},"h2_fallbacks":{},"h2_disabled":{}}}"#,
             self.relay_calls,
             self.relay_failures,
             self.coalesced,
             self.bytes_relayed,
+            self.blocked_requests,
             self.cache_hits,
             self.cache_misses,
             self.cache_bytes,
@@ -5077,6 +5093,32 @@ mod tests {
             self.position += take;
             Poll::Ready(Ok(()))
         }
+    }
+
+    #[test]
+    fn stats_snapshot_exports_local_block_counter() {
+        let snapshot = StatsSnapshot {
+            relay_calls: 10,
+            relay_failures: 1,
+            coalesced: 2,
+            bytes_relayed: 4096,
+            blocked_requests: 7,
+            cache_hits: 3,
+            cache_misses: 4,
+            cache_bytes: 2048,
+            blacklisted_scripts: 0,
+            total_scripts: 2,
+            today_calls: 5,
+            today_bytes: 1024,
+            today_key: "2026-05-24".to_string(),
+            today_reset_secs: 3600,
+            h2_calls: 8,
+            h2_fallbacks: 2,
+            h2_disabled: false,
+        };
+
+        assert!(snapshot.fmt_line().contains("blocked=7"));
+        assert!(snapshot.to_json().contains(r#""blocked_requests":7"#));
     }
 
     #[tokio::test]

@@ -252,12 +252,11 @@ struct FormState {
     normalize_x_graphql: bool,
     youtube_via_relay: bool,
     passthrough_hosts: Vec<String>,
-    /// Config-only local block list. Round-tripped from config.toml so
-    /// UI Save preserves hand-edited quota-saving filters.
-    block_hosts: Vec<String>,
-    /// Round-tripped from config.toml so the UI's save path doesn't
-    /// drop the user's setting. Not currently exposed as a UI control;
-    /// users edit `block_quic` directly in `config.toml` (Issue #213).
+    /// Multiline editor buffer for local block-list entries. Saved back to
+    /// `network.block_hosts` after trimming blank lines.
+    block_hosts_text: String,
+    /// Exposed beside local host blocking so users can keep browser HTTP/3
+    /// probes from burning Full-mode UDP tunnel work.
     block_quic: bool,
     /// Round-tripped from config.toml and exposed beside QUIC blocking.
     /// Default true to push WebRTC apps toward TCP TURN instead of slow
@@ -382,7 +381,7 @@ fn load_form() -> (FormState, Option<String>) {
             normalize_x_graphql: c.normalize_x_graphql,
             youtube_via_relay: c.youtube_via_relay,
             passthrough_hosts: c.passthrough_hosts.clone(),
-            block_hosts: c.block_hosts.clone(),
+            block_hosts_text: format_host_list_for_editor(&c.block_hosts),
             block_quic: c.block_quic,
             block_stun: c.block_stun,
             disable_padding: c.disable_padding,
@@ -423,7 +422,7 @@ fn load_form() -> (FormState, Option<String>) {
             normalize_x_graphql: false,
             youtube_via_relay: false,
             passthrough_hosts: Vec::new(),
-            block_hosts: Vec::new(),
+            block_hosts_text: String::new(),
             block_quic: true,
             block_stun: false,
             disable_padding: false,
@@ -486,6 +485,19 @@ fn sni_pool_for_form(user: Option<&[String]>, front_domain: &str) -> Vec<SniRow>
         }
     }
     out
+}
+
+fn format_host_list_for_editor(hosts: &[String]) -> String {
+    hosts.join("\n")
+}
+
+fn parse_host_list_editor(input: &str) -> Vec<String> {
+    input
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.starts_with('#'))
+        .map(str::to_string)
+        .collect()
 }
 
 impl FormState {
@@ -583,11 +595,7 @@ impl FormState {
             // Similarly config-only for now; round-trips through the
             // file so the UI doesn't drop the user's entries on save.
             passthrough_hosts: self.passthrough_hosts.clone(),
-            // Local block list: config-only, preserved on Save.
-            block_hosts: self.block_hosts.clone(),
-            // Issue #213: block_quic is config-only for now (no UI
-            // control yet). Round-trip through the file so save
-            // doesn't drop a user-set true.
+            block_hosts: parse_host_list_editor(&self.block_hosts_text),
             block_quic: self.block_quic,
             block_stun: self.block_stun,
             // Issue #391: disable_padding is config-only for now.
@@ -1116,6 +1124,39 @@ impl eframe::App for App {
                              Script relay instead — slower for video, but the visible SNI matches the site.",
                         );
                     });
+                    form_row(ui, "Block hosts", Some(
+                        "One hostname per line. Exact entries match only that host; entries \
+                         starting with a dot match the parent suffix and subdomains. Matching \
+                         requests are answered locally before relay, tunnel-node, SNI rewrite, \
+                         or upstream SOCKS5 dispatch, saving quota and latency."
+                    ), |ui, label_id| {
+                        ui.add(egui::TextEdit::multiline(&mut self.form.block_hosts_text)
+                            .hint_text("ads.example.com\n.tracker.example")
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(3))
+                        .labelled_by(label_id);
+                    });
+                    let block_host_count = parse_host_list_editor(&self.form.block_hosts_text).len();
+                    ui.horizontal(|ui| {
+                        ui.add_space(120.0 + 8.0);
+                        let text = if block_host_count == 0 {
+                            "No local block rules configured.".to_string()
+                        } else {
+                            format!(
+                                "{} local block rule{} configured.",
+                                block_host_count,
+                                if block_host_count == 1 { "" } else { "s" }
+                            )
+                        };
+                        ui.small(
+                            egui::RichText::new(text)
+                                .color(if block_host_count == 0 {
+                                    egui::Color32::from_gray(140)
+                                } else {
+                                    OK_GREEN
+                                }),
+                        );
+                    });
                     ui.horizontal(|ui| {
                         ui.add_space(120.0 + 8.0);
                         ui.checkbox(&mut self.form.block_quic, "Block QUIC (UDP/443)")
@@ -1189,6 +1230,7 @@ impl eframe::App for App {
                         ("relay calls", s.relay_calls.to_string()),
                         ("failures", s.relay_failures.to_string()),
                         ("coalesced", s.coalesced.to_string()),
+                        ("blocked local", s.blocked_requests.to_string()),
                         (
                             "cache hits",
                             format!(
@@ -2573,5 +2615,36 @@ fn push_log(shared: &Shared, msg: &str) {
     s.log.push_back(line);
     while s.log.len() > LOG_MAX {
         s.log.pop_front();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_host_list_for_editor, parse_host_list_editor};
+
+    #[test]
+    fn host_list_editor_trims_blank_and_comment_lines() {
+        let parsed = parse_host_list_editor(
+            "\n  ads.example.com  \n# saved note\n.tracker.example\n   \n",
+        );
+        assert_eq!(
+            parsed,
+            vec![
+                "ads.example.com".to_string(),
+                ".tracker.example".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn host_list_editor_round_trips_one_host_per_line() {
+        let hosts = vec![
+            "ads.example.com".to_string(),
+            ".tracker.example".to_string(),
+        ];
+        assert_eq!(
+            parse_host_list_editor(&format_host_list_for_editor(&hosts)),
+            hosts
+        );
     }
 }

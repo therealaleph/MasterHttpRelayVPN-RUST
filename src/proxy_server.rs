@@ -1,9 +1,11 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use portable_atomic::AtomicU64;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Mutex};
@@ -241,6 +243,7 @@ pub struct RewriteCtx {
     /// consuming relay, tunnel, SNI-rewrite, or upstream SOCKS5 resources.
     /// Matching follows `passthrough_hosts` semantics.
     pub block_hosts: Vec<String>,
+    pub blocked_requests: Arc<AtomicU64>,
     /// If true, drop SOCKS5 UDP datagrams destined for port 443 so
     /// callers fall back to TCP/HTTPS. See config.rs `block_quic` for
     /// the trade-off. Issue #213.
@@ -412,6 +415,12 @@ pub fn matches_block_host(host: &str, list: &[String]) -> bool {
     matches_passthrough(host, list)
 }
 
+fn record_blocked_request(rewrite_ctx: &RewriteCtx) {
+    rewrite_ctx
+        .blocked_requests
+        .fetch_add(1, Ordering::Relaxed);
+}
+
 impl ProxyServer {
     pub fn new(config: &Config, mitm: Arc<Mutex<MitmCertManager>>) -> Result<Self, ProxyError> {
         let mode = config
@@ -516,6 +525,10 @@ impl ProxyServer {
             youtube_via_relay: config.youtube_via_relay,
             passthrough_hosts: config.passthrough_hosts.clone(),
             block_hosts: config.block_hosts.clone(),
+            blocked_requests: fronter
+                .as_ref()
+                .map(|f| f.blocked_requests_counter())
+                .unwrap_or_else(|| Arc::new(AtomicU64::new(0))),
             block_quic: config.block_quic,
             block_stun: config.block_stun,
             bypass_doh: !config.tunnel_doh,
@@ -825,6 +838,7 @@ async fn handle_http_client(
     if method.eq_ignore_ascii_case("CONNECT") {
         let (host, port) = parse_host_port(&target);
         if matches_block_host(&host, &rewrite_ctx.block_hosts) {
+            record_blocked_request(&rewrite_ctx);
             tracing::info!("CONNECT {}:{} blocked locally by block_hosts", host, port);
             write_http_no_content(&mut sock).await?;
             return Ok(());
@@ -850,6 +864,7 @@ async fn handle_http_client(
     } else {
         if let Some((host, port, _path)) = resolve_plain_http_target(&target, &headers) {
             if matches_block_host(&host, &rewrite_ctx.block_hosts) {
+                record_blocked_request(&rewrite_ctx);
                 tracing::info!("HTTP {}:{} blocked locally by block_hosts", host, port);
                 write_http_no_content(&mut sock).await?;
                 return Ok(());
@@ -949,6 +964,7 @@ async fn handle_socks5_client(
     }
 
     if matches_block_host(&host, &rewrite_ctx.block_hosts) {
+        record_blocked_request(&rewrite_ctx);
         tracing::info!("SOCKS5 CONNECT -> {}:{} blocked locally by block_hosts", host, port);
         sock.write_all(&[0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
             .await?;
@@ -1220,6 +1236,7 @@ async fn handle_socks5_udp_associate(
                 let payload_slice = &recv_buf[payload_off..n];
 
                 if matches_block_host(&target.host, &rewrite_ctx.block_hosts) {
+                    record_blocked_request(&rewrite_ctx);
                     tracing::debug!("udp dropped: target {} blocked by block_hosts", target.host);
                     continue;
                 }
@@ -1672,6 +1689,7 @@ async fn dispatch_tunnel(
     tunnel_mux: Option<Arc<TunnelMux>>,
 ) -> std::io::Result<()> {
     if matches_block_host(&host, &rewrite_ctx.block_hosts) {
+        record_blocked_request(&rewrite_ctx);
         tracing::info!("dispatch {}:{} -> blocked locally by block_hosts", host, port);
         drop(sock);
         return Ok(());
