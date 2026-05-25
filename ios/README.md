@@ -66,19 +66,19 @@ changing it, run `xcodegen generate`.
 The committed bundle ID `com.therealaleph.mhrv` is reserved for the main release.
 A bundle ID is globally unique across all of Apple, so if you want to ship your
 own build (e.g. a personal TestFlight build that installs **alongside** the main
-app without claiming its ID), append a unique suffix to the IDs **locally** —
-do **not** commit this. Use `.pixel` (or your own):
+app without claiming its ID), append a unique suffix of your choice — shown below
+as `<suffix>` (e.g. your initials) — to the IDs **locally**. Do **not** commit this.
 
 1. `ios/project.yml` — app target:
-   `PRODUCT_BUNDLE_IDENTIFIER: com.therealaleph.mhrv` → `com.therealaleph.mhrv.pixel`
+   `PRODUCT_BUNDLE_IDENTIFIER: com.therealaleph.mhrv` → `com.therealaleph.mhrv.<suffix>`
 2. `ios/project.yml` — `MhrvTunnel` target (the extension ID **must** stay a child
    of the app ID):
-   `com.therealaleph.mhrv.tunnel` → `com.therealaleph.mhrv.pixel.tunnel`
+   `com.therealaleph.mhrv.tunnel` → `com.therealaleph.mhrv.<suffix>.tunnel`
 3. `ios/App/ContentView.swift` — `VpnManager.tunnelId` must equal the extension ID:
-   `"com.therealaleph.mhrv.tunnel"` → `"com.therealaleph.mhrv.pixel.tunnel"`
+   `"com.therealaleph.mhrv.tunnel"` → `"com.therealaleph.mhrv.<suffix>.tunnel"`
 4. (Optional, for a fully independent data container) change the App Group in both
    `*.entitlements` and the `groupId` strings in `ContentView.swift` /
-   `PacketTunnelProvider.swift` to `group.com.therealaleph.mhrv.pixel`.
+   `PacketTunnelProvider.swift` to `group.com.therealaleph.mhrv.<suffix>`.
 5. `cd ios && xcodegen generate`, then create the App Store Connect record for the
    new bundle ID.
 
