@@ -1,0 +1,27 @@
+# Per-target rustflags for cross-compilation.
+#
+# iOS staticlib build (aarch64-apple-ios):
+#   -C panic=abort — propagate abort strategy to all crates so they match the
+#   [profile.release] panic = "abort" setting in Cargo.toml. Without this,
+#   leaf-ffi (which has its own staticlib crate-type) links panic_unwind and
+#   conflicts with our abort-strategy staticlib.
+# IPHONEOS_DEPLOYMENT_TARGET=16.0 is required so the linker doesn't default
+# to iOS 10 and produce version-mismatch errors with leaf's netstack-lwip C
+# objects (which are compiled against the current Xcode SDK).
+[target.aarch64-apple-ios]
+rustflags = []
+
+[target.aarch64-apple-ios.env]
+IPHONEOS_DEPLOYMENT_TARGET = "16.0"
+
+[target.aarch64-apple-ios-sim]
+rustflags = []
+
+[target.aarch64-apple-ios-sim.env]
+IPHONEOS_DEPLOYMENT_TARGET = "16.0"
+
+[target.x86_64-apple-ios]
+rustflags = []
+
+[target.x86_64-apple-ios.env]
+IPHONEOS_DEPLOYMENT_TARGET = "16.0"

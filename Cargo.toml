@@ -11,7 +11,8 @@ path = "src/lib.rs"
 # `cdylib` lets the Android app dlopen libmhrv_rs.so via System.loadLibrary.
 # `rlib` keeps the desktop binaries linking normally — same .rlib is used
 # for `mhrv-rs` and `mhrv-rs-ui` builds on macOS/Linux/Windows.
-crate-type = ["rlib", "cdylib"]
+# `staticlib` produces libmhrv_rs.a for the iOS NetworkExtension target.
+crate-type = ["rlib", "cdylib", "staticlib"]
 
 [[bin]]
 name = "mhrv-rs"
@@ -99,6 +100,30 @@ libc = "0.2"
 jni = { version = "0.21", default-features = false }
 tun2proxy = { version = "0.7", default-features = false, features = ["udpgw"] }
 
+# iOS-only deps for the NetworkExtension static lib (libmhrv_rs.a).
+#
+# leaf-ffi is the TUN <-> SOCKS5 bridge for iOS. Unlike Android (which gets a
+# raw fd from VpnService), iOS NEPacketTunnelProvider does not expose a public
+# raw fd — leaf reads the utun fd we obtain via the SYSPROTO_CONTROL socket
+# trick (see PacketTunnelProvider.swift) and handles:
+#   • userspace TCP/IP stack (smoltcp under the hood)
+#   • FakeIP/virtual DNS — intercepts DNS, returns 198.18.x.x fake IPs so
+#     mhrv-rs receives domain names instead of IPs for domain-fronting
+#   • SOCKS5 outbound → our mhrv-rs proxy
+#
+# Feature flags: default-ring uses ring for crypto (consistent with the rest
+# of this crate); inbound-tun + outbound-socks are the only inbound/outbound
+# types we need; config-json lets us build the leaf config as a JSON string
+# at runtime rather than requiring a file on disk.
+[target.'cfg(target_os = "ios")'.dependencies]
+# leaf is not on crates.io — pull from the upstream git workspace.
+# We use the `leaf` library crate directly (not `leaf-ffi`) to avoid the
+# panic_unwind conflict that arises when leaf-ffi's staticlib/dylib crate-type
+# links its own panic runtime against our panic=abort staticlib.
+# `default-ring` enables: all-configs (config-json), all-endpoints
+# (inbound-tun, outbound-socks), ring crypto — everything we need.
+leaf = { git = "https://github.com/eycorsican/leaf", package = "leaf", default-features = false, features = ["default-ring"] }
+
 [dev-dependencies]
 # Used in mitm tests to sanity-check the cert extensions we emit.
 x509-parser = "0.16"
@@ -113,3 +138,12 @@ codegen-units = 1
 lto = true
 opt-level = 3
 strip = true
+
+# iOS static lib build — panic=unwind lets catch_unwind stop leaf panics from
+# killing the whole Network Extension process. Strip disabled so the compact
+# unwind tables stay in the .a for the linker to use.
+[profile.release-ios]
+inherits = "release"
+panic = "unwind"
+strip = false
+

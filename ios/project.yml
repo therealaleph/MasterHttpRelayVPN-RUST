@@ -1,0 +1,103 @@
+name: MhrvVPN
+options:
+  bundleIdPrefix: com.therealaleph.mhrv
+  deploymentTarget:
+    iOS: "16.0"
+  xcodeVersion: "15"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+    SWIFT_VERSION: "5.9"
+    ENABLE_BITCODE: NO
+    DEBUG_INFORMATION_FORMAT: dwarf-with-dsym
+    # Keep in sync with the crate version in Cargo.toml. The toolbar reads
+    # CFBundleShortVersionString, which Info.plist maps to $(MARKETING_VERSION).
+    MARKETING_VERSION: "1.9.34"
+    CURRENT_PROJECT_VERSION: "1"
+
+packages: {}
+
+# Signing team comes from a local, gitignored xcconfig so the team ID never
+# lands in version control. Copy Local.xcconfig.example -> Local.xcconfig.
+configFiles:
+  Debug: Local.xcconfig
+  Release: Local.xcconfig
+
+targets:
+
+  # ── Container app ────────────────────────────────────────────────────────────
+  MhrvVPN:
+    type: application
+    platform: iOS
+    sources:
+      - path: App
+        excludes:
+          - "**/.DS_Store"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.therealaleph.mhrv
+        INFOPLIST_FILE: App/Info.plist
+        CODE_SIGN_ENTITLEMENTS: App/MhrvVPN.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    dependencies:
+      - target: MhrvTunnel
+        embed: true
+
+  # ── Network Extension (Packet Tunnel Provider) ────────────────────────────────
+  MhrvTunnel:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: NetworkExtension
+        excludes:
+          - "*.h"
+          - "**/.DS_Store"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.therealaleph.mhrv.tunnel
+        INFOPLIST_FILE: NetworkExtension/Info.plist
+        CODE_SIGN_ENTITLEMENTS: NetworkExtension/MhrvTunnel.entitlements
+        # Link the Rust static lib.  Run scripts/build-ios.sh first.
+        LIBRARY_SEARCH_PATHS: "$(PROJECT_DIR)/build/$(CONFIGURATION)"
+        OTHER_LDFLAGS: "-lmhrv_rs"
+        # Bridging header so Swift can call our C FFI.
+        SWIFT_OBJC_BRIDGING_HEADER: NetworkExtension/BridgingHeader.h
+    preBuildScripts:
+      - name: Build Rust static lib
+        script: |
+          set -e
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cd "$SRCROOT/.."
+
+          PROFILE=release-ios
+          CARGO_FLAGS="--profile release-ios"
+          if [ "$CONFIGURATION" = "Debug" ]; then
+            PROFILE=debug
+            CARGO_FLAGS=""
+          fi
+
+          # Pick the right Rust target from what Xcode is building for.
+          if [[ "$PLATFORM_NAME" == *simulator* ]]; then
+            RUST_TARGET="aarch64-apple-ios-sim"
+          else
+            RUST_TARGET="aarch64-apple-ios"
+          fi
+
+          export DEVELOPER_DIR="$(xcode-select -p)"
+          export SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
+          export IPHONEOS_DEPLOYMENT_TARGET="16.0"
+
+          rustup target add "$RUST_TARGET" 2>/dev/null || true
+          # Build ONLY the staticlib. `cargo build --lib` also links the cdylib,
+          # whose link fails on iOS (undefined ___chkstk_darwin from C deps under
+          # -nodefaultlibs), aborting the whole build and leaving a stale .a.
+          # `cargo rustc --crate-type staticlib` skips the cdylib entirely.
+          cargo rustc $CARGO_FLAGS --target "$RUST_TARGET" --lib --crate-type staticlib
+
+          mkdir -p "$PROJECT_DIR/build/$CONFIGURATION"
+          cp "target/${RUST_TARGET}/${PROFILE}/libmhrv_rs.a" \
+             "$PROJECT_DIR/build/$CONFIGURATION/libmhrv_rs.a"
+        outputFiles:
+          - "$(PROJECT_DIR)/build/$(CONFIGURATION)/libmhrv_rs.a"

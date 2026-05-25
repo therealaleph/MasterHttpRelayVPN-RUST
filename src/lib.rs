@@ -17,3 +17,6 @@ pub mod update_check;
 
 #[cfg(target_os = "android")]
 pub mod android_jni;
+
+#[cfg(target_os = "ios")]
+pub mod ios_ffi;
