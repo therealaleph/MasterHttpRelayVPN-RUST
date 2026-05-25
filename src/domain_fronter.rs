@@ -1797,7 +1797,7 @@ impl DomainFronter {
                 "[quota] global hard stop active — all Apps Script account buckets exhausted"
             );
             return error_response(
-                502,
+                503,
                 "All Apps Script accounts quota exhausted; hard stop active. \
                  Quota resets on a rolling 24-hour window per account.",
             );

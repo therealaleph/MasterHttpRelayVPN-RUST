@@ -359,11 +359,20 @@ impl QuotaTracker {
         // Secondary check: aggregate remaining < N × safety_buffer
         // AND at least one quota error signal has been seen (not just network
         // failures or local disconnects).
-        let total_quota_errors: u64 = st.buckets.values().map(|b| b.quota_error_count).sum();
+        // Only sum over currently configured script_ids so stale buckets from
+        // removed accounts don't inflate the used count or error tally and
+        // falsely trip this check.
+        let total_quota_errors: u64 = self.script_ids.iter()
+            .filter_map(|sid| st.buckets.get(sid))
+            .map(|b| b.quota_error_count)
+            .sum();
         if total_quota_errors == 0 {
             return false;
         }
-        let total_used: u64 = st.buckets.values().map(|b| b.requests_used).sum();
+        let total_used: u64 = self.script_ids.iter()
+            .filter_map(|sid| st.buckets.get(sid))
+            .map(|b| b.requests_used)
+            .sum();
         let total_cap = self.daily_limit * self.script_ids.len() as u64;
         let total_remaining = total_cap.saturating_sub(total_used);
         let aggregate_reserve = self.safety_buffer * self.script_ids.len() as u64;
@@ -557,5 +566,66 @@ impl QuotaTracker {
 impl Drop for QuotaTracker {
     fn drop(&mut self) {
         self.save();
+    }
+}
+
+#[cfg(test)]
+impl QuotaTracker {
+    fn new_for_test(
+        script_ids: Vec<String>,
+        daily_limit: u64,
+        safety_buffer: u64,
+        state: QuotaState,
+    ) -> Self {
+        Self {
+            state: Mutex::new(state),
+            script_ids,
+            daily_limit,
+            safety_buffer,
+            dirty_count: AtomicU64::new(0),
+            state_path: std::path::PathBuf::from("/dev/null"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stale exhausted bucket from a removed script ID must not cause a
+    /// global hard stop when the currently configured ID is fresh and healthy.
+    #[test]
+    fn stale_exhausted_bucket_does_not_trigger_global_hard_stop() {
+        let stale_id = "stale_removed_aaaa1111bbbb2222cccc".to_string();
+        let active_id = "active_fresh_xxxx9999yyyy8888zzzz".to_string();
+
+        let mut state = QuotaState::default();
+        state.buckets.insert(stale_id.clone(), AccountBucket {
+            masked_id: mask_id(&stale_id),
+            requests_used: 19_500,
+            quota_error_count: 5,
+            exhausted: true,
+            hard_stopped: true,
+            exhaustion_reason: Some("quota exhausted".into()),
+            ..Default::default()
+        });
+        state.buckets.insert(active_id.clone(), AccountBucket {
+            masked_id: mask_id(&active_id),
+            requests_used: 100,
+            ..Default::default()
+        });
+
+        // Only active_id is in the live config — stale_id was removed.
+        let tracker = QuotaTracker::new_for_test(
+            vec![active_id],
+            20_000,
+            500,
+            state,
+        );
+
+        assert!(
+            !tracker.is_globally_hard_stopped(),
+            "stale exhausted bucket from a removed script_id should not trigger global hard stop"
+        );
     }
 }
