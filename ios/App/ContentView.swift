@@ -407,18 +407,27 @@ private struct RelaySection: View {
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
 
-                    ForEach(Array(vpn.config.scriptIds.enumerated()), id: \.offset) { idx, id in
+                    ForEach(Array(vpn.config.scriptIds.enumerated()), id: \.offset) { idx, _ in
                         HStack {
                             TextField("#\(idx + 1)", text: Binding(
-                                get: { vpn.config.scriptIds[idx] },
+                                // Guard the index: after a delete, SwiftUI may
+                                // re-evaluate a removed row's binding before the
+                                // list updates — a stale index would crash.
+                                get: { idx < vpn.config.scriptIds.count ? vpn.config.scriptIds[idx] : "" },
                                 // Normalize on edit so a pasted full URL collapses
                                 // to the bare deployment ID (no prefix sticks).
-                                set: { vpn.config.scriptIds[idx] = VpnConfig.extractId($0); vpn.save() }
+                                set: {
+                                    guard idx < vpn.config.scriptIds.count else { return }
+                                    vpn.config.scriptIds[idx] = VpnConfig.extractId($0); vpn.save()
+                                }
                             ))
                             .font(.system(.caption, design: .monospaced))
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
-                            Button { vpn.config.scriptIds.remove(at: idx); vpn.save() } label: {
+                            Button {
+                                guard idx < vpn.config.scriptIds.count else { return }
+                                vpn.config.scriptIds.remove(at: idx); vpn.save()
+                            } label: {
                                 Image(systemName: "xmark.circle.fill")
                                     .foregroundStyle(.red)
                             }
