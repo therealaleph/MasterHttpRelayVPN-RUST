@@ -8,8 +8,6 @@
     <string>$(EXECUTABLE_NAME)</string>
     <key>CFBundleDisplayName</key>
     <string>MhrvVPN</string>
-    <key>CFBundleIdentifier</key>
-    <string>com.therealaleph.mhrv</string>
     <key>CFBundleName</key>
     <string>MhrvVPN</string>
     <key>CFBundlePackageType</key>
@@ -18,6 +16,10 @@
     <string>$(MARKETING_VERSION)</string>
     <key>CFBundleVersion</key>
     <string>$(CURRENT_PROJECT_VERSION)</string>
+    <!-- Uses only standard TLS/HTTPS — exempt from export-compliance docs.
+         Skips the encryption prompt on every TestFlight upload. -->
+    <key>ITSAppUsesNonExemptEncryption</key>
+    <false/>
     <key>LSRequiresIPhoneOS</key>
     <true/>
     <key>UIApplicationSceneManifest</key>
