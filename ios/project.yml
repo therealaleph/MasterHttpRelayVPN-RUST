@@ -41,6 +41,7 @@ targets:
         INFOPLIST_FILE: App/Info.plist
         CODE_SIGN_ENTITLEMENTS: App/MhrvVPN.entitlements
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        TARGETED_DEVICE_FAMILY: "1"
     dependencies:
       - target: MhrvTunnel
         embed: true
@@ -59,6 +60,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.therealaleph.mhrv.tunnel
         INFOPLIST_FILE: NetworkExtension/Info.plist
         CODE_SIGN_ENTITLEMENTS: NetworkExtension/MhrvTunnel.entitlements
+        TARGETED_DEVICE_FAMILY: "1"
         # Link the Rust static lib.  Run scripts/build-ios.sh first.
         LIBRARY_SEARCH_PATHS: "$(PROJECT_DIR)/build/$(CONFIGURATION)"
         OTHER_LDFLAGS: "-lmhrv_rs"
