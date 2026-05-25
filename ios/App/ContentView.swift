@@ -50,6 +50,8 @@ struct VpnConfig {
     var blockStun: Bool = true
     var blockDoh: Bool = true
     var tunnelDoh: Bool = true
+    var coalesceStepMs: Int = 10          // full-mode batch coalescing
+    var coalesceMaxMs: Int = 1000
 
     // MARK: serialise
 
@@ -69,6 +71,8 @@ struct VpnConfig {
             "block_stun": blockStun,
             "block_doh": blockDoh,
             "tunnel_doh": tunnelDoh,
+            "coalesce_step_ms": coalesceStepMs,
+            "coalesce_max_ms": coalesceMaxMs,
             "fetch_ips_from_api": false,
             "max_ips_to_scan": 20,
             "scan_batch_size": 100,
@@ -158,6 +162,8 @@ struct VpnConfig {
         if let v = obj["block_stun"]   as? Bool    { cfg.blockStun   = v }
         if let v = obj["block_doh"]    as? Bool    { cfg.blockDoh    = v }
         if let v = obj["tunnel_doh"]   as? Bool    { cfg.tunnelDoh   = v }
+        if let v = obj["coalesce_step_ms"] as? Int { cfg.coalesceStepMs = v }
+        if let v = obj["coalesce_max_ms"]  as? Int { cfg.coalesceMaxMs  = v }
         // script_ids: array or single string (both Android formats)
         if let arr = obj["script_ids"] as? [String] {
             cfg.scriptIds = arr.map { extractId($0) }.filter { !$0.isEmpty }
@@ -735,6 +741,31 @@ private struct AdvancedSection: View {
                     get: { vpn.config.verifySsl },
                     set: { vpn.config.verifySsl = $0; vpn.save() }
                 ))
+
+                Divider()
+
+                // Full-mode batch coalescing.
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Batch Coalescing").font(.subheadline).foregroundStyle(.secondary)
+                    HStack(spacing: 10) {
+                        LabeledField(label: "Window (ms)") {
+                            TextField("10", value: Binding(
+                                get: { vpn.config.coalesceStepMs },
+                                set: { vpn.config.coalesceStepMs = max(0, $0); vpn.save() }
+                            ), format: .number)
+                            .keyboardType(.numberPad)
+                        }
+                        LabeledField(label: "Max (ms)") {
+                            TextField("1000", value: Binding(
+                                get: { vpn.config.coalesceMaxMs },
+                                set: { vpn.config.coalesceMaxMs = max(0, $0); vpn.save() }
+                            ), format: .number)
+                            .keyboardType(.numberPad)
+                        }
+                    }
+                    Text("How long the tunnel waits to batch outbound requests to Apps Script. Lower = snappier; higher = fewer round-trips (better throughput). 0 = compiled default.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }
         }
     }
