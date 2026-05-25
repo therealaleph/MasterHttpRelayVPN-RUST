@@ -287,6 +287,11 @@ struct ContentView: View {
                 .padding(.horizontal, 16)
                 .padding(.top, 8)
             }
+            // Dismiss the keyboard on a tap in empty space or on scroll.
+            // Interactive controls consume their own taps, so fields/buttons
+            // still work — only non-control taps fall through to here.
+            .scrollDismissesKeyboard(.interactively)
+            .onTapGesture { UIApplication.shared.endEditing() }
             .navigationTitle("mhrv-rs")
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
@@ -1194,6 +1199,13 @@ class VpnManager: ObservableObject {
 }
 
 // MARK: — Helpers
+
+extension UIApplication {
+    /// Resign first responder on whatever is focused — hides the keyboard.
+    func endEditing() {
+        sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+    }
+}
 
 extension NEVPNStatus {
     var displayName: String {
