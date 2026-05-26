@@ -83,6 +83,13 @@ const UDP_QUEUE_LIMIT: usize = 256;
 /// a maximum-size IPv4 datagram without truncation.
 const UDP_RECV_BUF_BYTES: usize = 65536;
 
+/// Hard cap on each TCP session's `read_buf`. The reader_task pauses
+/// when the buffer reaches this size and resumes once the client drains
+/// it below the cap. Bounds per-session memory to ~32 MB regardless of
+/// upstream throughput — prevents OOM when fast upstreams (video,
+/// downloads) outpace Apps Script's 2-7 s polling interval.
+const READ_BUF_CAP: usize = 32 * 1024 * 1024;
+
 /// Maximum raw bytes per TCP drain that we hand back to Apps Script in
 /// one batch response. Apps Script's hard cap on Web App response body
 /// is ~50 MiB. Accounting for base64 encoding (1.33×) and JSON envelope
@@ -252,6 +259,16 @@ fn create_udpgw_session() -> ManagedSession {
 async fn reader_task(mut reader: impl AsyncRead + Unpin, session: Arc<SessionInner>) {
     let mut buf = vec![0u8; 2 * 1024 * 1024];
     loop {
+        // Backpressure: pause reads when the buffer hits READ_BUF_CAP.
+        // Bounds per-session memory regardless of upstream throughput.
+        // The drain on the batch side drops the lock between calls, so
+        // this sleep loop will observe the updated size and resume.
+        loop {
+            if session.read_buf.lock().await.len() < READ_BUF_CAP {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         match reader.read(&mut buf).await {
             Ok(0) => {
                 session.eof.store(true, Ordering::Release);
@@ -927,7 +944,10 @@ async fn handle_batch(
                     sessions.get(&sid).map(|s| s.inner.clone())
                 };
                 if let Some(inner) = inner {
-                    *inner.last_active.lock().await = Instant::now();
+                    // last_active is bumped only on real uplink activity
+                    // here, or on actual downstream drain below. Empty
+                    // polls must not refresh it — matches udp_data branch.
+                    let mut had_uplink = false;
                     if let Some(ref data_b64) = op.d {
                         if !data_b64.is_empty() {
                             // Decode first; only count this op as a real
@@ -947,6 +967,7 @@ async fn handle_batch(
                             };
                             if !bytes.is_empty() {
                                 had_writes_or_connects = true;
+                                had_uplink = true;
                                 tracing::info!(
                                     "session {} upload {}B wseq={:?}",
                                     &sid[..sid.len().min(8)], bytes.len(), op.wseq,
@@ -997,6 +1018,9 @@ async fn handle_batch(
                                 }
                             }
                         }
+                    }
+                    if had_uplink {
+                        *inner.last_active.lock().await = Instant::now();
                     }
                     tcp_drains.push((i, sid, inner, op.seq));
                 } else {
@@ -1205,6 +1229,7 @@ async fn handle_batch(
             let drained = all_data.len();
             if drained > 0 {
                 tracing::info!("session {} drained {}KB", &sid[..sid.len().min(8)], drained / 1024);
+                *inner.last_active.lock().await = Instant::now();
             }
             if final_eof {
                 tcp_eof_sids.push(sid.clone());
@@ -1219,7 +1244,7 @@ async fn handle_batch(
             let mut sessions = state.sessions.lock().await;
             for sid in &tcp_eof_sids {
                 if let Some(s) = sessions.remove(sid) {
-                    s.reader_handle.abort();
+                    s.abort_all();
                     tracing::info!("session {} closed by remote (batch)", sid);
                 }
             }
@@ -1566,15 +1591,22 @@ async fn cleanup_task(
         {
             let mut map = sessions.lock().await;
             let mut stale = Vec::new();
+            let mut total_read_buf: usize = 0;
             for (k, s) in map.iter() {
                 let last = *s.inner.last_active.lock().await;
+                total_read_buf += s.inner.read_buf.lock().await.len();
                 if now.duration_since(last) > Duration::from_secs(300) {
                     stale.push(k.clone());
                 }
             }
+            tracing::info!(
+                "cleanup: {} tcp sessions, {:.1} MB total read_buf",
+                map.len(),
+                total_read_buf as f64 / (1024.0 * 1024.0),
+            );
             for k in &stale {
                 if let Some(s) = map.remove(k) {
-                    s.reader_handle.abort();
+                    s.abort_all();
                     tracing::info!("reaped idle session {}", k);
                 }
             }
