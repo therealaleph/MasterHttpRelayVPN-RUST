@@ -88,6 +88,23 @@ struct VpnConfig {
         return str
     }
 
+    /// Android-compatible share string: `mhrv-rs://` + URL-safe base64 of the
+    /// zlib-compressed (RFC 1950) JSON — byte-for-byte decodable by Android's
+    /// ConfigStore.decode (InflaterInputStream). Falls back to uncompressed
+    /// base64 if compression fails (still decodable by both sides).
+    func encode() -> String {
+        let json = toJson(pretty: false)
+        let bytes = Data(json.utf8)
+        let payload = Self.zlibDeflate(bytes) ?? bytes
+        return "mhrv-rs://" + Self.urlSafeBase64(payload)
+    }
+
+    private static func urlSafeBase64(_ data: Data) -> String {
+        data.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+    }
+
     // MARK: parse
 
     /// Try to parse raw text — mhrv-rs:// (Android share), JSON, or TOML.
@@ -108,10 +125,18 @@ struct VpnConfig {
         let rem = b64.count % 4
         if rem != 0 { b64 += String(repeating: "=", count: 4 - rem) }
         // ignoreUnknownCharacters handles any stray whitespace/newlines in the clipboard.
-        guard let compressed = Data(base64Encoded: b64, options: .ignoreUnknownCharacters),
-              let inflated   = zlibInflate(compressed),
-              let json       = String(data: inflated, encoding: .utf8) else { return nil }
-        return fromJson(json)
+        guard let raw = Data(base64Encoded: b64, options: .ignoreUnknownCharacters) else { return nil }
+        // Prefer zlib-inflated JSON; fall back to raw UTF-8 (mirrors Android's
+        // inflateOrRaw — handles uncompressed mhrv-rs:// payloads too).
+        if let inflated = zlibInflate(raw),
+           let json = String(data: inflated, encoding: .utf8),
+           let cfg = fromJson(json) {
+            return cfg
+        }
+        if let json = String(data: raw, encoding: .utf8) {
+            return fromJson(json)
+        }
+        return nil
     }
 
     /// Decompress Java DeflaterOutputStream output (zlib / RFC 1950).
@@ -141,6 +166,41 @@ struct VpnConfig {
         }
         guard written > 0 else { return nil }
         return Data(outBuf.prefix(written))
+    }
+
+    /// Compress to zlib format (RFC 1950) so Android's InflaterInputStream reads
+    /// it: 2-byte header + raw DEFLATE (Apple COMPRESSION_ZLIB) + 4-byte Adler-32.
+    private static func zlibDeflate(_ data: Data) -> Data? {
+        guard !data.isEmpty else { return nil }
+        let cap = data.count + 4096
+        var outBuf = [UInt8](repeating: 0, count: cap)
+        var written = 0
+        data.withUnsafeBytes { (srcPtr: UnsafeRawBufferPointer) in
+            guard let src = srcPtr.bindMemory(to: UInt8.self).baseAddress else { return }
+            outBuf.withUnsafeMutableBufferPointer { dstPtr in
+                written = compression_encode_buffer(
+                    dstPtr.baseAddress!, cap,
+                    src, srcPtr.count,
+                    nil, COMPRESSION_ZLIB
+                )
+            }
+        }
+        guard written > 0 else { return nil }
+        var out = Data([0x78, 0x9C])                 // zlib header: deflate, default level
+        out.append(contentsOf: outBuf[0..<written])  // raw DEFLATE body
+        var adler = adler32(data).bigEndian          // Adler-32 over uncompressed bytes, MSB first
+        withUnsafeBytes(of: &adler) { out.append(contentsOf: $0) }
+        return out
+    }
+
+    private static func adler32(_ data: Data) -> UInt32 {
+        var a: UInt32 = 1, b: UInt32 = 0
+        let mod: UInt32 = 65521
+        for byte in data {
+            a = (a + UInt32(byte)) % mod
+            b = (b + a) % mod
+        }
+        return (b << 16) | a
     }
 
     static func fromJson(_ json: String) -> VpnConfig? {
@@ -341,7 +401,7 @@ private struct ConfigSharingBar: View {
             }
             .buttonStyle(.bordered)
             .sheet(isPresented: $showShareSheet) {
-                ShareSheet(items: [vpn.config.toJson()])
+                ShareSheet(items: [vpn.config.encode()])
             }
         }
     }
