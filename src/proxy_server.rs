@@ -1,9 +1,11 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use portable_atomic::AtomicU64;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Mutex};
@@ -237,6 +239,11 @@ pub struct RewriteCtx {
     /// and pass through as plain TCP (optionally via upstream_socks5).
     /// See config.rs `passthrough_hosts` for matching rules. Issues #39, #127.
     pub passthrough_hosts: Vec<String>,
+    /// User-configured hostnames that should be answered locally instead of
+    /// consuming relay, tunnel, SNI-rewrite, or upstream SOCKS5 resources.
+    /// Matching follows `passthrough_hosts` semantics.
+    pub block_hosts: Vec<String>,
+    pub blocked_requests: Arc<AtomicU64>,
     /// If true, drop SOCKS5 UDP datagrams destined for port 443 so
     /// callers fall back to TCP/HTTPS. See config.rs `block_quic` for
     /// the trade-off. Issue #213.
@@ -404,6 +411,16 @@ pub fn matches_passthrough(host: &str, list: &[String]) -> bool {
     })
 }
 
+pub fn matches_block_host(host: &str, list: &[String]) -> bool {
+    matches_passthrough(host, list)
+}
+
+fn record_blocked_request(rewrite_ctx: &RewriteCtx) {
+    rewrite_ctx
+        .blocked_requests
+        .fetch_add(1, Ordering::Relaxed);
+}
+
 impl ProxyServer {
     pub fn new(config: &Config, mitm: Arc<Mutex<MitmCertManager>>) -> Result<Self, ProxyError> {
         let mode = config
@@ -507,6 +524,11 @@ impl ProxyServer {
             mode,
             youtube_via_relay: config.youtube_via_relay,
             passthrough_hosts: config.passthrough_hosts.clone(),
+            block_hosts: config.block_hosts.clone(),
+            blocked_requests: fronter
+                .as_ref()
+                .map(|f| f.blocked_requests_counter())
+                .unwrap_or_else(|| Arc::new(AtomicU64::new(0))),
             block_quic: config.block_quic,
             block_stun: config.block_stun,
             bypass_doh: !config.tunnel_doh,
@@ -810,11 +832,17 @@ async fn handle_http_client(
         }
     };
 
-    let (method, target, _version, _headers) = parse_request_head(&head)
+    let (method, target, _version, headers) = parse_request_head(&head)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad request"))?;
 
     if method.eq_ignore_ascii_case("CONNECT") {
         let (host, port) = parse_host_port(&target);
+        if matches_block_host(&host, &rewrite_ctx.block_hosts) {
+            record_blocked_request(&rewrite_ctx);
+            tracing::info!("CONNECT {}:{} blocked locally by block_hosts", host, port);
+            write_http_no_content(&mut sock).await?;
+            return Ok(());
+        }
         // Mirror the SOCKS5 short-circuit: if the tunnel-node just failed
         // this (host, port) with unreachable, return 502 immediately rather
         // than acknowledging the CONNECT and blowing tunnel quota on a
@@ -834,6 +862,14 @@ async fn handle_http_client(
         sock.flush().await?;
         dispatch_tunnel(sock, host, port, fronter, mitm, rewrite_ctx, tunnel_mux).await
     } else {
+        if let Some((host, port, _path)) = resolve_plain_http_target(&target, &headers) {
+            if matches_block_host(&host, &rewrite_ctx.block_hosts) {
+                record_blocked_request(&rewrite_ctx);
+                tracing::info!("HTTP {}:{} blocked locally by block_hosts", host, port);
+                write_http_no_content(&mut sock).await?;
+                return Ok(());
+            }
+        }
         // Plain HTTP proxy request (e.g. `GET http://…`).
         //
         // apps_script mode: relay through the Apps Script fronter (which
@@ -924,7 +960,16 @@ async fn handle_socks5_client(
 
     if cmd == 0x03 {
         tracing::info!("SOCKS5 UDP ASSOCIATE requested for {}:{}", host, port);
-        return handle_socks5_udp_associate(sock, rewrite_ctx, tunnel_mux).await;
+        return handle_socks5_udp_associate(sock, fronter, rewrite_ctx, tunnel_mux).await;
+    }
+
+    if matches_block_host(&host, &rewrite_ctx.block_hosts) {
+        record_blocked_request(&rewrite_ctx);
+        tracing::info!("SOCKS5 CONNECT -> {}:{} blocked locally by block_hosts", host, port);
+        sock.write_all(&[0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await?;
+        sock.flush().await?;
+        return Ok(());
     }
 
     // Negative-cache short-circuit: if the tunnel-node just failed to reach
@@ -1095,6 +1140,7 @@ const MAX_UDP_PAYLOAD_BYTES: usize = 9 * 1024;
 
 async fn handle_socks5_udp_associate(
     mut control: TcpStream,
+    fronter: Option<Arc<DomainFronter>>,
     rewrite_ctx: Arc<RewriteCtx>,
     tunnel_mux: Option<Arc<TunnelMux>>,
 ) -> std::io::Result<()> {
@@ -1190,6 +1236,29 @@ async fn handle_socks5_udp_associate(
                 };
                 let payload_slice = &recv_buf[payload_off..n];
 
+                if rewrite_ctx.block_quic && target.port == 53 {
+                    if let Some(response) = dns_empty_response_for_https_or_svcb(payload_slice) {
+                        if let Some(f) = &fronter {
+                            f.record_https_rr_suppressed();
+                        }
+                        let framed = build_socks5_udp_packet(&target, &response);
+                        if let Err(e) = udp.send_to(&framed, peer).await {
+                            tracing::debug!(
+                                "udp DNS HTTPS/SVCB suppression reply to {} failed: {}",
+                                peer,
+                                e
+                            );
+                        }
+                        continue;
+                    }
+                }
+
+                if matches_block_host(&target.host, &rewrite_ctx.block_hosts) {
+                    record_blocked_request(&rewrite_ctx);
+                    tracing::debug!("udp dropped: target {} blocked by block_hosts", target.host);
+                    continue;
+                }
+
                 // Issue #213: client-side QUIC block. UDP/443 is
                 // HTTP/3 — drop the datagram silently so the client
                 // stack retries a couple of times and then falls back
@@ -1207,6 +1276,9 @@ async fn handle_socks5_udp_associate(
                 // a "no response → fall back" timeout, so silent drop
                 // is the contractually correct shape.
                 if rewrite_ctx.block_quic && target.port == 443 {
+                    if let Some(f) = &fronter {
+                        f.record_quic_udp_drop();
+                    }
                     tracing::debug!(
                         "udp dropped: block_quic=true, target {}:443",
                         target.host
@@ -1504,6 +1576,16 @@ async fn write_socks5_reply(
     sock.flush().await
 }
 
+async fn write_http_no_content(sock: &mut TcpStream) -> std::io::Result<()> {
+    sock.write_all(
+        b"HTTP/1.1 204 No Content\r\n\
+          Connection: close\r\n\
+          Content-Length: 0\r\n\r\n",
+    )
+    .await?;
+    sock.flush().await
+}
+
 /// Parse the SOCKS5 UDP frame header and return the target plus the byte
 /// offset at which the payload starts. Splitting "structure parsing"
 /// from "give me a payload slice" lets the recv hot path stay on a
@@ -1596,6 +1678,69 @@ fn build_socks5_udp_packet(target: &SocksUdpTarget, payload: &[u8]) -> Vec<u8> {
     out
 }
 
+const DNS_TYPE_SVCB: u16 = 64;
+const DNS_TYPE_HTTPS: u16 = 65;
+
+fn dns_empty_response_for_https_or_svcb(query: &[u8]) -> Option<Vec<u8>> {
+    let question_end = dns_single_question_https_or_svcb_end(query)?;
+    let mut out = Vec::with_capacity(question_end);
+    out.extend_from_slice(&query[..question_end]);
+    // QR=1, opcode copied, AA=0, TC=0, RD copied, RA=0, Z=0, RCODE=0.
+    out[2] = (query[2] & 0x78) | 0x80 | (query[2] & 0x01);
+    out[3] = 0x00;
+    // QDCOUNT stays 1. ANCOUNT, NSCOUNT, ARCOUNT become 0.
+    out[6] = 0;
+    out[7] = 0;
+    out[8] = 0;
+    out[9] = 0;
+    out[10] = 0;
+    out[11] = 0;
+    Some(out)
+}
+
+fn dns_single_question_https_or_svcb_end(query: &[u8]) -> Option<usize> {
+    if query.len() < 12 {
+        return None;
+    }
+    let qdcount = u16::from_be_bytes([query[4], query[5]]);
+    if qdcount != 1 {
+        return None;
+    }
+    if query[2] & 0x80 != 0 {
+        return None;
+    }
+
+    let mut pos = 12usize;
+    loop {
+        let len = *query.get(pos)?;
+        pos += 1;
+        if len == 0 {
+            break;
+        }
+        if len & 0xc0 != 0 {
+            return None;
+        }
+        let label_len = len as usize;
+        if label_len > 63 || pos.checked_add(label_len)? > query.len() {
+            return None;
+        }
+        pos += label_len;
+    }
+    if pos.checked_add(4)? > query.len() {
+        return None;
+    }
+    let qtype = u16::from_be_bytes([query[pos], query[pos + 1]]);
+    let qclass = u16::from_be_bytes([query[pos + 2], query[pos + 3]]);
+    if qclass != 1 {
+        return None;
+    }
+    if qtype == DNS_TYPE_SVCB || qtype == DNS_TYPE_HTTPS {
+        Some(pos + 4)
+    } else {
+        None
+    }
+}
+
 // ---------- Smart dispatch (used by both HTTP CONNECT and SOCKS5) ----------
 
 fn should_use_sni_rewrite(
@@ -1627,6 +1772,13 @@ async fn dispatch_tunnel(
     rewrite_ctx: Arc<RewriteCtx>,
     tunnel_mux: Option<Arc<TunnelMux>>,
 ) -> std::io::Result<()> {
+    if matches_block_host(&host, &rewrite_ctx.block_hosts) {
+        record_blocked_request(&rewrite_ctx);
+        tracing::info!("dispatch {}:{} -> blocked locally by block_hosts", host, port);
+        drop(sock);
+        return Ok(());
+    }
+
     // 0. User-configured passthrough list wins over every other path.
     //    If the host matches `passthrough_hosts`, we raw-TCP it (through
     //    upstream_socks5 if set) and never touch Apps Script, SNI-rewrite,
@@ -3505,6 +3657,106 @@ mod tests {
         let list = vec!["example.com.".to_string()];
         assert!(matches_passthrough("example.com", &list));
         assert!(matches_passthrough("example.com.", &list));
+    }
+
+    fn dns_query(qtype: u16) -> Vec<u8> {
+        let mut q = Vec::new();
+        q.extend_from_slice(&[0x12, 0x34, 0x01, 0x00]);
+        q.extend_from_slice(&[0x00, 0x01, 0x00, 0x00]);
+        q.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        for label in ["www", "example", "com"] {
+            q.push(label.len() as u8);
+            q.extend_from_slice(label.as_bytes());
+        }
+        q.push(0);
+        q.extend_from_slice(&qtype.to_be_bytes());
+        q.extend_from_slice(&1u16.to_be_bytes());
+        q
+    }
+
+    fn dns_query_with_class(qtype: u16, qclass: u16) -> Vec<u8> {
+        let mut q = dns_query(qtype);
+        let n = q.len();
+        q[n - 2..n].copy_from_slice(&qclass.to_be_bytes());
+        q
+    }
+
+    #[test]
+    fn dns_https_question_gets_empty_success_response() {
+        let query = dns_query(DNS_TYPE_HTTPS);
+        let response = dns_empty_response_for_https_or_svcb(&query).unwrap();
+        assert_eq!(&response[0..2], &[0x12, 0x34]);
+        assert_eq!(response[2] & 0x80, 0x80);
+        assert_eq!(response[3] & 0x0f, 0);
+        assert_eq!(&response[4..6], &[0x00, 0x01]);
+        assert_eq!(&response[6..12], &[0, 0, 0, 0, 0, 0]);
+        assert_eq!(&response[12..], &query[12..]);
+    }
+
+    #[test]
+    fn dns_https_response_preserves_rd_and_clears_additional_records() {
+        let mut query = dns_query(DNS_TYPE_HTTPS);
+        // Pretend the client included one additional record after the
+        // question. The local policy answer must not echo that section.
+        query[11] = 1;
+        query.extend_from_slice(&[0, 0, 41, 16, 0, 0, 0, 0, 0, 0, 0]);
+
+        let response = dns_empty_response_for_https_or_svcb(&query).unwrap();
+        assert_eq!(response[2] & 0x01, 0x01);
+        assert_eq!(&response[10..12], &[0, 0]);
+        assert!(response.len() < query.len());
+    }
+
+    #[test]
+    fn dns_svcb_question_gets_empty_success_response() {
+        let query = dns_query(DNS_TYPE_SVCB);
+        assert!(dns_empty_response_for_https_or_svcb(&query).is_some());
+    }
+
+    #[test]
+    fn dns_a_question_is_not_suppressed() {
+        let query = dns_query(1);
+        assert!(dns_empty_response_for_https_or_svcb(&query).is_none());
+    }
+
+    #[test]
+    fn dns_multi_question_query_is_not_suppressed() {
+        let mut query = dns_query(DNS_TYPE_HTTPS);
+        query[5] = 2;
+        assert!(dns_empty_response_for_https_or_svcb(&query).is_none());
+    }
+
+    #[test]
+    fn dns_compressed_question_name_is_not_suppressed() {
+        let mut query = Vec::new();
+        query.extend_from_slice(&[0x12, 0x34, 0x01, 0x00]);
+        query.extend_from_slice(&[0x00, 0x01, 0x00, 0x00]);
+        query.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        query.extend_from_slice(&[0xc0, 0x0c]);
+        query.extend_from_slice(&DNS_TYPE_HTTPS.to_be_bytes());
+        query.extend_from_slice(&1u16.to_be_bytes());
+        assert!(dns_empty_response_for_https_or_svcb(&query).is_none());
+    }
+
+    #[test]
+    fn dns_non_in_question_is_not_suppressed() {
+        let query = dns_query_with_class(DNS_TYPE_HTTPS, 3);
+        assert!(dns_empty_response_for_https_or_svcb(&query).is_none());
+    }
+
+    #[test]
+    fn block_hosts_use_passthrough_matching_rules() {
+        let list = vec![
+            "ads.example.com".to_string(),
+            ".tracker.example".to_string(),
+            "  ".to_string(),
+        ];
+        assert!(matches_block_host("ads.example.com", &list));
+        assert!(matches_block_host("ADS.EXAMPLE.COM.", &list));
+        assert!(!matches_block_host("cdn.ads.example.com", &list));
+        assert!(matches_block_host("tracker.example", &list));
+        assert!(matches_block_host("pixel.tracker.example", &list));
+        assert!(!matches_block_host("nottracker.example", &list));
     }
 
     #[test]

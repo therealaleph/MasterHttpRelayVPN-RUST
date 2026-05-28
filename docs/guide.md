@@ -206,6 +206,19 @@ upstream_socks5 = "127.0.0.1:50529"
 
 HTTP / HTTPS keeps going through Apps Script (no change), and the SNI-rewrite tunnel for `google.com` / `youtube.com` keeps bypassing both — YouTube stays as fast as before while Telegram gets a real tunnel.
 
+## Local host blocking
+
+Use `block_hosts` for destinations that should be answered locally instead of spending Apps Script quota, tunnel-node capacity, or upstream SOCKS5 traffic. Exact entries match only that hostname; entries that start with `.` match the parent suffix and its subdomains.
+
+```toml
+[network]
+block_hosts = ["ads.example.com", ".tracker.example"]
+```
+
+You can edit the same list in the desktop UI under **Advanced → Block hosts**. The editor saves one hostname per line back to `network.block_hosts`, preserving the same exact-match and suffix-match behavior as the TOML field.
+
+Blocked HTTP and HTTP CONNECT requests receive a local `204 No Content` response. SOCKS5 CONNECT requests receive a ruleset failure reply before any outbound connection is opened. The desktop traffic panel and stats JSON expose `blocked_requests`, which counts local block-list hits that avoided relay, tunnel-node, SNI rewrite, and upstream SOCKS5 dispatch.
+
 ## Full Tunnel mode
 
 `"mode": "full"` routes **all** traffic end-to-end through Apps Script and a remote [tunnel-node](../tunnel-node/) — no MITM certificate needed. TCP carried as persistent tunnel sessions, UDP from Android / TUN clients via SOCKS5 `UDP ASSOCIATE` to the tunnel-node which emits real UDP server-side. Trade-off: higher per-request latency (every byte goes Apps Script → tunnel-node → destination), but works for any protocol and any app, no CA install required.
@@ -317,6 +330,8 @@ Memory footprint ~15–20 MB resident — fine on anything ≥128 MB RAM. No UI 
 - **`mhrv-rs test-sni`** — parallel TLS probe of every SNI name in your rotation pool against `google_ip`. Tells you which front-domain names pass through your ISP's DPI. UI has same thing in **SNI pool…** window with checkboxes, per-row **Test** buttons, and **Keep ✓ only** to auto-trim.
 - **Periodic stats** logged every 60 s at `info` level (relay calls, cache hit rate, bytes relayed, active vs blacklisted scripts). UI shows live.
 
+When `block_quic = true`, the SOCKS5 UDP relay drops UDP/443 datagrams and answers DNS HTTPS/SVCB (type 65/64) questions with an empty successful response. Ordinary A/AAAA DNS questions are unchanged. Browsers then skip HTTP/3 advertisement and fall back to TCP/HTTPS sooner, without forwarding those QUIC discovery packets through the relay.
+
 ### SNI pool editor
 
 By default, mhrv-rs rotates through `{www, mail, drive, docs, calendar}.google.com` on outbound TLS to your `google_ip`, to avoid fingerprinting one name too heavily. Some may be locally blocked (e.g. `mail.google.com` has been targeted in Iran at various times).
@@ -356,6 +371,7 @@ This port focuses on the **`apps_script` mode** — the only one that reliably w
 - [x] Script IDs masked in logs (`prefix…suffix`) so logs don't leak deployment IDs
 - [x] Desktop UI (egui) — cross-platform, no bundler needed
 - [x] Optional upstream SOCKS5 chaining for non-HTTP traffic (Telegram MTProto, IMAP, SSH…)
+- [x] Local `block_hosts` short-circuit before relay, tunnel, SNI rewrite, or upstream SOCKS5 dispatch
 - [x] Connection pool pre-warm on startup
 - [x] Per-connection SNI rotation across `{www, mail, drive, docs, calendar}.google.com`
 - [x] Optional parallel script-ID dispatch (`parallel_relay`): fan-out to N script instances, return first success
