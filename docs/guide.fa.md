@@ -225,7 +225,9 @@ HTTP / HTTPS مثل قبل از Apps Script می‌رود (تغییری نمی�
 | ۶ | ۱۸۰ | توصیه‌شده برای استفادهٔ سنگین |
 | ۱۲ | ۳۶۰ | چند حساب — حداکثر توان |
 
-بیشتر Deployment = همزمانی بیشتر = تأخیر کمتر هر سشن. هر بَچ بین IDها چرخش می‌کند و بار به‌طور یکنواخت توزیع می‌شود، احتمال رسیدن به سقف سهمیهٔ یک Deployment کاهش می‌یابد.
+بیشتر Deployment = همزمانی بیشتر = تأخیر کمتر هر سشن. انتخاب هر بَچ از بین IDهای تنظیم‌شده با یک ledger محلی rolling 24-hour انجام می‌شود؛ بار پخش می‌شود و کلاینت از Deploymentهایی که همین دستگاه نزدیک سقف request سهمیهٔ رایگان برده دوری می‌کند.
+
+پنل **Script health** در UI دسکتاپ همین وضعیت محلی را فقط به‌صورت read-only نشان می‌دهد: Deployment ID ماسک‌شده، تعداد callهای مشاهده‌شده در پنجرهٔ rolling 24-hour، اینکه threshold محلی free-tier اشباع شده یا نه، cooldown باقی‌مانده، دلیل/کلاس خطایی که آن cooldown را ساخته، و تعداد timeout strikeهای فعلی. این فقط telemetry سمت کلاینت است؛ اگر دستگاه‌های دیگر هم از همان deployment استفاده کنند، Google ممکن است callهای بیشتری شمرده باشد.
 
 **محافظ‌های منابع:**
 - **حداکثر ۵۰ op** در هر بَچ — اگر سشن‌های فعال بیشتر باشند، مالتی‌پلکسر چند بَچ می‌فرستد
@@ -350,7 +352,7 @@ sni_hosts = ["www.google.com", "drive.google.com", "docs.google.com"]
 | Connection pool | TTL ۴۵ ثانیه، حداکثر ۲۰ idle |
 | رمزگشایی gzip | اتوماتیک |
 | چند اسکریپت | چرخش round-robin |
-| Blacklist خودکار | روی خطای 429 / quota، با cooldown ۱۰ دقیقه |
+| قرنطینهٔ خودکار اسکریپت | خطاهای quota/account برای ۲۴ ساعت؛ خطاهای گذرای relay با cooldown کوتاه |
 | کش پاسخ | ۵۰ مگابایت، FIFO + TTL، آگاه از `Cache-Control: max-age`، heuristic برای static asset |
 | Coalescing | GETهای یکسان همزمان یک fetch upstream را به اشتراک می‌گذارند |
 | تونل بازنویسی SNI | مستقیم به لبهٔ گوگل (بدون رله) برای `google.com`، `youtube.com`، `youtu.be`، `youtube-nocookie.com`، `fonts.googleapis.com` — دامنه‌های اضافی از فیلد `hosts` |

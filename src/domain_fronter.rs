@@ -13,7 +13,7 @@
 //! buffered `relay_parallel_range` compatibility wrapper for callers that
 //! want a `Vec<u8>` back.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 // AtomicU64 via portable-atomic: native on 64-bit / armv7, spinlock-
 // backed on mipsel (MIPS32 has no 64-bit atomic instructions). API
 // is identical to std::sync::atomic::AtomicU64 so call sites need
@@ -147,6 +147,12 @@ const H1_OPEN_TIMEOUT_SECS: u64 = 8;
 /// request to wake back up — most painful on YouTube / streaming where
 /// the first chunk after a quiet pause stalls the player.
 const H1_KEEPALIVE_INTERVAL_SECS: u64 = 240;
+/// Conservative local estimate of the Apps Script UrlFetchApp free-tier
+/// request budget per deployment account. This is not an authoritative Google
+/// quota read; it is a client-side selector guard that avoids concentrating
+/// traffic on a deployment this process has already used heavily.
+const SCRIPT_QUOTA_FREE_TIER_CALLS: usize = 20_000;
+const SCRIPT_QUOTA_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 /// Largest response body Apps Script's `UrlFetchApp` will deliver before
 /// the script gets killed mid-execution. The hard wire ceiling is ~50 MiB;
 /// after base64 / envelope overhead and edge variance, the practical raw
@@ -357,6 +363,15 @@ pub struct DomainFronter {
     inflight: Arc<Mutex<HashMap<String, broadcast::Sender<Vec<u8>>>>>,
     coalesced: AtomicU64,
     blacklist: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+    /// Human-readable cooldown reason keyed by script ID. Kept separate
+    /// from `blacklist` so the selection hot path still only checks the
+    /// timestamp map while diagnostics can explain the active cooldown.
+    script_cooldown_reasons: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    /// Per-deployment local call ledger used by `next_script_id` /
+    /// `next_script_ids` to avoid selecting an already saturated deployment
+    /// while another configured script still has locally-observed capacity.
+    /// Entries are pruned on selection against a rolling 24-hour window.
+    script_quota_ledger: Arc<std::sync::Mutex<HashMap<String, VecDeque<Instant>>>>,
     /// Per-deployment rolling timeout counter. Maps `script_id` →
     /// `(window_start, strike_count)`. Reset when the window expires
     /// or when a batch succeeds. Triggers a short-cooldown blacklist
@@ -465,7 +480,30 @@ impl HostStat {
     }
 }
 
-const BLACKLIST_COOLDOWN_SECS: u64 = 600;
+const TRANSIENT_SCRIPT_COOLDOWN_SECS: u64 = 600;
+const HARD_SCRIPT_QUARANTINE_SECS: u64 = 24 * 60 * 60;
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum ScriptQuarantine {
+    Hard,
+    Transient,
+}
+
+impl ScriptQuarantine {
+    fn cooldown(self) -> Duration {
+        match self {
+            ScriptQuarantine::Hard => Duration::from_secs(HARD_SCRIPT_QUARANTINE_SECS),
+            ScriptQuarantine::Transient => Duration::from_secs(TRANSIENT_SCRIPT_COOLDOWN_SECS),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            ScriptQuarantine::Hard => "hard quota/account quarantine",
+            ScriptQuarantine::Transient => "transient relay cooldown",
+        }
+    }
+}
 
 /// Auto-blacklist defaults are now per-instance fields on `DomainFronter`,
 /// driven by `Config::auto_blacklist_strikes` / `_window_secs` /
@@ -625,6 +663,8 @@ impl DomainFronter {
             inflight: Arc::new(Mutex::new(HashMap::new())),
             coalesced: AtomicU64::new(0),
             blacklist: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            script_cooldown_reasons: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            script_quota_ledger: Arc::new(std::sync::Mutex::new(HashMap::new())),
             script_timeouts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             relay_calls: AtomicU64::new(0),
             relay_failures: AtomicU64::new(0),
@@ -794,6 +834,43 @@ impl DomainFronter {
         }
     }
 
+    pub fn snapshot_script_health(&self) -> Vec<ScriptHealthSnapshot> {
+        let now = Instant::now();
+        let bl = self.blacklist.lock().unwrap();
+        let reasons = self.script_cooldown_reasons.lock().unwrap();
+        let quota = self.script_quota_ledger.lock().unwrap();
+        let timeouts = self.script_timeouts.lock().unwrap();
+
+        self.script_ids
+            .iter()
+            .map(|sid| {
+                let quota_used = quota
+                    .get(sid)
+                    .map(|calls| {
+                        calls
+                            .iter()
+                            .filter(|at| now.saturating_duration_since(**at) < SCRIPT_QUOTA_WINDOW)
+                            .count()
+                    })
+                    .unwrap_or(0);
+                let cooldown_secs = bl
+                    .get(sid)
+                    .map(|until| until.saturating_duration_since(now).as_secs())
+                    .filter(|secs| *secs > 0);
+                let timeout_strikes = timeouts.get(sid).map(|(_, strikes)| *strikes).unwrap_or(0);
+                ScriptHealthSnapshot {
+                    script_id: mask_script_id(sid),
+                    quota_used,
+                    quota_limit: SCRIPT_QUOTA_FREE_TIER_CALLS,
+                    quota_saturated: quota_used >= SCRIPT_QUOTA_FREE_TIER_CALLS,
+                    cooldown_secs,
+                    cooldown_reason: reasons.get(sid).cloned(),
+                    timeout_strikes,
+                }
+            })
+            .collect()
+    }
+
     pub fn num_scripts(&self) -> usize {
         self.script_ids.len()
     }
@@ -815,21 +892,44 @@ impl DomainFronter {
         let mut bl = self.blacklist.lock().unwrap();
         let now = Instant::now();
         bl.retain(|_, until| *until > now);
+        self.script_cooldown_reasons
+            .lock()
+            .unwrap()
+            .retain(|sid, _| bl.contains_key(sid));
+        let mut quota = self.script_quota_ledger.lock().unwrap();
+        prune_script_quota_ledger(&mut quota, now);
 
+        let mut saturated_fallback: Option<String> = None;
         for _ in 0..n {
             let idx = self.script_idx.fetch_add(1, Ordering::Relaxed);
             let sid = &self.script_ids[idx % n];
             if !bl.contains_key(sid) {
-                return sid.clone();
+                if script_has_local_quota_capacity(&quota, sid) {
+                    record_script_quota_call_locked(&mut quota, sid, now);
+                    return sid.clone();
+                }
+                saturated_fallback.get_or_insert_with(|| sid.clone());
             }
+        }
+        // If every non-blacklisted deployment is locally saturated, preserve
+        // connectivity instead of hard-failing. Paid Workspace quotas and
+        // traffic from other clients are not visible to this process, so this
+        // ledger is a steering signal, not an authoritative quota gate.
+        if let Some(sid) = saturated_fallback {
+            record_script_quota_call_locked(&mut quota, &sid, now);
+            return sid;
         }
         // All blacklisted: pick whichever comes off cooldown soonest.
         if let Some((sid, _)) = bl.iter().min_by_key(|(_, t)| **t) {
             let sid = sid.clone();
             bl.remove(&sid);
+            self.script_cooldown_reasons.lock().unwrap().remove(&sid);
+            record_script_quota_call_locked(&mut quota, &sid, now);
             return sid;
         }
-        self.script_ids[0].clone()
+        let sid = self.script_ids[0].clone();
+        record_script_quota_call_locked(&mut quota, &sid, now);
+        sid
     }
 
     /// Pick `want` distinct non-blacklisted script IDs for a parallel fan-out
@@ -844,8 +944,15 @@ impl DomainFronter {
         let mut bl = self.blacklist.lock().unwrap();
         let now = Instant::now();
         bl.retain(|_, until| *until > now);
+        self.script_cooldown_reasons
+            .lock()
+            .unwrap()
+            .retain(|sid, _| bl.contains_key(sid));
+        let mut quota = self.script_quota_ledger.lock().unwrap();
+        prune_script_quota_ledger(&mut quota, now);
 
         let mut picked: Vec<String> = Vec::with_capacity(want);
+        let mut saturated_fallback: Vec<String> = Vec::with_capacity(want);
         for _ in 0..n {
             if picked.len() >= want {
                 break;
@@ -853,20 +960,31 @@ impl DomainFronter {
             let idx = self.script_idx.fetch_add(1, Ordering::Relaxed);
             let sid = &self.script_ids[idx % n];
             if !bl.contains_key(sid) && !picked.iter().any(|p| p == sid) {
-                picked.push(sid.clone());
+                if script_has_local_quota_capacity(&quota, sid) {
+                    picked.push(sid.clone());
+                } else if !saturated_fallback.iter().any(|p| p == sid) {
+                    saturated_fallback.push(sid.clone());
+                }
             }
         }
         if picked.is_empty() {
-            picked.push(self.script_ids[0].clone());
+            if let Some(sid) = saturated_fallback.into_iter().next() {
+                picked.push(sid);
+            } else {
+                picked.push(self.script_ids[0].clone());
+            }
+        }
+        for sid in &picked {
+            record_script_quota_call_locked(&mut quota, sid, now);
         }
         picked
     }
 
-    fn blacklist_script(&self, script_id: &str, reason: &str) {
+    fn quarantine_script(&self, script_id: &str, quarantine: ScriptQuarantine, reason: &str) {
         self.blacklist_script_for(
             script_id,
-            Duration::from_secs(BLACKLIST_COOLDOWN_SECS),
-            reason,
+            quarantine.cooldown(),
+            &format!("{}: {}", quarantine.label(), reason),
         );
     }
 
@@ -874,6 +992,10 @@ impl DomainFronter {
         let until = Instant::now() + cooldown;
         let mut bl = self.blacklist.lock().unwrap();
         bl.insert(script_id.to_string(), until);
+        self.script_cooldown_reasons
+            .lock()
+            .unwrap()
+            .insert(script_id.to_string(), reason.to_string());
         tracing::warn!(
             "blacklisted script {} for {}s: {}",
             mask_script_id(script_id),
@@ -2696,8 +2818,12 @@ impl DomainFronter {
                         .chars()
                         .take(200)
                         .collect::<String>();
-                    if should_blacklist(status, &body_txt) {
-                        self.blacklist_script(&script_id, &format!("HTTP {}", status));
+                    if let Some(quarantine) = classify_script_failure(status, &body_txt) {
+                        self.quarantine_script(
+                            &script_id,
+                            quarantine,
+                            &format!("HTTP {}", status),
+                        );
                     }
                     return Err(FronterError::Relay(format!(
                         "Apps Script HTTP {}: {}",
@@ -2707,7 +2833,7 @@ impl DomainFronter {
                 return parse_relay_json(&resp_body).map_err(|e| {
                     if let FronterError::Relay(ref msg) = e {
                         if looks_like_quota_error(msg) {
-                            self.blacklist_script(&script_id, msg);
+                            self.quarantine_script(&script_id, ScriptQuarantine::Hard, msg);
                         }
                     }
                     e
@@ -2805,8 +2931,12 @@ impl DomainFronter {
                             .chars()
                             .take(200)
                             .collect::<String>();
-                        if should_blacklist(status, &body_txt) {
-                            self.blacklist_script(&script_id, &format!("HTTP {}", status));
+                        if let Some(quarantine) = classify_script_failure(status, &body_txt) {
+                            self.quarantine_script(
+                                &script_id,
+                                quarantine,
+                                &format!("HTTP {}", status),
+                            );
                         }
                         return Err(FronterError::Relay(format!(
                             "Apps Script HTTP {}: {}",
@@ -2818,7 +2948,11 @@ impl DomainFronter {
                         Err(e) => {
                             if let FronterError::Relay(ref msg) = e {
                                 if looks_like_quota_error(msg) {
-                                    self.blacklist_script(&script_id, msg);
+                                    self.quarantine_script(
+                                        &script_id,
+                                        ScriptQuarantine::Hard,
+                                        msg,
+                                    );
                                 }
                             }
                             Err(e)
@@ -3215,8 +3349,8 @@ impl DomainFronter {
                 .chars()
                 .take(200)
                 .collect::<String>();
-            if should_blacklist(status, &body_txt) {
-                self.blacklist_script(script_id, &format!("HTTP {}", status));
+            if let Some(quarantine) = classify_script_failure(status, &body_txt) {
+                self.quarantine_script(script_id, quarantine, &format!("HTTP {}", status));
             }
             return Err(FronterError::Relay(format!(
                 "tunnel HTTP {}: {}",
@@ -3405,8 +3539,8 @@ impl DomainFronter {
                 .chars()
                 .take(200)
                 .collect::<String>();
-            if should_blacklist(status, &body_txt) {
-                self.blacklist_script(script_id, &format!("HTTP {}", status));
+            if let Some(quarantine) = classify_script_failure(status, &body_txt) {
+                self.quarantine_script(script_id, quarantine, &format!("HTTP {}", status));
             }
             return Err(FronterError::Relay(format!(
                 "batch tunnel HTTP {}: {}",
@@ -4138,6 +4272,40 @@ fn add_random_pad(map: &mut serde_json::Map<String, Value>) {
     let mut buf = vec![0u8; len];
     rng.fill_bytes(&mut buf);
     map.insert("_pad".into(), Value::String(B64.encode(&buf)));
+}
+
+fn prune_script_quota_ledger(
+    ledger: &mut HashMap<String, VecDeque<Instant>>,
+    now: Instant,
+) {
+    let cutoff = now.checked_sub(SCRIPT_QUOTA_WINDOW).unwrap_or(now);
+    ledger.retain(|_, calls| {
+        while calls.front().map(|ts| *ts <= cutoff).unwrap_or(false) {
+            calls.pop_front();
+        }
+        !calls.is_empty()
+    });
+}
+
+fn script_has_local_quota_capacity(
+    ledger: &HashMap<String, VecDeque<Instant>>,
+    script_id: &str,
+) -> bool {
+    ledger
+        .get(script_id)
+        .map(|calls| calls.len() < SCRIPT_QUOTA_FREE_TIER_CALLS)
+        .unwrap_or(true)
+}
+
+fn record_script_quota_call_locked(
+    ledger: &mut HashMap<String, VecDeque<Instant>>,
+    script_id: &str,
+    now: Instant,
+) {
+    ledger
+        .entry(script_id.to_string())
+        .or_default()
+        .push_back(now);
 }
 
 /// "YYYY-MM-DD" of the current Pacific Time date. Used as the daily-reset
@@ -5094,6 +5262,24 @@ pub struct StatsSnapshot {
     pub h2_disabled: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptHealthSnapshot {
+    /// Masked deployment ID (`prefix...suffix`) safe to render in logs/UI.
+    pub script_id: String,
+    /// Locally observed calls inside the rolling 24-hour steering window.
+    pub quota_used: usize,
+    /// Local free-tier steering threshold. This is not an authoritative
+    /// Google-side quota read; it is the client-side selection guard.
+    pub quota_limit: usize,
+    pub quota_saturated: bool,
+    /// Remaining local cooldown, if the deployment is currently sidelined.
+    pub cooldown_secs: Option<u64>,
+    /// Human-readable failure class/reason used when the cooldown was set.
+    pub cooldown_reason: Option<String>,
+    /// Current timeout strikes inside the auto-blacklist rolling window.
+    pub timeout_strikes: u32,
+}
+
 impl StatsSnapshot {
     pub fn hit_rate(&self) -> f64 {
         let total = self.cache_hits + self.cache_misses;
@@ -5170,11 +5356,17 @@ impl StatsSnapshot {
     }
 }
 
-fn should_blacklist(status: u16, body: &str) -> bool {
+fn classify_script_failure(status: u16, body: &str) -> Option<ScriptQuarantine> {
     if status == 429 || status == 403 {
-        return true;
+        return Some(ScriptQuarantine::Hard);
     }
-    looks_like_quota_error(body)
+    if looks_like_quota_error(body) {
+        return Some(ScriptQuarantine::Hard);
+    }
+    if matches!(status, 500 | 502 | 503 | 504) && looks_like_transient_script_error(body) {
+        return Some(ScriptQuarantine::Transient);
+    }
+    None
 }
 
 fn looks_like_quota_error(msg: &str) -> bool {
@@ -5189,6 +5381,20 @@ fn looks_like_quota_error(msg: &str) -> bool {
         || lower.contains("datenübertragungsrate")
         || lower.contains("transfer rate")
         || lower.contains("limit exceeded")
+}
+
+fn looks_like_transient_script_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("google")
+        || lower.contains("apps script")
+        || lower.contains("script.google")
+        || lower.contains("googleusercontent")
+        || lower.contains("gfe")
+        || lower.contains("backend error")
+        || lower.contains("service unavailable")
+        || lower.contains("temporary")
+        || lower.contains("timeout")
+        || lower.contains("timed out")
 }
 
 fn mask_script_id(id: &str) -> String {
@@ -5310,6 +5516,15 @@ mod tests {
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use tokio::io::{duplex, AsyncRead, AsyncWriteExt, ReadBuf};
+
+    fn find_script_health<'a>(
+        rows: &'a [ScriptHealthSnapshot],
+        masked_script_id: &str,
+    ) -> &'a ScriptHealthSnapshot {
+        rows.iter()
+            .find(|row| row.script_id == masked_script_id)
+            .expect("script health row must exist")
+    }
 
     // Test fixture for ungraceful TLS close: emit a fixed prefix of bytes
     // then return io::ErrorKind::UnexpectedEof on the next read. Mirrors
@@ -6630,16 +6845,86 @@ hello";
 
     #[test]
     fn blacklist_heuristics() {
-        assert!(should_blacklist(429, ""));
-        assert!(should_blacklist(403, "quota"));
-        assert!(should_blacklist(500, "Service invoked too many times per day: urlfetch"));
-        assert!(!should_blacklist(200, ""));
-        assert!(!should_blacklist(502, "bad gateway"));
+        assert_eq!(classify_script_failure(429, ""), Some(ScriptQuarantine::Hard));
+        assert_eq!(
+            classify_script_failure(403, "quota"),
+            Some(ScriptQuarantine::Hard)
+        );
+        assert_eq!(
+            classify_script_failure(500, "Service invoked too many times per day: urlfetch"),
+            Some(ScriptQuarantine::Hard)
+        );
+        assert_eq!(classify_script_failure(502, "bad gateway"), None);
+        assert_eq!(
+            classify_script_failure(502, "Google backend error"),
+            Some(ScriptQuarantine::Transient)
+        );
+        assert_eq!(classify_script_failure(200, ""), None);
         assert!(looks_like_quota_error("Exception: Service invoked too many times per day"));
         assert!(looks_like_quota_error(
             "Exception: Bandbreitenkontingent überschritten: https://example.com. Verringern Sie die Datenübertragungsrate."
         ));
         assert!(!looks_like_quota_error("bad url"));
+    }
+
+    #[test]
+    fn script_quarantine_durations_match_failure_class() {
+        assert_eq!(
+            ScriptQuarantine::Hard.cooldown(),
+            Duration::from_secs(HARD_SCRIPT_QUARANTINE_SECS)
+        );
+        assert_eq!(
+            ScriptQuarantine::Transient.cooldown(),
+            Duration::from_secs(TRANSIENT_SCRIPT_COOLDOWN_SECS)
+        );
+    }
+
+    #[test]
+    fn script_health_snapshot_exposes_quota_and_cooldown_state() {
+        const SCRIPT_A: &str = "AKfycbxScriptHealthAlpha001";
+        const SCRIPT_B: &str = "AKfycbxScriptHealthBravo002";
+        let fronter = fronter_for_script_ids(&[SCRIPT_A, SCRIPT_B]);
+        let now = Instant::now();
+        seed_script_quota(&fronter, SCRIPT_A, 3, now);
+        fronter.blacklist_script_for(
+            SCRIPT_A,
+            Duration::from_secs(600),
+            "transient relay cooldown: HTTP 502",
+        );
+        fronter.record_timeout_strike(SCRIPT_B);
+
+        let rows = fronter.snapshot_script_health();
+        let a = find_script_health(&rows, &mask_script_id(SCRIPT_A));
+        let b = find_script_health(&rows, &mask_script_id(SCRIPT_B));
+
+        assert_eq!(a.quota_used, 3);
+        assert_eq!(a.quota_limit, SCRIPT_QUOTA_FREE_TIER_CALLS);
+        assert!(!a.quota_saturated);
+        assert!(a.cooldown_secs.is_some_and(|secs| secs <= 600 && secs > 0));
+        assert_eq!(
+            a.cooldown_reason.as_deref(),
+            Some("transient relay cooldown: HTTP 502")
+        );
+        assert_eq!(b.timeout_strikes, 1);
+        assert!(b.cooldown_secs.is_none());
+    }
+
+    #[test]
+    fn script_health_snapshot_marks_local_quota_saturation() {
+        const SCRIPT_A: &str = "AKfycbxScriptHealthAlpha001";
+        let fronter = fronter_for_script_ids(&[SCRIPT_A]);
+        seed_script_quota(
+            &fronter,
+            SCRIPT_A,
+            SCRIPT_QUOTA_FREE_TIER_CALLS,
+            Instant::now(),
+        );
+
+        let rows = fronter.snapshot_script_health();
+        let row = find_script_health(&rows, &mask_script_id(SCRIPT_A));
+
+        assert_eq!(row.quota_used, SCRIPT_QUOTA_FREE_TIER_CALLS);
+        assert!(row.quota_saturated);
     }
 
     #[test]
@@ -6865,6 +7150,110 @@ hello";
         );
         let cfg: Config = serde_json::from_str(&json).unwrap();
         DomainFronter::new(&cfg).expect("test fronter must construct")
+    }
+
+    fn fronter_for_script_ids(script_ids: &[&str]) -> DomainFronter {
+        let script_ids_json = serde_json::to_string(script_ids).unwrap();
+        let json = format!(
+            r#"{{
+                "mode": "apps_script",
+                "google_ip": "127.0.0.1",
+                "front_domain": "www.google.com",
+                "script_id": {},
+                "auth_key": "test_auth_key",
+                "listen_host": "127.0.0.1",
+                "listen_port": 8085,
+                "log_level": "info",
+                "verify_ssl": true
+            }}"#,
+            script_ids_json
+        );
+        let cfg: Config = serde_json::from_str(&json).unwrap();
+        DomainFronter::new(&cfg).expect("test fronter must construct")
+    }
+
+    fn seed_script_quota(fronter: &DomainFronter, script_id: &str, count: usize, at: Instant) {
+        let mut ledger = fronter.script_quota_ledger.lock().unwrap();
+        ledger
+            .entry(script_id.to_string())
+            .or_default()
+            .extend(std::iter::repeat(at).take(count));
+    }
+
+    #[test]
+    fn next_script_id_skips_locally_saturated_deployment() {
+        let fronter = fronter_for_script_ids(&["SCRIPT_A", "SCRIPT_B"]);
+        seed_script_quota(
+            &fronter,
+            "SCRIPT_A",
+            SCRIPT_QUOTA_FREE_TIER_CALLS,
+            Instant::now(),
+        );
+
+        let selected = fronter.next_script_id();
+
+        assert_eq!(selected, "SCRIPT_B");
+        let ledger = fronter.script_quota_ledger.lock().unwrap();
+        assert_eq!(
+            ledger.get("SCRIPT_B").map(|calls| calls.len()),
+            Some(1),
+            "selection must be recorded in the local rolling ledger"
+        );
+    }
+
+    #[test]
+    fn script_quota_prune_removes_expired_observations() {
+        let recorded_at = Instant::now();
+        let prune_at = recorded_at
+            .checked_add(SCRIPT_QUOTA_WINDOW + Duration::from_secs(1))
+            .expect("test clock must support a 24h monotonic addition");
+        let mut ledger = HashMap::new();
+        ledger.insert(
+            "SCRIPT_A".to_string(),
+            std::iter::repeat(recorded_at)
+                .take(SCRIPT_QUOTA_FREE_TIER_CALLS)
+                .collect::<VecDeque<_>>(),
+        );
+
+        prune_script_quota_ledger(&mut ledger, prune_at);
+
+        assert!(
+            ledger.is_empty(),
+            "rolling quota ledger should discard observations outside the 24h window"
+        );
+    }
+
+    #[test]
+    fn next_script_id_preserves_connectivity_when_all_scripts_are_locally_saturated() {
+        let fronter = fronter_for_script_ids(&["SCRIPT_A", "SCRIPT_B"]);
+        let now = Instant::now();
+        seed_script_quota(&fronter, "SCRIPT_A", SCRIPT_QUOTA_FREE_TIER_CALLS, now);
+        seed_script_quota(&fronter, "SCRIPT_B", SCRIPT_QUOTA_FREE_TIER_CALLS, now);
+
+        let selected = fronter.next_script_id();
+
+        assert_eq!(selected, "SCRIPT_A");
+        let ledger = fronter.script_quota_ledger.lock().unwrap();
+        assert_eq!(
+            ledger.get("SCRIPT_A").map(|calls| calls.len()),
+            Some(SCRIPT_QUOTA_FREE_TIER_CALLS + 1),
+            "local saturation is a steering signal, not a hard outage trigger"
+        );
+    }
+
+    #[test]
+    fn parallel_script_selection_prefers_unsaturated_deployments() {
+        let fronter = fronter_for_script_ids(&["SCRIPT_A", "SCRIPT_B", "SCRIPT_C"]);
+        seed_script_quota(
+            &fronter,
+            "SCRIPT_A",
+            SCRIPT_QUOTA_FREE_TIER_CALLS,
+            Instant::now(),
+        );
+
+        let selected = fronter.next_script_ids(2);
+
+        assert_eq!(selected, vec!["SCRIPT_B".to_string(), "SCRIPT_C".to_string()]);
     }
 
     #[tokio::test(flavor = "current_thread")]

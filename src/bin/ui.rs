@@ -117,6 +117,7 @@ struct UiState {
     running: bool,
     started_at: Option<Instant>,
     last_stats: Option<mhrv_rs::domain_fronter::StatsSnapshot>,
+    last_script_health: Vec<mhrv_rs::domain_fronter::ScriptHealthSnapshot>,
     last_per_site: Vec<(String, mhrv_rs::domain_fronter::HostStat)>,
     log: VecDeque<String>,
     /// Result + timestamp for transient status banners (auto-hide after 10s).
@@ -1320,7 +1321,7 @@ impl eframe::App for App {
             ui.add_space(8.0);
 
             // ── Status + stats card ────────────────────────────────────────
-            let (running, started_at, stats, ca_trusted, last_test_msg, per_site) = {
+            let (running, started_at, stats, ca_trusted, last_test_msg, per_site, script_health) = {
                 let s = self.shared.state.lock().unwrap();
                 (
                     s.running,
@@ -1329,6 +1330,7 @@ impl eframe::App for App {
                     s.ca_trusted,
                     s.last_test_msg.clone(),
                     s.last_per_site.clone(),
+                    s.last_script_health.clone(),
                 )
             };
 
@@ -1479,6 +1481,66 @@ impl eframe::App for App {
                             .small(),
                         );
                     });
+                });
+            }
+
+            if !script_health.is_empty() {
+                ui.add_space(2.0);
+                egui::CollapsingHeader::new(format!(
+                    "Script health ({} deployments)",
+                    script_health.len()
+                ))
+                .default_open(false)
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(160.0)
+                        .show(ui, |ui| {
+                            egui::Grid::new("script_health")
+                                .num_columns(5)
+                                .spacing([8.0, 2.0])
+                                .striped(true)
+                                .show(ui, |ui| {
+                                    ui.label(egui::RichText::new("script").strong());
+                                    ui.label(egui::RichText::new("quota").strong());
+                                    ui.label(egui::RichText::new("cooldown").strong());
+                                    ui.label(egui::RichText::new("reason").strong());
+                                    ui.label(egui::RichText::new("timeouts").strong());
+                                    ui.end_row();
+
+                                    for st in &script_health {
+                                        let quota = format!(
+                                            "{} / {}{}",
+                                            st.quota_used,
+                                            st.quota_limit,
+                                            if st.quota_saturated { " saturated" } else { "" }
+                                        );
+                                        let cooldown = st
+                                            .cooldown_secs
+                                            .map(fmt_seconds_compact)
+                                            .unwrap_or_else(|| "-".to_string());
+                                        let reason = st
+                                            .cooldown_reason
+                                            .as_deref()
+                                            .unwrap_or("-")
+                                            .to_string();
+                                        ui.label(egui::RichText::new(&st.script_id).monospace());
+                                        ui.label(egui::RichText::new(quota).monospace());
+                                        ui.label(egui::RichText::new(cooldown).monospace());
+                                        ui.label(egui::RichText::new(reason).small());
+                                        ui.label(
+                                            egui::RichText::new(st.timeout_strikes.to_string())
+                                                .monospace(),
+                                        );
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                    ui.small(
+                        egui::RichText::new(
+                            "Local view only: Google quota can also be consumed by other clients using the same deployment.",
+                        )
+                        .color(egui::Color32::from_gray(130)),
+                    );
                 });
             }
 
@@ -2113,6 +2175,16 @@ fn fmt_duration(d: Duration) -> String {
     format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
 }
 
+fn fmt_seconds_compact(seconds: u64) -> String {
+    if seconds >= 3600 {
+        format!("{}h {}m", seconds / 3600, (seconds / 60) % 60)
+    } else if seconds >= 60 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}s", seconds)
+    }
+}
+
 fn fmt_bytes(b: u64) -> String {
     const K: u64 = 1024;
     const M: u64 = K * K;
@@ -2150,9 +2222,11 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                         if let Some(fronter) = f.as_ref() {
                             let s = fronter.snapshot_stats();
                             let per_site = fronter.snapshot_per_site();
+                            let script_health = fronter.snapshot_script_health();
                             let mut st = shared.state.lock().unwrap();
                             st.last_stats = Some(s);
                             st.last_per_site = per_site;
+                            st.last_script_health = script_health;
                         }
                     });
                 }
@@ -2228,6 +2302,7 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                         // or normal shutdown without Cmd::Stop). The
                         // Stop handler clears this too — either is fine.
                         st.proxy_active = false;
+                        st.last_script_health.clear();
                     }
                     push_log(&shared2, "[ui] proxy stopped");
                 });
@@ -2258,6 +2333,7 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                     st.running = false;
                     st.started_at = None;
                     st.proxy_active = false;
+                    st.last_script_health.clear();
                 }
             }
 
@@ -2731,5 +2807,17 @@ fn push_log(shared: &Shared, msg: &str) {
     s.log.push_back(line);
     while s.log.len() > LOG_MAX {
         s.log.pop_front();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fmt_seconds_compact;
+
+    #[test]
+    fn compact_seconds_formatter_scales_units() {
+        assert_eq!(fmt_seconds_compact(9), "9s");
+        assert_eq!(fmt_seconds_compact(125), "2m 5s");
+        assert_eq!(fmt_seconds_compact(3660), "1h 1m");
     }
 }

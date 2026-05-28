@@ -225,12 +225,16 @@ max_concurrent = 30 × number_of_deployment_ids
 | 6 | 180 | Recommended for heavy use |
 | 12 | 360 | Multi-account power setup |
 
-More deployments = more total concurrency = lower per-session latency. Each batch round-robins across your IDs, spreading load and reducing the chance of hitting any single deployment's quota ceiling.
+More deployments = more total concurrency = lower per-session latency. Each batch is selected from the configured IDs with a local rolling 24-hour ledger, spreading load and steering away from deployments this client has already driven near the free-tier request budget.
+
+The desktop **Script health** panel shows this local state without changing routing behavior: masked deployment ID, locally observed calls inside the rolling 24-hour window, whether the local free-tier steering threshold is saturated, any remaining cooldown, the failure class/reason that set that cooldown, and the current timeout-strike count. Treat it as client-side telemetry only; Google may also count requests from other devices using the same deployment.
 
 **Resource guards:**
 - **50 ops max** per batch — if more sessions are active, the mux splits into multiple batches
 - **4 MB payload cap** per batch — well under Apps Script's 50 MB limit
 - **30 s timeout** per batch — slow / dead targets can't block other sessions forever
+
+Opening/data-bearing tunnel operations bypass the short coalescing wait; empty polls and close notices stay batch-friendly.
 
 ### Full mode quick start
 
@@ -346,7 +350,7 @@ This port focuses on the **`apps_script` mode** — the only one that reliably w
 - [x] Connection pooling (45 s TTL, max 20 idle)
 - [x] Gzip response decoding
 - [x] Multi-script round-robin
-- [x] Auto-blacklist failing scripts on 429 / quota errors (10 min cooldown)
+- [x] Auto-quarantine failing scripts: quota/account failures for 24 h, transient relay failures for a short cooldown
 - [x] Response cache (50 MB, FIFO + TTL, `Cache-Control: max-age` aware, heuristics for static assets)
 - [x] Request coalescing: concurrent identical GETs share one upstream fetch
 - [x] SNI-rewrite tunnels for `google.com`, `youtube.com`, `youtu.be`, `youtube-nocookie.com`, `fonts.googleapis.com`, configurable via `hosts` map

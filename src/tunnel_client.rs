@@ -300,6 +300,30 @@ enum MuxMsg {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DispatchPriority {
+    Immediate,
+    Batch,
+}
+
+impl MuxMsg {
+    fn dispatch_priority(&self) -> DispatchPriority {
+        match self {
+            MuxMsg::Connect { .. } | MuxMsg::ConnectData { .. } => DispatchPriority::Immediate,
+            MuxMsg::Data { data, .. }
+            | MuxMsg::UdpOpen { data, .. }
+            | MuxMsg::UdpData { data, .. } => {
+                if data.is_empty() {
+                    DispatchPriority::Batch
+                } else {
+                    DispatchPriority::Immediate
+                }
+            }
+            MuxMsg::Close { .. } => DispatchPriority::Batch,
+        }
+    }
+}
+
 /// Raw, not-yet-encoded form of a batch operation. Lives only inside
 /// `mux_loop` and gets converted to `BatchOp` (with base64-encoded `d`)
 /// inside `fire_batch`'s spawned task — keeping the encoding work off
@@ -762,6 +786,8 @@ async fn mux_loop(mut rx: mpsc::UnboundedReceiver<MuxMsg>, fronter: Arc<DomainFr
         // queue. Once the first op lands, the adaptive coalesce loop waits
         // in `coalesce_step` increments (resetting on each new arrival, up
         // to `coalesce_max`) so concurrent ops land in the same batch.
+        // Opening/data-bearing ops bypass that wait after any already-queued
+        // work is drained; empty polls and closes remain batch-friendly.
         match rx.recv().await {
             Some(msg) => msgs.push(msg),
             None => break,
@@ -774,6 +800,9 @@ async fn mux_loop(mut rx: mpsc::UnboundedReceiver<MuxMsg>, fronter: Arc<DomainFr
                 msgs.push(msg);
                 // Reset the soft deadline — more ops are arriving.
                 soft_deadline = tokio::time::Instant::now() + coalesce_step;
+            }
+            if has_immediate_priority(&msgs) {
+                break;
             }
             let now = tokio::time::Instant::now();
             let wait_until = soft_deadline.min(hard_deadline);
@@ -906,6 +935,11 @@ async fn mux_loop(mut rx: mpsc::UnboundedReceiver<MuxMsg>, fronter: Arc<DomainFr
 
         fire_batch(&sems, &fronter, accum.pending_ops, accum.data_replies).await;
     }
+}
+
+fn has_immediate_priority(msgs: &[MuxMsg]) -> bool {
+    msgs.iter()
+        .any(|msg| msg.dispatch_priority() == DispatchPriority::Immediate)
 }
 
 /// Per-iteration accumulator for `mux_loop`. Owns the three fields that
@@ -2605,6 +2639,86 @@ mod tests {
             !mux.all_servers_legacy(),
             "aggregate must self-correct when all entries expire — otherwise the 30 s read timeout sticks forever"
         );
+    }
+
+    fn batched_reply_for_test() -> BatchedReply {
+        oneshot::channel::<Result<(TunnelResponse, String), String>>().0
+    }
+
+    #[test]
+    fn mux_priority_marks_opening_and_payload_ops_immediate() {
+        let (connect_reply, _connect_rx) = oneshot::channel();
+        let connect = MuxMsg::Connect {
+            host: "example.com".into(),
+            port: 443,
+            reply: connect_reply,
+        };
+        let connect_data = MuxMsg::ConnectData {
+            host: "example.com".into(),
+            port: 443,
+            data: Bytes::from_static(b"\x16\x03\x01"),
+            reply: batched_reply_for_test(),
+        };
+        let data = MuxMsg::Data {
+            sid: "sid-1".into(),
+            data: Bytes::from_static(b"payload"),
+            seq: None,
+            wseq: None,
+            reply: batched_reply_for_test(),
+        };
+        let udp_open = MuxMsg::UdpOpen {
+            host: "example.com".into(),
+            port: 53,
+            data: Bytes::from_static(b"dns"),
+            reply: batched_reply_for_test(),
+        };
+
+        assert_eq!(connect.dispatch_priority(), DispatchPriority::Immediate);
+        assert_eq!(connect_data.dispatch_priority(), DispatchPriority::Immediate);
+        assert_eq!(data.dispatch_priority(), DispatchPriority::Immediate);
+        assert_eq!(udp_open.dispatch_priority(), DispatchPriority::Immediate);
+    }
+
+    #[test]
+    fn mux_priority_keeps_empty_polls_and_closes_batchable() {
+        let empty_data = MuxMsg::Data {
+            sid: "sid-1".into(),
+            data: Bytes::new(),
+            seq: None,
+            wseq: None,
+            reply: batched_reply_for_test(),
+        };
+        let empty_udp = MuxMsg::UdpData {
+            sid: "sid-2".into(),
+            data: Bytes::new(),
+            reply: batched_reply_for_test(),
+        };
+        let close = MuxMsg::Close {
+            sid: "sid-3".into(),
+        };
+
+        assert_eq!(empty_data.dispatch_priority(), DispatchPriority::Batch);
+        assert_eq!(empty_udp.dispatch_priority(), DispatchPriority::Batch);
+        assert_eq!(close.dispatch_priority(), DispatchPriority::Batch);
+        assert!(!has_immediate_priority(&[empty_data, empty_udp, close]));
+    }
+
+    #[test]
+    fn mux_priority_detects_immediate_inside_batchable_group() {
+        let empty_poll = MuxMsg::Data {
+            sid: "sid-1".into(),
+            data: Bytes::new(),
+            seq: None,
+            wseq: None,
+            reply: batched_reply_for_test(),
+        };
+        let payload = MuxMsg::UdpData {
+            sid: "sid-2".into(),
+            data: Bytes::from_static(b"packet"),
+            reply: batched_reply_for_test(),
+        };
+
+        assert!(has_immediate_priority(&[empty_poll, payload]));
     }
 
     #[test]
