@@ -220,6 +220,7 @@ pub struct ProxyServer {
     tunnel_mux: Option<Arc<TunnelMux>>,
     coalesce_step_ms: u64,
     coalesce_max_ms: u64,
+    network_preset: Option<String>,
 }
 
 pub struct RewriteCtx {
@@ -527,6 +528,7 @@ impl ProxyServer {
             tunnel_mux: None, // initialized in run() inside the tokio runtime
             coalesce_step_ms: if config.coalesce_step_ms > 0 { config.coalesce_step_ms as u64 } else { 10 },
             coalesce_max_ms: if config.coalesce_max_ms > 0 { config.coalesce_max_ms as u64 } else { 1000 },
+            network_preset: config.network_preset.clone(),
         })
     }
 
@@ -548,7 +550,7 @@ impl ProxyServer {
         // Initialize TunnelMux inside the runtime (tokio::spawn requires it).
         if self.rewrite_ctx.mode == Mode::Full {
             if let Some(f) = self.fronter.as_ref() {
-                self.tunnel_mux = Some(TunnelMux::start(f.clone(), self.coalesce_step_ms, self.coalesce_max_ms));
+                self.tunnel_mux = Some(TunnelMux::start(f.clone(), self.coalesce_step_ms, self.coalesce_max_ms, self.network_preset.as_deref()));
             }
         }
 
@@ -3698,51 +3700,53 @@ mod tests {
         assert!(FrontingGroupResolved::from_config(&bad).is_err());
     }
 
-    /// Verifies that copy_bidirectional_with_sizes correctly transfers data
-    /// in both directions through in-memory duplex pipes.
+    /// Verifies that copy_bidirectional_with_sizes correctly relays data in
+    /// both directions. Splits each duplex into read/write halves so the
+    /// write task and read assertions can operate independently.
     #[tokio::test(flavor = "current_thread")]
     async fn copy_bidirectional_large_buf_roundtrip() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
 
         // a_client <-> a_server  and  b_client <-> b_server
-        let (mut a_client, mut a_server) = tokio::io::duplex(128 * 1024);
-        let (mut b_client, mut b_server) = tokio::io::duplex(128 * 1024);
+        let (a_client, mut a_server) = tokio::io::duplex(128 * 1024);
+        let (b_client, mut b_server) = tokio::io::duplex(128 * 1024);
 
-        let payload_a = vec![0xAAu8; 32 * 1024]; // 32 KB a→b
-        let payload_b = vec![0xBBu8; 48 * 1024]; // 48 KB b→a
+        let (mut a_client_read, mut a_client_write) = tokio::io::split(a_client);
+        let (mut b_client_read, mut b_client_write) = tokio::io::split(b_client);
 
-        let pa = payload_a.clone();
-        let pb = payload_b.clone();
+        let payload_ab = vec![0xAAu8; 32 * 1024]; // a→b
+        let payload_ba = vec![0xBBu8; 48 * 1024]; // b→a
 
-        // Writer task: sends payloads and shuts down its write half.
+        let pa = payload_ab.clone();
+        let pb = payload_ba.clone();
+
+        // Writer task: fills both pipes and shuts down write halves so the
+        // relay sees EOF and can propagate the shutdown to the other side.
         let write_task = tokio::spawn(async move {
-            a_client.write_all(&pa).await.unwrap();
-            a_client.shutdown().await.unwrap();
-            b_client.write_all(&pb).await.unwrap();
-            b_client.shutdown().await.unwrap();
+            a_client_write.write_all(&pa).await.unwrap();
+            a_client_write.shutdown().await.unwrap();
+            b_client_write.write_all(&pb).await.unwrap();
+            b_client_write.shutdown().await.unwrap();
         });
 
         // Relay task: bridges a_server <-> b_server with 64 KB buffers.
         let relay_task = tokio::spawn(async move {
-            let _ = tokio::io::copy_bidirectional_with_sizes(
-                &mut a_server,
-                &mut b_server,
-                65536,
-                65536,
-            )
-            .await;
+            tokio::io::copy_bidirectional_with_sizes(&mut a_server, &mut b_server, 65536, 65536)
+                .await
+                .unwrap();
         });
 
-        // Read what came through.
-        let mut got_b = Vec::new();
-        let read_b = tokio::io::AsyncReadExt::read_to_end(&mut a_client, &mut got_b);
-        // a_client write half is done; read remaining bytes from b direction.
-        // Reconstruct handles: duplex was already consumed above; test through
-        // the relay instead by reading from the write-task's pair.
-        // (Simplified: just verify write+relay complete without panic.)
         write_task.await.unwrap();
         relay_task.await.unwrap();
-        drop(read_b); // readers already at EOF after shutdown
-        // Passed: no panic, bidirectional copy completed cleanly.
+
+        // After relay finishes it has propagated each shutdown to the opposite
+        // side, so both client read halves are at EOF.
+        let mut got_at_b = Vec::new();
+        b_client_read.read_to_end(&mut got_at_b).await.unwrap();
+        assert_eq!(got_at_b, payload_ab, "data written to A must arrive at B");
+
+        let mut got_at_a = Vec::new();
+        a_client_read.read_to_end(&mut got_at_a).await.unwrap();
+        assert_eq!(got_at_a, payload_ba, "data written to B must arrive at A");
     }
 }

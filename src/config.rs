@@ -112,6 +112,13 @@ pub struct Config {
     /// Hard cap on total coalesce wait (ms). 0 = use compiled default (1000ms).
     #[serde(default)]
     pub coalesce_max_ms: u16,
+    /// Adaptive coalescing preset. One of "auto" (default), "fast", or "slow".
+    /// "auto" measures batch RTT and switches automatically.
+    /// "fast" uses 50ms/300ms windows — best for broadband/fiber.
+    /// "slow" uses 150ms/600ms windows — best for slow links (Iran cable, mobile).
+    /// Leave unset or set to "auto" for automatic detection.
+    #[serde(default)]
+    pub network_preset: Option<String>,
     /// Optional explicit SNI rotation pool for outbound TLS to `google_ip`.
     /// Empty / missing = auto-expand from `front_domain` (current default of
     /// {www, mail, drive, docs, calendar}.google.com). Set to an explicit list
@@ -785,6 +792,8 @@ pub struct TomlRelay {
     #[serde(default)]
     pub coalesce_max_ms: u16,
     #[serde(default)]
+    pub network_preset: Option<String>,
+    #[serde(default)]
     pub youtube_via_relay: bool,
     #[serde(default)]
     pub normalize_x_graphql: bool,
@@ -935,6 +944,7 @@ impl From<TomlConfig> for Config {
             parallel_relay: t.relay.parallel_relay,
             coalesce_step_ms: t.relay.coalesce_step_ms,
             coalesce_max_ms: t.relay.coalesce_max_ms,
+            network_preset: t.relay.network_preset,
             sni_hosts: t.network.sni_hosts,
             fetch_ips_from_api: t.scan.fetch_ips_from_api,
             max_ips_to_scan: t.scan.max_ips_to_scan,
@@ -977,6 +987,7 @@ impl From<&Config> for TomlConfig {
                 enable_batching: c.enable_batching,
                 coalesce_step_ms: c.coalesce_step_ms,
                 coalesce_max_ms: c.coalesce_max_ms,
+                network_preset: c.network_preset.clone(),
                 youtube_via_relay: c.youtube_via_relay,
                 normalize_x_graphql: c.normalize_x_graphql,
                 disable_padding: c.disable_padding,
