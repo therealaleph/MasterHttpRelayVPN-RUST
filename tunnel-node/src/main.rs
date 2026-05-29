@@ -10,7 +10,7 @@
 //!   PORT           — listen port (default 8080, Cloud Run sets this)
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -124,6 +124,19 @@ const BATCH_RESPONSE_BUDGET: usize = 32 * 1024 * 1024;
 /// session can't flood the operator's log.
 const UDP_QUEUE_DROP_LOG_STRIDE: u64 = 100;
 
+/// Truncated session ID for log messages — first 8 characters, safe for
+/// any valid UUID string (which is always ≥ 8 chars).
+fn sid_short(sid: &str) -> &str {
+    &sid[..sid.len().min(8)]
+}
+
+/// Nginx-style 404 body used as a decoy on bad auth. Duplicated only
+/// because the response types differ between the single-op and batch
+/// handlers; extracting the body as a named const keeps them in sync.
+const DECOY_404_BODY: &str = "<html>\r\n<head><title>404 Not Found</title></head>\r\n\
+    <body>\r\n<center><h1>404 Not Found</h1></center>\r\n\
+    <hr><center>nginx</center>\r\n</body>\r\n</html>\r\n";
+
 // ---------------------------------------------------------------------------
 // Session
 // ---------------------------------------------------------------------------
@@ -155,11 +168,21 @@ struct SessionInner {
     read_buf: Mutex<Vec<u8>>,
     eof: AtomicBool,
     last_active: Mutex<Instant>,
+    /// Tracks `read_buf.len()` without acquiring the mutex. Updated by
+    /// `reader_task` and `drain_now`; read lock-free by the straggler
+    /// settle loop. Relaxed ordering is fine — the settle loop only
+    /// needs a best-effort estimate to detect ongoing growth.
+    buf_len: AtomicUsize,
     /// Fired by `reader_task` whenever new bytes land in `read_buf` or the
     /// upstream socket closes. `wait_for_any_drainable` listens on this
     /// to wake the drain phase as soon as any session has something to
     /// ship, replacing the old fixed-sleep heuristic.
     notify: Notify,
+    /// Fired by `drain_now` / `wait_and_drain` whenever bytes are consumed
+    /// from `read_buf`. The `reader_task` awaits this instead of polling,
+    /// so it wakes promptly when space becomes available rather than
+    /// busy-waiting on a 50ms timer.
+    drain_notify: Notify,
     /// Sequence-ordered write buffer: pipelined data ops may arrive
     /// out of order (different batches completing at different times).
     /// We buffer out-of-order writes and flush in seq order.
@@ -199,6 +222,10 @@ struct UdpSessionInner {
     /// so the proxy-side session task knows to exit instead of polling
     /// a zombie session until the 120 s idle reaper kills it.
     eof: AtomicBool,
+    /// Tracks `packets.len()` without acquiring the mutex. Updated by
+    /// `udp_reader_task` and `drain_udp_now`; read lock-free by the
+    /// straggler settle loop. Relaxed ordering is fine.
+    pkt_count: AtomicUsize,
     /// Total datagrams dropped because the queue hit `UDP_QUEUE_LIMIT`.
     /// Surfaced via tracing so operators can correlate "choppy call"
     /// reports with relay backpressure.
@@ -224,6 +251,8 @@ async fn create_session(host: &str, port: u16) -> std::io::Result<ManagedSession
         eof: AtomicBool::new(false),
         last_active: Mutex::new(Instant::now()),
         notify: Notify::new(),
+        drain_notify: Notify::new(),
+        buf_len: AtomicUsize::new(0),
         next_write_seq: Mutex::new(None),
         pending_writes: Mutex::new(std::collections::BTreeMap::new()),
     });
@@ -245,6 +274,8 @@ fn create_udpgw_session() -> ManagedSession {
         eof: AtomicBool::new(false),
         last_active: Mutex::new(Instant::now()),
         notify: Notify::new(),
+        drain_notify: Notify::new(),
+        buf_len: AtomicUsize::new(0),
         next_write_seq: Mutex::new(None),
         pending_writes: Mutex::new(std::collections::BTreeMap::new()),
     });
@@ -261,13 +292,13 @@ async fn reader_task(mut reader: impl AsyncRead + Unpin, session: Arc<SessionInn
     loop {
         // Backpressure: pause reads when the buffer hits READ_BUF_CAP.
         // Bounds per-session memory regardless of upstream throughput.
-        // The drain on the batch side drops the lock between calls, so
-        // this sleep loop will observe the updated size and resume.
+        // The drain side fires `drain_notify` after consuming bytes, so
+        // this wait is event-driven rather than polling.
         loop {
             if session.read_buf.lock().await.len() < READ_BUF_CAP {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            session.drain_notify.notified().await;
         }
         match reader.read(&mut buf).await {
             Ok(0) => {
@@ -286,6 +317,7 @@ async fn reader_task(mut reader: impl AsyncRead + Unpin, session: Arc<SessionInn
                 // so we never lose an edge across the spawn race in
                 // wait_for_any_drainable.
                 session.read_buf.lock().await.extend_from_slice(&buf[..n]);
+                session.buf_len.fetch_add(n, Ordering::Release);
                 session.notify.notify_one();
             }
             Err(_) => {
@@ -320,6 +352,7 @@ async fn create_udp_session(host: &str, port: u16) -> std::io::Result<ManagedUdp
         last_active: Mutex::new(Instant::now()),
         notify: Notify::new(),
         eof: AtomicBool::new(false),
+        pkt_count: AtomicUsize::new(0),
         queue_drops: AtomicU64::new(0),
     });
 
@@ -357,7 +390,7 @@ async fn udp_reader_task(socket: Arc<UdpSocket>, session: Arc<UdpSessionInner>) 
                     }
                 }
                 packets.push_back(buf[..n].to_vec());
-                drop(packets);
+                session.pkt_count.store(packets.len(), Ordering::Release);
                 // Inbound packet counts as activity — keeps server-push
                 // UDP (e.g. SIP/RTP, server-sent telemetry) out of the
                 // idle reaper. Empty `udp_data` polls deliberately do
@@ -396,21 +429,28 @@ async fn udp_reader_task(socket: Arc<UdpSocket>, session: Arc<UdpSessionInner>) 
 /// AND upstream has signaled EOF — otherwise a partial drain would
 /// prematurely tear the session down on the client side.
 async fn drain_now(session: &SessionInner, max_bytes: usize) -> (Vec<u8>, bool) {
-    let mut buf = session.read_buf.lock().await;
     let raw_eof = session.eof.load(Ordering::Acquire);
     let cap = max_bytes.min(TCP_DRAIN_MAX_BYTES);
-    if buf.len() <= cap {
-        let data = std::mem::take(&mut *buf);
-        (data, raw_eof)
-    } else {
-        // Take the prefix; leave the tail in the buffer.
-        let tail = buf.split_off(cap);
-        let head = std::mem::replace(&mut *buf, tail);
-        // Don't propagate eof yet — buffer still has data even if upstream
-        // has closed. The client will get eof on the drain that returns
-        // an empty (or sub-cap) buffer.
-        (head, false)
-    }
+    // Scope the lock so the MutexGuard is dropped before firing
+    // drain_notify, allowing the reader_task to acquire the lock
+    // immediately when it wakes.
+    let (drained, was_partial) = {
+        let mut buf = session.read_buf.lock().await;
+        let (drained, was_partial) = if buf.len() <= cap {
+            (std::mem::take(&mut *buf), false)
+        } else {
+            let tail = buf.split_off(cap);
+            let head = std::mem::replace(&mut *buf, tail);
+            (head, true)
+        };
+        session.buf_len.store(buf.len(), Ordering::Release);
+        (drained, was_partial)
+    };
+    session.drain_notify.notify_one();
+    // was_partial => buffer still has data even if upstream closed.
+    // The client gets eof on the final sub-cap drain.
+    let eof = if was_partial { false } else { raw_eof };
+    (drained, eof)
 }
 
 /// Block until *any* of `inners` has buffered data, hits EOF, or the
@@ -533,6 +573,7 @@ async fn is_any_drainable(inners: &[Arc<SessionInner>]) -> bool {
 async fn drain_udp_now(session: &UdpSessionInner) -> (Vec<Vec<u8>>, bool) {
     let mut packets = session.packets.lock().await;
     let drained: Vec<Vec<u8>> = packets.drain(..).collect();
+    session.pkt_count.store(0, Ordering::Release);
     let eof = session.eof.load(Ordering::Acquire);
     (drained, eof)
 }
@@ -614,9 +655,14 @@ async fn wait_and_drain(session: &SessionInner, max_wait: Duration) -> (Vec<u8>,
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    let mut buf = session.read_buf.lock().await;
-    let data = std::mem::take(&mut *buf);
-    let eof = session.eof.load(Ordering::Acquire);
+    let (data, eof) = {
+        let mut buf = session.read_buf.lock().await;
+        let data = std::mem::take(&mut *buf);
+        let eof = session.eof.load(Ordering::Acquire);
+        session.buf_len.store(0, Ordering::Release);
+        (data, eof)
+    };
+    session.drain_notify.notify_one();
     (data, eof)
 }
 
@@ -750,13 +796,10 @@ fn decoy_or_unauthorized(diagnostic_mode: bool) -> axum::response::Response {
     if diagnostic_mode {
         return Json(TunnelResponse::error("unauthorized")).into_response();
     }
-    let body = "<html>\r\n<head><title>404 Not Found</title></head>\r\n\
-                <body>\r\n<center><h1>404 Not Found</h1></center>\r\n\
-                <hr><center>nginx</center>\r\n</body>\r\n</html>\r\n";
     (
         StatusCode::NOT_FOUND,
         [(header::CONTENT_TYPE, "text/html")],
-        body,
+        DECOY_404_BODY,
     )
         .into_response()
 }
@@ -803,12 +846,7 @@ async fn handle_batch(
         }
         // Production: same nginx-404 decoy as the single-op path. See
         // `decoy_or_unauthorized` for rationale.
-        let body = "<html>\r\n<head><title>404 Not Found</title></head>\r\n\
-                    <body>\r\n<center><h1>404 Not Found</h1></center>\r\n\
-                    <hr><center>nginx</center>\r\n</body>\r\n</html>\r\n"
-            .as_bytes()
-            .to_vec();
-        return (StatusCode::NOT_FOUND, [(header::CONTENT_TYPE, "text/html")], body);
+        return (StatusCode::NOT_FOUND, [(header::CONTENT_TYPE, "text/html")], DECOY_404_BODY.as_bytes().to_vec());
     }
 
     let had_zops = req.zops.is_some();
@@ -970,7 +1008,7 @@ async fn handle_batch(
                                 had_uplink = true;
                                 tracing::info!(
                                     "session {} upload {}B wseq={:?}",
-                                    &sid[..sid.len().min(8)], bytes.len(), op.wseq,
+                                    sid_short(&sid), bytes.len(), op.wseq,
                                 );
                                 match op.wseq {
                                     None => {
@@ -987,7 +1025,7 @@ async fn handle_batch(
                                             // Stale / duplicate — skip.
                                             tracing::debug!(
                                                 "session {} wseq {} < expected {} — skipping",
-                                                &sid[..sid.len().min(8)], wseq, *expected,
+                                                sid_short(&sid), wseq, *expected,
                                             );
                                         } else if wseq == *expected {
                                             // In order — write immediately.
@@ -1009,7 +1047,7 @@ async fn handle_batch(
                                             // Out of order — buffer for later.
                                             tracing::debug!(
                                                 "session {} wseq {} > expected {} — buffering",
-                                                &sid[..sid.len().min(8)], wseq, *expected,
+                                                sid_short(&sid), wseq, *expected,
                                             );
                                             let mut pw = inner.pending_writes.lock().await;
                                             pw.insert(wseq, bytes);
@@ -1151,14 +1189,18 @@ async fn handle_batch(
             //  1. No new data arrived in the last step (burst is over)
             //  2. STRAGGLER_SETTLE_MAX reached
             let settle_end = Instant::now() + STRAGGLER_SETTLE_MAX;
+            // Snapshot current buffer sizes via atomics so the settle
+            // loop doesn't contend with reader_tasks and drains on the
+            // per-session mutexes. Relaxed ordering is fine: we only
+            // need a best-effort estimate of whether data is still
+            // arriving.
             let mut prev_tcp_bytes: usize = 0;
             let mut prev_udp_pkts: usize = 0;
-            // Snapshot current buffer sizes.
             for inner in &tcp_inners {
-                prev_tcp_bytes += inner.read_buf.lock().await.len();
+                prev_tcp_bytes += inner.buf_len.load(Ordering::Relaxed);
             }
             for inner in &udp_inners {
-                prev_udp_pkts += inner.packets.lock().await.len();
+                prev_udp_pkts += inner.pkt_count.load(Ordering::Relaxed);
             }
             loop {
                 let now = Instant::now();
@@ -1168,14 +1210,14 @@ async fn handle_batch(
                 let remaining = settle_end.duration_since(now);
                 tokio::time::sleep(STRAGGLER_SETTLE_STEP.min(remaining)).await;
 
-                // Measure current buffer sizes.
+                // Measure current buffer sizes via atomics.
                 let mut tcp_bytes: usize = 0;
                 let mut udp_pkts: usize = 0;
                 for inner in &tcp_inners {
-                    tcp_bytes += inner.read_buf.lock().await.len();
+                    tcp_bytes += inner.buf_len.load(Ordering::Relaxed);
                 }
                 for inner in &udp_inners {
-                    udp_pkts += inner.packets.lock().await.len();
+                    udp_pkts += inner.pkt_count.load(Ordering::Relaxed);
                 }
 
                 // No new data since last step — burst is over.
@@ -1228,7 +1270,7 @@ async fn handle_batch(
             }
             let drained = all_data.len();
             if drained > 0 {
-                tracing::info!("session {} drained {}KB", &sid[..sid.len().min(8)], drained / 1024);
+                tracing::info!("session {} drained {}KB", sid_short(sid), drained / 1024);
                 *inner.last_active.lock().await = Instant::now();
             }
             if final_eof {
@@ -1588,7 +1630,10 @@ async fn cleanup_task(
         interval.tick().await;
         let now = Instant::now();
 
-        {
+        // Collect stale TCP sessions and remove them under the lock,
+        // then abort outside the lock so other handlers aren't blocked
+        // during abort_all().
+        let (tcp_count, total_read_buf, reaped, active_count) = {
             let mut map = sessions.lock().await;
             let mut stale = Vec::new();
             let mut total_read_buf: usize = 0;
@@ -1599,27 +1644,32 @@ async fn cleanup_task(
                     stale.push(k.clone());
                 }
             }
-            tracing::info!(
-                "cleanup: {} tcp sessions, {:.1} MB total read_buf",
-                map.len(),
-                total_read_buf as f64 / (1024.0 * 1024.0),
-            );
+            let tcp_count = map.len();
+            let mut reaped: Vec<ManagedSession> = Vec::with_capacity(stale.len());
             for k in &stale {
                 if let Some(s) = map.remove(k) {
-                    s.abort_all();
-                    tracing::info!("reaped idle session {}", k);
+                    reaped.push(s);
                 }
             }
-            if !stale.is_empty() {
-                tracing::info!("cleanup: reaped {}, {} active", stale.len(), map.len());
-            }
+            let active_count = map.len();
+            (tcp_count, total_read_buf, reaped, active_count)
+        }; // sessions lock released
+
+        tracing::info!(
+            "cleanup: {} tcp sessions, {:.1} MB total read_buf",
+            tcp_count,
+            total_read_buf as f64 / (1024.0 * 1024.0),
+        );
+        for s in &reaped {
+            s.abort_all();
+        }
+        if !reaped.is_empty() {
+            tracing::info!("cleanup: reaped {} tcp, {} active", reaped.len(), active_count);
         }
 
-        {
-            // UDP sessions get a tighter idle window because UDP flows
-            // are typically short-lived (DNS, STUN, single-RTT QUIC) or
-            // make their own keepalives. 120 s avoids leaking sockets
-            // for one-shot lookups while keeping calls/streams alive.
+        // UDP sessions — same pattern: collect stale, remove, release
+        // lock, then abort outside it.
+        let (udp_reaped, udp_active) = {
             let mut map = udp_sessions.lock().await;
             let mut stale = Vec::new();
             for (k, s) in map.iter() {
@@ -1628,19 +1678,21 @@ async fn cleanup_task(
                     stale.push(k.clone());
                 }
             }
+            let mut reaped: Vec<ManagedUdpSession> = Vec::with_capacity(stale.len());
             for k in &stale {
                 if let Some(s) = map.remove(k) {
-                    s.reader_handle.abort();
-                    tracing::info!("reaped idle udp session {}", k);
+                    reaped.push(s);
                 }
             }
-            if !stale.is_empty() {
-                tracing::info!(
-                    "cleanup: reaped {}, {} active udp",
-                    stale.len(),
-                    map.len()
-                );
-            }
+            let active = map.len();
+            (reaped, active)
+        }; // udp_sessions lock released
+
+        for s in &udp_reaped {
+            s.reader_handle.abort();
+        }
+        if !udp_reaped.is_empty() {
+            tracing::info!("cleanup: reaped {} udp, {} active udp", udp_reaped.len(), udp_active);
         }
     }
 }
@@ -1899,6 +1951,8 @@ mod tests {
             eof: AtomicBool::new(false),
             last_active: Mutex::new(Instant::now()),
             notify: Notify::new(),
+            drain_notify: Notify::new(),
+            buf_len: AtomicUsize::new(0),
             next_write_seq: Mutex::new(None),
             pending_writes: Mutex::new(std::collections::BTreeMap::new()),
         })
@@ -2152,6 +2206,8 @@ mod tests {
             eof: AtomicBool::new(false),
             last_active: Mutex::new(Instant::now()),
             notify: Notify::new(),
+            drain_notify: Notify::new(),
+            buf_len: AtomicUsize::new(0),
             next_write_seq: Mutex::new(None),
             pending_writes: Mutex::new(std::collections::BTreeMap::new()),
         });
@@ -2485,6 +2541,7 @@ mod tests {
             last_active: Mutex::new(Instant::now()),
             notify: Notify::new(),
             eof: AtomicBool::new(false),
+            pkt_count: AtomicUsize::new(0),
             queue_drops: AtomicU64::new(0),
         });
         // Healthy state: drain reports no eof.

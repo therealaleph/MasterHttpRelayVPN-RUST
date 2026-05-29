@@ -27,6 +27,7 @@ use tokio::net::UdpSocket;
 /// range for hostname lookups. If the magic IP collided with one of those
 /// synthetic IPs, every request to whichever hostname got that allocation
 /// would be silently mis-routed into the udpgw path. See issue #251.
+#[allow(dead_code)]
 pub const UDPGW_MAGIC_IP: [u8; 4] = [192, 0, 2, 1];
 /// Pre-formatted dotted-quad form of `UDPGW_MAGIC_IP`. Compared against
 /// incoming hostnames in [`is_udpgw_dest`]; kept in sync with the octets
@@ -38,6 +39,7 @@ pub const UDPGW_MAGIC_PORT: u16 = 7300;
 /// deprecation cycle so users who upgrade the `mhrv-tunnel` Docker
 /// container ahead of the Android APK don't lose Full-mode UDP relay
 /// during the version-skew window. Slated for removal in v1.10.0.
+#[allow(dead_code)]
 const LEGACY_UDPGW_MAGIC_IP: [u8; 4] = [198, 18, 0, 1];
 const LEGACY_UDPGW_MAGIC_HOST: &str = "198.18.0.1";
 
@@ -64,14 +66,13 @@ enum DstAddr {
 }
 
 impl DstAddr {
-    fn to_socket_addr(&self) -> std::io::Result<SocketAddr> {
+    async fn to_socket_addr(&self) -> std::io::Result<SocketAddr> {
         match self {
             DstAddr::V4(ip, port) => Ok(SocketAddr::V4(SocketAddrV4::new(*ip, *port))),
             DstAddr::V6(ip, port) => Ok(SocketAddr::V6(SocketAddrV6::new(*ip, *port, 0, 0))),
             DstAddr::Domain(name, port) => {
-                use std::net::ToSocketAddrs;
-                (name.as_str(), *port)
-                    .to_socket_addrs()?
+                tokio::net::lookup_host((name.as_str(), *port))
+                    .await?
                     .next()
                     .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "DNS resolution failed"))
             }
@@ -254,6 +255,8 @@ pub async fn udpgw_server_task(stream: DuplexStream) {
 
     let mut buf = Vec::with_capacity(65536);
     let mut tmp = [0u8; 65536];
+    /// Max accumulation buffer to prevent OOM on repeated corrupt frames.
+    const BUF_MAX: usize = 65536 * 4;
 
     loop {
         let n = match read_half.read(&mut tmp).await {
@@ -268,7 +271,13 @@ pub async fn udpgw_server_task(stream: DuplexStream) {
                     buf.drain(..consumed);
                     handle_frame(&frame, &tx, &mut sockets).await;
                 }
-                Ok(None) => break,
+                Ok(None) => {
+                    if buf.len() >= BUF_MAX {
+                        tracing::warn!("udpgw buffer overflow ({} bytes) — clearing", buf.len());
+                        buf.clear();
+                    }
+                    break;
+                }
                 Err(e) => {
                     tracing::warn!("udpgw frame parse error: {}", e);
                     if buf.len() >= 2 {
@@ -387,7 +396,7 @@ async fn handle_frame(
         return;
     }
 
-    let dst_addr = match dst.to_socket_addr() {
+    let dst_addr = match dst.to_socket_addr().await {
         Ok(a) => a,
         Err(e) => {
             tracing::debug!("udpgw resolve failed: {}", e);
