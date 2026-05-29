@@ -95,9 +95,9 @@ impl FronterError {
 }
 
 type PooledStream = TlsStream<TcpStream>;
-const POOL_TTL_SECS: u64 = 60;
+const POOL_TTL_SECS: u64 = 30;
 const POOL_MIN: usize = 8;
-const POOL_REFILL_INTERVAL_SECS: u64 = 5;
+const POOL_REFILL_INTERVAL_SECS: u64 = 2;
 const POOL_MAX: usize = 80;
 const REQUEST_TIMEOUT_SECS: u64 = 25;
 const RANGE_PARALLEL_CHUNK_BYTES: u64 = 256 * 1024;
@@ -118,7 +118,7 @@ const H2_CONN_TTL_SECS: u64 = 540;
 /// `h2_round_trip`. This way a slow but legitimate Apps Script call
 /// isn't cut off at an arbitrary fixed cap, and Full-mode batches can
 /// honor the user's `request_timeout_secs` setting.
-const H2_READY_TIMEOUT_SECS: u64 = 5;
+const H2_READY_TIMEOUT_SECS: u64 = 3;
 /// Default response-phase deadline used by `relay_uncoalesced` callers
 /// (the Apps-Script direct path). Sized to be just under the outer
 /// `REQUEST_TIMEOUT_SECS` (25 s) so an h2 timeout still leaves a few
@@ -147,7 +147,7 @@ const H1_OPEN_TIMEOUT_SECS: u64 = 8;
 /// containers go cold after ~5min idle and cost 1-3s on the first
 /// request to wake back up — most painful on YouTube / streaming where
 /// the first chunk after a quiet pause stalls the player.
-const H1_KEEPALIVE_INTERVAL_SECS: u64 = 240;
+const H1_KEEPALIVE_INTERVAL_SECS: u64 = 60;
 /// Largest response body Apps Script's `UrlFetchApp` will deliver before
 /// the script gets killed mid-execution. The hard wire ceiling is ~50 MiB;
 /// after base64 / envelope overhead and edge variance, the practical raw
@@ -1405,10 +1405,13 @@ impl DomainFronter {
         // `release_capacity` on every chunk for typical Apps Script
         // payloads (usually < 1 MB; range chunks are 256 KB). We still
         // release capacity in the body-read loop for safety on larger
-        // bodies.
+        // bodies. 16/32 MB windows eliminate stalls for range-parallel
+        // streaming (256 KB chunks × many streams) without adding memory
+        // overhead on idle connections (the window is just a counter until
+        // data flows).
         let (send, conn) = h2::client::Builder::new()
-            .initial_window_size(4 * 1024 * 1024)
-            .initial_connection_window_size(8 * 1024 * 1024)
+            .initial_window_size(16 * 1024 * 1024)
+            .initial_connection_window_size(32 * 1024 * 1024)
             .handshake(tls)
             .await
             .map_err(|e| OpenH2Error::Handshake(e.to_string()))?;
@@ -1626,9 +1629,15 @@ impl DomainFronter {
         // through Apps Script (where a 256 KB range chunk can take 30-90s
         // of wall-clock time) are not killed by the tighter `batch_timeout`.
         // Release flow-control credit per chunk so large responses don't
-        // stall after the initial 4 MB window.
+        // stall after the initial window.
+        // Pre-size from content-length to avoid O(log n) realloc cycles
+        // on large GAS responses (up to 40 MB).
         let stream_timeout = self.stream_timeout();
-        let mut buf: Vec<u8> = Vec::new();
+        let body_hint: usize = headers.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, v)| v.parse().ok())
+            .unwrap_or(0);
+        let mut buf: Vec<u8> = Vec::with_capacity(body_hint.min(APPS_SCRIPT_BODY_MAX_BYTES as usize));
         loop {
             match tokio::time::timeout(stream_timeout, body.data()).await {
                 Ok(None) => break,

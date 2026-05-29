@@ -56,7 +56,7 @@ const REPLY_TIMEOUT_SLACK: Duration = Duration::from_secs(5);
 /// Per-inflight reply timeout used by the pipelined poll loop. Each
 /// in-flight future independently times out after this duration so a
 /// dead target on the tunnel-node side doesn't block the session.
-const REPLY_TIMEOUT: Duration = Duration::from_secs(35);
+const REPLY_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How long we'll briefly hold the client socket after the local
 /// CONNECT/SOCKS5 handshake, waiting for the client's first bytes (the
@@ -1543,13 +1543,14 @@ async fn tunnel_loop(
     }
 
     // Send initial pre-fill empty polls (optimist depth), staggered
-    // 1s apart so they land in separate batches. The pending data op
+    // 100ms apart so they land in separate batches without blocking
+    // session startup for a full second per slot. The pending data op
     // (if any) already occupies one slot.
     {
         let polls_to_send = max_inflight.saturating_sub(inflight.len());
         for i in 0..polls_to_send {
             if i > 0 {
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
             let (meta, reply_rx) = send_empty_poll(sid, &mut next_send_seq, mux);
             tracing::debug!(
