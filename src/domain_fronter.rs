@@ -413,6 +413,10 @@ pub struct DomainFronter {
     /// payloads. Mirrors `Config::disable_padding` (#391). Default false
     /// (padding active = stronger DPI defense at +25% bandwidth cost).
     disable_padding: bool,
+    /// Strip CDN noise headers (report-to, nel, alt-svc, etc.) from the
+    /// relay response before forwarding to the browser. Default true.
+    /// Mirrors `Config::strip_noise_response_headers`.
+    strip_noise_response_headers: bool,
     zstd_enabled: Arc<AtomicBool>,
     /// Per-instance auto-blacklist tuning. Mirrors `Config::auto_blacklist_*`
     /// (#391, #444). Cached here so the hot path in `record_timeout_strike`
@@ -648,6 +652,7 @@ impl DomainFronter {
             today_bytes: AtomicU64::new(0),
             today_key: std::sync::Mutex::new(current_pt_day_key()),
             disable_padding: config.disable_padding,
+            strip_noise_response_headers: config.strip_noise_response_headers,
             zstd_enabled: Arc::new(AtomicBool::new(false)),
             auto_blacklist_strikes: config.auto_blacklist_strikes.max(1),
             auto_blacklist_window: Duration::from_secs(
@@ -2851,7 +2856,7 @@ impl DomainFronter {
                         status, body_txt
                     )));
                 }
-                return parse_relay_json(&resp_body).map_err(|e| {
+                return parse_relay_json(&resp_body, self.strip_noise_response_headers).map_err(|e| {
                     if let FronterError::Relay(ref msg) = e {
                         if looks_like_quota_error(msg) {
                             self.blacklist_script(&script_id, msg);
@@ -2960,7 +2965,7 @@ impl DomainFronter {
                             status, body_txt
                         )));
                     }
-                    match parse_relay_json(&resp_body) {
+                    match parse_relay_json(&resp_body, self.strip_noise_response_headers) {
                         Ok(bytes) => Ok::<_, FronterError>((bytes, true)),
                         Err(e) => {
                             if let FronterError::Relay(ref msg) = e {
@@ -5001,8 +5006,27 @@ fn is_h2_fronting_refusal_status(status: u16) -> bool {
     status == 421
 }
 
+/// CDN metadata headers that carry no value through a MITM relay.
+/// Stripped when `strip_noise_response_headers = true` (the default).
+/// The browser never reads them through a proxy, and they add 400-700 bytes
+/// of JSON per CDN-backed response for zero benefit.
+static NOISE_RESPONSE_HEADERS: &[&str] = &[
+    "report-to",
+    "reporting-endpoints",
+    "nel",
+    "alt-svc",
+    "server-timing",
+    "origin-trial",
+    "cf-ray",
+    "cf-cache-status",
+    "x-amzn-requestid",
+    "x-amzn-trace-id",
+    "x-request-id",
+    "x-correlation-id",
+];
+
 /// Parse the JSON envelope from Apps Script and build a raw HTTP response.
-fn parse_relay_json(body: &[u8]) -> Result<Vec<u8>, FronterError> {
+fn parse_relay_json(body: &[u8], strip_noise: bool) -> Result<Vec<u8>, FronterError> {
     let text = std::str::from_utf8(body)
         .map_err(|_| FronterError::BadResponse("non-utf8 json".into()))?
         .trim();
@@ -5082,6 +5106,9 @@ fn parse_relay_json(body: &[u8]) -> Result<Vec<u8>, FronterError> {
         for (k, v) in hmap {
             let lk = k.to_ascii_lowercase();
             if SKIP.contains(&lk.as_str()) {
+                continue;
+            }
+            if strip_noise && NOISE_RESPONSE_HEADERS.contains(&lk.as_str()) {
                 continue;
             }
             match v {
@@ -5905,7 +5932,7 @@ mod tests {
     #[test]
     fn parse_relay_basic_json() {
         let body = r#"{"s":200,"h":{"Content-Type":"text/plain"},"b":"SGVsbG8="}"#;
-        let raw = parse_relay_json(body.as_bytes()).unwrap();
+        let raw = parse_relay_json(body.as_bytes(), true).unwrap();
         let s = String::from_utf8_lossy(&raw);
         assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(s.contains("Content-Type: text/plain\r\n"));
@@ -6804,14 +6831,14 @@ hello";
     #[test]
     fn parse_relay_error_field() {
         let body = r#"{"e":"unauthorized"}"#;
-        let err = parse_relay_json(body.as_bytes()).unwrap_err();
+        let err = parse_relay_json(body.as_bytes(), true).unwrap_err();
         assert!(matches!(err, FronterError::Relay(_)));
     }
 
     #[test]
     fn parse_relay_rejects_invalid_body_base64() {
         let body = r#"{"s":200,"b":"***not-base64***"}"#;
-        let err = parse_relay_json(body.as_bytes()).unwrap_err();
+        let err = parse_relay_json(body.as_bytes(), true).unwrap_err();
         assert!(matches!(err, FronterError::BadResponse(_)));
     }
 
@@ -6870,7 +6897,7 @@ hello";
     #[test]
     fn parse_relay_array_set_cookie() {
         let body = r#"{"s":200,"h":{"Set-Cookie":["a=1","b=2"]},"b":""}"#;
-        let raw = parse_relay_json(body.as_bytes()).unwrap();
+        let raw = parse_relay_json(body.as_bytes(), true).unwrap();
         let s = String::from_utf8_lossy(&raw);
         assert!(s.contains("Set-Cookie: a=1\r\n"));
         assert!(s.contains("Set-Cookie: b=2\r\n"));
@@ -6938,7 +6965,7 @@ hello";
         // to fail with `key must be a string at line 2`.
         let inner_json = r#"{"s":200,"h":{},"b":""}"#;
         let wrapped = build_goog_script_init_wrapper(inner_json);
-        let raw = parse_relay_json(wrapped.as_bytes()).unwrap();
+        let raw = parse_relay_json(wrapped.as_bytes(), true).unwrap();
         let s = String::from_utf8_lossy(&raw);
         assert!(s.starts_with("HTTP/1.1 200 "), "got: {}", s);
     }

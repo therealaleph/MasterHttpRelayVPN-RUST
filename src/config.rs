@@ -433,6 +433,16 @@ pub struct Config {
     /// Default 500.
     #[serde(default = "default_quota_safety_buffer")]
     pub quota_safety_buffer: u64,
+
+    /// Strip CDN noise headers from relay responses before forwarding to
+    /// the browser. Headers such as `report-to`, `nel`, `alt-svc`, and
+    /// `server-timing` are attached by modern CDNs (Cloudflare, AWS,
+    /// Fastly) and add 400–700 bytes per response for no benefit through
+    /// a MITM relay — the proxy ignores them and the browser never reads
+    /// them. Default `true`. Set to `false` only to inspect raw origin
+    /// headers for debugging.
+    #[serde(default = "default_strip_noise_response_headers")]
+    pub strip_noise_response_headers: bool,
 }
 
 /// Configuration for the optional second-hop exit node.
@@ -563,6 +573,7 @@ fn default_auto_blacklist_window_secs() -> u64 { 30 }
 fn default_auto_blacklist_cooldown_secs() -> u64 { 120 }
 fn default_quota_daily_limit() -> u64 { 20_000 }
 fn default_quota_safety_buffer() -> u64 { 500 }
+fn default_strip_noise_response_headers() -> bool { true }
 
 /// Default for `request_timeout_secs`: 30s, matching the historical
 /// hard-coded `BATCH_TIMEOUT` and Apps Script's typical response cliff.
@@ -811,6 +822,8 @@ pub struct TomlRelay {
     pub request_timeout_secs: u64,
     #[serde(default = "default_stream_timeout_secs")]
     pub stream_timeout_secs: u64,
+    #[serde(default = "default_strip_noise_response_headers")]
+    pub strip_noise_response_headers: bool,
 }
 
 /// [network] section of config.toml.
@@ -969,6 +982,7 @@ impl From<TomlConfig> for Config {
             exit_node: t.exit_node,
             quota_daily_limit: default_quota_daily_limit(),
             quota_safety_buffer: default_quota_safety_buffer(),
+            strip_noise_response_headers: t.relay.strip_noise_response_headers,
         }
     }
 }
@@ -997,6 +1011,7 @@ impl From<&Config> for TomlConfig {
                 auto_blacklist_cooldown_secs: c.auto_blacklist_cooldown_secs,
                 request_timeout_secs: c.request_timeout_secs,
                 stream_timeout_secs: c.stream_timeout_secs,
+                strip_noise_response_headers: c.strip_noise_response_headers,
             },
             network: TomlNetwork {
                 google_ip: c.google_ip.clone(),

@@ -46,6 +46,32 @@ const AUTH_KEY = "CHANGE_ME_TO_A_STRONG_SECRET";
 // (Inspired by #365 Section 3, mhrv-rs v1.8.0+.)
 const DIAGNOSTIC_MODE = false;
 
+// ── Response header noise filtering ────────────────────────────────────────
+// CDN stacks (Cloudflare, AWS, Fastly, Google) attach metadata headers to
+// every response that are useless through a MITM relay: report-to, nel,
+// alt-svc, server-timing, etc. These add 400-700 bytes of JSON per response
+// for no benefit — the relay ignores them and the browser never reads them.
+//
+// STRIP_NOISE_RESPONSE_HEADERS controls whether _respHeaders() filters them
+// before returning. Hardcoded true here for GAS-side payload reduction.
+// The primary user toggle is `strip_noise_response_headers` in config.toml
+// on the Rust client side, which drops them even if Code.gs sends them.
+//
+// Set to false only if you need to see raw origin headers in GAS logs.
+// ---------------------------------------------------------------------------
+const STRIP_NOISE_RESPONSE_HEADERS = true;
+
+const STRIP_RESPONSE_HEADERS = {
+  "report-to": 1, "reporting-endpoints": 1,
+  "nel": 1,
+  "alt-svc": 1,
+  "server-timing": 1,
+  "origin-trial": 1,
+  "cf-ray": 1, "cf-cache-status": 1,
+  "x-amzn-requestid": 1, "x-amzn-trace-id": 1,
+  "x-request-id": 1, "x-correlation-id": 1,
+};
+
 // ── Optional Spreadsheet Cache ──────────────────────────────
 // Set to a valid Spreadsheet ID to enable response caching.
 // Leave as-is to disable caching entirely (zero overhead).
@@ -329,12 +355,20 @@ function _buildOpts(req) {
 }
 
 function _respHeaders(resp) {
+  var raw;
   try {
-    if (typeof resp.getAllHeaders === "function") {
-      return resp.getAllHeaders();
-    }
-  } catch (err) {}
-  return resp.getHeaders();
+    raw = typeof resp.getAllHeaders === "function"
+      ? resp.getAllHeaders()
+      : resp.getHeaders();
+  } catch (err) {
+    raw = {};
+  }
+  if (!STRIP_NOISE_RESPONSE_HEADERS) return raw;
+  var out = {};
+  for (var k in raw) {
+    if (!STRIP_RESPONSE_HEADERS[k.toLowerCase()]) out[k] = raw[k];
+  }
+  return out;
 }
 
 function _json(obj) {
