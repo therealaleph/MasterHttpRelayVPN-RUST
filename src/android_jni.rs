@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use jni::objects::{JClass, JString};
+use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jboolean, jlong, jstring, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
 use tokio::runtime::Runtime;
@@ -70,6 +70,8 @@ extern "C" {
 
 const ANDROID_LOG_INFO: i32 = 4;
 const LOG_RING_CAP: usize = 500;
+const ANDROID_RUNTIME_MIN_WORKERS: usize = 2;
+const ANDROID_RUNTIME_MAX_WORKERS: usize = 4;
 
 fn log_ring() -> &'static Mutex<VecDeque<String>> {
     static RING: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
@@ -146,8 +148,24 @@ fn jstring_to_string(env: &mut JNIEnv, s: &JString) -> String {
         .unwrap_or_else(|_| String::new())
 }
 
+/// Helper: String -> jstring, returning null on allocation failure.
+fn string_to_jstring(env: &mut JNIEnv, value: &str) -> jstring {
+    let obj: jni::errors::Result<JObject> = env.with_local_frame_returning_local(4, |env| {
+        env.new_string(value).map(JObject::from)
+    });
+    obj.map(|s| s.into_raw() as jstring)
+        .unwrap_or(std::ptr::null_mut())
+}
+
 fn safe<F: FnOnce() -> R + std::panic::UnwindSafe, R>(default: R, f: F) -> R {
     std::panic::catch_unwind(f).unwrap_or(default)
+}
+
+fn android_runtime_worker_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(ANDROID_RUNTIME_MIN_WORKERS)
+        .clamp(ANDROID_RUNTIME_MIN_WORKERS, ANDROID_RUNTIME_MAX_WORKERS)
 }
 
 /// Build a throwaway tokio runtime for one-shot blocking calls from JNI.
@@ -202,8 +220,9 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_startProxy(
 
         // Try to build the runtime first — if allocation fails we want to
         // know before spinning up anything stateful.
+        let worker_threads = android_runtime_worker_threads();
         let rt = match tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
+            .worker_threads(worker_threads)
             .enable_all()
             .thread_name("mhrv-worker")
             .build()
@@ -214,6 +233,7 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_startProxy(
                 return 0i64;
             }
         };
+        tracing::info!("android: tokio runtime worker_threads={}", worker_threads);
 
         let base = crate::data_dir::data_dir();
         let mitm = match MitmCertManager::new_in(&base) {
@@ -328,11 +348,11 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_exportCa(
 /// `Native.version()` -> String. Trivial smoke test for the JNI linkage.
 #[no_mangle]
 pub extern "system" fn Java_com_therealaleph_mhrv_Native_version<'a>(
-    env: JNIEnv<'a>,
+    mut env: JNIEnv<'a>,
     _class: JClass,
 ) -> jstring {
     let v = env!("CARGO_PKG_VERSION");
-    env.new_string(v).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    string_to_jstring(&mut env, v)
 }
 
 /// `Native.drainLogs()` -> String. Returns the full ring buffer as a single
@@ -341,7 +361,7 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_version<'a>(
 /// for display. Empty string when there's nothing to read.
 #[no_mangle]
 pub extern "system" fn Java_com_therealaleph_mhrv_Native_drainLogs<'a>(
-    env: JNIEnv<'a>,
+    mut env: JNIEnv<'a>,
     _class: JClass,
 ) -> jstring {
     let out = safe(String::new(), AssertUnwindSafe(|| {
@@ -352,7 +372,7 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_drainLogs<'a>(
         let lines: Vec<String> = g.drain(..).collect();
         lines.join("\n")
     }));
-    env.new_string(out).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    string_to_jstring(&mut env, &out)
 }
 
 /// `Native.checkUpdate()` -> String. Runs the same `update_check::check`
@@ -368,7 +388,7 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_drainLogs<'a>(
 /// Blocking — hit from a background dispatcher.
 #[no_mangle]
 pub extern "system" fn Java_com_therealaleph_mhrv_Native_checkUpdate<'a>(
-    env: JNIEnv<'a>,
+    mut env: JNIEnv<'a>,
     _class: JClass,
 ) -> jstring {
     let result_json = safe(
@@ -384,9 +404,7 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_checkUpdate<'a>(
             update_check_to_json(&outcome)
         }),
     );
-    env.new_string(result_json)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+    string_to_jstring(&mut env, &result_json)
 }
 
 fn update_check_to_json(u: &crate::update_check::UpdateCheck) -> String {
@@ -456,7 +474,7 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_testSni<'a>(
             _ => r#"{"ok":false,"error":"unknown"}"#.to_string(),
         }
     }));
-    env.new_string(result_json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    string_to_jstring(&mut env, &result_json)
 }
 
 /// `Native.statsJson(long handle)` -> String. Returns a JSON blob with the
@@ -467,7 +485,7 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_testSni<'a>(
 /// timer to render the "Usage today (estimated)" card.
 #[no_mangle]
 pub extern "system" fn Java_com_therealaleph_mhrv_Native_statsJson<'a>(
-    env: JNIEnv<'a>,
+    mut env: JNIEnv<'a>,
     _class: JClass,
     handle: jlong,
 ) -> jstring {
@@ -484,7 +502,7 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_statsJson<'a>(
         };
         f.snapshot_stats().to_json()
     }));
-    env.new_string(out).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    string_to_jstring(&mut env, &out)
 }
 
 /// `Native.pipelineDebugJson()` -> String. Snapshot of pipeline debug state:
@@ -492,13 +510,13 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_statsJson<'a>(
 /// Temporary — for the debug overlay.
 #[no_mangle]
 pub extern "system" fn Java_com_therealaleph_mhrv_Native_pipelineDebugJson<'a>(
-    env: JNIEnv<'a>,
+    mut env: JNIEnv<'a>,
     _class: JClass,
 ) -> jstring {
     let out = safe(String::new(), AssertUnwindSafe(|| {
         crate::tunnel_client::pipeline_debug::to_json()
     }));
-    env.new_string(out).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    string_to_jstring(&mut env, &out)
 }
 
 // ---------------------------------------------------------------------------
