@@ -367,7 +367,7 @@ This port focuses on the **`apps_script` mode** — the only one that reliably w
 
 Intentionally **not** implemented:
 
-- **HTTP/2 multiplexing** — `h2` crate state machine has too many subtle hang cases; coalescing + 20-conn pool gets most of the benefit
+- **HTTP/2 multiplexing** — the relay can use an `h2` fast path when the Google edge negotiates it. The client advertises explicit browser-scale stream and connection flow-control settings, then falls back to the warmed HTTP/1.1 pool when ALPN refuses h2, the h2 connection stalls, or the deployment returns a fronting-incompatibility status.
 - **Request batching (`q:[...]` mode in apps_script mode)** — connection pool + tokio async already parallelizes well; batching adds ~200 lines of state for unclear gain
 - **Range-based parallel download** — edge cases real (non-Range servers, chunked mid-stream); YouTube already bypasses Apps Script via SNI-rewrite tunnel
 - **Other modes** (`domain_fronting`, `google_fronting`, `custom_domain`) — Cloudflare killed generic domain fronting in 2024; Cloud Run needs a paid plan
