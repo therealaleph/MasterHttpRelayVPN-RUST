@@ -206,6 +206,8 @@ upstream_socks5 = "127.0.0.1:50529"
 
 HTTP / HTTPS keeps going through Apps Script (no change), and the SNI-rewrite tunnel for `google.com` / `youtube.com` keeps bypassing both — YouTube stays as fast as before while Telegram gets a real tunnel.
 
+SOCKS5 domain targets preserve remote-DNS semantics: if the proxy would have to resolve a hostname locally for raw TCP and neither Full Tunnel nor `upstream_socks5` is available, it fails closed instead of leaking a plaintext DNS lookup.
+
 ## Full Tunnel mode
 
 `"mode": "full"` routes **all** traffic end-to-end through Apps Script and a remote [tunnel-node](../tunnel-node/) — no MITM certificate needed. TCP carried as persistent tunnel sessions, UDP from Android / TUN clients via SOCKS5 `UDP ASSOCIATE` to the tunnel-node which emits real UDP server-side. Trade-off: higher per-request latency (every byte goes Apps Script → tunnel-node → destination), but works for any protocol and any app, no CA install required.
