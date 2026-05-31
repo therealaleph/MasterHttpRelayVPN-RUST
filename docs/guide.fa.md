@@ -343,7 +343,7 @@ sni_hosts = ["www.google.com", "drive.google.com", "docs.google.com"]
 |---|---|
 | HTTP proxy محلی | CONNECT برای HTTPS، forwarding ساده برای HTTP |
 | SOCKS5 محلی | dispatch هوشمند TLS / HTTP / TCP خام (تلگرام، xray، …) |
-| MITM | تولید گواهی per-domain روی پرواز با `rcgen` |
+| MITM | تولید گواهی per-domain روی پرواز با `rcgen`؛ configهای leaf تولیدشده داخل یک کش LRU محدود نگه‌داری می‌شوند |
 | نصب CA | تولید + نصب خودکار روی مک / لینوکس / ویندوز |
 | پشتیبانی فایرفاکس | نصب گواهی NSS با `certutil` (best-effort) |
 | رلهٔ JSON | پروتکل سازگار با `Code.gs` |
@@ -351,7 +351,7 @@ sni_hosts = ["www.google.com", "drive.google.com", "docs.google.com"]
 | رمزگشایی gzip | اتوماتیک |
 | چند اسکریپت | چرخش round-robin |
 | Blacklist خودکار | روی خطای 429 / quota، با cooldown ۱۰ دقیقه |
-| کش پاسخ | ۵۰ مگابایت، FIFO + TTL، آگاه از `Cache-Control: max-age`، heuristic برای static asset |
+| کش پاسخ | ۵۰ مگابایت، LRU + TTL، آگاه از `Cache-Control: max-age`، heuristic برای static asset |
 | Coalescing | GETهای یکسان همزمان یک fetch upstream را به اشتراک می‌گذارند |
 | تونل بازنویسی SNI | مستقیم به لبهٔ گوگل (بدون رله) برای `google.com`، `youtube.com`، `youtu.be`، `youtube-nocookie.com`، `fonts.googleapis.com` — دامنه‌های اضافی از فیلد `hosts` |
 | هندل ریدایرکت | اتوماتیک: `/exec` → `googleusercontent.com` |
