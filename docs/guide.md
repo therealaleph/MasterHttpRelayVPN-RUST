@@ -269,7 +269,36 @@ The destination sees the exit node's IP, not Google's, so the anti-bot heuristic
 
 ## Sharing via hotspot
 
-mhrv-rs listens on `0.0.0.0` by default, so any device on the same network can use it. Common scenario: share the tunnel from an Android phone to an iPhone, iPad, or laptop over hotspot:
+mhrv-rs listens on `127.0.0.1` by default, so only apps on the same device can use the HTTP/SOCKS proxy. To share the proxy with another phone, tablet, laptop, or a home router, switch the bind address to `0.0.0.0` and choose one of two persisted LAN modes:
+
+- **Authenticated LAN sharing**: configure `[network.proxy_auth]`. HTTP clients must send `Proxy-Authorization: Basic ...`; SOCKS5 clients must use username/password authentication. This is the recommended mode on shared Wi-Fi, dorm networks, offices, libraries, and any hotspot where you do not fully control every connected device.
+- **Open trusted-LAN sharing**: set `allow_unauthenticated_lan = true`. This keeps the old frictionless hotspot workflow for a trusted home LAN or personal hotspot. Anyone who can reach the proxy port can use your Apps Script quota and tunnel, so leave this off on shared networks.
+
+The UI exposes both modes. After you save, the selected mode becomes the default for future launches; switch it back and save again whenever you need to return to the safer authenticated mode.
+
+TOML example:
+
+```toml
+[network]
+listen_host = "0.0.0.0"
+listen_port = 8085
+socks5_port = 8086
+allow_unauthenticated_lan = false
+
+[network.proxy_auth]
+username = "home"
+password = "CHANGE_ME"
+```
+
+For a private home/hotspot setup without credentials:
+
+```toml
+[network]
+listen_host = "0.0.0.0"
+allow_unauthenticated_lan = true
+```
+
+Basic hotspot workflow:
 
 1. **Android:** enable mobile hotspot + start the app
 2. **Other device:** connect to the Android hotspot Wi-Fi
@@ -287,7 +316,7 @@ For full device-wide coverage on iOS, use [Shadowrocket](https://apps.apple.com/
 
 Set system HTTP proxy to `192.168.43.1:8080`, or per-app SOCKS5 to `192.168.43.1:1081`.
 
-> If `listen_host` is `127.0.0.1` in your config, change to `0.0.0.0` to allow other devices.
+If authenticated LAN sharing is enabled, enter the configured username/password in the client proxy settings. If the client only supports unauthenticated proxies, use open trusted-LAN mode only on a network you control.
 
 ## Running on OpenWRT
 
@@ -306,7 +335,7 @@ chmod +x /usr/bin/mhrv-rs /etc/init.d/mhrv-rs
 logread -e mhrv-rs -f       # tail logs
 ```
 
-LAN devices then point HTTP proxy at the router's LAN IP (default port `8085`) or SOCKS5 at `<router-ip>:8086`. Set `listen_host` to `0.0.0.0` in `/etc/mhrv-rs/config.toml` so the router accepts LAN connections.
+OpenWRT can act as a LAN-wide proxy by setting `listen_host = "0.0.0.0"` in `/etc/mhrv-rs/config.toml`. Use `[network.proxy_auth]` when other people can join the LAN. For a private home network where you intentionally want the old no-password behavior, set `allow_unauthenticated_lan = true`.
 
 Memory footprint ~15–20 MB resident — fine on anything ≥128 MB RAM. No UI on musl (routers are headless).
 

@@ -10,7 +10,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 
 use mhrv_rs::cert_installer::{install_ca, reconcile_sudo_environment, remove_ca};
-use mhrv_rs::config::{Config, FrontingGroup, ScriptId};
+use mhrv_rs::config::{Config, FrontingGroup, ProxyAuth, ScriptId};
 use mhrv_rs::data_dir;
 use mhrv_rs::domain_fronter::{DomainFronter, DEFAULT_GOOGLE_SNI_POOL};
 use mhrv_rs::lan_utils::{detect_lan_ip, is_share_on_lan};
@@ -235,6 +235,10 @@ struct FormState {
     listen_host: String,
     listen_port: String,
     socks5_port: String,
+    proxy_auth_username: String,
+    proxy_auth_password: String,
+    show_proxy_auth_password: bool,
+    allow_unauthenticated_lan: bool,
     log_level: String,
     verify_ssl: bool,
     upstream_socks5: String,
@@ -372,6 +376,10 @@ fn load_form() -> (FormState, Option<String>) {
             listen_host: c.listen_host,
             listen_port: c.listen_port.to_string(),
             socks5_port: c.socks5_port.map(|p| p.to_string()).unwrap_or_default(),
+            proxy_auth_username: c.proxy_auth.as_ref().map(|a| a.username.clone()).unwrap_or_default(),
+            proxy_auth_password: c.proxy_auth.as_ref().map(|a| a.password.clone()).unwrap_or_default(),
+            show_proxy_auth_password: false,
+            allow_unauthenticated_lan: c.allow_unauthenticated_lan,
             log_level: c.log_level,
             verify_ssl: c.verify_ssl,
             upstream_socks5: c.upstream_socks5.unwrap_or_default(),
@@ -415,6 +423,10 @@ fn load_form() -> (FormState, Option<String>) {
             listen_host: "127.0.0.1".into(),
             listen_port: "8085".into(),
             socks5_port: "8086".into(),
+            proxy_auth_username: String::new(),
+            proxy_auth_password: String::new(),
+            show_proxy_auth_password: false,
+            allow_unauthenticated_lan: false,
             log_level: "info".into(),
             verify_ssl: true,
             upstream_socks5: String::new(),
@@ -547,6 +559,16 @@ impl FormState {
             script_id,
             script_ids: None,
             auth_key: self.auth_key.clone(),
+            proxy_auth: {
+                let username = self.proxy_auth_username.trim().to_string();
+                let password = self.proxy_auth_password.clone();
+                if self.allow_unauthenticated_lan || (username.is_empty() && password.is_empty()) {
+                    None
+                } else {
+                    Some(ProxyAuth { username, password })
+                }
+            },
+            allow_unauthenticated_lan: self.allow_unauthenticated_lan,
             listen_host: self.listen_host.trim().to_string(),
             listen_port,
             socks5_port,
@@ -1099,22 +1121,12 @@ impl eframe::App for App {
                     .labelled_by(label_id);
                 });
 
-                // Network sharing: phones, tablets, other laptops on the
-                // same Wi-Fi can use this proxy when the bind address is
-                // 0.0.0.0 instead of 127.0.0.1. We expose this as a
-                // single-checkbox UI rather than the raw `listen_host`
-                // text field — typing `0.0.0.0` from memory is enough of
-                // a friction point that almost no one does it. Power
-                // users with a custom bind IP (specific NIC) can still
-                // edit `listen_host` directly in `config.toml`; we
-                // detect that case and show a "Custom bind" badge so
-                // the checkbox doesn't silently overwrite their setting
-                // on the next Save.
+                // Network sharing can be authenticated or explicitly open.
+                // The selected mode is persisted with the rest of the config.
                 //
                 // Snapshot the relevant flags before entering form_row's
-                // closure — we need to mutate `self.form.listen_host`
-                // inside the closure when the checkbox toggles, so we
-                // can't hold a borrow on it through the closure.
+                // closure — we may reset `self.form.listen_host` inside
+                // the closure, so avoid holding a borrow through it.
                 let listen_host_snapshot = self.form.listen_host.trim().to_string();
                 let listen_port_snapshot = self.form.listen_port.trim().to_string();
                 let socks5_port_snapshot = self.form.socks5_port.trim().to_string();
@@ -1126,24 +1138,20 @@ impl eframe::App for App {
                     && lower_snapshot != "localhost";
                 let mut new_listen_host: Option<String> = None;
                 form_row(ui, "Network", Some(
-                    "By default the proxy is reachable only from this computer. \
-                     Turn this on to let phones, tablets, and other laptops on the \
-                     same Wi-Fi (or a hotspot you're sharing) use it too. The \
-                     other devices then point their HTTP / SOCKS5 proxy at the \
-                     LAN IP shown below. Make sure your firewall lets in the proxy \
-                     port — macOS pops up a Firewall prompt the first time."
+                    "Loopback is local-only. LAN sharing binds the proxy to all \
+                     interfaces. Use proxy auth on shared networks; open LAN mode \
+                     is for trusted home networks and personal hotspots."
                 ), |ui, _label_id| {
                     if is_custom_bind {
-                        // The user manually wrote a specific bind IP —
-                        // don't let the checkbox stomp on it. Show what
-                        // they have and tell them to edit config.toml
-                        // if they want to change it.
                         ui.vertical(|ui| {
                             ui.label(egui::RichText::new(format!(
                                 "Custom bind: {}",
                                 listen_host_snapshot
                             )).color(egui::Color32::from_rgb(220, 180, 100)));
                             ui.small("Edit `listen_host` in config.toml to change.");
+                            if ui.small_button("Reset to loopback").clicked() {
+                                self.form.listen_host = "127.0.0.1".to_string();
+                            }
                         });
                     } else {
                         let mut share = was_share_on_lan;
@@ -1155,12 +1163,47 @@ impl eframe::App for App {
                             });
                         }
                         if share {
-                            // detect_lan_ip() opens a UDP socket and
-                            // asks the kernel which interface a packet
-                            // to a public IP would use. Cheap (no
-                            // syscall does network I/O) and accurate
-                            // (it's the same selection any outbound
-                            // connection would make).
+                            let open_lan_changed = ui.checkbox(
+                                &mut self.form.allow_unauthenticated_lan,
+                                "Allow LAN clients without proxy auth",
+                            )
+                            .on_hover_text(
+                                "Use only on a trusted home LAN or personal hotspot. \
+                                 Anyone who can reach this port can use your proxy.",
+                            )
+                            .changed();
+                            if open_lan_changed && self.form.allow_unauthenticated_lan {
+                                self.status = Some(
+                                    "Open LAN mode selected. Save to make this the default for future launches; turn it off and save again to return to authenticated sharing."
+                                        .to_string(),
+                                );
+                            } else if open_lan_changed {
+                                self.status = Some(
+                                    "Authenticated LAN mode selected. Save to require proxy credentials on future launches."
+                                        .to_string(),
+                                );
+                            }
+                            let auth_ready = self.form.allow_unauthenticated_lan
+                                || (!self.form.proxy_auth_username.trim().is_empty()
+                                    && !self.form.proxy_auth_password.is_empty());
+                            ui.small(
+                                egui::RichText::new(if self.form.allow_unauthenticated_lan {
+                                    "Open LAN sharing is persisted after Save. Anyone on this network can use the proxy until you turn this off and save again."
+                                } else if auth_ready {
+                                    "Authenticated LAN sharing is persisted after Save. LAN clients must send HTTP Basic or SOCKS5 username/password credentials."
+                                } else {
+                                    "Set proxy username and password before saving LAN sharing."
+                                })
+                                .color(if auth_ready {
+                                    if self.form.allow_unauthenticated_lan {
+                                        egui::Color32::from_rgb(220, 180, 100)
+                                    } else {
+                                        OK_GREEN
+                                    }
+                                } else {
+                                    ERR_RED
+                                }),
+                            );
                             match detect_lan_ip() {
                                 Some(ip) => {
                                     let port = if listen_port_snapshot.is_empty() {
@@ -1181,16 +1224,46 @@ impl eframe::App for App {
                                 None => {
                                     ui.small(egui::RichText::new(
                                         "Couldn't detect your LAN IP. Find it in System Settings \
-                                         → Network → Wi-Fi → Details (macOS) or `ipconfig` (Windows)."
+                                         -> Network, or run `ipconfig` on Windows."
                                     ).color(egui::Color32::from_rgb(220, 180, 100)));
                                 }
                             }
+                        } else {
+                            self.form.allow_unauthenticated_lan = false;
                         }
                     }
                 });
                 if let Some(updated) = new_listen_host {
                     self.form.listen_host = updated;
                 }
+
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [120.0, 20.0],
+                        egui::Label::new(egui::RichText::new("Proxy auth")
+                            .color(egui::Color32::from_gray(200))),
+                    );
+                    let auth_inputs_enabled = !self.form.allow_unauthenticated_lan;
+                    let user_label = ui.label(egui::RichText::new("User").small());
+                    ui.add_enabled(
+                        auth_inputs_enabled,
+                        egui::TextEdit::singleline(&mut self.form.proxy_auth_username)
+                            .desired_width(110.0),
+                    )
+                    .labelled_by(user_label.id);
+                    let pass_label = ui.label(egui::RichText::new("Pass").small());
+                    ui.add_enabled(
+                        auth_inputs_enabled,
+                        egui::TextEdit::singleline(&mut self.form.proxy_auth_password)
+                            .password(!self.form.show_proxy_auth_password)
+                            .desired_width(130.0),
+                    )
+                    .labelled_by(pass_label.id);
+                    ui.add_enabled(
+                        auth_inputs_enabled,
+                        egui::Checkbox::new(&mut self.form.show_proxy_auth_password, "Show"),
+                    );
+                });
 
                 ui.horizontal(|ui| {
                     ui.add_sized(
