@@ -439,8 +439,12 @@ pub struct Config {
     /// `server-timing` are attached by modern CDNs (Cloudflare, AWS,
     /// Fastly) and add 400–700 bytes per response for no benefit through
     /// a MITM relay — the proxy ignores them and the browser never reads
-    /// them. Default `true`. Set to `false` only to inspect raw origin
-    /// headers for debugging.
+    /// them. Default `true`. Set to `false` to pass all headers through.
+    ///
+    /// Note: `Code.gs` has a separate `STRIP_NOISE_RESPONSE_HEADERS`
+    /// constant (default `false`) that strips at the GAS side before the
+    /// JSON reaches Rust. To see fully raw headers in the browser, both
+    /// this field and the Code.gs constant must be `false`.
     #[serde(default = "default_strip_noise_response_headers")]
     pub strip_noise_response_headers: bool,
 }

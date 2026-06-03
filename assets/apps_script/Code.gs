@@ -52,14 +52,18 @@ const DIAGNOSTIC_MODE = false;
 // alt-svc, server-timing, etc. These add 400-700 bytes of JSON per response
 // for no benefit — the relay ignores them and the browser never reads them.
 //
-// STRIP_NOISE_RESPONSE_HEADERS controls whether _respHeaders() filters them
-// before returning. Hardcoded true here for GAS-side payload reduction.
 // The primary user toggle is `strip_noise_response_headers` in config.toml
-// on the Rust client side, which drops them even if Code.gs sends them.
+// on the Rust client side. That field controls what the browser sees and
+// works regardless of this constant.
 //
-// Set to false only if you need to see raw origin headers in GAS logs.
+// STRIP_NOISE_RESPONSE_HEADERS is a separate GAS-side optimization: when
+// true, headers are stripped before building the JSON payload, reducing the
+// data sent over the GAS -> Rust leg. Set to true only for extra bandwidth
+// savings. Leave false (the default) so the Rust config is the sole control
+// and `strip_noise_response_headers = false` in config.toml shows raw headers
+// without also requiring a Code.gs redeploy.
 // ---------------------------------------------------------------------------
-const STRIP_NOISE_RESPONSE_HEADERS = true;
+const STRIP_NOISE_RESPONSE_HEADERS = false;
 
 const STRIP_RESPONSE_HEADERS = {
   "report-to": 1, "reporting-endpoints": 1,

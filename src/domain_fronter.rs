@@ -415,7 +415,9 @@ pub struct DomainFronter {
     disable_padding: bool,
     /// Strip CDN noise headers (report-to, nel, alt-svc, etc.) from the
     /// relay response before forwarding to the browser. Default true.
-    /// Mirrors `Config::strip_noise_response_headers`.
+    /// Mirrors `Config::strip_noise_response_headers`. Independent of the
+    /// GAS-side `STRIP_NOISE_RESPONSE_HEADERS` constant in Code.gs — both
+    /// must be false to see fully raw headers.
     strip_noise_response_headers: bool,
     zstd_enabled: Arc<AtomicBool>,
     /// Per-instance auto-blacklist tuning. Mirrors `Config::auto_blacklist_*`
