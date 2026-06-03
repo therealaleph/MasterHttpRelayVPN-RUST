@@ -307,17 +307,14 @@ async fn reader_task(mut reader: impl AsyncRead + Unpin, session: Arc<SessionInn
                 break;
             }
             Ok(n) => {
-                // Extend the buffer before notifying. The MutexGuard is
-                // dropped at the end of the statement, *before* the
-                // notify_one call below, so any waiter that wakes on the
-                // notify and then locks read_buf can immediately observe
-                // the new bytes — no torn read where the wake fires but
-                // the buffer still looks empty. Notify::notify_one also
-                // stores a permit if no waiter is currently registered,
-                // so we never lose an edge across the spawn race in
-                // wait_for_any_drainable.
-                session.read_buf.lock().await.extend_from_slice(&buf[..n]);
-                session.buf_len.fetch_add(n, Ordering::Release);
+                let mut read_buf = session.read_buf.lock().await;
+                read_buf.extend_from_slice(&buf[..n]);
+                session.buf_len.store(read_buf.len(), Ordering::Release);
+                // Drop the MutexGuard before notify_one so any waiter
+                // that wakes on the notify and then locks read_buf can
+                // immediately observe the new bytes — no torn read where
+                // the wake fires but the buffer still looks empty.
+                drop(read_buf);
                 session.notify.notify_one();
             }
             Err(_) => {
