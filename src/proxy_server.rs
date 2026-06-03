@@ -526,8 +526,8 @@ impl ProxyServer {
             mitm,
             rewrite_ctx,
             tunnel_mux: None, // initialized in run() inside the tokio runtime
-            coalesce_step_ms: if config.coalesce_step_ms > 0 { config.coalesce_step_ms as u64 } else { 10 },
-            coalesce_max_ms: if config.coalesce_max_ms > 0 { config.coalesce_max_ms as u64 } else { 1000 },
+            coalesce_step_ms: config.coalesce_step_ms as u64,
+            coalesce_max_ms: config.coalesce_max_ms as u64,
             network_preset: config.network_preset.clone(),
         })
     }

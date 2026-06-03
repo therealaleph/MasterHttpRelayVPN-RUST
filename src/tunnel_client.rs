@@ -641,6 +641,14 @@ impl TunnelMux {
         self.reply_timeout
     }
 
+    /// Returns true when the RttTracker is active (auto-adaptive mode).
+    /// False when the coalesce preset is locked (explicit ms values or
+    /// `network_preset = "fast"/"slow"`). Used by tests to verify that
+    /// the default/auto path wires up auto-adaptation correctly.
+    pub fn is_adaptive(&self) -> bool {
+        self.rtt_tracker.is_some()
+    }
+
     fn send_sync(&self, msg: MuxMsg) {
         let _ = self.tx.send(msg);
     }
@@ -2508,6 +2516,44 @@ mod tests {
             Duration::from_secs(60) + REPLY_TIMEOUT_SLACK,
             "reply_timeout must equal batch_timeout + REPLY_TIMEOUT_SLACK"
         );
+    }
+
+    /// Regression guard for the ProxyServer coalesce wiring bug: ProxyServer
+    /// was converting 0 -> 10/1000 before calling TunnelMux::start(), which
+    /// caused TunnelMux to treat the filled-in values as explicit overrides and
+    /// lock the preset, silently killing auto-adaptation for every default config.
+    /// The fix is to pass raw 0 values through; TunnelMux::start() already
+    /// handles 0 = "use preset default" correctly.
+    #[tokio::test]
+    async fn auto_preset_default_coalesce_creates_rtt_tracker() {
+        use crate::config::Config;
+        let cfg: Config = serde_json::from_str(
+            r#"{
+                "mode": "apps_script",
+                "google_ip": "127.0.0.1",
+                "front_domain": "www.google.com",
+                "script_id": "TEST",
+                "auth_key": "test_auth_key",
+                "listen_host": "127.0.0.1",
+                "listen_port": 8085,
+                "log_level": "info",
+                "verify_ssl": true
+            }"#,
+        )
+        .unwrap();
+        let fronter = Arc::new(DomainFronter::new(&cfg).expect("test fronter"));
+
+        // (0, 0, None) = default config, no preset set -- must be auto-adaptive
+        let mux = TunnelMux::start(fronter.clone(), 0, 0, None);
+        assert!(mux.is_adaptive(), "default config (coalesce=0, no preset) must create active RttTracker");
+
+        // (0, 0, Some("auto")) = explicit "auto" -- also adaptive
+        let mux2 = TunnelMux::start(fronter.clone(), 0, 0, Some("auto"));
+        assert!(mux2.is_adaptive(), "network_preset=auto must create active RttTracker");
+
+        // explicit ms values -- must lock the preset, no RttTracker
+        let mux3 = TunnelMux::start(fronter, 50, 300, None);
+        assert!(!mux3.is_adaptive(), "explicit coalesce_ms values must lock the preset");
     }
 
     /// The buffered ClientHello from the pre-read window must reach the
