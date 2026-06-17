@@ -1,4 +1,4 @@
-package com.therealaleph.mhrv
+package com.therealaleph.mhrv.data
 
 import android.content.Context
 import android.graphics.Color
@@ -12,6 +12,7 @@ import android.view.View
 import android.view.WindowManager
 import android.widget.LinearLayout
 import android.widget.TextView
+import com.therealaleph.mhrv.Native
 import org.json.JSONObject
 
 /**

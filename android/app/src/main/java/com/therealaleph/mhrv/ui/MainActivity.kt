@@ -1,39 +1,50 @@
-package com.therealaleph.mhrv
+package com.therealaleph.mhrv.ui
 
 import android.Manifest
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
-import android.content.Context
-import android.content.res.Configuration
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
-import androidx.appcompat.app.AppCompatActivity
-import java.util.Locale
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.viewModels
+import androidx.appcompat.app.AppCompatActivity
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import com.therealaleph.mhrv.ui.CaInstallOutcome
-import com.therealaleph.mhrv.ui.HomeScreen
+import com.therealaleph.mhrv.data.CaInstall
+import com.therealaleph.mhrv.data.MhrvVpnService
+import com.therealaleph.mhrv.Native
+import com.therealaleph.mhrv.data.ConfigStore
+import com.therealaleph.mhrv.data.ConnectionMode
+import com.therealaleph.mhrv.data.MhrvConfig
+import com.therealaleph.mhrv.data.UiLang
 import com.therealaleph.mhrv.ui.theme.MhrvTheme
-
-// UiLang is in the outer package namespace already.
-
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.launch
+import java.util.Locale
+import kotlin.getValue
 
 // AppCompatActivity (not plain ComponentActivity) because it's what picks
 // up AppCompatDelegate.setApplicationLocales() and swaps per-activity
 // Configuration + LayoutDirection on recreate(). Compose works fine on
 // top — setContent / rememberLauncherForActivityResult live on
 // ComponentActivity and AppCompatActivity inherits from it.
+@AndroidEntryPoint
 class MainActivity : AppCompatActivity() {
+
+    private val viewModel: HomeViewModel by viewModels()
 
     override fun attachBaseContext(newBase: Context) {
         // Force the persisted ui_lang into the Activity's Configuration
@@ -119,6 +130,10 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        val cfg by viewModel.config.collectAsState()
+
+        val scope = rememberCoroutineScope()
+
         // CA install flow. We hold the fingerprint of the cert we fired the
         // intent with so we can look it up in AndroidCAStore after the
         // picker returns — the resultCode itself is unreliable on Android
@@ -135,14 +150,19 @@ class MainActivity : AppCompatActivity() {
         val installCaLauncher = rememberLauncherForActivityResult(
             ActivityResultContracts.StartActivityForResult(),
         ) { _ ->
-            val fp = pendingFingerprint
-            caOutcome = when {
-                fp == null -> CaInstallOutcome.Failed("Internal error: no fingerprint")
-                CaInstall.isInstalled(fp) -> CaInstallOutcome.Installed
-                else -> CaInstallOutcome.NotInstalled(pendingDownloadPath)
+            scope.launch {
+                val fp = pendingFingerprint
+                caOutcome = if (fp == null) {
+                    CaInstallOutcome.Failed("Internal error: no fingerprint")
+                } else {
+                    when (viewModel.checkCaInstall(fp)) {
+                        true -> CaInstallOutcome.Installed
+                        false -> CaInstallOutcome.NotInstalled(pendingDownloadPath)
+                    }
+                }
+                pendingFingerprint = null
+                pendingDownloadPath = null
             }
-            pendingFingerprint = null
-            pendingDownloadPath = null
         }
 
         HomeScreen(
@@ -160,7 +180,6 @@ class MainActivity : AppCompatActivity() {
                 // VpnService.prepare — firing the consent dialog there
                 // would be wrong (user said "no VPN") and MhrvVpnService
                 // wouldn't call establish() anyway.
-                val cfg = ConfigStore.load(this)
                 if (cfg.connectionMode == ConnectionMode.VPN_TUN) {
                     val prepareIntent = VpnService.prepare(this)
                     if (prepareIntent == null) {
@@ -200,11 +219,11 @@ class MainActivity : AppCompatActivity() {
                 // OS-wide VPN grant and the user approved it deliberately.
                 // Revoking it would force a re-prompt on next Start, which
                 // is worse UX.
-                val stopAction = Intent(this, MhrvVpnService::class.java)
-                    .setAction(MhrvVpnService.ACTION_STOP)
+                val stopAction =
+                    Intent(this, MhrvVpnService::class.java).setAction(MhrvVpnService.ACTION_STOP)
                 startService(stopAction)
             },
-            onInstallCaConfirmed = {
+            onInstallCaConfirmed = { fingerprint ->
                 // The flow is (1) export cert, (2) copy it to Downloads so
                 // the user can find it in the Files app, (3) deep-link to
                 // Security Settings where they can tap "Install a
@@ -214,43 +233,38 @@ class MainActivity : AppCompatActivity() {
                 // on Android 11+ that intent just opens a dead-end
                 // "Install in Settings" dialog with no path forward, which
                 // is confusing for users.
-                val fp = CaInstall.fingerprint(this)
-                val downloadPath = CaInstall.saveToDownloads(this)
-                if (fp != null) {
-                    pendingFingerprint = fp
+                scope.launch {
+                    val downloadPath = viewModel.saveToDownloads()
+                    pendingFingerprint = fingerprint
                     pendingDownloadPath = downloadPath
                     installCaLauncher.launch(CaInstall.buildSettingsIntent())
-                } else {
-                    caOutcome = CaInstallOutcome.Failed(
-                        "Couldn't read the CA cert. Tap Start once so the proxy creates it, then try again.",
-                    )
                 }
             },
             caOutcome = caOutcome,
-            onCaOutcomeConsumed = { caOutcome = null },
-            onLangChange = { lang ->
-                // Re-apply the new locale to the running process. AppCompatDelegate
-                // picks it up from MhrvApp.onCreate on process restart, so we
-                // recreate() the activity to take effect immediately — otherwise
-                // the user would have to swipe the app away and reopen it for
-                // RTL/LTR to swap.
-                val tag = when (lang) {
-                    UiLang.FA -> "fa"
-                    UiLang.EN -> "en"
-                    UiLang.AUTO -> ""
-                }
-                androidx.appcompat.app.AppCompatDelegate.setApplicationLocales(
-                    if (tag.isEmpty())
-                        androidx.core.os.LocaleListCompat.getEmptyLocaleList()
-                    else
-                        androidx.core.os.LocaleListCompat.forLanguageTags(tag),
-                )
-                // AppCompatDelegate triggers recreate internally on API 33+
-                // via the per-app language OS setting, but on older API
-                // levels it doesn't — call it explicitly for consistent
-                // behaviour across the minSdk=24 range.
-                recreate()
-            },
+            onCaOutcomeConsumed =
+                { caOutcome = null },
+            onLangChange =
+                { lang ->
+                    // Re-apply the new locale to the running process. AppCompatDelegate
+                    // picks it up from MhrvApp.onCreate on process restart, so we
+                    // recreate() the activity to take effect immediately — otherwise
+                    // the user would have to swipe the app away and reopen it for
+                    // RTL/LTR to swap.
+                    val tag = when (lang) {
+                        UiLang.FA -> "fa"
+                        UiLang.EN -> "en"
+                        UiLang.AUTO -> ""
+                    }
+                    androidx.appcompat.app.AppCompatDelegate.setApplicationLocales(
+                        if (tag.isEmpty()) androidx.core.os.LocaleListCompat.getEmptyLocaleList()
+                        else androidx.core.os.LocaleListCompat.forLanguageTags(tag),
+                    )
+                    // AppCompatDelegate triggers recreate internally on API 33+
+                    // via the per-app language OS setting, but on older API
+                    // levels it doesn't — call it explicitly for consistent
+                    // behaviour across the minSdk=24 range.
+                    recreate()
+                },
         )
     }
 
@@ -261,6 +275,7 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val REQ_NOTIF = 42
+
         /** Deep link config waiting for user confirmation. Read by ConfigSharingBar. */
         val pendingDeepLinkConfig = mutableStateOf<MhrvConfig?>(null)
     }
