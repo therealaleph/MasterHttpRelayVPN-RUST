@@ -1,6 +1,6 @@
 [relay]
 mode = "apps_script"
-script_id = "YOUR_APPS_SCRIPT_DEPLOYMENT_ID"
+script_id = "AKfycbzUoZ76-VZw-7bDziTR9upLV7Dj4qfcSdhPrFwYPn4J1WuoPlk8C_RDZLhe23XvZvC9mg"
 auth_key = "CHANGE_ME_TO_A_STRONG_SECRET"
 
 [network]
