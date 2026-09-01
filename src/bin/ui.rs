@@ -273,6 +273,12 @@ struct FormState {
     /// users edit `force_http1` directly when needed. Default false
     /// (HTTP/2 multiplexing on the relay leg active).
     force_http1: bool,
+    /// Adaptive relay-network tuning preset. Config-only for now; preserve
+    /// hand-edited `auto`, `fast`, or `slow` values when the UI saves.
+    network_preset: Option<String>,
+    /// Strip CDN telemetry/noise headers from relay responses. Config-only
+    /// for now and enabled by default; preserve explicit user overrides.
+    strip_noise_response_headers: bool,
     /// Round-tripped from config.toml. Not exposed in the UI form yet —
     /// the bypass-DoH default is the right answer for almost everyone
     /// (DoH already encrypts, the tunnel was just adding latency), so
@@ -392,6 +398,8 @@ fn load_form() -> (FormState, Option<String>) {
             block_stun: c.block_stun,
             disable_padding: c.disable_padding,
             force_http1: c.force_http1,
+            network_preset: c.network_preset.clone(),
+            strip_noise_response_headers: c.strip_noise_response_headers,
             tunnel_doh: c.tunnel_doh,
             bypass_doh_hosts: c.bypass_doh_hosts.clone(),
             block_doh: c.block_doh,
@@ -435,6 +443,8 @@ fn load_form() -> (FormState, Option<String>) {
             block_stun: false,
             disable_padding: false,
             force_http1: false,
+            network_preset: None,
+            strip_noise_response_headers: true,
             tunnel_doh: true,
             bypass_doh_hosts: Vec::new(),
             block_doh: true,
@@ -604,6 +614,10 @@ impl FormState {
             // HTTP/2 multiplexing kill switch. Config-only for now;
             // round-trip preserves the user's choice across Save.
             force_http1: self.force_http1,
+            // Relay tuning and response-header filtering are config-only for
+            // now. Preserve hand-edited values when saving from the UI.
+            network_preset: self.network_preset.clone(),
+            strip_noise_response_headers: self.strip_noise_response_headers,
             // DoH bypass is enabled-by-default with `tunnel_doh = false`.
             // Round-trip the user's choice (and any extra hostnames they
             // added) so save doesn't drop them.
