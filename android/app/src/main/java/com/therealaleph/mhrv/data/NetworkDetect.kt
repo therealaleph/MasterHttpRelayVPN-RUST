@@ -1,4 +1,4 @@
-package com.therealaleph.mhrv
+package com.therealaleph.mhrv.data
 
 import java.net.Inet4Address
 import java.net.InetAddress

@@ -1,4 +1,4 @@
-package com.therealaleph.mhrv
+package com.therealaleph.mhrv.data
 
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow

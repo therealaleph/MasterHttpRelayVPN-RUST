@@ -1,5 +1,6 @@
 package com.therealaleph.mhrv.ui
 
+import com.therealaleph.mhrv.R
 import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
@@ -17,8 +18,6 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
-import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.HourglassBottom
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -33,19 +32,16 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.therealaleph.mhrv.CaInstall
-import com.therealaleph.mhrv.ConfigStore
-import com.therealaleph.mhrv.DEFAULT_SNI_POOL
-import com.therealaleph.mhrv.MhrvConfig
-import com.therealaleph.mhrv.Mode
-import com.therealaleph.mhrv.Native
-import com.therealaleph.mhrv.ConnectionMode
-import com.therealaleph.mhrv.NetworkDetect
-import com.therealaleph.mhrv.R
-import com.therealaleph.mhrv.SplitMode
-import com.therealaleph.mhrv.UiLang
-import com.therealaleph.mhrv.VpnState
 import androidx.compose.ui.res.stringResource
+import androidx.hilt.navigation.compose.hiltViewModel
+import com.therealaleph.mhrv.Native
+import com.therealaleph.mhrv.data.ConnectionMode
+import com.therealaleph.mhrv.data.DEFAULT_SNI_POOL
+import com.therealaleph.mhrv.data.MhrvConfig
+import com.therealaleph.mhrv.data.Mode
+import com.therealaleph.mhrv.data.SplitMode
+import com.therealaleph.mhrv.data.UiLang
+import com.therealaleph.mhrv.data.VpnState
 import com.therealaleph.mhrv.ui.theme.ErrRed
 import com.therealaleph.mhrv.ui.theme.OkGreen
 import kotlinx.coroutines.Dispatchers
@@ -63,6 +59,7 @@ import org.json.JSONObject
  */
 sealed class CaInstallOutcome {
     object Installed : CaInstallOutcome()
+
     /**
      * Cert not found in the AndroidCAStore after the Settings activity
      * returned. Carries an optional downloadPath so the snackbar can tell
@@ -86,10 +83,11 @@ sealed class CaInstallOutcome {
 fun HomeScreen(
     onStart: () -> Unit,
     onStop: () -> Unit,
-    onInstallCaConfirmed: () -> Unit,
+    onInstallCaConfirmed: (fingerprint: ByteArray) -> Unit,
     caOutcome: CaInstallOutcome?,
     onCaOutcomeConsumed: () -> Unit,
     onLangChange: (UiLang) -> Unit = {},
+    viewModel: HomeViewModel = hiltViewModel()
 ) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -97,10 +95,32 @@ fun HomeScreen(
 
     // Persisted form state. Any edit writes back to disk immediately —
     // cheap at this write rate, avoids "I tapped Start before saving" bugs.
-    var cfg by remember { mutableStateOf(ConfigStore.load(ctx)) }
+    val cfg by viewModel.config.collectAsState()
     fun persist(new: MhrvConfig) {
-        cfg = new
-        ConfigStore.save(ctx, new)
+        viewModel.saveConfig(new)
+    }
+
+    LaunchedEffect(Unit) {
+        viewModel.googleIpResult.collect { result ->
+            when (result) {
+                is GoogleIpResult.Success -> {
+                    snackbar.showSnackbar(
+                        ctx.getString(R.string.snack_google_ip_updated, result.googleIp),
+                    )
+                }
+
+                is GoogleIpResult.Error -> {
+                    snackbar.showSnackbar(ctx.getString(R.string.snack_dns_lookup_failed))
+                }
+
+                is GoogleIpResult.NoChange -> {
+                    snackbar.showSnackbar(
+                        ctx.getString(R.string.snack_google_ip_current, cfg.googleIp),
+                    )
+                }
+
+            }
+        }
     }
 
     // CA install dialog visibility.
@@ -123,7 +143,7 @@ fun HomeScreen(
             if (obj?.optString("kind") == "updateAvailable") {
                 snackbar.showSnackbar(
                     "Update available: v${obj.optString("current")} → " +
-                    "v${obj.optString("latest")}  ${obj.optString("url")}",
+                            "v${obj.optString("latest")}  ${obj.optString("url")}",
                     withDismissAction = true,
                 )
             }
@@ -165,6 +185,7 @@ fun HomeScreen(
         val msg = when (o) {
             is CaInstallOutcome.Installed ->
                 "Certificate installed ✓"
+
             is CaInstallOutcome.NotInstalled -> buildString {
                 append("Certificate not yet installed.")
                 if (!o.downloadPath.isNullOrBlank()) {
@@ -174,6 +195,7 @@ fun HomeScreen(
                     append(" Tap Install again to retry.")
                 }
             }
+
             is CaInstallOutcome.Failed -> o.message
         }
         snackbar.showSnackbar(msg, withDismissAction = true)
@@ -232,8 +254,8 @@ fun HomeScreen(
                     ) {
                         Text(
                             text = if (checking) stringResource(R.string.tb_check_update_checking)
-                                   else stringResource(R.string.tb_version_prefix) +
-                                        runCatching { Native.version() }.getOrDefault("?"),
+                            else stringResource(R.string.tb_version_prefix) +
+                                    runCatching { Native.version() }.getOrDefault("?"),
                             style = MaterialTheme.typography.labelMedium,
                         )
                     }
@@ -296,28 +318,14 @@ fun HomeScreen(
                             // just because the two values differ. They
                             // can still force a re-resolve via the
                             // explicit "Auto-detect" button above.
-                            var updated = cfg
-                            if (updated.googleIp.isBlank()) {
-                                val fresh = withContext(Dispatchers.IO) {
-                                    NetworkDetect.resolveGoogleIp()
-                                }
-                                if (!fresh.isNullOrBlank()) {
-                                    updated = updated.copy(googleIp = fresh)
-                                }
-                            }
-                            if (updated.frontDomain.isBlank() ||
-                                updated.frontDomain.parseAsIpOrNull() != null
-                            ) {
-                                updated = updated.copy(frontDomain = "www.google.com")
-                            }
-                            if (updated !== cfg) persist(updated)
+                            viewModel.prepareConfigForStart()
                             onStart()
                         }
                     }
                 },
                 enabled = (isVpnRunning ||
-                    cfg.mode == Mode.DIRECT ||
-                    (cfg.hasDeploymentId && cfg.authKey.isNotBlank())) && !transitioning,
+                        cfg.mode == Mode.DIRECT ||
+                        (cfg.hasDeploymentId && cfg.authKey.isNotBlank())) && !transitioning,
                 colors = ButtonDefaults.buttonColors(
                     containerColor = if (isVpnRunning) ErrRed else OkGreen,
                     contentColor = androidx.compose.ui.graphics.Color.White,
@@ -347,7 +355,7 @@ fun HomeScreen(
             CollapsibleSection(
                 title = stringResource(R.string.sec_apps_script_relay),
                 initiallyExpanded = appsScriptEnabled &&
-                    (cfg.appsScriptUrls.isEmpty() || cfg.authKey.isBlank()),
+                        (cfg.appsScriptUrls.isEmpty() || cfg.authKey.isBlank()),
             ) {
                 DeploymentIdsField(
                     urls = cfg.appsScriptUrls,
@@ -406,41 +414,7 @@ fun HomeScreen(
             // a one-tap fix without needing to look up nslookup output.
             TextButton(
                 onClick = {
-                    scope.launch {
-                        val fresh = withContext(Dispatchers.IO) {
-                            NetworkDetect.resolveGoogleIp()
-                        }
-                        if (!fresh.isNullOrBlank()) {
-                            var updated = cfg
-                            if (fresh != updated.googleIp) {
-                                updated = updated.copy(googleIp = fresh)
-                            }
-                            // Same repair logic as the Start button —
-                            // if front_domain has been corrupted into an
-                            // IP we can't use it for SNI, so put the
-                            // default hostname back.
-                            if (updated.frontDomain.isBlank() ||
-                                updated.frontDomain.parseAsIpOrNull() != null
-                            ) {
-                                updated = updated.copy(frontDomain = "www.google.com")
-                            }
-                            // Captured up-front so the lambda has access
-                            // to the format-string resources via context
-                            // before running on the IO dispatcher.
-                            if (updated !== cfg) {
-                                persist(updated)
-                                snackbar.showSnackbar(
-                                    ctx.getString(R.string.snack_google_ip_updated, fresh),
-                                )
-                            } else {
-                                snackbar.showSnackbar(
-                                    ctx.getString(R.string.snack_google_ip_current, fresh),
-                                )
-                            }
-                        } else {
-                            snackbar.showSnackbar(ctx.getString(R.string.snack_dns_lookup_failed))
-                        }
-                    }
+                    viewModel.autoDetectGoogleIp()
                 },
                 modifier = Modifier.align(Alignment.End),
             ) { Text(stringResource(R.string.btn_auto_detect_google_ip)) }
@@ -493,7 +467,10 @@ fun HomeScreen(
             UsageTodayCard()
             PipelineDebugCard()
 
-            CollapsibleSection(title = stringResource(R.string.sec_live_logs), initiallyExpanded = false) {
+            CollapsibleSection(
+                title = stringResource(R.string.sec_live_logs),
+                initiallyExpanded = false
+            ) {
                 LiveLogPane()
             }
 
@@ -511,61 +488,83 @@ fun HomeScreen(
         }
     }
 
+    LaunchedEffect(showInstallDialog) {
+        if (showInstallDialog) {
+            viewModel.prepareCaDialogData()
+        }
+    }
+
     // ---- CA install confirmation dialog ---------------------------------
     if (showInstallDialog) {
         // Export eagerly so we can show the fingerprint in the dialog body
         // — builds user confidence ("yes, that's the cert I'm trusting")
         // and gives us a usable failure path if the CA doesn't exist yet.
-        val exported = remember { CaInstall.export(ctx) }
-        val fp = remember(exported) { if (exported) CaInstall.fingerprint(ctx) else null }
-        val cn = remember(exported) { if (exported) CaInstall.subjectCn(ctx) else null }
+
+        val caState by viewModel.caCertState.collectAsState()
 
         AlertDialog(
             onDismissRequest = { showInstallDialog = false },
             title = { Text(stringResource(R.string.dialog_install_mitm_title)) },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(
-                        "mhrv-rs creates a local certificate authority so it can decrypt " +
-                        "and re-encrypt HTTPS traffic before tunnelling it through the Apps " +
-                        "Script relay. Without this CA installed as trusted, apps will show " +
-                        "certificate errors."
-                    )
-                    Text(
-                        "On Android 11+ the system removed the inline install path, so " +
-                        "tapping Install will: (1) save a PEM copy to Downloads/mhrv-ca.crt, " +
-                        "(2) open the Settings app.\n\n" +
-                        "Inside Settings, tap the search bar and type \"CA certificate\". " +
-                        "Open the result labelled \"CA certificate\" (NOT \"VPN & app user " +
-                        "certificate\" or \"Wi-Fi certificate\"). Pick mhrv-ca.crt from " +
-                        "Downloads when prompted. If you don't have a screen lock, Android " +
-                        "will ask you to add one first — that's an OS requirement for " +
-                        "installing any user CA."
-                    )
-                    if (fp != null) {
-                        Text("Subject: ${cn ?: "(unknown)"}", style = MaterialTheme.typography.labelMedium)
-                        Text(
-                            text = "SHA-256: ${CaInstall.fingerprintHex(fp)}",
-                            style = MaterialTheme.typography.labelSmall,
-                            fontFamily = FontFamily.Monospace,
-                        )
-                    } else {
+                when (val state = caState) {
+                    is CaCertState.Ready -> {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text(
+                                "mhrv-rs creates a local certificate authority so it can decrypt " +
+                                        "and re-encrypt HTTPS traffic before tunnelling it through the Apps " +
+                                        "Script relay. Without this CA installed as trusted, apps will show " +
+                                        "certificate errors."
+                            )
+                            Text(
+                                "On Android 11+ the system removed the inline install path, so " +
+                                        "tapping Install will: (1) save a PEM copy to Downloads/mhrv-ca.crt, " +
+                                        "(2) open the Settings app.\n\n" +
+                                        "Inside Settings, tap the search bar and type \"CA certificate\". " +
+                                        "Open the result labelled \"CA certificate\" (NOT \"VPN & app user " +
+                                        "certificate\" or \"Wi-Fi certificate\"). Pick mhrv-ca.crt from " +
+                                        "Downloads when prompted. If you don't have a screen lock, Android " +
+                                        "will ask you to add one first — that's an OS requirement for " +
+                                        "installing any user CA."
+                            )
+                            Text(
+                                "Subject: ${state.info.subjectCn ?: "(unknown)"}",
+                                style = MaterialTheme.typography.labelMedium
+                            )
+                            Text(
+                                text = "SHA-256: ${state.info.fingerprintHex}",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontFamily = FontFamily.Monospace,
+                            )
+                        }
+                    }
+                    CaCertState.NotFound -> {
                         Text(
                             "Could not read the CA cert yet. Tap Start once so the " +
-                            "proxy generates it, then come back.",
+                                    "proxy generates it, then come back.",
                             color = MaterialTheme.colorScheme.error,
                         )
                     }
+                    else -> {
+
+                    }
                 }
+
             },
             confirmButton = {
-                TextButton(
-                    onClick = {
-                        showInstallDialog = false
-                        if (fp != null) onInstallCaConfirmed()
-                    },
-                    enabled = fp != null,
-                ) { Text("Install") }
+                when (val state = caState) {
+                    is CaCertState.Ready -> {
+                        TextButton(
+                            onClick = {
+                                showInstallDialog = false
+                                onInstallCaConfirmed(state.info.fingerprint)
+                            },
+                        ) { Text("Install") }
+                    }
+
+                    else -> {
+                        TextButton(onClick = {}, enabled = false) { Text("Install") }
+                    }
+                }
             },
             dismissButton = {
                 TextButton(onClick = { showInstallDialog = false }) { Text("Cancel") }
@@ -689,7 +688,9 @@ private fun ConnectionModeDropdown(
                 readOnly = true,
                 label = { Text(stringResource(R.string.field_connection_mode)) },
                 trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
-                modifier = Modifier.fillMaxWidth().menuAnchor(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .menuAnchor(),
             )
             ExposedDropdownMenu(
                 expanded = expanded,
@@ -719,6 +720,7 @@ private fun ConnectionModeDropdown(
         val help = when (mode) {
             ConnectionMode.VPN_TUN ->
                 stringResource(R.string.help_mode_vpn_tun)
+
             ConnectionMode.PROXY_ONLY ->
                 stringResource(R.string.help_mode_proxy_only, httpPort, socks5Port)
         }
@@ -868,7 +870,9 @@ private fun ModeDropdown(
                 readOnly = true,
                 label = { Text("Mode") },
                 trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
-                modifier = Modifier.fillMaxWidth().menuAnchor(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .menuAnchor(),
             )
             ExposedDropdownMenu(
                 expanded = expanded,
@@ -892,8 +896,10 @@ private fun ModeDropdown(
         val help = when (mode) {
             Mode.APPS_SCRIPT ->
                 "Full DPI bypass through your deployed Apps Script relay."
+
             Mode.DIRECT ->
                 "SNI-rewrite tunnel only — no relay. Reach *.google.com (and any configured fronting_groups) directly. Useful as a bootstrap to open script.google.com and deploy Code.gs."
+
             Mode.FULL ->
                 "All traffic tunneled end-to-end through Apps Script + remote tunnel node. No certificate needed."
         }
@@ -971,7 +977,8 @@ private fun SniPoolEditor(
                     val next = if (nowEnabled) {
                         (cfg.sniHosts.takeIf { it.isNotEmpty() } ?: emptyList()) + sni
                     } else {
-                        val current = if (cfg.sniHosts.isNotEmpty()) cfg.sniHosts else enabledSet.toList()
+                        val current =
+                            if (cfg.sniHosts.isNotEmpty()) cfg.sniHosts else enabledSet.toList()
                         current.filter { it != sni }
                     }
                     onChange(cfg.copy(sniHosts = next.distinct()))
@@ -1079,6 +1086,7 @@ private fun ProbeBadge(state: ProbeState) {
                 strokeWidth = 2.dp,
             )
         }
+
         is ProbeState.Ok -> {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 // Same green the desktop UI uses for OK status (OK_GREEN
@@ -1092,6 +1100,7 @@ private fun ProbeBadge(state: ProbeState) {
                 Text("${state.latencyMs} ms", style = MaterialTheme.typography.labelSmall)
             }
         }
+
         is ProbeState.Err -> {
             Icon(
                 Icons.Default.ErrorOutline, state.message,
@@ -1120,6 +1129,7 @@ private fun summarizeUpdateCheck(json: String?): String {
                 val url = obj.optString("url")
                 "Update available: v$cur → v$latest   $url"
             }
+
             "offline" -> "Offline: ${obj.optString("reason", "no details")}"
             "error" -> "Check failed: ${obj.optString("reason", "no details")}"
             else -> "Check failed (unknown response)"
@@ -1184,7 +1194,10 @@ private fun AdvancedSettings(
             modifier = Modifier.fillMaxWidth(),
         ) {
             Column(modifier = Modifier.weight(1f)) {
-                Text(stringResource(R.string.adv_verify_tls), style = MaterialTheme.typography.bodyMedium)
+                Text(
+                    stringResource(R.string.adv_verify_tls),
+                    style = MaterialTheme.typography.bodyMedium
+                )
                 Text(
                     stringResource(R.string.adv_verify_tls_help),
                     style = MaterialTheme.typography.labelSmall,
@@ -1203,7 +1216,10 @@ private fun AdvancedSettings(
             modifier = Modifier.fillMaxWidth(),
         ) {
             Column(modifier = Modifier.weight(1f)) {
-                Text(stringResource(R.string.adv_youtube_via_relay), style = MaterialTheme.typography.bodyMedium)
+                Text(
+                    stringResource(R.string.adv_youtube_via_relay),
+                    style = MaterialTheme.typography.bodyMedium
+                )
                 Text(
                     stringResource(R.string.adv_youtube_via_relay_help),
                     style = MaterialTheme.typography.labelSmall,
@@ -1229,7 +1245,9 @@ private fun AdvancedSettings(
                 readOnly = true,
                 label = { Text(stringResource(R.string.adv_log_level)) },
                 trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
-                modifier = Modifier.fillMaxWidth().menuAnchor(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .menuAnchor(),
             )
             ExposedDropdownMenu(
                 expanded = expanded,
@@ -1363,7 +1381,13 @@ private fun AdvancedSettings(
             )
             Slider(
                 value = cfg.coalesceStepMs.toFloat(),
-                onValueChange = { onChange(cfg.copy(coalesceStepMs = it.toInt().coerceIn(10, 500))) },
+                onValueChange = {
+                    onChange(
+                        cfg.copy(
+                            coalesceStepMs = it.toInt().coerceIn(10, 500)
+                        )
+                    )
+                },
                 valueRange = 10f..500f,
             )
         }
@@ -1376,7 +1400,13 @@ private fun AdvancedSettings(
             )
             Slider(
                 value = cfg.coalesceMaxMs.toFloat(),
-                onValueChange = { onChange(cfg.copy(coalesceMaxMs = it.toInt().coerceIn(100, 2000))) },
+                onValueChange = {
+                    onChange(
+                        cfg.copy(
+                            coalesceMaxMs = it.toInt().coerceIn(100, 2000)
+                        )
+                    )
+                },
                 valueRange = 100f..2000f,
             )
         }
@@ -1451,7 +1481,9 @@ private fun LiveLogPane() {
         Surface(
             color = MaterialTheme.colorScheme.surfaceVariant,
             shape = RoundedCornerShape(8.dp),
-            modifier = Modifier.fillMaxWidth().heightIn(min = 160.dp, max = 320.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = 160.dp, max = 320.dp),
         ) {
             // SelectionContainer makes log lines selectable for manual
             // copy of partial ranges. Cross-line selection works within the

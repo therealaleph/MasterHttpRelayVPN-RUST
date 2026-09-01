@@ -1,17 +1,14 @@
 package com.therealaleph.mhrv.ui
 
-import android.app.Activity
 import android.graphics.Bitmap
 import android.graphics.Color
 import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ContentPaste
-import androidx.compose.material.icons.filled.QrCode
 import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.*
@@ -29,10 +26,11 @@ import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
-import com.therealaleph.mhrv.ConfigStore
-import com.therealaleph.mhrv.MhrvConfig
+import com.therealaleph.mhrv.data.ConfigStore
+import com.therealaleph.mhrv.data.MhrvConfig
 import androidx.compose.foundation.text.selection.SelectionContainer
 import com.therealaleph.mhrv.R
+import com.therealaleph.mhrv.data.Mode
 import kotlinx.coroutines.launch
 
 // =========================================================================
@@ -46,16 +44,16 @@ fun ConfigSharingBar(
     onSnackbar: suspend (String) -> Unit,
 ) {
     // Deep link import — requires confirmation before applying.
-    val deepLinkCfg by com.therealaleph.mhrv.MainActivity.pendingDeepLinkConfig
+    val deepLinkCfg by MainActivity.pendingDeepLinkConfig
     if (deepLinkCfg != null) {
         ImportConfirmDialog(
             cfg = deepLinkCfg!!,
             onConfirm = {
                 onImport(deepLinkCfg!!)
-                com.therealaleph.mhrv.MainActivity.pendingDeepLinkConfig.value = null
+                MainActivity.pendingDeepLinkConfig.value = null
             },
             onDismiss = {
-                com.therealaleph.mhrv.MainActivity.pendingDeepLinkConfig.value = null
+                MainActivity.pendingDeepLinkConfig.value = null
             },
         )
     }
@@ -263,9 +261,9 @@ private fun ImportConfirmDialog(
     }
     val preview = ids.take(3).joinToString("\n") { "  ${it.take(20)}…" }
     val modeLabel = when (cfg.mode) {
-        com.therealaleph.mhrv.Mode.APPS_SCRIPT -> "apps_script"
-        com.therealaleph.mhrv.Mode.DIRECT -> "direct"
-        com.therealaleph.mhrv.Mode.FULL -> "full"
+        Mode.APPS_SCRIPT -> "apps_script"
+        Mode.DIRECT -> "direct"
+        Mode.FULL -> "full"
     }
 
     AlertDialog(

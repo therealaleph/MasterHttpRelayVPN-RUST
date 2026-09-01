@@ -27,6 +27,8 @@
     <string name="btn_copy">Copy</string>
     <string name="btn_install">Install</string>
     <string name="btn_cancel">Cancel</string>
+    <string name="btn_select_all">Select all</string>
+    <string name="btn_unselect_all">Unselect all</string>
 
     <!-- Field labels -->
     <string name="field_deployment_urls">Deployment URL(s) or script ID(s)</string>
@@ -46,6 +48,7 @@
     <string name="split_only">Only selected apps</string>
     <string name="split_except">All except selected</string>
     <string name="split_pick_apps">Pick apps…</string>
+    <string name="split_show_system">Show system apps</string>
 
     <!-- Install dialog title -->
     <string name="dialog_install_mitm_title">Install MITM certificate?</string>

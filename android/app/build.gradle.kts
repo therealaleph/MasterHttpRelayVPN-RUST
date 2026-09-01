@@ -4,6 +4,8 @@ plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
+    id("com.google.devtools.ksp")
+    id("com.google.dagger.hilt.android")
 }
 
 android {
@@ -128,6 +130,10 @@ dependencies {
     // out of AppCompat — lets us flip the whole app locale at runtime
     // from MhrvApp.onCreate without touching every composable.
     implementation("androidx.appcompat:appcompat:1.7.0")
+
+    implementation("com.google.dagger:hilt-android:2.57.1")
+    implementation("androidx.hilt:hilt-navigation-compose:1.0.0")
+    ksp("com.google.dagger:hilt-android-compiler:2.57.1")
 
     // Compose UI.
     implementation("androidx.compose.ui:ui")
