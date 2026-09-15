@@ -1,0 +1,53 @@
+name: FreeBSD Rust Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  freebsd:
+    name: FreeBSD amd64
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build on FreeBSD 15.0
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "15.0"
+          usesh: true
+          prepare: |
+            pkg install -y curl git bash gmake pkgconf openssl
+            curl https://sh.rustup.rs -sSf | sh -s -- -y
+          run: |
+            set -e
+
+            . "$HOME/.cargo/env"
+
+            rustup default stable
+
+            rustc --version
+            cargo --version
+
+            cargo build --release --bin mhrv-rs
+            cargo build --release --features ui --bin mhrv-rs-ui
+
+            mkdir -p dist
+
+            cp target/release/mhrv-rs dist/mhrv-rs
+            cp target/release/mhrv-rs-ui dist/mhrv-rs-ui
+
+            tar -C dist \
+              -czf dist/mhrv-rs-freebsd-amd64.tar.gz \
+              mhrv-rs mhrv-rs-ui
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mhrv-rs-freebsd-amd64
+          path: dist/mhrv-rs-freebsd-amd64.tar.gz
