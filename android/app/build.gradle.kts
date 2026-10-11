@@ -135,6 +135,8 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
+    // Ripple indication (needed for rememberRipple)
+    implementation("androidx.compose.material:material-ripple")
 
     // QR code generation + scanning (self-contained, no ML Kit needed).
     implementation("com.google.zxing:core:3.5.3")
