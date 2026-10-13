@@ -46,7 +46,7 @@
         tools:targetApi="34">
 
         <activity
-            android:name=".MainActivity"
+            android:name=".ui.MainActivity"
             android:exported="true"
             android:launchMode="singleTask"
             android:theme="@style/Theme.Mhrv">
@@ -88,7 +88,7 @@
           and route through us.
         -->
         <service
-            android:name=".MhrvVpnService"
+            android:name=".data.MhrvVpnService"
             android:exported="false"
             android:permission="android.permission.BIND_VPN_SERVICE"
             android:foregroundServiceType="specialUse">

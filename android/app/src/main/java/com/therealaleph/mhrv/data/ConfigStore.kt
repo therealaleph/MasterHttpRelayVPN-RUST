@@ -1,9 +1,13 @@
-package com.therealaleph.mhrv
+package com.therealaleph.mhrv.data
 
 import android.content.Context
+import android.util.Base64
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.util.zip.DeflaterOutputStream
+import java.util.zip.InflaterInputStream
 
 /**
  * Config I/O. The source of truth is a JSON file in the app's files dir —
@@ -363,13 +367,13 @@ object ConfigStore {
 
         // Compress with DEFLATE then base64.
         val jsonBytes = obj.toString().toByteArray(Charsets.UTF_8)
-        val compressed = java.io.ByteArrayOutputStream().also { bos ->
-            java.util.zip.DeflaterOutputStream(bos).use { it.write(jsonBytes) }
+        val compressed = ByteArrayOutputStream().also { bos ->
+            DeflaterOutputStream(bos).use { it.write(jsonBytes) }
         }.toByteArray()
 
-        val b64 = android.util.Base64.encodeToString(
+        val b64 = Base64.encodeToString(
             compressed,
-            android.util.Base64.NO_WRAP or android.util.Base64.URL_SAFE,
+            Base64.NO_WRAP or Base64.URL_SAFE,
         )
         return "$HASH_PREFIX$b64"
     }
@@ -378,7 +382,7 @@ object ConfigStore {
      *  (for backward compat with uncompressed exports). */
     private fun inflateOrRaw(raw: ByteArray): String {
         return try {
-            java.util.zip.InflaterInputStream(raw.inputStream()).bufferedReader().readText()
+            InflaterInputStream(raw.inputStream()).bufferedReader().readText()
         } catch (_: Throwable) {
             String(raw, Charsets.UTF_8)
         }
@@ -398,7 +402,7 @@ object ConfigStore {
         // Try mhrv:// base64 encoded (possibly DEFLATE-compressed).
         val payload = if (trimmed.startsWith(HASH_PREFIX)) trimmed.removePrefix(HASH_PREFIX) else trimmed
         return try {
-            val raw = android.util.Base64.decode(payload, android.util.Base64.NO_WRAP or android.util.Base64.URL_SAFE)
+            val raw = Base64.decode(payload, Base64.NO_WRAP or Base64.URL_SAFE)
             val text = inflateOrRaw(raw)
             val obj = JSONObject(text)
             if (!obj.has("mode") && !obj.has("script_ids") && !obj.has("auth_key")) return null

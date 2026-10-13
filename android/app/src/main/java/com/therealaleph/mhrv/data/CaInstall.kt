@@ -1,4 +1,4 @@
-package com.therealaleph.mhrv
+package com.therealaleph.mhrv.data
 
 import android.content.ContentValues
 import android.content.Context
@@ -9,10 +9,12 @@ import android.provider.MediaStore
 import android.provider.Settings
 import android.security.KeyChain
 import android.util.Base64
+import com.therealaleph.mhrv.Native
 import java.io.File
 import java.security.KeyStore
 import java.security.MessageDigest
 import java.security.cert.CertificateFactory
+import java.security.cert.X509Certificate
 
 /**
  * Helpers for the MITM-CA install UX.
@@ -195,7 +197,7 @@ object CaInstall {
         val der = readDer(ctx) ?: return null
         return try {
             val cf = CertificateFactory.getInstance("X.509")
-            val cert = cf.generateCertificate(der.inputStream()) as java.security.cert.X509Certificate
+            val cert = cf.generateCertificate(der.inputStream()) as X509Certificate
             val dn = cert.subjectX500Principal.name  // RFC 2253, CN=foo,O=bar
             Regex("""CN=([^,]+)""").find(dn)?.groupValues?.get(1)
         } catch (_: Throwable) { null }

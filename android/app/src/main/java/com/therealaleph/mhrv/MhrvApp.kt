@@ -4,6 +4,9 @@ import android.app.Application
 import android.util.Log
 import androidx.appcompat.app.AppCompatDelegate
 import androidx.core.os.LocaleListCompat
+import com.therealaleph.mhrv.data.ConfigStore
+import com.therealaleph.mhrv.data.UiLang
+import dagger.hilt.android.HiltAndroidApp
 
 /**
  * Application-level setup. The only job here right now is to catch
@@ -19,6 +22,7 @@ import androidx.core.os.LocaleListCompat
  * including the tun2proxy worker and the log-drain coroutine —
  * important because those don't have an activity in scope.
  */
+@HiltAndroidApp
 class MhrvApp : Application() {
     override fun onCreate() {
         super.onCreate()
@@ -53,7 +57,8 @@ class MhrvApp : Application() {
                     "uncaught on thread=${thread.name} (id=${thread.id}): ${throwable.message}",
                     throwable,
                 )
-            } catch (_: Throwable) { }
+            } catch (_: Throwable) {
+            }
             // Let the default handler still terminate the process and
             // show the system "app closed" dialog — we just wanted to
             // get a log line out the door first.
